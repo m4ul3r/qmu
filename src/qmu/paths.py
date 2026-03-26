@@ -71,3 +71,26 @@ def skill_source_dir() -> Path:
 
 def skill_install_dir() -> Path:
     return claude_skills_dir() / SKILL_NAME
+
+
+def config_home() -> Path:
+    env = os.environ.get("QMU_CONFIG_DIR")
+    if env:
+        return Path(env).expanduser()
+
+    system = platform.system()
+    home = Path.home()
+    if system == "Darwin":
+        return home / "Library" / "Application Support" / "qmu"
+    if system == "Windows":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "qmu"
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / "qmu"
+    return home / ".config" / "qmu"
+
+
+def global_config_path() -> Path:
+    return config_home() / "config.toml"

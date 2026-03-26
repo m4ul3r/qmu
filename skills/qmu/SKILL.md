@@ -7,6 +7,44 @@ description: Use the local qmu CLI to manage QEMU VMs for kernel exploit develop
 
 Use this skill when the user wants to boot, manage, or interact with QEMU VMs for kernel security research. The tool provides structured JSON or text output and handles the common pain points of QEMU-based kernel exploit development.
 
+## Configuration
+
+qmu uses TOML config files for machine settings (arch, rootfs, SSH key, profiles). Resolution order (later wins):
+
+1. **Built-in defaults** — arch=x86_64, memory=4G, cpus=2
+2. **Global config** — `~/.config/qmu/config.toml`
+3. **Project config** — `qmu.toml` found by walking up from CWD
+4. **CLI flags** — `--rootfs`, `--memory`, `--arch`, etc.
+
+```bash
+qmu config show         # Show resolved config and sources
+qmu config init         # Create starter qmu.toml in current directory
+qmu config path         # Show config file search paths
+```
+
+Example `qmu.toml`:
+```toml
+[machine]
+arch = "x86_64"         # determines qemu-system-{arch} binary
+memory = "4G"
+cpus = 2
+# extra_args = ["-M", "virt", "-cpu", "cortex-a57"]  # for aarch64
+
+[drive]
+rootfs = "/path/to/rootfs.img"
+format = "raw"
+
+[ssh]
+key = "/path/to/ssh.id_rsa"
+user = "root"
+port_start = 10021
+
+[profiles.exploit-dev]
+cmdline = "console=ttyS0 root=/dev/sda selinux=0 apparmor=0 kasan.fault=panic"
+```
+
+The `arch` field drives which `qemu-system-*` binary is used and whether KVM is enabled (only when guest arch matches host). Use `extra_args` for arch-specific machine flags.
+
 ## Quick Start
 
 ```bash
@@ -37,7 +75,7 @@ Boot profiles:
 - `trigger-test`: adds panic_on_warn=1 — validate bug triggers
 - `exploit-test`: adds panic_on_oops=1 — final exploit validation
 
-The rootfs image defaults to `/media/ssd/kernel_research/tools/qemu/trixie.img`. Override with `--rootfs`. The drive uses `snapshot=on` so the base image is never modified.
+Rootfs, SSH key, and other settings come from `qmu.toml` config. Override any setting with CLI flags (e.g. `--rootfs`, `--arch`). The drive uses `snapshot=on` so the base image is never modified.
 
 ### Multiple VMs
 

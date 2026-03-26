@@ -11,9 +11,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .config import QMUConfig, STARTER_CONFIG, find_project_config, resolve_config
 from .instance import QMUError, VMInstance, choose_instance, list_instances, remove_instance
 from .output import render_value, write_output_result
-from .paths import skill_install_dir, skill_source_dir
+from .paths import global_config_path, skill_install_dir, skill_source_dir
 from .qmp import QMPClient, QMPError
 from .serial import extract_crash, tail_log
 from .snapshot import (
@@ -24,14 +25,7 @@ from .snapshot import (
 )
 from .ssh import SSHClient, SSHError
 from .version import VERSION
-from .vm import (
-    BOOT_PROFILES,
-    DEFAULT_CPUS,
-    DEFAULT_MEMORY,
-    DEFAULT_ROOTFS,
-    DEFAULT_SSH_KEY,
-    launch_vm,
-)
+from .vm import launch_vm
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +39,30 @@ def _make_ssh(inst: VMInstance) -> SSHClient:
 
 def _qmp_ctx(inst: VMInstance) -> QMPClient:
     return QMPClient(inst.qmp_socket)
+
+
+def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
+    """Build a QMUConfig from CLI args, layered over config files."""
+    cli_overrides: dict[str, Any] = {}
+
+    # Map CLI flag names to QMUConfig field names
+    flag_map = {
+        "rootfs": "rootfs",
+        "ssh_key": "ssh_key",
+        "memory": "memory",
+        "cpus": "cpus",
+        "arch": "arch",
+    }
+    for flag, cfg_field in flag_map.items():
+        val = getattr(args, flag, None)
+        if val is not None:
+            cli_overrides[cfg_field] = val
+
+    config_path = getattr(args, "config", None)
+    return resolve_config(
+        cli_overrides=cli_overrides or None,
+        config_path_override=Path(config_path) if config_path else None,
+    )
 
 
 def _output(value: Any, args: argparse.Namespace, stem: str = "qmu") -> None:
@@ -72,16 +90,13 @@ def _add_common_opts(parser: argparse.ArgumentParser) -> None:
 def _add_launch(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("launch", help="Start a QEMU VM")
     p.add_argument("--kernel", required=True, help="Path to bzImage")
-    p.add_argument("--rootfs", default=DEFAULT_ROOTFS, help="Path to rootfs image")
-    p.add_argument("--ssh-key", default=DEFAULT_SSH_KEY, help="SSH private key for guest")
-    p.add_argument("--memory", default=DEFAULT_MEMORY, help="VM memory (default: 4G)")
-    p.add_argument("--cpus", type=int, default=DEFAULT_CPUS, help="VM CPUs (default: 2)")
-    p.add_argument(
-        "--profile",
-        choices=list(BOOT_PROFILES.keys()),
-        default="exploit-dev",
-        help="Boot profile (default: exploit-dev)",
-    )
+    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
+    p.add_argument("--rootfs", default=None, help="Path to rootfs image (overrides config)")
+    p.add_argument("--ssh-key", default=None, dest="ssh_key", help="SSH private key (overrides config)")
+    p.add_argument("--arch", default=None, help="Architecture (overrides config, e.g. x86_64, aarch64)")
+    p.add_argument("--memory", default=None, help="VM memory (overrides config)")
+    p.add_argument("--cpus", type=int, default=None, help="VM CPUs (overrides config)")
+    p.add_argument("--profile", default="exploit-dev", help="Boot profile (default: exploit-dev)")
     p.add_argument("--cmdline", default=None, help="Override kernel command line")
     p.add_argument("--gdb", action="store_true", help="Enable GDB stub")
     p.add_argument("--name", default=None, help="VM instance name")
@@ -95,12 +110,11 @@ def _add_launch(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_launch(args: argparse.Namespace) -> int:
+    config = _resolve_config_from_args(args)
+
     inst = launch_vm(
+        config=config,
         kernel=args.kernel,
-        rootfs=args.rootfs,
-        ssh_key=args.ssh_key,
-        memory=args.memory,
-        cpus=args.cpus,
         profile=args.profile,
         cmdline=args.cmdline,
         gdb=args.gdb,
@@ -132,11 +146,13 @@ def _handle_launch(args: argparse.Namespace) -> int:
         "kernel": inst.kernel,
         "profile": inst.profile,
         "serial_log": inst.serial_log,
+        "arch": config.arch,
     }
 
     if args.format == "text":
         lines = [
             f"VM '{inst.vm_id}' launched (pid={inst.pid})",
+            f"  Arch:    {config.arch}",
             f"  SSH:     port {inst.ssh_port} ({ssh_status})",
         ]
         if inst.gdb_port:
@@ -321,51 +337,84 @@ def _handle_status(args: argparse.Namespace) -> int:
 
 def _add_doctor(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("doctor", help="Health check")
+    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_doctor)
 
 
 def _handle_doctor(args: argparse.Namespace) -> int:
+    config_path = getattr(args, "config", None)
+    config = resolve_config(
+        config_path_override=Path(config_path) if config_path else None,
+    )
     checks: list[dict[str, Any]] = []
 
-    # QEMU binary
-    qemu = shutil.which("qemu-system-x86_64")
+    # Config sources
     checks.append({
-        "check": "qemu-system-x86_64",
+        "check": "config",
+        "status": "ok",
+        "detail": " -> ".join(config._sources),
+    })
+
+    # QEMU binary (arch-aware)
+    binary = config.qemu_binary()
+    qemu = shutil.which(binary)
+    checks.append({
+        "check": binary,
         "status": "ok" if qemu else "MISSING",
         "detail": qemu or "Not found in PATH",
     })
 
-    # Default rootfs
-    rootfs_ok = Path(DEFAULT_ROOTFS).exists()
-    checks.append({
-        "check": "rootfs image",
-        "status": "ok" if rootfs_ok else "MISSING",
-        "detail": DEFAULT_ROOTFS,
-    })
+    # Rootfs
+    if config.rootfs:
+        rootfs_ok = Path(config.rootfs).exists()
+        checks.append({
+            "check": "rootfs image",
+            "status": "ok" if rootfs_ok else "MISSING",
+            "detail": config.rootfs,
+        })
+    else:
+        checks.append({
+            "check": "rootfs image",
+            "status": "not configured",
+            "detail": "Set [drive] rootfs in qmu.toml or pass --rootfs",
+        })
 
     # SSH key
-    key_path = Path(DEFAULT_SSH_KEY)
-    key_ok = key_path.exists()
-    key_perms = ""
-    if key_ok:
-        mode = oct(key_path.stat().st_mode)[-3:]
-        key_perms = f" (mode={mode})"
-        if mode not in ("600", "400"):
-            key_perms += " WARNING: should be 600"
-    checks.append({
-        "check": "SSH key",
-        "status": "ok" if key_ok else "MISSING",
-        "detail": f"{DEFAULT_SSH_KEY}{key_perms}",
-    })
+    if config.ssh_key:
+        key_path = Path(config.ssh_key)
+        key_ok = key_path.exists()
+        key_perms = ""
+        if key_ok:
+            mode = oct(key_path.stat().st_mode)[-3:]
+            key_perms = f" (mode={mode})"
+            if mode not in ("600", "400"):
+                key_perms += " WARNING: should be 600"
+        checks.append({
+            "check": "SSH key",
+            "status": "ok" if key_ok else "MISSING",
+            "detail": f"{config.ssh_key}{key_perms}",
+        })
+    else:
+        checks.append({
+            "check": "SSH key",
+            "status": "not configured",
+            "detail": "Set [ssh] key in qmu.toml or pass --ssh-key",
+        })
 
     # KVM
-    kvm_ok = Path("/dev/kvm").exists()
-    checks.append({
-        "check": "/dev/kvm",
-        "status": "ok" if kvm_ok else "MISSING",
-        "detail": "KVM acceleration available" if kvm_ok else "No KVM — will be slow",
-    })
+    if config.use_kvm():
+        checks.append({
+            "check": "KVM",
+            "status": "ok",
+            "detail": "KVM acceleration available",
+        })
+    else:
+        checks.append({
+            "check": "KVM",
+            "status": "info",
+            "detail": f"Not available for arch={config.arch} (will use TCG)",
+        })
 
     # Running instances
     instances = list_instances()
@@ -386,14 +435,109 @@ def _handle_doctor(args: argparse.Namespace) -> int:
     if args.format == "text":
         lines = ["qmu doctor:"]
         for c in checks:
-            mark = "+" if c["status"] == "ok" else "!"
+            mark = "+" if c["status"] in ("ok", "info") else "!"
             lines.append(f"  [{mark}] {c['check']}: {c['detail']}")
         _output("\n".join(lines), args, stem="doctor")
     else:
         _output(checks, args, stem="doctor")
 
-    all_ok = all(c["status"] == "ok" for c in checks)
+    all_ok = all(c["status"] in ("ok", "info") for c in checks)
     return 0 if all_ok else 1
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+
+def _add_config(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("config", help="Manage qmu configuration")
+    sp = p.add_subparsers(dest="config_cmd")
+
+    s = sp.add_parser("show", help="Show resolved configuration")
+    s.add_argument("--config", default=None, help="Path to qmu.toml config file")
+    _add_common_opts(s)
+    s.set_defaults(handler=_handle_config_show)
+
+    s = sp.add_parser("init", help="Create a starter qmu.toml in current directory")
+    s.set_defaults(handler=_handle_config_init)
+
+    s = sp.add_parser("path", help="Show config file search paths")
+    s.set_defaults(handler=_handle_config_path)
+
+
+def _handle_config_show(args: argparse.Namespace) -> int:
+    config_path = getattr(args, "config", None)
+    config = resolve_config(
+        config_path_override=Path(config_path) if config_path else None,
+    )
+
+    data = {
+        "sources": config._sources,
+        "machine": {
+            "arch": config.arch,
+            "memory": config.memory,
+            "cpus": config.cpus,
+            "qemu_binary": config.qemu_binary(),
+            "kvm": config.use_kvm(),
+            "extra_args": config.extra_args,
+        },
+        "drive": {
+            "rootfs": config.rootfs,
+            "format": config.drive_format,
+        },
+        "ssh": {
+            "key": config.ssh_key,
+            "user": config.ssh_user,
+            "port_start": config.ssh_port_start,
+        },
+        "gdb": {
+            "port_start": config.gdb_port_start,
+        },
+        "profiles": config.profiles,
+    }
+
+    if args.format == "text":
+        lines = ["Resolved qmu config:"]
+        lines.append(f"  Sources: {' -> '.join(config._sources)}")
+        lines.append(f"  Arch:        {config.arch} ({config.qemu_binary()})")
+        lines.append(f"  KVM:         {config.use_kvm()}")
+        lines.append(f"  Memory:      {config.memory}")
+        lines.append(f"  CPUs:        {config.cpus}")
+        lines.append(f"  Rootfs:      {config.rootfs or '(not set)'}")
+        lines.append(f"  Drive fmt:   {config.drive_format}")
+        lines.append(f"  SSH key:     {config.ssh_key or '(not set)'}")
+        lines.append(f"  SSH user:    {config.ssh_user}")
+        lines.append(f"  SSH port:    {config.ssh_port_start}+")
+        lines.append(f"  GDB port:    {config.gdb_port_start}+")
+        if config.extra_args:
+            lines.append(f"  Extra args:  {' '.join(config.extra_args)}")
+        lines.append(f"  Profiles:    {', '.join(config.profiles.keys())}")
+        _output("\n".join(lines), args, stem="config-show")
+    else:
+        _output(data, args, stem="config-show")
+    return 0
+
+
+def _handle_config_init(args: argparse.Namespace) -> int:
+    target = Path.cwd() / "qmu.toml"
+    if target.exists():
+        sys.stderr.write(f"[qmu] {target} already exists\n")
+        return 1
+    target.write_text(STARTER_CONFIG)
+    print(f"Created {target}")
+    return 0
+
+
+def _handle_config_path(args: argparse.Namespace) -> int:
+    gpath = global_config_path()
+    ppath = find_project_config()
+    lines = [
+        f"Global config:  {gpath} ({'exists' if gpath.is_file() else 'not found'})",
+        f"Project config: {ppath or '(none found — searched up from CWD)'}",
+    ]
+    print("\n".join(lines))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -868,6 +1012,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_list(sub)
     _add_status(sub)
     _add_doctor(sub)
+    _add_config(sub)
     _add_snapshot(sub)
     _add_push(sub)
     _add_pull(sub)

@@ -7,32 +7,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .config import QMUConfig
 from .instance import QMUError, VMInstance, save_instance
 from .paths import instances_dir, qmp_socket_path, serial_log_path
 from .qmp import QMPClient
-
-
-DEFAULT_ROOTFS = "/media/ssd/kernel_research/tools/qemu/trixie.img"
-DEFAULT_SSH_KEY = "/media/ssd/kernel_research/tools/qemu/trixie.id_rsa"
-DEFAULT_MEMORY = "4G"
-DEFAULT_CPUS = 2
-DEFAULT_SSH_PORT_START = 10021
-DEFAULT_GDB_PORT_START = 1234
-
-BOOT_PROFILES: dict[str, str] = {
-    "exploit-dev": (
-        "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0"
-        " selinux=0 apparmor=0 kasan.fault=panic"
-    ),
-    "trigger-test": (
-        "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0"
-        " selinux=0 apparmor=0 panic_on_warn=1 kasan.fault=panic"
-    ),
-    "exploit-test": (
-        "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0"
-        " selinux=0 apparmor=0 panic_on_oops=1 kasan.fault=panic"
-    ),
-}
 
 
 def find_free_port(start: int, max_tries: int = 100) -> int:
@@ -50,10 +28,9 @@ def find_free_port(start: int, max_tries: int = 100) -> int:
 
 def build_qemu_command(
     *,
+    config: QMUConfig,
     kernel: str,
     rootfs: str,
-    memory: str,
-    cpus: int,
     ssh_port: int,
     gdb_port: int | None,
     qmp_socket: str,
@@ -61,36 +38,41 @@ def build_qemu_command(
     cmdline: str,
     extra_args: list[str] | None = None,
 ) -> list[str]:
-    """Build the qemu-system-x86_64 command line."""
+    """Build the qemu-system command line from config."""
     cmd = [
-        "qemu-system-x86_64",
-        "-m", memory,
-        "-smp", str(cpus),
+        config.qemu_binary(),
+        "-m", config.memory,
+        "-smp", str(config.cpus),
         "-kernel", kernel,
         "-append", cmdline,
-        "-drive", f"file={rootfs},format=raw,snapshot=on",
+        "-drive", f"file={rootfs},format={config.drive_format},snapshot=on",
         "-net", f"user,host=10.0.2.10,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
         "-net", "nic,model=e1000",
-        "-enable-kvm",
         "-display", "none",
         "-serial", f"file:{serial_log}",
         "-monitor", "none",
         "-qmp", f"unix:{qmp_socket},server,wait=off",
     ]
+
+    if config.use_kvm():
+        cmd.append("-enable-kvm")
+
+    if config.extra_args:
+        cmd.extend(config.extra_args)
+
     if gdb_port is not None:
         cmd.extend(["-gdb", f"tcp::{gdb_port}"])
+
     if extra_args:
         cmd.extend(extra_args)
+
     return cmd
 
 
 def launch_vm(
     *,
+    config: QMUConfig,
     kernel: str,
-    rootfs: str = DEFAULT_ROOTFS,
-    ssh_key: str = DEFAULT_SSH_KEY,
-    memory: str = DEFAULT_MEMORY,
-    cpus: int = DEFAULT_CPUS,
     profile: str = "exploit-dev",
     cmdline: str | None = None,
     gdb: bool = False,
@@ -106,27 +88,35 @@ def launch_vm(
     if not kernel_path.exists():
         raise QMUError(f"Kernel not found: {kernel}")
 
-    rootfs_path = Path(rootfs).resolve()
+    if config.rootfs is None:
+        raise QMUError(
+            "No rootfs configured. Set [drive] rootfs in qmu.toml or pass --rootfs"
+        )
+    rootfs_path = Path(config.rootfs).resolve()
     if not rootfs_path.exists():
-        raise QMUError(f"Rootfs image not found: {rootfs}")
+        raise QMUError(f"Rootfs image not found: {config.rootfs}")
 
-    key_path = Path(ssh_key).resolve()
+    if config.ssh_key is None:
+        raise QMUError(
+            "No SSH key configured. Set [ssh] key in qmu.toml or pass --ssh-key"
+        )
+    key_path = Path(config.ssh_key).resolve()
     if not key_path.exists():
-        raise QMUError(f"SSH key not found: {ssh_key}")
+        raise QMUError(f"SSH key not found: {config.ssh_key}")
 
-    if profile not in BOOT_PROFILES:
-        valid = ", ".join(BOOT_PROFILES.keys())
+    if profile not in config.profiles:
+        valid = ", ".join(config.profiles.keys())
         raise QMUError(f"Unknown profile '{profile}'. Valid: {valid}")
 
     # Resolve command line
     if cmdline is None:
-        cmdline = BOOT_PROFILES[profile]
+        cmdline = config.profiles[profile]
 
     # Allocate ports
     if ssh_port is None:
-        ssh_port = find_free_port(DEFAULT_SSH_PORT_START)
+        ssh_port = find_free_port(config.ssh_port_start)
     if gdb and gdb_port is None:
-        gdb_port = find_free_port(DEFAULT_GDB_PORT_START)
+        gdb_port = find_free_port(config.gdb_port_start)
 
     # Generate VM ID
     vm_id = name or f"vm-{ssh_port}"
@@ -143,10 +133,9 @@ def launch_vm(
 
     # Build command
     cmd = build_qemu_command(
+        config=config,
         kernel=str(kernel_path),
         rootfs=str(rootfs_path),
-        memory=memory,
-        cpus=cpus,
         ssh_port=ssh_port,
         gdb_port=gdb_port,
         qmp_socket=qmp_sock,
@@ -204,8 +193,8 @@ def launch_vm(
         serial_log=serial_path,
         kernel=str(kernel_path),
         rootfs=str(rootfs_path),
-        memory=memory,
-        cpus=cpus,
+        memory=config.memory,
+        cpus=config.cpus,
         cmdline=cmdline,
         profile=profile,
         started_at=datetime.now(timezone.utc).isoformat(),
