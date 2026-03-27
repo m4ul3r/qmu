@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import QMUConfig, STARTER_CONFIG, find_project_config, resolve_config
-from .instance import QMUError, VMInstance, choose_instance, list_instances, remove_instance
+from .instance import QMUError, VMInstance, choose_instance, is_pid_alive, list_instances, load_instance, remove_instance
 from .output import render_value, write_output_result
 from .paths import global_config_path, skill_install_dir, skill_source_dir
 from .qmp import QMPClient, QMPError
@@ -76,6 +76,32 @@ def _output(value: Any, args: argparse.Namespace, stem: str = "qmu") -> None:
         sys.stderr.write(f"[qmu] Output spilled to {result.artifact['artifact_path']}\n")
 
 
+def _kill_vm(inst: VMInstance, force: bool = False) -> None:
+    """Kill a VM instance: QMP quit → SIGTERM → SIGKILL → cleanup."""
+    if not force:
+        try:
+            with _qmp_ctx(inst) as qmp:
+                qmp.execute("quit", timeout=5)
+        except (QMPError, OSError):
+            pass
+        time.sleep(1)
+
+    try:
+        os.kill(inst.pid, 0)
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        os.kill(inst.pid, sig)
+        time.sleep(1)
+        try:
+            os.kill(inst.pid, 0)
+            os.kill(inst.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    except OSError:
+        pass  # Already dead
+
+    remove_instance(inst.vm_id)
+
+
 def _add_common_opts(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vm", default=None, help="VM instance ID (auto-selects if only one)")
     parser.add_argument("--format", choices=["text", "json", "ndjson"], default="text")
@@ -100,6 +126,8 @@ def _add_launch(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--cmdline", default=None, help="Override kernel command line")
     p.add_argument("--gdb", action="store_true", help="Enable GDB stub")
     p.add_argument("--name", default=None, help="VM instance name")
+    p.add_argument("--no-replace", action="store_true",
+                   help="Don't kill existing VM with same name (default: replace)")
     p.add_argument("--ssh-port", type=int, default=None, help="SSH port (auto-allocated)")
     p.add_argument("--gdb-port", type=int, default=None, help="GDB port (auto-allocated)")
     p.add_argument("--ssh-timeout", type=int, default=60, help="SSH wait timeout in seconds")
@@ -111,6 +139,16 @@ def _add_launch(sub: argparse._SubParsersAction) -> None:
 
 def _handle_launch(args: argparse.Namespace) -> int:
     config = _resolve_config_from_args(args)
+
+    # Replace existing VM with the same name (default behavior)
+    if args.name and not args.no_replace:
+        existing = load_instance(args.name)
+        if existing is not None and is_pid_alive(existing.pid):
+            sys.stderr.write(f"[qmu] Replacing existing VM '{args.name}' (pid={existing.pid})\n")
+            _kill_vm(existing)
+        elif existing is not None:
+            # Stale metadata from dead process — just clean up
+            remove_instance(existing.vm_id)
 
     inst = launch_vm(
         config=config,
@@ -180,34 +218,7 @@ def _add_kill(sub: argparse._SubParsersAction) -> None:
 
 def _handle_kill(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
-
-    # Try graceful QMP quit first
-    if not args.force:
-        try:
-            with _qmp_ctx(inst) as qmp:
-                qmp.execute("quit", timeout=5)
-        except (QMPError, OSError):
-            pass
-        # Give it a moment
-        time.sleep(1)
-
-    # Check if still alive
-    try:
-        os.kill(inst.pid, 0)
-        # Still alive — escalate
-        sig = signal.SIGKILL if args.force else signal.SIGTERM
-        os.kill(inst.pid, sig)
-        time.sleep(1)
-        # Final check
-        try:
-            os.kill(inst.pid, 0)
-            os.kill(inst.pid, signal.SIGKILL)
-        except OSError:
-            pass
-    except OSError:
-        pass  # Already dead
-
-    remove_instance(inst.vm_id)
+    _kill_vm(inst, force=args.force)
     _output(f"VM '{inst.vm_id}' stopped.", args, stem="kill")
     return 0
 

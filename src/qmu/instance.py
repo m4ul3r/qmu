@@ -49,7 +49,7 @@ def load_instance(vm_id: str) -> VMInstance | None:
         return None
 
 
-def _is_pid_alive(pid: int) -> bool:
+def is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
@@ -69,7 +69,7 @@ def list_instances() -> list[VMInstance]:
         except (json.JSONDecodeError, TypeError, KeyError):
             p.unlink(missing_ok=True)
             continue
-        if _is_pid_alive(inst.pid):
+        if is_pid_alive(inst.pid):
             live.append(inst)
         else:
             # Stale — clean up
