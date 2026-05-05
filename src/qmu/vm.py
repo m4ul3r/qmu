@@ -30,29 +30,57 @@ def build_qemu_command(
     *,
     config: QMUConfig,
     kernel: str,
-    rootfs: str,
-    ssh_port: int,
+    rootfs: str | None,
+    ssh_port: int | None,
     gdb_port: int | None,
     qmp_socket: str,
     serial_log: str,
     cmdline: str,
+    initrd: str | None = None,
+    drives: list[str] | None = None,
+    no_net: bool = False,
+    nic_model: str | None = None,
     extra_args: list[str] | None = None,
 ) -> list[str]:
     """Build the qemu-system command line from config."""
+    nic = nic_model or config.nic_model
+
     cmd = [
         config.qemu_binary(),
         "-m", config.memory,
         "-smp", str(config.cpus),
         "-kernel", kernel,
         "-append", cmdline,
-        "-drive", f"file={rootfs},format={config.drive_format},snapshot=on",
-        "-net", f"user,host=10.0.2.10,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
-        "-net", "nic,model=e1000",
+    ]
+
+    if initrd:
+        cmd.extend(["-initrd", initrd])
+
+    # Drives: explicit --drive specs win and suppress the implicit rootfs drive.
+    if drives:
+        for spec in drives:
+            cmd.extend(["-drive", spec])
+    elif rootfs is not None:
+        cmd.extend(["-drive", f"file={rootfs},format={config.drive_format},snapshot=on"])
+
+    # Networking
+    if no_net:
+        cmd.extend(["-nic", "none"])
+    elif ssh_port is None:
+        # No SSH hostfwd, but still provide a NIC (rare: --no-wait-ssh without --no-net).
+        cmd.extend(["-nic", f"user,model={nic}"])
+    else:
+        cmd.extend([
+            "-net", f"user,host=10.0.2.10,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
+            "-net", f"nic,model={nic}",
+        ])
+
+    cmd.extend([
         "-display", "none",
         "-serial", f"file:{serial_log}",
         "-monitor", "none",
         "-qmp", f"unix:{qmp_socket},server,wait=off",
-    ]
+    ])
 
     if config.use_kvm():
         cmd.append("-enable-kvm")
@@ -81,6 +109,11 @@ def launch_vm(
     gdb_port: int | None = None,
     extra_args: list[str] | None = None,
     ssh_timeout: int = 60,
+    initrd: str | None = None,
+    drives: list[str] | None = None,
+    no_net: bool = False,
+    nic_model: str | None = None,
+    harness: bool = False,
 ) -> VMInstance:
     """Launch a QEMU VM and return the instance."""
     # Validate files
@@ -88,21 +121,37 @@ def launch_vm(
     if not kernel_path.exists():
         raise QMUError(f"Kernel not found: {kernel}")
 
-    if config.rootfs is None:
-        raise QMUError(
-            "No rootfs configured. Set [drive] rootfs in qmu.toml or pass --rootfs"
-        )
-    rootfs_path = Path(config.rootfs).resolve()
-    if not rootfs_path.exists():
-        raise QMUError(f"Rootfs image not found: {config.rootfs}")
+    rootfs_path: Path | None = None
+    if not harness and not drives:
+        if config.rootfs is None:
+            raise QMUError(
+                "No rootfs configured. Set [drive] rootfs in qmu.toml or pass --rootfs"
+            )
+        rootfs_path = Path(config.rootfs).resolve()
+        if not rootfs_path.exists():
+            raise QMUError(f"Rootfs image not found: {config.rootfs}")
+    elif config.rootfs is not None:
+        # rootfs is configured but suppressed by --drive or --harness; only resolve
+        # so we can record the path on the instance for diagnostics.
+        candidate = Path(config.rootfs).resolve()
+        if candidate.exists():
+            rootfs_path = candidate
 
-    if config.ssh_key is None:
-        raise QMUError(
-            "No SSH key configured. Set [ssh] key in qmu.toml or pass --ssh-key"
-        )
-    key_path = Path(config.ssh_key).resolve()
-    if not key_path.exists():
-        raise QMUError(f"SSH key not found: {config.ssh_key}")
+    key_path: Path | None = None
+    if not harness:
+        if config.ssh_key is None:
+            raise QMUError(
+                "No SSH key configured. Set [ssh] key in qmu.toml or pass --ssh-key"
+            )
+        key_path = Path(config.ssh_key).resolve()
+        if not key_path.exists():
+            raise QMUError(f"SSH key not found: {config.ssh_key}")
+
+    initrd_path: Path | None = None
+    if initrd is not None:
+        initrd_path = Path(initrd).resolve()
+        if not initrd_path.exists():
+            raise QMUError(f"Initrd not found: {initrd}")
 
     if profile not in config.profiles:
         valid = ", ".join(config.profiles.keys())
@@ -113,13 +162,20 @@ def launch_vm(
         cmdline = config.profiles[profile]
 
     # Allocate ports
-    if ssh_port is None:
+    if harness:
+        ssh_port = None
+    elif ssh_port is None:
         ssh_port = find_free_port(config.ssh_port_start)
     if gdb and gdb_port is None:
         gdb_port = find_free_port(config.gdb_port_start)
 
     # Generate VM ID
-    vm_id = name or f"vm-{ssh_port}"
+    if name:
+        vm_id = name
+    elif ssh_port is not None:
+        vm_id = f"vm-{ssh_port}"
+    else:
+        vm_id = f"vm-h{int(time.time())}"
 
     # Prepare paths
     idir = instances_dir()
@@ -131,16 +187,23 @@ def launch_vm(
     # Remove stale socket if present
     Path(qmp_sock).unlink(missing_ok=True)
 
+    # Resolved nic for instance record
+    resolved_nic = nic_model or config.nic_model
+
     # Build command
     cmd = build_qemu_command(
         config=config,
         kernel=str(kernel_path),
-        rootfs=str(rootfs_path),
+        rootfs=str(rootfs_path) if rootfs_path else None,
         ssh_port=ssh_port,
         gdb_port=gdb_port,
         qmp_socket=qmp_sock,
         serial_log=serial_path,
         cmdline=cmdline,
+        initrd=str(initrd_path) if initrd_path else None,
+        drives=drives,
+        no_net=no_net,
+        nic_model=nic_model,
         extra_args=extra_args,
     )
 
@@ -188,16 +251,18 @@ def launch_vm(
         pid=proc.pid,
         qmp_socket=qmp_sock,
         ssh_port=ssh_port,
-        ssh_key=str(key_path),
+        ssh_key=str(key_path) if key_path else None,
         gdb_port=gdb_port,
         serial_log=serial_path,
         kernel=str(kernel_path),
-        rootfs=str(rootfs_path),
+        rootfs=str(rootfs_path) if rootfs_path else None,
         memory=config.memory,
         cpus=config.cpus,
         cmdline=cmdline,
         profile=profile,
         started_at=datetime.now(timezone.utc).isoformat(),
+        harness=harness,
+        nic_model=resolved_nic,
     )
     save_instance(inst)
 

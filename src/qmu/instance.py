@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 from .paths import instance_json_path, instances_dir
@@ -18,17 +18,25 @@ class VMInstance:
     vm_id: str
     pid: int
     qmp_socket: str
-    ssh_port: int
-    ssh_key: str
+    ssh_port: int | None
+    ssh_key: str | None
     gdb_port: int | None
     serial_log: str
     kernel: str
-    rootfs: str
+    rootfs: str | None
     memory: str
     cpus: int
     cmdline: str
     profile: str
     started_at: str
+    harness: bool = False
+    nic_model: str | None = None
+
+
+def _instance_from_dict(data: dict) -> VMInstance:
+    """Tolerant constructor: ignore unknown keys (forward compat for old JSON)."""
+    known = {f.name for f in fields(VMInstance)}
+    return VMInstance(**{k: v for k, v in data.items() if k in known})
 
 
 def save_instance(inst: VMInstance) -> Path:
@@ -44,7 +52,7 @@ def load_instance(vm_id: str) -> VMInstance | None:
         return None
     try:
         data = json.loads(path.read_text())
-        return VMInstance(**data)
+        return _instance_from_dict(data)
     except (json.JSONDecodeError, TypeError, KeyError):
         return None
 
@@ -65,7 +73,7 @@ def list_instances() -> list[VMInstance]:
     for p in sorted(idir.glob("*.json")):
         try:
             data = json.loads(p.read_text())
-            inst = VMInstance(**data)
+            inst = _instance_from_dict(data)
         except (json.JSONDecodeError, TypeError, KeyError):
             p.unlink(missing_ok=True)
             continue
@@ -103,5 +111,8 @@ def choose_instance(vm_id: str | None = None) -> VMInstance:
 
     lines = [f"Multiple VMs running. Specify one with --vm <id>:"]
     for inst in instances:
-        lines.append(f"  {inst.vm_id}  (pid={inst.pid}, ssh={inst.ssh_port})")
+        if inst.harness or inst.ssh_port is None:
+            lines.append(f"  {inst.vm_id}  (pid={inst.pid}, harness)")
+        else:
+            lines.append(f"  {inst.vm_id}  (pid={inst.pid}, ssh={inst.ssh_port})")
     raise QMUError("\n".join(lines))

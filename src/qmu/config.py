@@ -35,6 +35,7 @@ class QMUConfig:
     arch: str = "x86_64"
     memory: str = "4G"
     cpus: int = 2
+    nic_model: str = "virtio-net-pci"
     extra_args: list[str] = field(default_factory=list)
 
     # drive
@@ -94,6 +95,8 @@ def _apply_toml(cfg: QMUConfig, raw: dict[str, Any], source: str) -> None:
         cfg.memory = machine["memory"]
     if "cpus" in machine:
         cfg.cpus = int(machine["cpus"])
+    if "nic_model" in machine:
+        cfg.nic_model = machine["nic_model"]
     if "extra_args" in machine:
         cfg.extra_args = list(machine["extra_args"])
 
@@ -186,6 +189,7 @@ STARTER_CONFIG = """\
 arch = "x86_64"
 memory = "4G"
 cpus = 2
+# nic_model = "virtio-net-pci"   # or "e1000", "rtl8139", ...
 # extra_args = ["-M", "virt", "-cpu", "cortex-a57"]  # e.g. for aarch64
 
 [drive]
