@@ -108,6 +108,19 @@ def test_nic_model_from_config():
     assert any(a == "nic,model=rtl8139" for a in cmd)
 
 
+def test_cpu_model_absent_by_default():
+    cmd = build_qemu_command(**_kwargs())
+    assert "-cpu" not in cmd
+
+
+def test_cpu_model_from_config_emits_flag():
+    cfg = _base_config()
+    cfg.cpu_model = "host"
+    cmd = build_qemu_command(**_kwargs(config=cfg))
+    assert "-cpu" in cmd
+    assert cmd[cmd.index("-cpu") + 1] == "host"
+
+
 def test_ssh_port_none_without_no_net_uses_nic_user():
     """Edge case: --no-wait-ssh without --no-net (harness=False, ssh_port=None)."""
     cmd = build_qemu_command(**_kwargs(ssh_port=None, no_net=False))

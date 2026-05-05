@@ -42,6 +42,7 @@ Example `qmu.toml` (matches what `qmu config init` writes):
 arch = "x86_64"                  # determines qemu-system-{arch} binary
 memory = "4G"
 cpus = 2
+# cpu = "host"                   # passes -cpu to QEMU; "host" is recommended with KVM
 # extra_args = ["-M", "virt", "-cpu", "cortex-a57"]  # for aarch64
 
 [drive]

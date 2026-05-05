@@ -53,6 +53,9 @@ def build_qemu_command(
         "-append", cmdline,
     ]
 
+    if config.cpu_model:
+        cmd.extend(["-cpu", config.cpu_model])
+
     if initrd:
         cmd.extend(["-initrd", initrd])
 

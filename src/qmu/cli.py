@@ -61,6 +61,7 @@ def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
         "ssh_key": "ssh_key",
         "memory": "memory",
         "cpus": "cpus",
+        "cpu_model": "cpu_model",
         "arch": "arch",
         "nic_model": "nic_model",
     }
@@ -132,7 +133,9 @@ def _add_launch(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--ssh-key", default=None, dest="ssh_key", help="SSH private key (overrides config)")
     p.add_argument("--arch", default=None, help="Architecture (overrides config, e.g. x86_64, aarch64)")
     p.add_argument("--memory", default=None, help="VM memory (overrides config)")
-    p.add_argument("--cpus", type=int, default=None, help="VM CPUs (overrides config)")
+    p.add_argument("--cpus", type=int, default=None, help="VM CPU count (overrides config)")
+    p.add_argument("--cpu", default=None, dest="cpu_model",
+                   help="QEMU -cpu model, e.g. 'host', 'max', 'qemu64' (overrides config)")
     p.add_argument("--profile", default="exploit-dev", help="Boot profile (default: exploit-dev)")
     p.add_argument("--cmdline", default=None, help="Override kernel command line")
     p.add_argument("--gdb", action="store_true", help="Enable GDB stub")
@@ -677,6 +680,7 @@ def _handle_config_show(args: argparse.Namespace) -> int:
             "arch": config.arch,
             "memory": config.memory,
             "cpus": config.cpus,
+            "cpu_model": config.cpu_model,
             "qemu_binary": config.qemu_binary(),
             "kvm": config.use_kvm(),
             "extra_args": config.extra_args,
@@ -703,6 +707,7 @@ def _handle_config_show(args: argparse.Namespace) -> int:
         lines.append(f"  KVM:         {config.use_kvm()}")
         lines.append(f"  Memory:      {config.memory}")
         lines.append(f"  CPUs:        {config.cpus}")
+        lines.append(f"  CPU model:   {config.cpu_model or '(qemu default)'}")
         lines.append(f"  Rootfs:      {config.rootfs or '(not set)'}")
         lines.append(f"  Drive fmt:   {config.drive_format}")
         lines.append(f"  SSH key:     {config.ssh_key or '(not set)'}")
