@@ -117,7 +117,7 @@ def launch_vm(
 ) -> VMInstance:
     """Launch a QEMU VM and return the instance."""
     # Validate files
-    kernel_path = Path(kernel).resolve()
+    kernel_path = Path(kernel).expanduser().resolve()
     if not kernel_path.exists():
         raise QMUError(f"Kernel not found: {kernel}")
 
@@ -127,13 +127,13 @@ def launch_vm(
             raise QMUError(
                 "No rootfs configured. Set [drive] rootfs in qmu.toml or pass --rootfs"
             )
-        rootfs_path = Path(config.rootfs).resolve()
+        rootfs_path = Path(config.rootfs).expanduser().resolve()
         if not rootfs_path.exists():
             raise QMUError(f"Rootfs image not found: {config.rootfs}")
     elif config.rootfs is not None:
         # rootfs is configured but suppressed by --drive or --harness; only resolve
         # so we can record the path on the instance for diagnostics.
-        candidate = Path(config.rootfs).resolve()
+        candidate = Path(config.rootfs).expanduser().resolve()
         if candidate.exists():
             rootfs_path = candidate
 
@@ -143,13 +143,13 @@ def launch_vm(
             raise QMUError(
                 "No SSH key configured. Set [ssh] key in qmu.toml or pass --ssh-key"
             )
-        key_path = Path(config.ssh_key).resolve()
+        key_path = Path(config.ssh_key).expanduser().resolve()
         if not key_path.exists():
             raise QMUError(f"SSH key not found: {config.ssh_key}")
 
     initrd_path: Path | None = None
     if initrd is not None:
-        initrd_path = Path(initrd).resolve()
+        initrd_path = Path(initrd).expanduser().resolve()
         if not initrd_path.exists():
             raise QMUError(f"Initrd not found: {initrd}")
 

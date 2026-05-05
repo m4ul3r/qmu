@@ -7,6 +7,20 @@ description: Use the local qmu CLI to manage QEMU VMs for kernel exploit develop
 
 Use this skill when the user wants to boot, manage, or interact with QEMU VMs for kernel security research. The tool provides structured JSON or text output and handles the common pain points of QEMU-based kernel exploit development.
 
+## Bootstrapping a new instance
+
+A fresh project has no `qmu.toml`. Drive every new setup through these steps — do not hand-write a config from scratch.
+
+1. **`qmu doctor`** — surfaces what's missing. If no config file is found, it prints `Tip: run 'qmu config init' ...`.
+2. **`qmu config init`** — drops a starter `qmu.toml` in the current directory. The template is host-arch aware and contains two `# CHANGE ME` lines.
+3. **Edit the two `# CHANGE ME` lines**:
+   - `[drive] rootfs` → path to a kernel rootfs image (relative, absolute, or `~`-prefixed all work).
+   - `[ssh] key` → private key matching the keys baked into the rootfs.
+4. **`qmu doctor`** again — confirm `rootfs image`, `SSH key`, and `SSH key permissions` all show `[+]`. Fix any `[!]` before launching.
+5. **For boot-and-die kernels** (kernelCTF judge envs, syzkaller reproducers): skip steps 3 — leave `[drive]` / `[ssh]` blank in the template (or delete them) and launch with `qmu launch --harness ...`. See the harness-mode block at the bottom of the generated `qmu.toml` for the exact invocation.
+
+Project-local config (`./qmu.toml`) is right for per-project rootfs/kernel paths. Per-user defaults that apply across projects (e.g., your SSH key) belong in `~/.config/qmu/config.toml`.
+
 ## Configuration
 
 qmu uses TOML config files for machine settings (arch, rootfs, SSH key, profiles). Resolution order (later wins):
@@ -22,28 +36,27 @@ qmu config init         # Create starter qmu.toml in current directory
 qmu config path         # Show config file search paths
 ```
 
-Example `qmu.toml`:
+Example `qmu.toml` (matches what `qmu config init` writes):
 ```toml
 [machine]
-arch = "x86_64"         # determines qemu-system-{arch} binary
+arch = "x86_64"                  # determines qemu-system-{arch} binary
 memory = "4G"
 cpus = 2
 # extra_args = ["-M", "virt", "-cpu", "cortex-a57"]  # for aarch64
 
 [drive]
-rootfs = "/path/to/rootfs.img"
+rootfs = "./rootfs.img"          # CHANGE ME
 format = "raw"
 
 [ssh]
-key = "/path/to/ssh.id_rsa"
+key = "~/.ssh/qmu_id_rsa"        # CHANGE ME — `~` expansion works
 user = "root"
-port_start = 10021
 
 [profiles.exploit-dev]
 cmdline = "console=ttyS0 root=/dev/sda selinux=0 apparmor=0 kasan.fault=panic"
 ```
 
-The `arch` field drives which `qemu-system-*` binary is used and whether KVM is enabled (only when guest arch matches host). Use `extra_args` for arch-specific machine flags.
+The `arch` field drives which `qemu-system-*` binary is used and whether KVM is enabled (only when guest arch matches host). Use `extra_args` for arch-specific machine flags. Path values (`rootfs`, `ssh.key`, `--kernel`, `--initrd`) accept `~` expansion.
 
 ## Quick Start
 
@@ -216,8 +229,10 @@ Large outputs (>10k tokens) are automatically spilled to `/tmp/qmu-spills/` to p
 ## Health Check
 
 ```bash
-qmu doctor      # Checks: QEMU binary, rootfs, SSH key, KVM, running VMs, skill
+qmu doctor      # Checks: config sources, QEMU binary, rootfs, SSH key + perms, KVM, running VMs, skill
 ```
+
+If no config file is found, doctor prints `Tip: run 'qmu config init' ...` and exits non-zero. SSH key existence and permissions are reported as separate checks.
 
 ## Known Limitations
 

@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import QMUConfig, STARTER_CONFIG, find_project_config, resolve_config
+from .config import QMUConfig, find_project_config, render_starter_config, resolve_config
 from .instance import QMUError, VMInstance, choose_instance, is_pid_alive, list_instances, load_instance, remove_instance
 from .output import render_value, write_output_result
 from .paths import global_config_path, skill_install_dir, skill_source_dir
@@ -522,12 +522,20 @@ def _handle_doctor(args: argparse.Namespace) -> int:
     )
     checks: list[dict[str, Any]] = []
 
-    # Config sources
-    checks.append({
-        "check": "config",
-        "status": "ok",
-        "detail": " -> ".join(config._sources),
-    })
+    # Config sources — distinguish "loaded a file" from "defaults only"
+    file_sources = [s for s in config._sources if s.startswith(("global:", "project:", "config:"))]
+    if file_sources:
+        checks.append({
+            "check": "config",
+            "status": "ok",
+            "detail": " -> ".join(config._sources),
+        })
+    else:
+        checks.append({
+            "check": "config",
+            "status": "warn",
+            "detail": "No qmu.toml or ~/.config/qmu/config.toml found. Run: qmu config init",
+        })
 
     # QEMU binary (arch-aware)
     binary = config.qemu_binary()
@@ -540,7 +548,8 @@ def _handle_doctor(args: argparse.Namespace) -> int:
 
     # Rootfs
     if config.rootfs:
-        rootfs_ok = Path(config.rootfs).exists()
+        rootfs_resolved = Path(config.rootfs).expanduser()
+        rootfs_ok = rootfs_resolved.exists()
         checks.append({
             "check": "rootfs image",
             "status": "ok" if rootfs_ok else "MISSING",
@@ -550,29 +559,37 @@ def _handle_doctor(args: argparse.Namespace) -> int:
         checks.append({
             "check": "rootfs image",
             "status": "not configured",
-            "detail": "Set [drive] rootfs in qmu.toml or pass --rootfs",
+            "detail": "Set [drive] rootfs in qmu.toml or pass --rootfs (skip for --harness)",
         })
 
-    # SSH key
+    # SSH key — split existence from permissions
     if config.ssh_key:
-        key_path = Path(config.ssh_key)
+        key_path = Path(config.ssh_key).expanduser()
         key_ok = key_path.exists()
-        key_perms = ""
-        if key_ok:
-            mode = oct(key_path.stat().st_mode)[-3:]
-            key_perms = f" (mode={mode})"
-            if mode not in ("600", "400"):
-                key_perms += " WARNING: should be 600"
         checks.append({
             "check": "SSH key",
             "status": "ok" if key_ok else "MISSING",
-            "detail": f"{config.ssh_key}{key_perms}",
+            "detail": config.ssh_key,
         })
+        if key_ok:
+            mode = oct(key_path.stat().st_mode)[-3:]
+            if mode in ("600", "400"):
+                checks.append({
+                    "check": "SSH key permissions",
+                    "status": "ok",
+                    "detail": f"mode={mode}",
+                })
+            else:
+                checks.append({
+                    "check": "SSH key permissions",
+                    "status": "warn",
+                    "detail": f"mode={mode} (should be 600 — `chmod 600 {config.ssh_key}`)",
+                })
     else:
         checks.append({
             "check": "SSH key",
             "status": "not configured",
-            "detail": "Set [ssh] key in qmu.toml or pass --ssh-key",
+            "detail": "Set [ssh] key in qmu.toml or pass --ssh-key (skip for --harness)",
         })
 
     # KVM
@@ -605,16 +622,25 @@ def _handle_doctor(args: argparse.Namespace) -> int:
         "detail": str(skill_install_dir()) if skill_ok else "Run: qmu skill install",
     })
 
+    healthy = ("ok", "info")
     if args.format == "text":
         lines = ["qmu doctor:"]
         for c in checks:
-            mark = "+" if c["status"] in ("ok", "info") else "!"
+            if c["status"] in healthy:
+                mark = "+"
+            elif c["status"] == "warn":
+                mark = "~"
+            else:
+                mark = "!"
             lines.append(f"  [{mark}] {c['check']}: {c['detail']}")
+        if not file_sources and config.rootfs is None and config.ssh_key is None:
+            lines.append("")
+            lines.append("Tip: run `qmu config init` to create a starter qmu.toml in this directory.")
         _output("\n".join(lines), args, stem="doctor")
     else:
         _output(checks, args, stem="doctor")
 
-    all_ok = all(c["status"] in ("ok", "info") for c in checks)
+    all_ok = all(c["status"] in healthy for c in checks)
     return 0 if all_ok else 1
 
 
@@ -697,7 +723,7 @@ def _handle_config_init(args: argparse.Namespace) -> int:
     if target.exists():
         sys.stderr.write(f"[qmu] {target} already exists\n")
         return 1
-    target.write_text(STARTER_CONFIG)
+    target.write_text(render_starter_config())
     print(f"Created {target}")
     return 0
 

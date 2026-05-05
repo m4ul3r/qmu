@@ -181,24 +181,46 @@ def resolve_config(
     return cfg
 
 
-STARTER_CONFIG = """\
+def render_starter_config(arch: str | None = None) -> str:
+    """Build a starter qmu.toml tailored to the host arch."""
+    host_arch = arch or platform.machine()
+    if host_arch == "aarch64":
+        machine_extras = '\nextra_args = ["-M", "virt", "-cpu", "cortex-a57"]'
+        alt_arch_hint = '# arch = "x86_64"  # set this if cross-emulating'
+    else:
+        host_arch = "x86_64"
+        machine_extras = '# extra_args = ["-M", "virt", "-cpu", "cortex-a57"]  # for aarch64'
+        alt_arch_hint = '# arch = "aarch64"  # set this if cross-emulating'
+
+    return f"""\
 # qmu.toml — QEMU VM configuration for qmu CLI
-# See: qmu config show
+#
+# Quick start:
+#   1. Edit the two `# CHANGE ME` lines below to point at your rootfs image
+#      and SSH private key.
+#   2. Run `qmu doctor` to verify everything resolves.
+#   3. Run `qmu launch --kernel /path/to/bzImage`.
+#
+# For boot-and-die kernels (kernelCTF, syzkaller reproducers) you do not need
+# a rootfs or SSH key — see the harness-mode block at the bottom of this file.
+#
+# See `qmu config show` for the full resolved config.
 
 [machine]
-arch = "x86_64"
+arch = "{host_arch}"
+{alt_arch_hint}
 memory = "4G"
 cpus = 2
 # nic_model = "virtio-net-pci"   # or "e1000", "rtl8139", ...
-# extra_args = ["-M", "virt", "-cpu", "cortex-a57"]  # e.g. for aarch64
+{machine_extras}
 
 [drive]
-# rootfs = "/path/to/rootfs.img"
-# format = "raw"
+rootfs = "./rootfs.img"          # CHANGE ME — path to a kernel rootfs image
+format = "raw"
 
 [ssh]
-# key = "/path/to/ssh.id_rsa"
-# user = "root"
+key = "~/.ssh/qmu_id_rsa"        # CHANGE ME — private key matching the rootfs
+user = "root"
 # port_start = 10021
 
 [gdb]
@@ -212,4 +234,16 @@ cmdline = "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0 selinux=
 
 [profiles.exploit-test]
 cmdline = "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0 selinux=0 apparmor=0 panic_on_oops=1 kasan.fault=panic"
+
+# ---------------------------------------------------------------------------
+# Harness mode (boot-and-die kernels)
+# ---------------------------------------------------------------------------
+# If your kernel boots from a kernel + initramfs + read-only rootfs, runs a
+# one-shot init script, and halts (kernelCTF judge envs, syzkaller repros),
+# you don't need [drive] or [ssh] above. Delete those sections and launch with:
+#
+#   qmu launch --harness \\
+#     --kernel ./bzImage --initrd ./ramdisk.img \\
+#     --drive 'file=./rootfs.img,if=virtio,readonly,format=raw' \\
+#     --cmdline 'console=ttyS0 root=/dev/vda1 ro init=/run.sh'
 """
