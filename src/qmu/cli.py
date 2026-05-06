@@ -14,7 +14,13 @@ from typing import Any
 from .config import QMUConfig, find_project_config, render_starter_config, resolve_config
 from .instance import QMUError, VMInstance, choose_instance, is_pid_alive, list_instances, load_instance, remove_instance
 from .output import render_value, write_output_result
-from .paths import global_config_path, skill_install_dir, skill_source_dir
+from .paths import (
+    claude_skills_dir,
+    codex_home,
+    codex_skills_dir,
+    global_config_path,
+    skill_source_dir,
+)
 from .qmp import QMPClient, QMPError
 from . import rootfs as rootfs_mod
 from .serial import extract_crash, tail_log
@@ -617,13 +623,31 @@ def _handle_doctor(args: argparse.Namespace) -> int:
         "detail": f"{len(instances)} instance(s)",
     })
 
-    # Skill installed
-    skill_ok = skill_install_dir().exists()
-    checks.append({
-        "check": "Claude skill",
-        "status": "ok" if skill_ok else "not installed",
-        "detail": str(skill_install_dir()) if skill_ok else "Run: qmu skill install",
-    })
+    # Skill installed — check Claude root, plus Codex root when ~/.codex/ exists
+    claude_skill = claude_skills_dir() / "qmu"
+    skill_paths = [claude_skill]
+    if codex_home().is_dir():
+        skill_paths.append(codex_skills_dir() / "qmu")
+    installed = [p for p in skill_paths if p.exists()]
+    missing = [p for p in skill_paths if not p.exists()]
+    if not missing:
+        checks.append({
+            "check": "skill",
+            "status": "ok",
+            "detail": ", ".join(str(p) for p in installed),
+        })
+    elif installed:
+        checks.append({
+            "check": "skill",
+            "status": "warn",
+            "detail": f"installed at {installed[0]}; missing at {missing[0]} (run: qmu skill install)",
+        })
+    else:
+        checks.append({
+            "check": "skill",
+            "status": "not installed",
+            "detail": "Run: qmu skill install",
+        })
 
     healthy = ("ok", "info")
     if args.format == "text":
@@ -1209,30 +1233,39 @@ def _handle_rootfs_shell(args: argparse.Namespace) -> int:
 
 
 def _add_skill(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("skill", help="Manage Claude Code skill")
+    p = sub.add_parser("skill", help="Manage Claude Code / Codex skill")
     sp = p.add_subparsers(dest="skill_cmd")
-    s = sp.add_parser("install", help="Install Claude Code skill")
+    s = sp.add_parser("install", help="Install skill into ~/.claude (and ~/.codex if present)")
     s.set_defaults(handler=_handle_skill_install)
+
+
+def _skill_install_roots() -> list[Path]:
+    """Return the destination dirs for `qmu skill install`.
+
+    Always installs into ~/.claude/skills/. Additionally installs into
+    ~/.codex/skills/ when ~/.codex/ exists.
+    """
+    roots = [claude_skills_dir()]
+    if codex_home().is_dir():
+        roots.append(codex_skills_dir())
+    return roots
 
 
 def _handle_skill_install(args: argparse.Namespace) -> int:
     src = skill_source_dir()
-    dst = skill_install_dir()
-
     if not src.exists():
         raise QMUError(f"Skill source not found: {src}")
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
-
-    # Remove existing (symlink or dir)
-    if dst.is_symlink() or dst.exists():
-        if dst.is_symlink():
-            dst.unlink()
-        else:
-            shutil.rmtree(dst)
-
-    dst.symlink_to(src)
-    print(f"Skill installed: {dst} -> {src}")
+    for root in _skill_install_roots():
+        dst = root / "qmu"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_symlink() or dst.exists():
+            if dst.is_symlink():
+                dst.unlink()
+            else:
+                shutil.rmtree(dst)
+        dst.symlink_to(src)
+        print(f"Skill installed: {dst} -> {src}")
     return 0
 
 

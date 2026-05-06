@@ -9,6 +9,8 @@ uv tool install -e .
 qmu skill install
 ```
 
+`qmu skill install` symlinks the bundled skill into `~/.claude/skills/`. If `~/.codex/` exists, it also installs into `~/.codex/skills/`. Restart your agent to pick up the new skill.
+
 ## Quick Start
 
 ```bash
