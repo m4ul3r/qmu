@@ -106,11 +106,16 @@ qmu kill --vm kasan-vm
 ### Other lifecycle commands
 
 ```bash
-qmu list                # List all running VMs with SSH/GDB port info
+qmu list                # List VMs (running and stopped) with status markers
 qmu status              # Detailed status (QMP state, SSH, kernel cmdline, etc.)
 qmu kill                # Graceful shutdown via QMP, falls back to SIGTERM
 qmu kill --force        # SIGKILL
+qmu kill --no-clean     # Stop the process but keep .serial.log + .json for forensics
+qmu prune --vm <name>   # Remove a stopped VM's state files
+qmu prune --all         # Remove every stopped VM's state files
 ```
+
+State files persist after a VM exits (e.g. harness boot-and-die, or `kill --no-clean`) — they're never silently removed. Read them with `qmu log --vm <name>` / `qmu crash --vm <name>`, then `qmu prune` when done.
 
 ## File Transfer
 
@@ -149,12 +154,13 @@ If the exploit crashes the kernel during `--run`, the crash report is automatica
 
 ## Crash Extraction
 
-The most important feature for kernel exploit development — works even when SSH is dead:
+The most important feature for kernel exploit development — works even when SSH is dead, and works **after** a VM has exited (state files survive until you prune them):
 
 ```bash
-qmu crash              # Extract last KASAN/BUG/Oops/panic from serial log
-qmu log --tail 100     # View last 100 lines of serial console
-qmu log --tail 500     # More context
+qmu crash                       # Extract last KASAN/BUG/Oops/panic from serial log
+qmu log --tail 100              # View last 100 lines of serial console
+qmu log --tail 500              # More context
+qmu crash --vm run-3            # Works on a stopped VM too — no need for it to be running
 ```
 
 Detected crash patterns: KASAN reports, BUG/Oops, kernel panic, general protection fault, UBSAN, slab-use-after-free, and more.
@@ -177,6 +183,24 @@ Typical workflow:
 4. `qmu crash` — read the crash
 5. `qmu snapshot load clean` — restore, SSH comes back
 6. Edit exploit, repeat from step 3
+
+### Snapshot loop for repeated runs
+
+When you need to run an exploit many times to measure reliability, rewinding via `loadvm` is much faster than rebooting the kernel each time:
+
+```bash
+qmu launch --kernel ./bzImage --name dev
+qmu push exploit /tmp/x
+qmu snapshot save clean
+
+for i in 1 2 3 4 5; do
+  qmu snapshot load clean         # rewinds kernel + FS overlay
+  qmu exec '/tmp/x'
+  qmu log --tail 200 > runs/run-$i.log
+done
+```
+
+This only works for exploit-dev VMs (rootfs-backed, mounted with `snapshot=on`). Harness-mode VMs have no qcow2 drive, so `savevm` fails — pass an explicit `--drive` if you need snapshots there.
 
 ## Kernel Logs
 
@@ -234,6 +258,19 @@ qmu doctor      # Checks: config sources, QEMU binary, rootfs, SSH key + perms, 
 ```
 
 If no config file is found, doctor prints `Tip: run 'qmu config init' ...` and exits non-zero. SSH key existence and permissions are reported as separate checks.
+
+## Files on disk
+
+Each VM keeps its state files under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
+
+| File                  | Purpose                                   | Lifetime                                   |
+|-----------------------|-------------------------------------------|--------------------------------------------|
+| `<name>.json`         | VM metadata (pid, ports, kernel, etc.)    | Until `qmu kill` or `qmu prune`            |
+| `<name>.serial.log`   | Serial console output (read with `qmu log`) | Until `qmu kill` or `qmu prune`          |
+| `<name>.qmp.sock`     | QMP control socket                         | Only meaningful while VM is running        |
+| `<name>.qemu.log`     | QEMU's stderr; rarely useful              | Until `qmu prune`                          |
+
+These files are **never silently removed**. After a harness VM powers off (or you call `kill --no-clean`), the `.serial.log` stays on disk and `qmu log --vm <name>` / `qmu crash --vm <name>` work. Use `qmu prune --vm <name>` (or `qmu prune --all`) to clean up explicitly. `qmu list` shows both running and stopped VMs with a status marker so you can see what's recoverable.
 
 ## Known Limitations
 

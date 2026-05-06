@@ -12,7 +12,17 @@ from pathlib import Path
 from typing import Any
 
 from .config import QMUConfig, find_project_config, render_starter_config, resolve_config
-from .instance import QMUError, VMInstance, choose_instance, is_pid_alive, list_instances, load_instance, remove_instance
+from .instance import (
+    QMUError,
+    VMInstance,
+    choose_instance,
+    find_instance,
+    is_pid_alive,
+    list_instances,
+    list_stopped_instances,
+    load_instance,
+    remove_instance,
+)
 from .output import render_value, write_output_result
 from .paths import (
     claude_skills_dir,
@@ -94,8 +104,12 @@ def _output(value: Any, args: argparse.Namespace, stem: str = "qmu") -> None:
         sys.stderr.write(f"[qmu] Output spilled to {result.artifact['artifact_path']}\n")
 
 
-def _kill_vm(inst: VMInstance, force: bool = False) -> None:
-    """Kill a VM instance: QMP quit → SIGTERM → SIGKILL → cleanup."""
+def _kill_vm(inst: VMInstance, force: bool = False, clean: bool = True) -> None:
+    """Kill a VM instance: QMP quit → SIGTERM → SIGKILL → optional cleanup.
+
+    With clean=False, the process is terminated but instance files are left
+    in place so the caller can still read .serial.log post-mortem.
+    """
     if not force:
         try:
             with _qmp_ctx(inst) as qmp:
@@ -117,7 +131,8 @@ def _kill_vm(inst: VMInstance, force: bool = False) -> None:
     except OSError:
         pass  # Already dead
 
-    remove_instance(inst.vm_id)
+    if clean:
+        remove_instance(inst.vm_id)
 
 
 def _add_common_opts(parser: argparse.ArgumentParser) -> None:
@@ -242,7 +257,7 @@ def _handle_launch(args: argparse.Namespace) -> int:
             lines.append(f"  GDB:     port {inst.gdb_port}")
         lines.append(f"  Kernel:  {inst.kernel}")
         lines.append(f"  Profile: {inst.profile}")
-        lines.append(f"  Log:     {inst.serial_log}")
+        lines.append(f"  Serial:  {inst.serial_log}")
         _output("\n".join(lines), args, stem="launch")
     else:
         _output(result, args, stem="launch")
@@ -257,14 +272,76 @@ def _handle_launch(args: argparse.Namespace) -> int:
 def _add_kill(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("kill", help="Stop a running VM")
     p.add_argument("--force", action="store_true", help="Force kill (SIGKILL)")
+    p.add_argument("--no-clean", action="store_true",
+                   help="Don't remove instance metadata or serial log after kill")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_kill)
 
 
 def _handle_kill(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
-    _kill_vm(inst, force=args.force)
-    _output(f"VM '{inst.vm_id}' stopped.", args, stem="kill")
+    _kill_vm(inst, force=args.force, clean=not args.no_clean)
+    if args.no_clean:
+        msg = f"VM '{inst.vm_id}' stopped. State preserved at {inst.serial_log}"
+    else:
+        msg = f"VM '{inst.vm_id}' stopped."
+    _output(msg, args, stem="kill")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# prune
+# ---------------------------------------------------------------------------
+
+
+def _add_prune(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("prune", help="Remove state files for stopped VMs")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--vm", default=None, help="Prune a specific stopped VM")
+    g.add_argument("--all", dest="prune_all", action="store_true",
+                   help="Prune every stopped VM")
+    p.add_argument("--keep-logs", action="store_true",
+                   help="Drop .json + .qmp.sock but preserve .serial.log")
+    # _add_common_opts adds --vm too; we declared --vm above so add the rest manually.
+    p.add_argument("--format", choices=["text", "json", "ndjson"], default="text")
+    p.add_argument("--out", default=None, help="Write output to file instead of stdout")
+    p.set_defaults(handler=_handle_prune)
+
+
+def _handle_prune(args: argparse.Namespace) -> int:
+    stopped = list_stopped_instances()
+    running = list_instances()
+    running_ids = {inst.vm_id for inst in running}
+
+    if args.vm is not None:
+        if args.vm in running_ids:
+            raise QMUError(
+                f"VM '{args.vm}' is running. Use 'qmu kill --vm {args.vm}' first."
+            )
+        target = next((inst for inst in stopped if inst.vm_id == args.vm), None)
+        if target is None:
+            raise QMUError(f"No stopped VM named '{args.vm}'.")
+        targets = [target]
+    elif args.prune_all:
+        targets = stopped
+    else:
+        raise QMUError("Specify either --vm <name> or --all.")
+
+    pruned: list[str] = []
+    for inst in targets:
+        remove_instance(inst.vm_id, keep_logs=args.keep_logs)
+        pruned.append(inst.vm_id)
+
+    if args.format == "text":
+        if not pruned:
+            _output("No stopped VMs to prune.", args, stem="prune")
+        else:
+            verb = "kept logs for" if args.keep_logs else "removed"
+            _output(f"Pruned {len(pruned)} VM(s) ({verb}): {', '.join(pruned)}",
+                    args, stem="prune")
+    else:
+        _output({"pruned": pruned, "keep_logs": args.keep_logs},
+                args, stem="prune")
     return 0
 
 
@@ -385,22 +462,24 @@ def _handle_wait(args: argparse.Namespace) -> int:
 
 
 def _add_list(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("list", help="List running VMs")
+    p = sub.add_parser("list", help="List VMs (running and stopped)")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_list)
 
 
 def _handle_list(args: argparse.Namespace) -> int:
-    instances = list_instances()
-    if not instances:
-        _output("No running VMs.", args, stem="list")
+    running = list_instances()
+    stopped = list_stopped_instances()
+    if not running and not stopped:
+        _output("No VMs.", args, stem="list")
         return 0
 
     if args.format != "text":
         data = []
-        for inst in instances:
+        for inst in running:
             entry: dict[str, Any] = {
                 "vm_id": inst.vm_id,
+                "status": "running",
                 "pid": inst.pid,
                 "harness": inst.harness,
                 "ssh_port": inst.ssh_port,
@@ -413,22 +492,40 @@ def _handle_list(args: argparse.Namespace) -> int:
             else:
                 entry["ssh_ready"] = _make_ssh(inst).is_ready()
             data.append(entry)
+        for inst in stopped:
+            data.append({
+                "vm_id": inst.vm_id,
+                "status": "stopped",
+                "pid": inst.pid or None,
+                "harness": inst.harness,
+                "ssh_port": inst.ssh_port,
+                "gdb_port": inst.gdb_port,
+                "kernel": inst.kernel or None,
+                "profile": inst.profile or None,
+                "ssh_ready": None,
+                "serial_log": inst.serial_log,
+            })
         _output(data, args, stem="list")
         return 0
 
     lines = []
-    for inst in instances:
+    for inst in running:
         if inst.harness or inst.ssh_port is None:
             ssh_str = "harness"
         else:
             ssh_ok = _make_ssh(inst).is_ready()
             ssh_str = f"ssh={inst.ssh_port}({'ok' if ssh_ok else 'down'})"
         gdb_str = f" gdb={inst.gdb_port}" if inst.gdb_port else ""
+        kernel_str = f"kernel={Path(inst.kernel).name}" if inst.kernel else ""
         lines.append(
             f"  {inst.vm_id}  pid={inst.pid}  {ssh_str}{gdb_str}  "
-            f"profile={inst.profile}  kernel={Path(inst.kernel).name}"
+            f"profile={inst.profile}  {kernel_str}  [running]"
         )
-    _output("Running VMs:\n" + "\n".join(lines), args, stem="list")
+    for inst in stopped:
+        kernel_str = f"kernel={Path(inst.kernel).name}" if inst.kernel else "kernel=?"
+        profile_str = f"profile={inst.profile}" if inst.profile else "profile=?"
+        lines.append(f"  {inst.vm_id}  {profile_str}  {kernel_str}  [stopped]")
+    _output("VMs:\n" + "\n".join(lines), args, stem="list")
     return 0
 
 
@@ -1065,7 +1162,7 @@ def _add_crash(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_crash(args: argparse.Namespace) -> int:
-    inst = choose_instance(args.vm)
+    inst = find_instance(args.vm)
     crash = extract_crash(inst.serial_log)
     if crash:
         _output(crash, args, stem="crash")
@@ -1087,7 +1184,7 @@ def _add_log(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_log(args: argparse.Namespace) -> int:
-    inst = choose_instance(args.vm)
+    inst = find_instance(args.vm)
     text = tail_log(inst.serial_log, lines=args.tail)
     if text:
         _output(text, args, stem="log")
@@ -1298,6 +1395,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _add_launch(sub)
     _add_kill(sub)
+    _add_prune(sub)
     _add_wait(sub)
     _add_list(sub)
     _add_status(sub)
