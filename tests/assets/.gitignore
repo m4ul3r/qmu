@@ -1,0 +1,10 @@
+# Built test assets — reproducible via build.sh, not committed.
+linux-*/
+linux-*.tar.xz
+bzImage
+vmlinux
+rootfs.img
+*.ko
+qmu_test.id_rsa
+qmu_test.id_rsa.pub
+build.log

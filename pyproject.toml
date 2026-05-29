@@ -4,9 +4,7 @@ version = "0.1.0"
 description = "Agent-friendly QEMU VM management CLI for kernel research"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "tiktoken>=0.12.0",
-]
+dependencies = []
 
 [project.scripts]
 qmu = "qmu.cli:main"
@@ -22,3 +20,7 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The vendored kernel tree under tests/assets/ ships its own test_*.py files;
+# do NOT collect them as part of the qmu suite.
+addopts = "--ignore=tests/assets"
+norecursedirs = ["tests/assets", "tests/eval-report"]

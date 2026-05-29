@@ -14,7 +14,14 @@ from .qmp import QMPClient
 
 
 def find_free_port(start: int, max_tries: int = 100) -> int:
-    """Find a free TCP port starting from `start`."""
+    """Find a free TCP port starting from `start`.
+
+    TOCTOU note: the probe socket is closed before QEMU binds, so under
+    concurrent launches another process (or VM) can claim the returned port in
+    the window between this check and QEMU's bind. QEMU will then fail to bind;
+    callers should be prepared for a launch-time bind failure rather than
+    treating a returned port as a hard reservation.
+    """
     for offset in range(max_tries):
         port = start + offset
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -92,7 +99,10 @@ def build_qemu_command(
         cmd.extend(config.extra_args)
 
     if gdb_port is not None:
-        cmd.extend(["-gdb", f"tcp::{gdb_port}"])
+        # Bind the gdb stub to 127.0.0.1 to match the address find_free_port
+        # probes; "tcp::{port}" would bind the wildcard and let the probe pass
+        # even when 127.0.0.1:{port} is already taken.
+        cmd.extend(["-gdb", f"tcp:127.0.0.1:{gdb_port}"])
 
     if extra_args:
         cmd.extend(extra_args)
@@ -164,89 +174,101 @@ def launch_vm(
     if cmdline is None:
         cmdline = config.profiles[profile]
 
-    # Allocate ports
-    if harness:
-        ssh_port = None
-    elif ssh_port is None:
-        ssh_port = find_free_port(config.ssh_port_start)
-    if gdb and gdb_port is None:
-        gdb_port = find_free_port(config.gdb_port_start)
-
-    # Generate VM ID
-    if name:
-        vm_id = name
-    elif ssh_port is not None:
-        vm_id = f"vm-{ssh_port}"
-    else:
-        vm_id = f"vm-h{int(time.time())}"
-
-    # Prepare paths
     idir = instances_dir()
     idir.mkdir(parents=True, exist_ok=True)
 
-    qmp_sock = str(qmp_socket_path(vm_id))
-    serial_path = str(serial_log_path(vm_id))
-
-    # Remove stale socket if present
-    Path(qmp_sock).unlink(missing_ok=True)
-
-    # Resolved nic for instance record
+    # Resolved NIC recorded on the instance.
     resolved_nic = nic_model or config.nic_model
 
-    # Build command
-    cmd = build_qemu_command(
-        config=config,
-        kernel=str(kernel_path),
-        rootfs=str(rootfs_path) if rootfs_path else None,
-        ssh_port=ssh_port,
-        gdb_port=gdb_port,
-        qmp_socket=qmp_sock,
-        serial_log=serial_path,
-        cmdline=cmdline,
-        initrd=str(initrd_path) if initrd_path else None,
-        drives=drives,
-        no_net=no_net,
-        nic_model=nic_model,
-        extra_args=extra_args,
-    )
+    # Harness VMs run boot-and-die with no SSH, so never allocate an SSH port.
+    # Otherwise auto-allocate any port the caller did not pin. Auto-allocated
+    # ports have a TOCTOU window (find_free_port closes its probe before QEMU
+    # binds), so a concurrent launch can steal one; QEMU then exits with a bind
+    # error and we retry with fresh ports. Pinned ports are never re-allocated.
+    if harness:
+        ssh_port = None
+    auto_ssh = (not harness) and (ssh_port is None)
+    auto_gdb = gdb and gdb_port is None
+    bind_markers = ("Address already in use", "Could not set up host forwarding", "Failed to bind")
 
-    # Spawn QEMU detached
-    log_fd = open(idir / f"{vm_id}.qemu.log", "w")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_fd,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    proc = None
+    vm_id = qmp_sock = serial_path = None
+    for attempt in range(3):
+        if auto_ssh:
+            ssh_port = find_free_port(config.ssh_port_start)
+        if auto_gdb:
+            gdb_port = find_free_port(config.gdb_port_start)
 
-    # Wait for QMP socket to appear
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        if Path(qmp_sock).exists():
-            break
-        if proc.poll() is not None:
+        if name:
+            vm_id = name
+        elif ssh_port is not None:
+            vm_id = f"vm-{ssh_port}"
+        else:
+            vm_id = f"vm-h{int(time.time())}"
+        qmp_sock = str(qmp_socket_path(vm_id))
+        serial_path = str(serial_log_path(vm_id))
+        Path(qmp_sock).unlink(missing_ok=True)  # remove stale socket if present
+
+        cmd = build_qemu_command(
+            config=config,
+            kernel=str(kernel_path),
+            rootfs=str(rootfs_path) if rootfs_path else None,
+            ssh_port=ssh_port,
+            gdb_port=gdb_port,
+            qmp_socket=qmp_sock,
+            serial_log=serial_path,
+            cmdline=cmdline,
+            initrd=str(initrd_path) if initrd_path else None,
+            drives=drives,
+            no_net=no_net,
+            nic_model=nic_model,
+            extra_args=extra_args,
+        )
+
+        log_fd = open(idir / f"{vm_id}.qemu.log", "w")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fd,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        # Wait for the QMP socket to appear (or QEMU to exit immediately).
+        deadline = time.monotonic() + 10
+        exited = False
+        while time.monotonic() < deadline:
+            if Path(qmp_sock).exists():
+                break
+            if proc.poll() is not None:
+                exited = True
+                break
+            time.sleep(0.2)
+        else:
+            proc.terminate()
+            log_fd.close()
+            raise QMUError("Timed out waiting for QMP socket to appear")
+
+        if exited:
             log_fd.close()
             qemu_log = (idir / f"{vm_id}.qemu.log").read_text(errors="replace")
+            if any(m in qemu_log for m in bind_markers) and (auto_ssh or auto_gdb) and attempt < 2:
+                continue  # lost a port race — retry with freshly allocated ports
             raise QMUError(
                 f"QEMU exited immediately (code {proc.returncode}).\n"
                 f"Command: {' '.join(cmd)}\n"
                 f"Output:\n{qemu_log[-2000:]}"
             )
-        time.sleep(0.2)
-    else:
-        proc.terminate()
-        log_fd.close()
-        raise QMUError("Timed out waiting for QMP socket to appear")
 
-    # Verify QMP connectivity
-    try:
-        with QMPClient(qmp_sock) as qmp:
-            qmp.execute("query-status")
-    except Exception as exc:
-        proc.terminate()
-        log_fd.close()
-        raise QMUError(f"QMP connection failed after launch: {exc}") from exc
+        # QMP socket appeared — verify connectivity.
+        try:
+            with QMPClient(qmp_sock) as qmp:
+                qmp.execute("query-status")
+        except Exception as exc:
+            proc.terminate()
+            log_fd.close()
+            raise QMUError(f"QMP connection failed after launch: {exc}") from exc
+        break  # launched successfully
 
     # Build and save instance
     inst = VMInstance(
@@ -255,6 +277,7 @@ def launch_vm(
         qmp_socket=qmp_sock,
         ssh_port=ssh_port,
         ssh_key=str(key_path) if key_path else None,
+        ssh_user=config.ssh_user,
         gdb_port=gdb_port,
         serial_log=serial_path,
         kernel=str(kernel_path),

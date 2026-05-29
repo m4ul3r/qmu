@@ -51,7 +51,7 @@ from .vm import launch_vm
 
 
 def _make_ssh(inst: VMInstance) -> SSHClient:
-    return SSHClient(port=inst.ssh_port, key_path=inst.ssh_key)
+    return SSHClient(port=inst.ssh_port, key_path=inst.ssh_key, user=inst.ssh_user)
 
 
 def _require_ssh(inst: VMInstance) -> None:
@@ -104,6 +104,33 @@ def _output(value: Any, args: argparse.Namespace, stem: str = "qmu") -> None:
         sys.stderr.write(f"[qmu] Output spilled to {result.artifact['artifact_path']}\n")
 
 
+def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) -> None:
+    """Emit an error honoring --format (ERG-1).
+
+    Text mode keeps the existing "[qmu] <prefix> ..." line on stderr. When the
+    format is not "text", emit the universal error envelope
+    {"ok": false, "error": ..., "error_type": ...} as JSON to stdout. ``args``
+    may be partially populated (e.g. if argparse failed before defaults were
+    applied), so the format is read defensively with getattr().
+    """
+    fmt = getattr(args, "format", "text") or "text"
+    if fmt == "text":
+        sys.stderr.write(f"{text_prefix} {exc}\n")
+    else:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+
 def _kill_vm(inst: VMInstance, force: bool = False, clean: bool = True) -> None:
     """Kill a VM instance: QMP quit → SIGTERM → SIGKILL → optional cleanup.
 
@@ -135,10 +162,68 @@ def _kill_vm(inst: VMInstance, force: bool = False, clean: bool = True) -> None:
         remove_instance(inst.vm_id)
 
 
-def _add_common_opts(parser: argparse.ArgumentParser) -> None:
+def _make_group_help_handler(group_parser: argparse.ArgumentParser):
+    """Return a handler that prints THIS group's own help and exits 2 (ERG-5).
+
+    Group commands (snapshot/config/rootfs/skill) require a sub-action. When
+    invoked bare (e.g. `qmu snapshot`) argparse leaves no leaf handler, so
+    without this the dispatcher would fall back to TOP-LEVEL help. This handler
+    prints the group's help instead and returns the usage exit code (2).
+    """
+
+    def _handler(args: argparse.Namespace) -> int:
+        group_parser.print_help(sys.stderr)
+        return 2
+
+    return _handler
+
+
+def _add_top_level_common_opts(parser: argparse.ArgumentParser) -> None:
+    """Register --vm/--format/--out on the TOP-LEVEL parser with real defaults.
+
+    These defaults are the ones that actually populate the namespace, so the
+    attributes always exist (e.g. for ``qmu --vm X exec``). The subparser copies
+    use argparse.SUPPRESS (see _add_common_opts) so they do not clobber a value
+    supplied here before the subcommand.
+    """
     parser.add_argument("--vm", default=None, help="VM instance ID (auto-selects if only one)")
     parser.add_argument("--format", choices=["text", "json", "ndjson"], default="text")
     parser.add_argument("--out", default=None, help="Write output to file instead of stdout")
+
+
+def _add_format_opts(parser: argparse.ArgumentParser) -> None:
+    """Register --format/--out on a leaf command where --vm is not meaningful
+    (version, config init/path). SUPPRESS defaults so a value parsed by the
+    top-level parser before the subcommand is preserved (ERG-6)."""
+    parser.add_argument(
+        "--format", choices=["text", "json", "ndjson"], default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--out", default=argparse.SUPPRESS,
+        help="Write output to file instead of stdout",
+    )
+
+
+def _add_common_opts(parser: argparse.ArgumentParser) -> None:
+    """Register --vm/--format/--out on a SUBPARSER so the flags also work AFTER
+    the subcommand (e.g. ``qmu exec --vm X``).
+
+    Defaults are argparse.SUPPRESS: when these flags are omitted after the
+    subcommand, argparse leaves the namespace attribute untouched, preserving
+    any value parsed by the top-level parser before the subcommand. The
+    top-level defaults (None/"text") guarantee the attributes always exist.
+    """
+    parser.add_argument(
+        "--vm", default=argparse.SUPPRESS,
+        help="VM instance ID (auto-selects if only one)",
+    )
+    parser.add_argument(
+        "--format", choices=["text", "json", "ndjson"], default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--out", default=argparse.SUPPRESS,
+        help="Write output to file instead of stdout",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +316,7 @@ def _handle_launch(args: argparse.Namespace) -> int:
         ssh_status = "skipped"
 
     result = {
+        "ok": True,
         "vm_id": inst.vm_id,
         "pid": inst.pid,
         "ssh_port": inst.ssh_port,
@@ -285,7 +371,19 @@ def _handle_kill(args: argparse.Namespace) -> int:
         msg = f"VM '{inst.vm_id}' stopped. State preserved at {inst.serial_log}"
     else:
         msg = f"VM '{inst.vm_id}' stopped."
-    _output(msg, args, stem="kill")
+    if args.format == "text":
+        _output(msg, args, stem="kill")
+    else:
+        _output(
+            {
+                "ok": True,
+                "vm_id": inst.vm_id,
+                "cleaned": not args.no_clean,
+                "serial_log": inst.serial_log,
+            },
+            args,
+            stem="kill",
+        )
     return 0
 
 
@@ -340,7 +438,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
             _output(f"Pruned {len(pruned)} VM(s) ({verb}): {', '.join(pruned)}",
                     args, stem="prune")
     else:
-        _output({"pruned": pruned, "keep_logs": args.keep_logs},
+        _output({"ok": True, "pruned": pruned, "keep_logs": args.keep_logs},
                 args, stem="prune")
     return 0
 
@@ -420,6 +518,9 @@ def _handle_wait(args: argparse.Namespace) -> int:
     crash = extract_crash(inst.serial_log) if stopped else None
 
     result = {
+        # ok mirrors success: True when the VM actually stopped, False on the
+        # timeout result object (exit 124).
+        "ok": stopped,
         "vm_id": inst.vm_id,
         "stopped": stopped,
         "reason": reason,
@@ -471,7 +572,10 @@ def _handle_list(args: argparse.Namespace) -> int:
     running = list_instances()
     stopped = list_stopped_instances()
     if not running and not stopped:
-        _output("No VMs.", args, stem="list")
+        if args.format == "text":
+            _output("No VMs.", args, stem="list")
+        else:
+            _output({"ok": True, "vms": []}, args, stem="list")
         return 0
 
     if args.format != "text":
@@ -505,7 +609,7 @@ def _handle_list(args: argparse.Namespace) -> int:
                 "ssh_ready": None,
                 "serial_log": inst.serial_log,
             })
-        _output(data, args, stem="list")
+        _output({"ok": True, "vms": data}, args, stem="list")
         return 0
 
     lines = []
@@ -561,6 +665,7 @@ def _handle_status(args: argparse.Namespace) -> int:
         ssh_state = "ready" if ssh_ok else "down"
 
     result = {
+        "ok": True,
         "vm_id": inst.vm_id,
         "pid": inst.pid,
         "harness": inst.harness,
@@ -712,6 +817,15 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             "detail": f"Not available for arch={config.arch} (will use TCG)",
         })
 
+    # pry (optional — only needed for `qmu gdb`)
+    pry = shutil.which("pry")
+    checks.append({
+        "check": "pry (GDB integration)",
+        "status": "ok" if pry else "info",
+        "detail": pry or "Not found in PATH — required only for `qmu gdb`. "
+                         "Install pry and ensure it is on PATH.",
+    })
+
     # Running instances
     instances = list_instances()
     checks.append({
@@ -747,6 +861,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
         })
 
     healthy = ("ok", "info")
+    all_ok = all(c["status"] in healthy for c in checks)
     if args.format == "text":
         lines = ["qmu doctor:"]
         for c in checks:
@@ -762,9 +877,8 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             lines.append("Tip: run `qmu config init` to create a starter qmu.toml in this directory.")
         _output("\n".join(lines), args, stem="doctor")
     else:
-        _output(checks, args, stem="doctor")
+        _output({"ok": all_ok, "checks": checks}, args, stem="doctor")
 
-    all_ok = all(c["status"] in healthy for c in checks)
     return 0 if all_ok else 1
 
 
@@ -775,6 +889,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
 
 def _add_config(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("config", help="Manage qmu configuration")
+    p.set_defaults(handler=_make_group_help_handler(p))
     sp = p.add_subparsers(dest="config_cmd")
 
     s = sp.add_parser("show", help="Show resolved configuration")
@@ -783,9 +898,11 @@ def _add_config(sub: argparse._SubParsersAction) -> None:
     s.set_defaults(handler=_handle_config_show)
 
     s = sp.add_parser("init", help="Create a starter qmu.toml in current directory")
+    _add_format_opts(s)
     s.set_defaults(handler=_handle_config_init)
 
     s = sp.add_parser("path", help="Show config file search paths")
+    _add_format_opts(s)
     s.set_defaults(handler=_handle_config_path)
 
 
@@ -796,6 +913,7 @@ def _handle_config_show(args: argparse.Namespace) -> int:
     )
 
     data = {
+        "ok": True,
         "sources": config._sources,
         "machine": {
             "arch": config.arch,
@@ -846,22 +964,51 @@ def _handle_config_show(args: argparse.Namespace) -> int:
 
 def _handle_config_init(args: argparse.Namespace) -> int:
     target = Path.cwd() / "qmu.toml"
+    # ERG-7: `config init` is idempotent — an existing file is a benign no-op
+    # (exit 0), not a failure. The file is never overwritten.
     if target.exists():
-        sys.stderr.write(f"[qmu] {target} already exists\n")
-        return 1
+        msg = f"{target} already exists, not overwritten"
+        if getattr(args, "format", "text") == "text":
+            _output(msg, args, stem="config-init")
+        else:
+            _output(
+                {"ok": True, "path": str(target), "created": False, "message": msg},
+                args,
+                stem="config-init",
+            )
+        return 0
     target.write_text(render_starter_config())
-    print(f"Created {target}")
+    if getattr(args, "format", "text") == "text":
+        _output(f"Created {target}", args, stem="config-init")
+    else:
+        _output(
+            {"ok": True, "path": str(target), "created": True},
+            args,
+            stem="config-init",
+        )
     return 0
 
 
 def _handle_config_path(args: argparse.Namespace) -> int:
     gpath = global_config_path()
     ppath = find_project_config()
-    lines = [
-        f"Global config:  {gpath} ({'exists' if gpath.is_file() else 'not found'})",
-        f"Project config: {ppath or '(none found — searched up from CWD)'}",
-    ]
-    print("\n".join(lines))
+    if getattr(args, "format", "text") == "text":
+        lines = [
+            f"Global config:  {gpath} ({'exists' if gpath.is_file() else 'not found'})",
+            f"Project config: {ppath or '(none found — searched up from CWD)'}",
+        ]
+        _output("\n".join(lines), args, stem="config-path")
+    else:
+        _output(
+            {
+                "ok": True,
+                "global_config": str(gpath),
+                "global_config_exists": gpath.is_file(),
+                "project_config": str(ppath) if ppath else None,
+            },
+            args,
+            stem="config-path",
+        )
     return 0
 
 
@@ -872,6 +1019,7 @@ def _handle_config_path(args: argparse.Namespace) -> int:
 
 def _add_snapshot(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("snapshot", help="VM snapshot management")
+    p.set_defaults(handler=_make_group_help_handler(p))
     sp = p.add_subparsers(dest="snapshot_cmd")
 
     s = sp.add_parser("save", help="Save a snapshot")
@@ -894,11 +1042,41 @@ def _add_snapshot(sub: argparse._SubParsersAction) -> None:
     s.set_defaults(handler=_handle_snapshot_delete)
 
 
+# HMP error markers that indicate a snapshot operation actually failed.
+# Deliberately specific so benign savevm slirp *warnings* (e.g. "warning: Slirp:
+# Save of field ... failed") are NOT treated as hard failures — those lines
+# begin with "warning:" and contain none of the markers below, so save still
+# exits 0.
+_SNAPSHOT_ERROR_MARKERS = (
+    "Error:",
+    "Missing section footer",
+    "Section footer error",
+    "does not support",
+    "Could not open",
+    "No block device",
+)
+
+
+def _snapshot_failed(msg: str) -> bool:
+    return any(m in msg for m in _SNAPSHOT_ERROR_MARKERS)
+
+
 def _handle_snapshot_save(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     with _qmp_ctx(inst) as qmp:
         msg = save_snapshot(qmp, args.name)
-    _output(msg, args, stem="snapshot-save")
+    failed = _snapshot_failed(msg)
+    if args.format == "text":
+        _output(msg, args, stem="snapshot-save")
+    else:
+        _output(
+            {"ok": not failed, "name": args.name, "message": msg},
+            args,
+            stem="snapshot-save",
+        )
+    if failed:
+        sys.stderr.write(f"[qmu] snapshot save failed: {msg}\n")
+        return 1
     return 0
 
 
@@ -906,7 +1084,23 @@ def _handle_snapshot_load(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     with _qmp_ctx(inst) as qmp:
         msg = load_snapshot(qmp, args.name)
-    _output(msg, args, stem="snapshot-load")
+    failed = _snapshot_failed(msg)
+    if args.format == "text":
+        _output(msg, args, stem="snapshot-load")
+    else:
+        _output(
+            {"ok": not failed, "name": args.name, "message": msg},
+            args,
+            stem="snapshot-load",
+        )
+    if failed:
+        sys.stderr.write(
+            f"[qmu] snapshot load failed: {msg}\n"
+            "[qmu] The VM was NOT restored. With the default -net user (slirp) "
+            "networking, savevm/loadvm cannot serialize NIC state; relaunch the "
+            "VM instead of relying on snapshot restore.\n"
+        )
+        return 1
     return 0
 
 
@@ -914,15 +1108,15 @@ def _handle_snapshot_list(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     with _qmp_ctx(inst) as qmp:
         snaps = list_snapshots(qmp)
-    if not snaps:
+    if args.format != "text":
+        _output({"ok": True, "snapshots": snaps}, args, stem="snapshot-list")
+    elif not snaps:
         _output("No snapshots.", args, stem="snapshot-list")
-    elif args.format == "text":
+    else:
         lines = ["Snapshots:"]
         for s in snaps:
             lines.append(f"  {s['id']}  {s['tag']}  size={s['vm_size']}  {s['date']} {s['time']}")
         _output("\n".join(lines), args, stem="snapshot-list")
-    else:
-        _output(snaps, args, stem="snapshot-list")
     return 0
 
 
@@ -930,7 +1124,18 @@ def _handle_snapshot_delete(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     with _qmp_ctx(inst) as qmp:
         msg = delete_snapshot(qmp, args.name)
-    _output(msg, args, stem="snapshot-delete")
+    failed = _snapshot_failed(msg)
+    if args.format == "text":
+        _output(msg, args, stem="snapshot-delete")
+    else:
+        _output(
+            {"ok": not failed, "name": args.name, "message": msg},
+            args,
+            stem="snapshot-delete",
+        )
+    if failed:
+        sys.stderr.write(f"[qmu] snapshot delete failed: {msg}\n")
+        return 1
     return 0
 
 
@@ -952,7 +1157,14 @@ def _handle_push(args: argparse.Namespace) -> int:
     _require_ssh(inst)
     ssh = _make_ssh(inst)
     ssh.push(args.local, args.remote)
-    _output(f"Pushed {args.local} -> guest:{args.remote}", args, stem="push")
+    if args.format == "text":
+        _output(f"Pushed {args.local} -> guest:{args.remote}", args, stem="push")
+    else:
+        _output(
+            {"ok": True, "local": args.local, "remote": args.remote},
+            args,
+            stem="push",
+        )
     return 0
 
 
@@ -969,7 +1181,14 @@ def _handle_pull(args: argparse.Namespace) -> int:
     _require_ssh(inst)
     ssh = _make_ssh(inst)
     ssh.pull(args.remote, args.local)
-    _output(f"Pulled guest:{args.remote} -> {args.local}", args, stem="pull")
+    if args.format == "text":
+        _output(f"Pulled guest:{args.remote} -> {args.local}", args, stem="pull")
+    else:
+        _output(
+            {"ok": True, "local": args.local, "remote": args.remote},
+            args,
+            stem="pull",
+        )
     return 0
 
 
@@ -986,6 +1205,64 @@ def _add_exec(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_exec)
 
 
+def _transport_lost(ssh: SSHClient) -> bool:
+    """True only if SSH is unreachable after probing twice (CORR-5).
+
+    rc==255 from `ssh.run` is ambiguous: it is both a legal guest exit code and
+    the code ssh returns when the transport drops (e.g. a kernel panic). Before
+    declaring a crash we confirm with a liveness probe — and retry once, since a
+    single slow probe against a busy live guest can spuriously fail and produce a
+    false-positive "kernel crashed". Only when BOTH probes fail do we treat the
+    transport as lost.
+    """
+    if ssh.is_ready(timeout=3):
+        return False
+    # Retry once: a busy guest may have missed the first short probe.
+    if ssh.is_ready(timeout=3):
+        return False
+    return True
+
+
+def _emit_ssh_lost(args: argparse.Namespace, command: str, inst: VMInstance) -> int:
+    """Emit the SSH-lost / probable-crash envelope and return exit 3.
+
+    Used for both an SSH timeout (TimeoutExpired -> SSHError) and a transport
+    disconnect (rc=255 + ssh transport marker), which both mean the guest very
+    likely panicked and dropped the connection. Exit 3 distinguishes a
+    crash/transport-loss from an ordinary non-zero guest command (exit 1).
+    """
+    crash = extract_crash(inst.serial_log)
+    # CORR-5: only assert a kernel crash when a crash report was actually
+    # extracted; otherwise the connection merely dropped (VM unreachable) and we
+    # must not send the agent chasing a phantom panic.
+    if crash is not None:
+        hint = (
+            "SSH connection lost. Kernel may have crashed. "
+            "See crash field or run: qmu crash"
+        )
+        text_msg = f"\nCrash from serial log:\n{crash}"
+    else:
+        hint = (
+            "SSH connection lost; VM may be unreachable. "
+            "No crash report in serial log. Check: qmu log --tail 100"
+        )
+        text_msg = "\nNo crash detected in serial log. Check: qmu log --tail 100"
+    result = {
+        "ok": False,
+        "ssh_error": True,
+        "crash_detected": crash is not None,
+        "command": command,
+        "crash": crash,
+        "hint": hint,
+    }
+    if args.format == "text":
+        lines = [f"SSH connection lost while running: {command}", text_msg]
+        _output("\n".join(lines), args, stem="exec")
+    else:
+        _output(result, args, stem="exec")
+    return 3
+
+
 def _handle_exec(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
@@ -995,24 +1272,18 @@ def _handle_exec(args: argparse.Namespace) -> int:
     try:
         rc, stdout, stderr = ssh.run(command, timeout=args.timeout)
     except SSHError:
-        # SSH died — likely kernel crash. Try to get crash info.
-        crash = extract_crash(inst.serial_log)
-        result = {
-            "ssh_error": True,
-            "command": command,
-            "crash": crash,
-            "hint": "SSH connection lost. Kernel may have crashed. See crash field or run: qmu crash",
-        }
-        if args.format == "text":
-            lines = [f"SSH connection lost while running: {command}"]
-            if crash:
-                lines.append(f"\nCrash from serial log:\n{crash}")
-            else:
-                lines.append("\nNo crash detected in serial log. Check: qmu log --tail 100")
-            _output("\n".join(lines), args, stem="exec")
-        else:
-            _output(result, args, stem="exec")
-        return 1
+        # SSH command exceeded qmu's own timeout — likely a hung/crashed guest.
+        return _emit_ssh_lost(args, command, inst)
+
+    # A kernel panic during the command drops the connection and ssh exits 255 —
+    # often with EMPTY stderr (LogLevel=ERROR suppresses the keepalive message),
+    # so a stderr-marker test is unreliable. rc=255 is also a legal guest exit
+    # code, so disambiguate with an authoritative liveness probe (retried once to
+    # avoid a false positive on a busy live guest): if SSH is still unreachable
+    # the guest vanished (crash); if it answers, the guest genuinely returned 255
+    # and we take the normal path.
+    if rc == 255 and _transport_lost(ssh):
+        return _emit_ssh_lost(args, command, inst)
 
     if args.format == "text":
         output_parts = []
@@ -1025,7 +1296,20 @@ def _handle_exec(args: argparse.Namespace) -> int:
         text = "\n".join(output_parts) if output_parts else f"[exit code: {rc}]"
         _output(text, args, stem="exec")
     else:
-        _output({"exit_code": rc, "stdout": stdout, "stderr": stderr}, args, stem="exec")
+        # L1: always include ssh_error/crash_detected so consumers have a stable,
+        # explicit contract (not an implicit "key omitted on success").
+        _output(
+            {
+                "ok": rc == 0,
+                "exit_code": rc,
+                "stdout": stdout,
+                "stderr": stderr,
+                "ssh_error": False,
+                "crash_detected": False,
+            },
+            args,
+            stem="exec",
+        )
     return 0 if rc == 0 else 1
 
 
@@ -1070,9 +1354,14 @@ def _handle_compile(args: argparse.Namespace) -> int:
         "compile_exit": rc,
         "compile_stdout": stdout,
         "compile_stderr": stderr,
+        # L1: always-present booleans for a stable JSON contract. Updated below
+        # if the run path detects a crash/transport loss.
+        "ssh_error": False,
+        "crash_detected": False,
     }
 
     if rc != 0:
+        result["ok"] = False
         if args.format == "text":
             _output(f"Compilation failed:\n{stderr.strip()}", args, stem="compile")
         else:
@@ -1082,6 +1371,7 @@ def _handle_compile(args: argparse.Namespace) -> int:
     result["compiled"] = True
 
     if not args.run:
+        result["ok"] = True
         if args.format == "text":
             _output(f"Compiled {source.name} -> {remote_bin}", args, stem="compile")
         else:
@@ -1091,7 +1381,16 @@ def _handle_compile(args: argparse.Namespace) -> int:
     # Run
     try:
         rc, stdout, stderr = ssh.run(remote_bin, timeout=args.timeout)
+        # A kernel panic during the run drops the connection and ssh exits 255
+        # (often with empty stderr). rc=255 is also a legal guest exit code, so
+        # confirm with a liveness probe (retried once to avoid a false positive
+        # on a busy live guest): if SSH still does not answer the guest vanished
+        # — raise SSHError so the crash-extraction except-block below handles it
+        # uniformly with the timeout case.
+        if rc == 255 and _transport_lost(ssh):
+            raise SSHError("SSH transport lost (rc=255) — guest likely crashed")
         result.update({
+            "ok": rc == 0,
             "run_exit": rc,
             "run_stdout": stdout,
             "run_stderr": stderr,
@@ -1111,19 +1410,28 @@ def _handle_compile(args: argparse.Namespace) -> int:
     except SSHError:
         crash = extract_crash(inst.serial_log)
         result.update({
+            "ok": False,
             "ssh_error": True,
+            "crash_detected": crash is not None,
             "crash": crash,
         })
         if args.format == "text":
             lines = [f"SSH connection lost while running {name}."]
+            # CORR-5: only the strong "Kernel may have crashed" wording when a
+            # crash report was actually extracted; otherwise report unreachable.
             if crash:
-                lines.append(f"\nCrash from serial log:\n{crash}")
+                lines.append(f"\nKernel may have crashed. Crash from serial log:\n{crash}")
             else:
-                lines.append("\nNo crash detected in serial log. Check: qmu log --tail 100")
+                lines.append(
+                    "\nSSH connection lost; VM may be unreachable. "
+                    "No crash report in serial log. Check: qmu log --tail 100"
+                )
             _output("\n".join(lines), args, stem="compile")
         else:
             _output(result, args, stem="compile")
-        return 1
+        # Exit 3 = crash/transport-loss (distinct from exit 1 for an ordinary
+        # non-zero guest command), consistent with _emit_ssh_lost in exec.
+        return 3
 
 
 # ---------------------------------------------------------------------------
@@ -1146,8 +1454,27 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
     if args.tail:
         cmd = f"dmesg | tail -{args.tail}"
     rc, stdout, stderr = ssh.run(cmd, timeout=15)
-    _output(stdout if stdout else stderr, args, stem="dmesg")
-    return 0
+
+    # L3: honor the guest exit code; do not silently render stderr as if it were
+    # the kernel log. The kernel log is stdout; stderr is labelled distinctly.
+    if args.format == "text":
+        if rc == 0:
+            _output(stdout if stdout.strip() else "(empty dmesg)", args, stem="dmesg")
+        else:
+            text = stdout.rstrip()
+            err = stderr.rstrip()
+            if err:
+                text = (text + "\n" if text else "") + f"[dmesg failed, exit {rc}] {err}"
+            elif not text:
+                text = f"[dmesg failed, exit {rc}]"
+            _output(text, args, stem="dmesg")
+    else:
+        _output(
+            {"ok": rc == 0, "exit_code": rc, "text": stdout, "stderr": stderr},
+            args,
+            stem="dmesg",
+        )
+    return 0 if rc == 0 else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1164,11 +1491,40 @@ def _add_crash(sub: argparse._SubParsersAction) -> None:
 def _handle_crash(args: argparse.Namespace) -> int:
     inst = find_instance(args.vm)
     crash = extract_crash(inst.serial_log)
-    if crash:
-        _output(crash, args, stem="crash")
+
+    # L2: distinguish "serial log missing" from "log present but no crash match"
+    # so an agent can tell a dead/never-booted VM apart from a clean run.
+    log_exists = Path(inst.serial_log).exists()
+    if crash is not None:
+        detected = True
+        reason = "crash report extracted from serial log"
+    elif not log_exists:
+        detected = False
+        reason = "serial log not found"
     else:
-        _output("No crash detected in serial log.", args, stem="crash")
-    return 0
+        detected = False
+        reason = "no crash markers found in serial log"
+
+    if args.format == "text":
+        if crash is not None:
+            _output(crash, args, stem="crash")
+        else:
+            _output(f"No crash detected: {reason}.", args, stem="crash")
+    else:
+        _output(
+            {
+                "ok": detected,
+                "detected": detected,
+                "reason": reason,
+                "serial_log": inst.serial_log,
+                "crash": crash,
+            },
+            args,
+            stem="crash",
+        )
+
+    # L2: non-zero when no crash was found (either missing log or no match).
+    return 0 if detected else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1186,10 +1542,14 @@ def _add_log(sub: argparse._SubParsersAction) -> None:
 def _handle_log(args: argparse.Namespace) -> int:
     inst = find_instance(args.vm)
     text = tail_log(inst.serial_log, lines=args.tail)
-    if text:
-        _output(text, args, stem="log")
+    if args.format == "text":
+        _output(text if text else "Serial log is empty or missing.", args, stem="log")
     else:
-        _output("Serial log is empty or missing.", args, stem="log")
+        _output(
+            {"ok": text is not None, "text": text or ""},
+            args,
+            stem="log",
+        )
     return 0
 
 
@@ -1214,7 +1574,7 @@ def _handle_gdb(args: argparse.Namespace) -> int:
 
     pry = shutil.which("pry")
     if not pry:
-        raise QMUError("pry not found in PATH. Install it from /opt/pry")
+        raise QMUError("pry not found in PATH. Install pry and ensure it is on PATH.")
 
     cmd = ["pry", "launch", "--connect", f"localhost:{inst.gdb_port}"]
     if args.symbols:
@@ -1222,15 +1582,80 @@ def _handle_gdb(args: argparse.Namespace) -> int:
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     if result.returncode == 0:
-        _output(
-            f"pry connected to VM '{inst.vm_id}' GDB stub on port {inst.gdb_port}",
-            args,
-            stem="gdb",
+        # H4: attaching to the gdb stub HALTS the vCPU. If the agent does not
+        # resume it, every subsequent exec/push/pull/compile will hang and fail
+        # with an ambiguous transport timeout. Warn loudly and tell them how to
+        # resume.
+        warning = (
+            "WARNING: the vCPU is now HALTED by the debugger. SSH (exec/push/"
+            "pull/compile) will hang until you resume it. Resume with `pry "
+            "continue` (in the debugger) or `qmu cont`."
         )
+        if args.format == "text":
+            _output(
+                f"pry connected to VM '{inst.vm_id}' GDB stub on port "
+                f"{inst.gdb_port}\n{warning}",
+                args,
+                stem="gdb",
+            )
+        else:
+            _output(
+                {
+                    "ok": True,
+                    "vm_id": inst.vm_id,
+                    "gdb_port": inst.gdb_port,
+                    "cpu_state": "halted",
+                    "warning": warning,
+                },
+                args,
+                stem="gdb",
+            )
     else:
         output = result.stderr.strip() or result.stdout.strip()
-        _output(f"pry launch failed: {output}", args, stem="gdb")
+        if args.format == "text":
+            _output(f"pry launch failed: {output}", args, stem="gdb")
+        else:
+            _output({"ok": False, "error": output}, args, stem="gdb")
         return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# cont (resume a halted vCPU)
+# ---------------------------------------------------------------------------
+
+
+def _add_cont(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "cont",
+        help="Resume a vCPU halted by the debugger (issues QMP cont)",
+    )
+    _add_common_opts(p)
+    p.set_defaults(handler=_handle_cont)
+
+
+def _handle_cont(args: argparse.Namespace) -> int:
+    inst = choose_instance(args.vm)
+    with _qmp_ctx(inst) as qmp:
+        # Resume the guest. QMP "cont" returns {} on success; if the VM is
+        # already running QEMU raises an error, which surfaces as QMPError.
+        qmp.execute("cont")
+        status = qmp.execute("query-status")
+    run_state = (
+        status.get("status", "unknown") if isinstance(status, dict) else str(status)
+    )
+    if args.format == "text":
+        _output(
+            f"VM '{inst.vm_id}' resumed (status: {run_state})",
+            args,
+            stem="cont",
+        )
+    else:
+        _output(
+            {"ok": True, "vm_id": inst.vm_id, "status": run_state},
+            args,
+            stem="cont",
+        )
     return 0
 
 
@@ -1249,10 +1674,23 @@ def _add_qmp(sub: argparse._SubParsersAction) -> None:
 
 def _handle_qmp(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
-    qmp_args = json.loads(args.args) if args.args else None
+    # M3: pre-validate --args JSON with a friendly QMUError instead of letting a
+    # raw JSONDecodeError escape as a traceback.
+    if args.args:
+        try:
+            qmp_args = json.loads(args.args)
+        except json.JSONDecodeError as exc:
+            raise QMUError(f"Invalid --args JSON: {exc}") from exc
+    else:
+        qmp_args = None
     with _qmp_ctx(inst) as qmp:
         result = qmp.execute(args.command, qmp_args)
-    _output(result, args, stem="qmp")
+    if args.format == "text":
+        _output(result, args, stem="qmp")
+    else:
+        # Wrap the raw QMP return (which may be any JSON type) so the universal
+        # {"ok": ...} contract holds; the original payload stays under "result".
+        _output({"ok": True, "result": result}, args, stem="qmp")
     return 0
 
 
@@ -1273,7 +1711,10 @@ def _handle_monitor(args: argparse.Namespace) -> int:
     command = " ".join(args.command)
     with _qmp_ctx(inst) as qmp:
         result = qmp.execute_hmp(command)
-    _output(result if result.strip() else "(no output)", args, stem="monitor")
+    if args.format == "text":
+        _output(result if result.strip() else "(no output)", args, stem="monitor")
+    else:
+        _output({"ok": True, "output": result}, args, stem="monitor")
     return 0
 
 
@@ -1284,6 +1725,7 @@ def _handle_monitor(args: argparse.Namespace) -> int:
 
 def _add_rootfs(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("rootfs", help="Manipulate rootfs images via libguestfs")
+    p.set_defaults(handler=_make_group_help_handler(p))
     sp = p.add_subparsers(dest="rootfs_cmd")
 
     s = sp.add_parser("inject", help="Copy local files into a rootfs image")
@@ -1306,6 +1748,7 @@ def _handle_rootfs_inject(args: argparse.Namespace) -> int:
     rootfs_mod.inject(args.image, parsed, partition=args.partition)
 
     summary = {
+        "ok": True,
         "image": args.image,
         "partition": args.partition,
         "injected": [{"local": l, "guest": g} for l, g in parsed],
@@ -1331,6 +1774,7 @@ def _handle_rootfs_shell(args: argparse.Namespace) -> int:
 
 def _add_skill(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("skill", help="Manage Claude Code / Codex skill")
+    p.set_defaults(handler=_make_group_help_handler(p))
     sp = p.add_subparsers(dest="skill_cmd")
     s = sp.add_parser("install", help="Install skill into ~/.claude (and ~/.codex if present)")
     s.set_defaults(handler=_handle_skill_install)
@@ -1373,11 +1817,15 @@ def _handle_skill_install(args: argparse.Namespace) -> int:
 
 def _add_version(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("version", help="Print version")
+    _add_format_opts(p)
     p.set_defaults(handler=_handle_version)
 
 
 def _handle_version(args: argparse.Namespace) -> int:
-    print(f"qmu {VERSION}")
+    if getattr(args, "format", "text") == "text":
+        _output(f"qmu {VERSION}", args, stem="version")
+    else:
+        _output({"ok": True, "version": VERSION}, args, stem="version")
     return 0
 
 
@@ -1390,7 +1838,29 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="qmu",
         description="Agent-friendly QEMU VM management CLI for kernel research",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "exit codes:\n"
+            "  0    success\n"
+            "  1    operation failed (guest command non-zero, doctor unhealthy,\n"
+            "       snapshot op failed, no crash found)\n"
+            "  2    usage / argparse error (also QMUError/QMPError/SSHError)\n"
+            "  3    guest kernel crash or SSH transport-loss\n"
+            "  4    internal / unexpected qmu error (catch-all; infra-subprocess\n"
+            "       failures such as a pry/gdb hang)\n"
+            "  124  wait timeout\n"
+            "\n"
+            "json contract:\n"
+            "  With --format json|ndjson every result is a JSON object carrying\n"
+            "  \"ok\": <bool>. Every error path emits\n"
+            "  {\"ok\": false, \"error\": ..., \"error_type\": ...} to stdout."
+        ),
     )
+    # Register --vm/--format/--out on the top-level parser so they may be given
+    # BEFORE the subcommand (e.g. `qmu --vm X exec "uname -r"`); the same flags
+    # are also added to each subparser (after the subcommand) via
+    # _add_common_opts with SUPPRESS defaults so neither order clobbers the other.
+    _add_top_level_common_opts(parser)
     sub = parser.add_subparsers(dest="subcommand")
 
     _add_launch(sub)
@@ -1410,6 +1880,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_crash(sub)
     _add_log(sub)
     _add_gdb(sub)
+    _add_cont(sub)
     _add_qmp(sub)
     _add_monitor(sub)
     _add_rootfs(sub)
@@ -1430,13 +1901,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return handler(args)
     except QMUError as exc:
-        sys.stderr.write(f"[qmu] Error: {exc}\n")
+        _emit_error(args, exc, "[qmu] Error:")
         return 2
     except QMPError as exc:
-        sys.stderr.write(f"[qmu] QMP error: {exc}\n")
+        _emit_error(args, exc, "[qmu] QMP error:")
         return 2
     except SSHError as exc:
-        sys.stderr.write(f"[qmu] SSH error: {exc}\n")
+        _emit_error(args, exc, "[qmu] SSH error:")
         return 2
     except KeyboardInterrupt:
         return 130
+    except Exception as exc:  # noqa: BLE001 — agent-facing catch-all
+        # CORR-3: never surface a raw Python traceback to the agent. Any
+        # unexpected internal error (the main() catch-all, plus infra-subprocess
+        # failures such as a pry/gdb/scp hang) becomes a machine-actionable
+        # message + JSON envelope with exit code 4 (internal/unexpected qmu
+        # error) so it is NOT confused with a guest kernel crash / SSH
+        # transport-loss (exit 3) or an ordinary non-zero guest command (exit 1).
+        _emit_error(args, exc, "[qmu] Error:")
+        return 4
