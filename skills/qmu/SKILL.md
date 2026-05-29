@@ -36,29 +36,42 @@ qmu config init         # Create starter qmu.toml in current directory
 qmu config path         # Show config file search paths
 ```
 
-Example `qmu.toml` (matches what `qmu config init` writes):
+Example `qmu.toml` (this is exactly what `qmu config init` writes, header comments elided):
 ```toml
 [machine]
-arch = "x86_64"                  # determines qemu-system-{arch} binary
+arch = "x86_64"
+# arch = "aarch64"  # set this if cross-emulating
 memory = "4G"
 cpus = 2
 # cpu = "host"                   # passes -cpu to QEMU; "host" is recommended with KVM
+# nic_model = "virtio-net-pci"   # or "e1000", "rtl8139", ...
 # extra_args = ["-M", "virt", "-cpu", "cortex-a57"]  # for aarch64
 
 [drive]
-rootfs = "./rootfs.img"          # CHANGE ME
+rootfs = "./rootfs.img"          # CHANGE ME — path to a kernel rootfs image
 format = "raw"
 
 [ssh]
-key = "~/.ssh/qmu_id_rsa"        # CHANGE ME — `~` expansion works
-user = "root"                    # SSH login user — honored by exec/push/pull (default: root)
-port_start = 10021
+key = "~/.ssh/qmu_id_rsa"        # CHANGE ME — private key matching the rootfs
+user = "root"
+# port_start = 10021
+
+[gdb]
+# port_start = 1234
 
 [profiles.exploit-dev]
-cmdline = "console=ttyS0 root=/dev/sda selinux=0 apparmor=0 kasan.fault=panic"
+cmdline = "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0 selinux=0 apparmor=0 kasan.fault=panic"
+
+[profiles.trigger-test]
+cmdline = "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0 selinux=0 apparmor=0 panic_on_warn=1 kasan.fault=panic"
+
+[profiles.exploit-test]
+cmdline = "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0 selinux=0 apparmor=0 panic_on_oops=1 kasan.fault=panic"
 ```
 
-The `arch` field drives which `qemu-system-*` binary is used and whether KVM is enabled (only when guest arch matches host). Use `extra_args` for arch-specific machine flags. Path values (`rootfs`, `ssh.key`, `--kernel`, `--initrd`) accept `~` expansion. The `[ssh] user` field sets the guest login user for `exec`/`push`/`pull`/`compile`; it is recorded on the VM at launch time, so change it before `qmu launch` (default `root`).
+The generated file also appends a commented **Harness mode** block (see the Harness section below). The `[ssh] user` field sets the guest login user for `exec`/`push`/`pull`/`compile`; it is recorded on the VM at launch time, so change it before `qmu launch` (default `root`). SSH and GDB port allocation start at `10021` and `1234` respectively (uncomment `port_start` to override).
+
+The `arch` field drives which `qemu-system-*` binary is used and whether KVM is enabled (only when guest arch matches host). Use `extra_args` for arch-specific machine flags. Path values (`rootfs`, `ssh.key`, `--kernel`, `--initrd`) accept `~` expansion.
 
 ## Quick Start
 
@@ -81,7 +94,28 @@ qmu launch --kernel /path/to/bzImage --profile trigger-test    # panic_on_warn=1
 qmu launch --kernel /path/to/bzImage --gdb                     # Enable GDB stub
 qmu launch --kernel /path/to/bzImage --name myvm --memory 8G --cpus 4
 qmu launch --kernel /path/to/bzImage --cmdline "console=ttyS0 root=/dev/sda custom=1"
+qmu launch --kernel /path/to/bzImage --cpu host                # set QEMU -cpu model (e.g. host, max, qemu64)
 ```
+
+Advanced boot flags (handy for harness/initrd kernels and custom block/NIC topologies):
+
+```bash
+# Boot from kernel + initramfs + an explicit, read-only rootfs drive, no implicit rootfs:
+qmu launch --kernel ./bzImage \
+  --initrd ./ramdisk.img \
+  --drive 'file=./rootfs.img,if=virtio,readonly,format=raw' \
+  --cmdline 'console=ttyS0 root=/dev/vda1 ro init=/run.sh'
+
+qmu launch --kernel ./bzImage --no-net                         # disable networking entirely (-nic none)
+qmu launch --kernel ./bzImage --nic-model e1000                # override NIC model (default: virtio-net-pci)
+qmu launch --kernel ./bzImage --drive 'file=a.img,...' --drive 'file=b.img,...'  # repeatable; suppresses the implicit rootfs drive
+```
+
+- `--initrd PATH` — attach an initramfs/initrd image (`~` expansion works).
+- `--drive SPEC` — raw QEMU `-drive` spec, repeatable. Supplying any `--drive` **suppresses the implicit rootfs drive**, so include the rootfs explicitly if you still need it.
+- `--no-net` — boot with `-nic none` (no guest networking; SSH-based commands will not work).
+- `--nic-model MODEL` — pick the emulated NIC (`virtio-net-pci`, `e1000`, `rtl8139`, ...).
+- `--cpu MODEL` — pass a QEMU `-cpu` model.
 
 Boot profiles:
 - `exploit-dev` (default): LSMs disabled, KASAN enabled, no panic_on_warn
@@ -90,11 +124,13 @@ Boot profiles:
 
 Rootfs, SSH key, and other settings come from `qmu.toml` config. Override any setting with CLI flags (e.g. `--rootfs`, `--arch`). The drive uses `snapshot=on` so the base image is never modified.
 
+**Auto-replace on launch.** Launching with a `--name` (or the default name) that matches an already-running VM **replaces** it: qmu kills the existing VM first, then boots the new one on the same name. This is the default so a stuck or stale VM never blocks a fresh boot and QEMU processes don't leak across launches. Pass `--no-replace` to instead fail if a VM with that name is already running.
+
 ### Multiple VMs
 
 Each VM gets its own SSH port (auto-allocated from 10021+), QMP socket, and serial log. When only one VM is running, commands auto-select it. With multiple VMs, select one with `--vm <id>`.
 
-**Important — flag placement matters.** `--vm` (like `--format` and `--out`) is a per-subcommand flag. It must appear **after** the subcommand, not before it. `qmu --vm <id> exec ...` is rejected by argparse (`error: argument subcommand: invalid choice: '<id>'`, exit 2). Always put `--vm`/`--format`/`--out` after the subcommand name.
+**Flag placement is flexible.** `--vm`, `--format`, and `--out` are accepted **both before and after** the subcommand. `qmu --vm <id> exec "..."` and `qmu exec --vm <id> "..."` are equivalent (both exit 0). Use whichever reads better; the examples below put them after the subcommand by convention.
 
 ```bash
 qmu launch --kernel /path/to/bzImage-kasan --name kasan-vm
@@ -114,9 +150,35 @@ qmu kill --force        # SIGKILL
 qmu kill --no-clean     # Stop the process but keep .serial.log + .json for forensics
 qmu prune --vm <name>   # Remove a stopped VM's state files
 qmu prune --all         # Remove every stopped VM's state files
+qmu prune --vm <name> --keep-logs   # Drop .json + .qmp.sock but PRESERVE .serial.log
 ```
 
-State files persist after a VM exits (e.g. harness boot-and-die, or `kill --no-clean`) — they're never silently removed. Read them with `qmu log --vm <name>` / `qmu crash --vm <name>`, then `qmu prune` when done.
+`prune --keep-logs` removes the metadata (`.json`) and dead socket (`.qmp.sock`) while keeping the `.serial.log` on disk, so `qmu crash`/`qmu log` against that log file still work afterward (the VM no longer appears in `qmu list`, since the metadata is gone).
+
+State files persist after a VM exits via the **non-`wait`** paths — `kill --no-clean`, or a harness VM that powered off without `qmu wait` reaping it — and on those paths they are never silently removed: read them with `qmu log --vm <name>` / `qmu crash --vm <name>`, then `qmu prune` when done. The one exception is `qmu wait`, which **auto-cleans** harness VMs by default once they stop (see Harness mode below) — in that case read the crash from `wait`'s own output, or pass `wait --no-clean` to keep the `.serial.log`.
+
+## Harness mode (boot-and-die kernels)
+
+For kernels that boot, run a one-shot init, and halt (kernelCTF judge envs, syzkaller reproducers) there is no SSH and no interactive guest. Launch with `--harness`, then block on `qmu wait`:
+
+```bash
+qmu launch --harness \
+  --kernel ./bzImage --initrd ./ramdisk.img \
+  --drive 'file=./rootfs.img,if=virtio,readonly,format=raw' \
+  --cmdline 'console=ttyS0 root=/dev/vda1 ro init=/run.sh'
+
+qmu wait                       # block until the VM stops (no timeout by default)
+qmu wait --timeout 120         # give up after 120s
+qmu wait --no-clean            # keep .serial.log after stop for later qmu crash/qmu log
+```
+
+`--harness` implies `--no-wait-ssh` and `--no-net`, and skips the rootfs/SSH-key requirement, so it works with no `[drive]`/`[ssh]` config.
+
+`qmu wait` is the harness/judge primitive. Its exit code and output:
+- **Exit 0** — the VM stopped cleanly (powered off / process exited). The result already **carries the crash**: in JSON the `crash` field holds the extracted report (null if none), and text mode prints `Crash from serial log:` followed by it.
+- **Exit 124** — the `--timeout` elapsed and the VM is still running.
+
+**`wait` auto-cleans harness VMs by default.** When the VM stops, `wait` removes its metadata (and the `.serial.log`) unless you passed `--no-clean`. Because of this, **read the crash from `wait`'s own output** rather than running `qmu crash` afterward — the log may already be gone. Pass `--no-clean` if you need the `.serial.log` to survive for a later `qmu crash`/`qmu log`. (Non-harness VMs are never auto-cleaned by `wait`.)
 
 ## File Transfer
 
@@ -126,6 +188,21 @@ qmu push exploit.c /tmp/exploit.c           # Push to specific path
 qmu pull /root/output.txt                   # Pull to current directory
 qmu pull /root/output.txt ./results/        # Pull to specific local path
 ```
+
+### Offline rootfs editing (no running VM, via libguestfs)
+
+When you need to bake files into a rootfs image **before** boot (e.g. harness rootfs that has no SSH), or inspect one without booting, use `qmu rootfs`. These operate on the image file directly and need no running VM:
+
+```bash
+# Copy local files/dirs into the image. Each pair is LOCAL:GUEST where GUEST is a directory:
+qmu rootfs inject ./rootfs.img ./exploit:/root ./run.sh:/
+qmu rootfs inject ./rootfs.img ./exploit:/root --partition 0   # whole-disk image (no partition table)
+
+# Drop into an interactive guestfish shell on the image:
+qmu rootfs shell ./rootfs.img
+```
+
+`inject` takes the image path, then one or more `LOCAL:GUEST` pairs (`GUEST` must be an existing directory in the image). `--partition N` selects the partition (default `1`; use `0` for a whole-disk/partitionless image). Both require libguestfs (`guestfish`) on the host.
 
 ## Guest Execution
 
@@ -231,7 +308,8 @@ qmu gdb --symbols /path/to/vmlinux         # Launches pry connected to GDB stub
 
 **Gotcha — `qmu gdb` halts the vCPU.** Attaching to the QEMU GDB stub halts the guest CPU. While the CPU
 is halted, every `qmu exec`/`push`/`pull`/`compile`/`dmesg` will fail with a banner/connect timeout
-(exit 255) because sshd is frozen. **Resume the guest before running SSH-based commands** with
+because sshd is frozen (the guest-side SSH return code is 255 — this is the frozen guest, not a qmu exit
+code, and not a kernel crash). **Resume the guest before running SSH-based commands** with
 `qmu cont` (or `pry continue`, or `qmu monitor cont`). If `qmu exec` starts timing out right after
 `qmu gdb`, the guest is almost certainly paused — resume it first.
 
@@ -259,13 +337,30 @@ qmu monitor "cont"                         # Resume a paused/halted guest (e.g. 
 
 ## Output Formats
 
-All commands support `--format text|json|ndjson` (placed **after** the subcommand, like `--vm`):
+All commands support `--format text|json|ndjson` (accepted both before and after the subcommand, like `--vm`):
 
 ```bash
 qmu status --format json          # Machine-readable status
 qmu exec "uname -a" --format json # Structured output with exit code
 qmu list --format json            # List as JSON array
 ```
+
+**Universal result contract.** Under `--format json` (or `ndjson`), **every** command emits a JSON object with an `"ok": <bool>` field — both on success and on every error path. Check `ok` for a single, command-agnostic success predicate; the exit code (see below) tells you *how* it failed. Errors emit `{"ok": false, "error": "<message>", "error_type": "<ExceptionClassName>"}` to stdout. In text mode, errors instead print `[qmu] Error: ...` to stderr.
+
+### Exit codes
+
+Every command follows one exit-code map. Use the code (not log scraping) to branch:
+
+| Code | Meaning |
+|------|---------|
+| `0`  | Success |
+| `1`  | Operation failed — guest command returned non-zero, `doctor` unhealthy, or a snapshot op failed |
+| `2`  | Usage / argument-parse error, or a runtime `QMUError`/`QMPError`/`SSHError` (e.g. no running VM, bad `--vm`, SSH/SCP failure, QMP error) |
+| `3`  | Guest kernel crash, or SSH transport loss (the connection dropped under a panic) |
+| `4`  | Internal/unexpected qmu error — the `main()` catch-all and infra-subprocess failures (e.g. a `pry`/`gdb` subprocess hang) |
+| `124`| `qmu wait` timed out (`--timeout` elapsed, VM still running) |
+
+Exit `3` specifically signals a guest-side crash/transport loss; an internal qmu fault (a hung helper subprocess, an unexpected exception) is `4`, so a tooling bug is never mistaken for a kernel panic.
 
 Large outputs (>10k estimated tokens) are automatically spilled to a file under `$TMPDIR/qmu-spills/`
 (default `/tmp/qmu-spills/` when `TMPDIR` is unset) to prevent context overflow. **Do not hardcode or
@@ -288,14 +383,14 @@ If no config file is found, doctor prints `Tip: run 'qmu config init' ...` and e
 
 Each VM keeps its state files under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
 
-| File                  | Purpose                                   | Lifetime                                   |
-|-----------------------|-------------------------------------------|--------------------------------------------|
-| `<name>.json`         | VM metadata (pid, ports, kernel, etc.)    | Until `qmu kill` or `qmu prune`            |
-| `<name>.serial.log`   | Serial console output (read with `qmu log`) | Until `qmu kill` or `qmu prune`          |
-| `<name>.qmp.sock`     | QMP control socket                         | Only meaningful while VM is running        |
-| `<name>.qemu.log`     | QEMU's stderr; rarely useful              | Until `qmu prune`                          |
+| File                  | Purpose                                     | Removed by                                                                 |
+|-----------------------|---------------------------------------------|----------------------------------------------------------------------------|
+| `<name>.json`         | VM metadata (pid, ports, kernel, etc.)      | `kill`, `prune`, `prune --keep-logs`, and `wait`'s harness auto-clean       |
+| `<name>.serial.log`   | Serial console output (read with `qmu log`) | `kill`, `prune`, and `wait`'s harness auto-clean — but **kept** by `kill --no-clean`, `prune --keep-logs`, and `wait --no-clean` |
+| `<name>.qmp.sock`     | QMP control socket                          | `kill`, `prune`, `prune --keep-logs`, and `wait`'s harness auto-clean       |
+| `<name>.qemu.log`     | QEMU's stderr; rarely useful                | Never removed by qmu — neither `kill` nor `prune` touch it; delete it by hand if needed |
 
-These files are **never silently removed**. After a harness VM powers off (or you call `kill --no-clean`), the `.serial.log` stays on disk and `qmu log --vm <name>` / `qmu crash --vm <name>` work. Use `qmu prune --vm <name>` (or `qmu prune --all`) to clean up explicitly. `qmu list` shows both running and stopped VMs with a status marker so you can see what's recoverable.
+Outside `wait`'s default harness auto-clean (see Harness mode), state files are **never silently removed**: after a harness VM powers off without `wait`, or after `kill --no-clean`, the `.serial.log` stays on disk and `qmu log --vm <name>` / `qmu crash --vm <name>` work. Clean up explicitly with `qmu prune --vm <name>` (or `qmu prune --all`), or `qmu prune --vm <name> --keep-logs` to drop metadata while keeping the serial log. `qmu list` shows both running and stopped VMs with a status marker so you can see what's recoverable.
 
 ## Known Limitations
 

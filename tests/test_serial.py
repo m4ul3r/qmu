@@ -94,6 +94,58 @@ KASLR_PANIC_LOG = """\
 [    6.531537] ---[ end Kernel panic - not syncing: kasan.fault=panic set ... ]---
 """
 
+# CORR-7: a WARNING/BUG that fires under panic_on_warn prints its OWN report
+# epilogue "---[ end trace ... ]---" and is then IMMEDIATELY followed by the
+# fatal "Kernel panic - not syncing" + final "---[ end Kernel panic ]---"
+# banner. The interior "---[ end trace ]---" is NOT the end of the crash event;
+# capture must span the FULL block [first start .. LAST end-marker], not stop
+# at the interior marker (which would drop the WARNING root cause, Call Trace
+# and RIP — the only useful content). Regression guard for interior-end-marker
+# truncation.
+WARN_PANIC_ON_WARN_LOG = """\
+[   10.000000] ------------[ cut here ]------------
+[   10.000100] WARNING: CPU: 0 PID: 142 at mm/slub.c:1234 kfree+0x1a/0x2b
+[   10.000200] Modules linked in: uaf
+[   10.000300] CPU: 0 PID: 142 Comm: insmod Tainted: G    W   6.6.75 #1
+[   10.000400] Call Trace:
+[   10.000500]  <TASK>
+[   10.000600]  dump_stack_lvl+0x4d/0x70
+[   10.000700]  __warn+0x81/0x130
+[   10.000800]  kfree+0x1a/0x2b
+[   10.000900]  </TASK>
+[   10.001000] RIP: 0010:kfree+0x1a/0x2b
+[   10.001100] ---[ end trace 0000000000000000 ]---
+[   10.001200] Kernel panic - not syncing: panic_on_warn set ...
+[   10.001300] CPU: 0 PID: 142 Comm: insmod Tainted: G    W   6.6.75 #1
+[   10.001400] Kernel Offset: 0x19c00000 from 0xffffffff81000000
+[   10.001500] ---[ end Kernel panic - not syncing: panic_on_warn set ... ]---
+"""
+
+# Two genuinely DISTINCT crashes: an earlier WARNING the kernel survived (normal
+# output resumes for many lines), then a later fatal panic. extract_crash must
+# return ONLY the last crash event, never leak the earlier one.
+TWO_DISTINCT_CRASHES_LOG = """\
+[    5.000000] WARNING: CPU: 0 PID: 10 at foo.c:1 old_warn+0x1/0x2
+[    5.000100] Call Trace:
+[    5.000200]  old_warn+0x1/0x2
+[    5.000300] ---[ end trace 1111111111111111 ]---
+[    6.000000] systemd[1]: Started Some Service.
+[    6.100000] EXT4-fs (sda): mounted filesystem
+[    6.200000] random: crng init done
+[    6.300000] usb 1-1: new high-speed USB device
+[    6.400000] eth0: link becomes ready
+[    6.500000] NetworkManager: connection activated
+[    6.600000] cron[123]: (CRON) STARTUP
+[    6.700000] sshd[200]: Server listening on 0.0.0.0 port 22
+[    9.000000] BUG: KASAN: slab-use-after-free in real_bug+0x5/0x6 [uaf]
+[    9.000100] Read of size 8 at addr ffff88800abc1000 by task insmod/142
+[    9.000200] Call Trace:
+[    9.000300]  real_bug+0x5/0x6 [uaf]
+[    9.000400] RIP: 0010:real_bug+0x5/0x6 [uaf]
+[    9.000500] Kernel panic - not syncing: kasan.fault=panic set
+[    9.000600] ---[ end Kernel panic - not syncing: kasan.fault=panic set ]---
+"""
+
 CLEAN_BOOT_LOG = """\
 [    0.000000] Linux version 6.6.75 (builder@host) #1 SMP
 [    0.500000] Command line: console=ttyS0 root=/dev/sda
@@ -177,6 +229,49 @@ def test_end_banner_alone_is_not_a_standalone_start():
         "the '---[ end Kernel panic ...' banner is wrongly matched as a crash "
         "START, so it becomes the detected crash_start and capture stops at one line"
     )
+
+
+def test_extract_crash_interior_end_marker_not_truncated(tmp_path):
+    """CORR-7: an interior '---[ end trace ]---' (the WARNING epilogue) emitted
+    before the final panic banner under panic_on_warn must NOT truncate the
+    report. The full block — WARNING root cause, Call Trace, RIP, the interior
+    marker, the panic banner — must be returned, anchored at the FIRST start."""
+    log = _write(tmp_path, "warn_panic.serial.log", WARN_PANIC_ON_WARN_LOG)
+    report = extract_crash(log)
+
+    assert report is not None
+    # The root cause and full report body MUST survive the interior end-marker:
+    assert "WARNING: CPU:" in report, (
+        "extract_crash truncated at the interior '---[ end trace ]---' and lost "
+        "the WARNING root cause"
+    )
+    assert "kfree+0x1a/0x2b" in report
+    assert "Call Trace:" in report
+    assert "RIP: 0010:kfree" in report
+    # The interior marker is kept INSIDE the block, not used as the boundary:
+    assert "---[ end trace 0000000000000000 ]---" in report
+    # And capture runs through the FINAL banner, not the interior one:
+    assert "---[ end Kernel panic" in report
+    assert report.count("\n") > 10, (
+        "extract_crash dropped the WARNING report body: " + repr(report)
+    )
+
+
+def test_extract_crash_returns_only_last_distinct_crash(tmp_path):
+    """A survived earlier WARNING followed by resumed normal output and then a
+    later fatal panic: only the LAST crash event is returned, never the earlier
+    distinct one."""
+    log = _write(tmp_path, "two.serial.log", TWO_DISTINCT_CRASHES_LOG)
+    report = extract_crash(log)
+
+    assert report is not None
+    assert "real_bug" in report, "lost the last (fatal) crash"
+    assert "BUG: KASAN: slab-use-after-free in real_bug" in report
+    assert "old_warn" not in report, (
+        "leaked the earlier, distinct crash — extract_crash must return only the "
+        "last crash event"
+    )
+    assert "---[ end trace 1111111111111111 ]---" not in report
 
 
 # --- These guard the None / no-crash branches ---

@@ -75,18 +75,47 @@ def extract_crash(log_path: str | Path, max_context_lines: int = 500) -> str | N
     # Only scan the tail for performance
     tail = lines[-max_context_lines:]
 
-    # Walk backwards to find the FIRST line of the LAST crash block. Going
-    # backwards, keep moving the anchor earlier across start lines; stop only
-    # when an end-marker appears *before* a start we have already found — that
-    # marker terminates the *previous* crash. Crucially, end-pattern lines that
-    # are part of THIS crash's epilogue (a relocatable kernel prints
-    # "Kernel Offset:" and then "---[ end Kernel panic ]---") are encountered
-    # while crash_start is still None and so never split the block.
+    # Walk backwards to find the FIRST line of the LAST crash event. Going
+    # backwards, keep moving the anchor earlier across start lines. An
+    # end-marker does NOT necessarily terminate the block: a single logical
+    # crash event commonly contains INTERIOR end-markers. The canonical case is
+    # a WARNING/BUG that, under panic_on_warn, prints its own report epilogue
+    # ("---[ end trace ]---") and is then IMMEDIATELY followed by a fatal
+    # "Kernel panic - not syncing" + final "---[ end Kernel panic ]---" banner.
+    # The interior "---[ end trace ]---" must not truncate the report (it would
+    # drop the WARNING/BUG root cause, RIP and Call Trace — the only useful
+    # part). A call trace can be arbitrarily long, so we cannot bound the
+    # distance from a start line ABOVE the marker; instead we look just BELOW
+    # the marker: an interior epilogue end-marker is followed almost immediately
+    # by the next crash-start of the SAME event (the panic banner), whereas an
+    # end-marker that closed a *previous, distinct* crash is followed by a run
+    # of ordinary resumed kernel/boot output before any later crash. Epilogue
+    # end-markers that precede the first start (a relocatable kernel prints
+    # "Kernel Offset:" then the banner) are seen while the anchor is still None
+    # and never split the block either.
+    #
+    # EPILOGUE_GAP: how soon below an interior end-marker the next crash-start
+    # of the same event appears. Real panic_on_warn output goes from
+    # "---[ end trace ]---" to "Kernel panic - not syncing" within a couple of
+    # lines; a distinct prior crash is followed by far more resumed output.
+    EPILOGUE_GAP = 8
     crash_start = None
     for i in range(len(tail) - 1, -1, -1):
         if _is_crash_start(tail[i]):
             crash_start = i
         elif crash_start is not None and _is_crash_end(tail[i]):
+            # Is the next crash-start within EPILOGUE_GAP lines BELOW this
+            # marker (i.e. between it and content we have already anchored)? If
+            # so, the marker is interior to one event — don't split. Blank
+            # lines do not count against the gap.
+            window_end = min(len(tail), i + 1 + EPILOGUE_GAP)
+            interior = False
+            for j in range(i + 1, window_end):
+                if _is_crash_start(tail[j]):
+                    interior = True
+                    break
+            if interior:
+                continue
             break
 
     if crash_start is None:
