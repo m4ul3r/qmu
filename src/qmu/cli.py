@@ -11,11 +11,28 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import QMUConfig, STARTER_CONFIG, find_project_config, resolve_config
-from .instance import QMUError, VMInstance, choose_instance, is_pid_alive, list_instances, load_instance, remove_instance
+from .config import QMUConfig, find_project_config, render_starter_config, resolve_config
+from .instance import (
+    QMUError,
+    VMInstance,
+    choose_instance,
+    find_instance,
+    is_pid_alive,
+    list_instances,
+    list_stopped_instances,
+    load_instance,
+    remove_instance,
+)
 from .output import render_value, write_output_result
-from .paths import global_config_path, skill_install_dir, skill_source_dir
+from .paths import (
+    claude_skills_dir,
+    codex_home,
+    codex_skills_dir,
+    global_config_path,
+    skill_source_dir,
+)
 from .qmp import QMPClient, QMPError
+from . import rootfs as rootfs_mod
 from .serial import extract_crash, tail_log
 from .snapshot import (
     delete_snapshot,
@@ -37,6 +54,15 @@ def _make_ssh(inst: VMInstance) -> SSHClient:
     return SSHClient(port=inst.ssh_port, key_path=inst.ssh_key, user=inst.ssh_user)
 
 
+def _require_ssh(inst: VMInstance) -> None:
+    """Raise QMUError if `inst` has no SSH (harness mode or unconfigured)."""
+    if inst.harness or inst.ssh_port is None or inst.ssh_key is None:
+        raise QMUError(
+            f"VM '{inst.vm_id}' is harness-mode (no SSH). "
+            f"Use 'qmu log', 'qmu crash', 'qmu qmp', or 'qmu wait' instead."
+        )
+
+
 def _qmp_ctx(inst: VMInstance) -> QMPClient:
     return QMPClient(inst.qmp_socket)
 
@@ -51,7 +77,9 @@ def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
         "ssh_key": "ssh_key",
         "memory": "memory",
         "cpus": "cpus",
+        "cpu_model": "cpu_model",
         "arch": "arch",
+        "nic_model": "nic_model",
     }
     for flag, cfg_field in flag_map.items():
         val = getattr(args, flag, None)
@@ -76,8 +104,12 @@ def _output(value: Any, args: argparse.Namespace, stem: str = "qmu") -> None:
         sys.stderr.write(f"[qmu] Output spilled to {result.artifact['artifact_path']}\n")
 
 
-def _kill_vm(inst: VMInstance, force: bool = False) -> None:
-    """Kill a VM instance: QMP quit → SIGTERM → SIGKILL → cleanup."""
+def _kill_vm(inst: VMInstance, force: bool = False, clean: bool = True) -> None:
+    """Kill a VM instance: QMP quit → SIGTERM → SIGKILL → optional cleanup.
+
+    With clean=False, the process is terminated but instance files are left
+    in place so the caller can still read .serial.log post-mortem.
+    """
     if not force:
         try:
             with _qmp_ctx(inst) as qmp:
@@ -99,7 +131,8 @@ def _kill_vm(inst: VMInstance, force: bool = False) -> None:
     except OSError:
         pass  # Already dead
 
-    remove_instance(inst.vm_id)
+    if clean:
+        remove_instance(inst.vm_id)
 
 
 def _add_top_level_common_opts(parser: argparse.ArgumentParser) -> None:
@@ -150,7 +183,9 @@ def _add_launch(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--ssh-key", default=None, dest="ssh_key", help="SSH private key (overrides config)")
     p.add_argument("--arch", default=None, help="Architecture (overrides config, e.g. x86_64, aarch64)")
     p.add_argument("--memory", default=None, help="VM memory (overrides config)")
-    p.add_argument("--cpus", type=int, default=None, help="VM CPUs (overrides config)")
+    p.add_argument("--cpus", type=int, default=None, help="VM CPU count (overrides config)")
+    p.add_argument("--cpu", default=None, dest="cpu_model",
+                   help="QEMU -cpu model, e.g. 'host', 'max', 'qemu64' (overrides config)")
     p.add_argument("--profile", default="exploit-dev", help="Boot profile (default: exploit-dev)")
     p.add_argument("--cmdline", default=None, help="Override kernel command line")
     p.add_argument("--gdb", action="store_true", help="Enable GDB stub")
@@ -161,6 +196,16 @@ def _add_launch(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--gdb-port", type=int, default=None, help="GDB port (auto-allocated)")
     p.add_argument("--ssh-timeout", type=int, default=60, help="SSH wait timeout in seconds")
     p.add_argument("--no-wait-ssh", action="store_true", help="Don't wait for SSH to be ready")
+    p.add_argument("--initrd", default=None, help="Path to initramfs/initrd image")
+    p.add_argument("--drive", action="append", dest="drives", default=None,
+                   help="QEMU -drive spec, repeatable (suppresses implicit rootfs drive)")
+    p.add_argument("--nic-model", default=None, dest="nic_model",
+                   help="NIC model (default: virtio-net-pci)")
+    p.add_argument("--no-net", action="store_true",
+                   help="Disable networking entirely (-nic none)")
+    p.add_argument("--harness", action="store_true",
+                   help="Harness/judge VM mode: implies --no-wait-ssh + --no-net; "
+                        "skips rootfs/ssh-key requirement")
     p.add_argument("extra", nargs="*", help="Extra QEMU arguments")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_launch)
@@ -168,6 +213,11 @@ def _add_launch(sub: argparse._SubParsersAction) -> None:
 
 def _handle_launch(args: argparse.Namespace) -> int:
     config = _resolve_config_from_args(args)
+
+    # Harness mode bundles --no-wait-ssh + --no-net
+    if args.harness:
+        args.no_wait_ssh = True
+        args.no_net = True
 
     # Replace existing VM with the same name (default behavior)
     if args.name and not args.no_replace:
@@ -190,12 +240,17 @@ def _handle_launch(args: argparse.Namespace) -> int:
         gdb_port=args.gdb_port,
         extra_args=args.extra or None,
         ssh_timeout=args.ssh_timeout,
+        initrd=args.initrd,
+        drives=args.drives,
+        no_net=args.no_net,
+        nic_model=args.nic_model,
+        harness=args.harness,
     )
 
-    ssh = _make_ssh(inst)
-    ssh_status = "waiting..."
-
-    if not args.no_wait_ssh:
+    if inst.harness or inst.ssh_port is None:
+        ssh_status = "n/a (harness)"
+    elif not args.no_wait_ssh:
+        ssh = _make_ssh(inst)
         sys.stderr.write(f"[qmu] VM launched (pid={inst.pid}). Waiting for SSH on port {inst.ssh_port}...\n")
         if ssh.wait_ready(timeout=args.ssh_timeout):
             ssh_status = "ready"
@@ -220,13 +275,18 @@ def _handle_launch(args: argparse.Namespace) -> int:
         lines = [
             f"VM '{inst.vm_id}' launched (pid={inst.pid})",
             f"  Arch:    {config.arch}",
-            f"  SSH:     port {inst.ssh_port} ({ssh_status})",
         ]
+        if inst.harness:
+            lines.append(f"  Mode:    harness (no SSH)")
+        elif inst.ssh_port is not None:
+            lines.append(f"  SSH:     port {inst.ssh_port} ({ssh_status})")
+        else:
+            lines.append(f"  SSH:     {ssh_status}")
         if inst.gdb_port:
             lines.append(f"  GDB:     port {inst.gdb_port}")
         lines.append(f"  Kernel:  {inst.kernel}")
         lines.append(f"  Profile: {inst.profile}")
-        lines.append(f"  Log:     {inst.serial_log}")
+        lines.append(f"  Serial:  {inst.serial_log}")
         _output("\n".join(lines), args, stem="launch")
     else:
         _output(result, args, stem="launch")
@@ -241,14 +301,187 @@ def _handle_launch(args: argparse.Namespace) -> int:
 def _add_kill(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("kill", help="Stop a running VM")
     p.add_argument("--force", action="store_true", help="Force kill (SIGKILL)")
+    p.add_argument("--no-clean", action="store_true",
+                   help="Don't remove instance metadata or serial log after kill")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_kill)
 
 
 def _handle_kill(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
-    _kill_vm(inst, force=args.force)
-    _output(f"VM '{inst.vm_id}' stopped.", args, stem="kill")
+    _kill_vm(inst, force=args.force, clean=not args.no_clean)
+    if args.no_clean:
+        msg = f"VM '{inst.vm_id}' stopped. State preserved at {inst.serial_log}"
+    else:
+        msg = f"VM '{inst.vm_id}' stopped."
+    _output(msg, args, stem="kill")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# prune
+# ---------------------------------------------------------------------------
+
+
+def _add_prune(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("prune", help="Remove state files for stopped VMs")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--vm", default=None, help="Prune a specific stopped VM")
+    g.add_argument("--all", dest="prune_all", action="store_true",
+                   help="Prune every stopped VM")
+    p.add_argument("--keep-logs", action="store_true",
+                   help="Drop .json + .qmp.sock but preserve .serial.log")
+    # _add_common_opts adds --vm too; we declared --vm above so add the rest manually.
+    p.add_argument("--format", choices=["text", "json", "ndjson"], default="text")
+    p.add_argument("--out", default=None, help="Write output to file instead of stdout")
+    p.set_defaults(handler=_handle_prune)
+
+
+def _handle_prune(args: argparse.Namespace) -> int:
+    stopped = list_stopped_instances()
+    running = list_instances()
+    running_ids = {inst.vm_id for inst in running}
+
+    if args.vm is not None:
+        if args.vm in running_ids:
+            raise QMUError(
+                f"VM '{args.vm}' is running. Use 'qmu kill --vm {args.vm}' first."
+            )
+        target = next((inst for inst in stopped if inst.vm_id == args.vm), None)
+        if target is None:
+            raise QMUError(f"No stopped VM named '{args.vm}'.")
+        targets = [target]
+    elif args.prune_all:
+        targets = stopped
+    else:
+        raise QMUError("Specify either --vm <name> or --all.")
+
+    pruned: list[str] = []
+    for inst in targets:
+        remove_instance(inst.vm_id, keep_logs=args.keep_logs)
+        pruned.append(inst.vm_id)
+
+    if args.format == "text":
+        if not pruned:
+            _output("No stopped VMs to prune.", args, stem="prune")
+        else:
+            verb = "kept logs for" if args.keep_logs else "removed"
+            _output(f"Pruned {len(pruned)} VM(s) ({verb}): {', '.join(pruned)}",
+                    args, stem="prune")
+    else:
+        _output({"pruned": pruned, "keep_logs": args.keep_logs},
+                args, stem="prune")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# wait
+# ---------------------------------------------------------------------------
+
+
+_STOP_EVENTS = {"STOP", "SHUTDOWN", "POWERDOWN", "RESET"}
+
+
+def _add_wait(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("wait", help="Block until a VM stops (harness/judge mode)")
+    p.add_argument("--timeout", type=float, default=None,
+                   help="Max seconds to wait (default: no timeout)")
+    p.add_argument("--no-clean", action="store_true",
+                   help="Don't remove instance metadata after stop (harness VMs only)")
+    _add_common_opts(p)
+    p.set_defaults(handler=_handle_wait)
+
+
+def _handle_wait(args: argparse.Namespace) -> int:
+    inst = choose_instance(args.vm)
+
+    start = time.monotonic()
+    deadline: float | None = (start + args.timeout) if args.timeout else None
+    reason = "unknown"
+    qemu_status = "unknown"
+    event_data: Any = None
+    stopped = False
+
+    try:
+        with _qmp_ctx(inst) as qmp:
+            # Short-circuit: query current state first.
+            try:
+                status = qmp.execute("query-status")
+                if isinstance(status, dict):
+                    qemu_status = status.get("status", "unknown")
+                    if qemu_status in ("paused", "shutdown", "postmigrate", "guest-panicked"):
+                        reason = qemu_status
+                        stopped = True
+            except (QMPError, OSError):
+                pass
+
+            # Loop in 1s ticks: wait for an event OR notice the PID died.
+            while not stopped:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        reason = "timeout"
+                        break
+                    tick = min(1.0, remaining)
+                else:
+                    tick = 1.0
+
+                ev = qmp.wait_event(_STOP_EVENTS, timeout=tick)
+                if ev is not None:
+                    reason = ev.get("event", "stopped")
+                    event_data = ev.get("data")
+                    stopped = True
+                    break
+
+                if not is_pid_alive(inst.pid):
+                    reason = "process_exited"
+                    stopped = True
+                    break
+    except (QMPError, OSError) as exc:
+        # If the QMP socket disappeared, the VM almost certainly stopped.
+        if not is_pid_alive(inst.pid):
+            stopped = True
+            reason = "process_exited"
+        else:
+            raise QMUError(f"QMP error during wait: {exc}") from exc
+
+    elapsed = time.monotonic() - start
+    crash = extract_crash(inst.serial_log) if stopped else None
+
+    result = {
+        "vm_id": inst.vm_id,
+        "stopped": stopped,
+        "reason": reason,
+        "elapsed": round(elapsed, 3),
+        "event_data": event_data,
+        "crash": crash,
+    }
+
+    # Auto-clean harness VMs unless --no-clean.
+    cleaned = False
+    if stopped and inst.harness and not args.no_clean:
+        try:
+            _kill_vm(inst, force=False)
+            cleaned = True
+        except QMUError:
+            pass
+    result["cleaned"] = cleaned
+
+    if args.format == "text":
+        lines = [
+            f"VM '{inst.vm_id}' {'stopped' if stopped else 'still running'} "
+            f"({reason}, elapsed={elapsed:.2f}s)"
+        ]
+        if crash:
+            lines.append("\nCrash from serial log:\n" + crash)
+        if cleaned:
+            lines.append("[qmu] Instance metadata cleaned up.")
+        _output("\n".join(lines), args, stem="wait")
+    else:
+        _output(result, args, stem="wait")
+
+    if not stopped:
+        return 124  # timeout
     return 0
 
 
@@ -258,44 +491,70 @@ def _handle_kill(args: argparse.Namespace) -> int:
 
 
 def _add_list(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("list", help="List running VMs")
+    p = sub.add_parser("list", help="List VMs (running and stopped)")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_list)
 
 
 def _handle_list(args: argparse.Namespace) -> int:
-    instances = list_instances()
-    if not instances:
-        _output("No running VMs.", args, stem="list")
+    running = list_instances()
+    stopped = list_stopped_instances()
+    if not running and not stopped:
+        _output("No VMs.", args, stem="list")
         return 0
 
     if args.format != "text":
         data = []
-        for inst in instances:
-            ssh = _make_ssh(inst)
-            data.append({
+        for inst in running:
+            entry: dict[str, Any] = {
                 "vm_id": inst.vm_id,
+                "status": "running",
                 "pid": inst.pid,
+                "harness": inst.harness,
                 "ssh_port": inst.ssh_port,
-                "ssh_ready": ssh.is_ready(),
                 "gdb_port": inst.gdb_port,
                 "kernel": inst.kernel,
                 "profile": inst.profile,
+            }
+            if inst.harness or inst.ssh_port is None:
+                entry["ssh_ready"] = None
+            else:
+                entry["ssh_ready"] = _make_ssh(inst).is_ready()
+            data.append(entry)
+        for inst in stopped:
+            data.append({
+                "vm_id": inst.vm_id,
+                "status": "stopped",
+                "pid": inst.pid or None,
+                "harness": inst.harness,
+                "ssh_port": inst.ssh_port,
+                "gdb_port": inst.gdb_port,
+                "kernel": inst.kernel or None,
+                "profile": inst.profile or None,
+                "ssh_ready": None,
+                "serial_log": inst.serial_log,
             })
         _output(data, args, stem="list")
         return 0
 
     lines = []
-    for inst in instances:
-        ssh = _make_ssh(inst)
-        ssh_ok = ssh.is_ready()
-        ssh_str = f"ssh={inst.ssh_port}({'ok' if ssh_ok else 'down'})"
+    for inst in running:
+        if inst.harness or inst.ssh_port is None:
+            ssh_str = "harness"
+        else:
+            ssh_ok = _make_ssh(inst).is_ready()
+            ssh_str = f"ssh={inst.ssh_port}({'ok' if ssh_ok else 'down'})"
         gdb_str = f" gdb={inst.gdb_port}" if inst.gdb_port else ""
+        kernel_str = f"kernel={Path(inst.kernel).name}" if inst.kernel else ""
         lines.append(
             f"  {inst.vm_id}  pid={inst.pid}  {ssh_str}{gdb_str}  "
-            f"profile={inst.profile}  kernel={Path(inst.kernel).name}"
+            f"profile={inst.profile}  {kernel_str}  [running]"
         )
-    _output("Running VMs:\n" + "\n".join(lines), args, stem="list")
+    for inst in stopped:
+        kernel_str = f"kernel={Path(inst.kernel).name}" if inst.kernel else "kernel=?"
+        profile_str = f"profile={inst.profile}" if inst.profile else "profile=?"
+        lines.append(f"  {inst.vm_id}  {profile_str}  {kernel_str}  [stopped]")
+    _output("VMs:\n" + "\n".join(lines), args, stem="list")
     return 0
 
 
@@ -312,7 +571,6 @@ def _add_status(sub: argparse._SubParsersAction) -> None:
 
 def _handle_status(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
-    ssh = _make_ssh(inst)
 
     qmp_ok = False
     qemu_status = "unknown"
@@ -324,15 +582,21 @@ def _handle_status(args: argparse.Namespace) -> int:
     except (QMPError, OSError):
         pass
 
-    ssh_ok = ssh.is_ready()
+    if inst.harness or inst.ssh_port is None:
+        ssh_state = "n/a (harness)"
+        ssh_ok = None
+    else:
+        ssh_ok = _make_ssh(inst).is_ready()
+        ssh_state = "ready" if ssh_ok else "down"
 
     result = {
         "vm_id": inst.vm_id,
         "pid": inst.pid,
+        "harness": inst.harness,
         "qmp": "connected" if qmp_ok else "unreachable",
         "qemu_status": qemu_status,
         "ssh_port": inst.ssh_port,
-        "ssh": "ready" if ssh_ok else "down",
+        "ssh": ssh_state,
         "gdb_port": inst.gdb_port,
         "kernel": inst.kernel,
         "rootfs": inst.rootfs,
@@ -350,8 +614,12 @@ def _handle_status(args: argparse.Namespace) -> int:
             f"  PID:       {inst.pid}",
             f"  QMP:       {'connected' if qmp_ok else 'unreachable'}",
             f"  QEMU:      {qemu_status}",
-            f"  SSH:       port {inst.ssh_port} ({'ready' if ssh_ok else 'down'})",
         ]
+        if inst.harness or inst.ssh_port is None:
+            lines.append(f"  Mode:      harness")
+            lines.append(f"  SSH:       n/a")
+        else:
+            lines.append(f"  SSH:       port {inst.ssh_port} ({ssh_state})")
         if inst.gdb_port:
             lines.append(f"  GDB:       port {inst.gdb_port}")
         lines.extend([
@@ -389,12 +657,20 @@ def _handle_doctor(args: argparse.Namespace) -> int:
     )
     checks: list[dict[str, Any]] = []
 
-    # Config sources
-    checks.append({
-        "check": "config",
-        "status": "ok",
-        "detail": " -> ".join(config._sources),
-    })
+    # Config sources — distinguish "loaded a file" from "defaults only"
+    file_sources = [s for s in config._sources if s.startswith(("global:", "project:", "config:"))]
+    if file_sources:
+        checks.append({
+            "check": "config",
+            "status": "ok",
+            "detail": " -> ".join(config._sources),
+        })
+    else:
+        checks.append({
+            "check": "config",
+            "status": "warn",
+            "detail": "No qmu.toml or ~/.config/qmu/config.toml found. Run: qmu config init",
+        })
 
     # QEMU binary (arch-aware)
     binary = config.qemu_binary()
@@ -407,7 +683,8 @@ def _handle_doctor(args: argparse.Namespace) -> int:
 
     # Rootfs
     if config.rootfs:
-        rootfs_ok = Path(config.rootfs).exists()
+        rootfs_resolved = Path(config.rootfs).expanduser()
+        rootfs_ok = rootfs_resolved.exists()
         checks.append({
             "check": "rootfs image",
             "status": "ok" if rootfs_ok else "MISSING",
@@ -417,29 +694,37 @@ def _handle_doctor(args: argparse.Namespace) -> int:
         checks.append({
             "check": "rootfs image",
             "status": "not configured",
-            "detail": "Set [drive] rootfs in qmu.toml or pass --rootfs",
+            "detail": "Set [drive] rootfs in qmu.toml or pass --rootfs (skip for --harness)",
         })
 
-    # SSH key
+    # SSH key — split existence from permissions
     if config.ssh_key:
-        key_path = Path(config.ssh_key)
+        key_path = Path(config.ssh_key).expanduser()
         key_ok = key_path.exists()
-        key_perms = ""
-        if key_ok:
-            mode = oct(key_path.stat().st_mode)[-3:]
-            key_perms = f" (mode={mode})"
-            if mode not in ("600", "400"):
-                key_perms += " WARNING: should be 600"
         checks.append({
             "check": "SSH key",
             "status": "ok" if key_ok else "MISSING",
-            "detail": f"{config.ssh_key}{key_perms}",
+            "detail": config.ssh_key,
         })
+        if key_ok:
+            mode = oct(key_path.stat().st_mode)[-3:]
+            if mode in ("600", "400"):
+                checks.append({
+                    "check": "SSH key permissions",
+                    "status": "ok",
+                    "detail": f"mode={mode}",
+                })
+            else:
+                checks.append({
+                    "check": "SSH key permissions",
+                    "status": "warn",
+                    "detail": f"mode={mode} (should be 600 — `chmod 600 {config.ssh_key}`)",
+                })
     else:
         checks.append({
             "check": "SSH key",
             "status": "not configured",
-            "detail": "Set [ssh] key in qmu.toml or pass --ssh-key",
+            "detail": "Set [ssh] key in qmu.toml or pass --ssh-key (skip for --harness)",
         })
 
     # KVM
@@ -473,24 +758,51 @@ def _handle_doctor(args: argparse.Namespace) -> int:
         "detail": f"{len(instances)} instance(s)",
     })
 
-    # Skill installed
-    skill_ok = skill_install_dir().exists()
-    checks.append({
-        "check": "Claude skill",
-        "status": "ok" if skill_ok else "not installed",
-        "detail": str(skill_install_dir()) if skill_ok else "Run: qmu skill install",
-    })
+    # Skill installed — check Claude root, plus Codex root when ~/.codex/ exists
+    claude_skill = claude_skills_dir() / "qmu"
+    skill_paths = [claude_skill]
+    if codex_home().is_dir():
+        skill_paths.append(codex_skills_dir() / "qmu")
+    installed = [p for p in skill_paths if p.exists()]
+    missing = [p for p in skill_paths if not p.exists()]
+    if not missing:
+        checks.append({
+            "check": "skill",
+            "status": "ok",
+            "detail": ", ".join(str(p) for p in installed),
+        })
+    elif installed:
+        checks.append({
+            "check": "skill",
+            "status": "warn",
+            "detail": f"installed at {installed[0]}; missing at {missing[0]} (run: qmu skill install)",
+        })
+    else:
+        checks.append({
+            "check": "skill",
+            "status": "not installed",
+            "detail": "Run: qmu skill install",
+        })
 
+    healthy = ("ok", "info")
     if args.format == "text":
         lines = ["qmu doctor:"]
         for c in checks:
-            mark = "+" if c["status"] in ("ok", "info") else "!"
+            if c["status"] in healthy:
+                mark = "+"
+            elif c["status"] == "warn":
+                mark = "~"
+            else:
+                mark = "!"
             lines.append(f"  [{mark}] {c['check']}: {c['detail']}")
+        if not file_sources and config.rootfs is None and config.ssh_key is None:
+            lines.append("")
+            lines.append("Tip: run `qmu config init` to create a starter qmu.toml in this directory.")
         _output("\n".join(lines), args, stem="doctor")
     else:
         _output(checks, args, stem="doctor")
 
-    all_ok = all(c["status"] in ("ok", "info") for c in checks)
+    all_ok = all(c["status"] in healthy for c in checks)
     return 0 if all_ok else 1
 
 
@@ -527,6 +839,7 @@ def _handle_config_show(args: argparse.Namespace) -> int:
             "arch": config.arch,
             "memory": config.memory,
             "cpus": config.cpus,
+            "cpu_model": config.cpu_model,
             "qemu_binary": config.qemu_binary(),
             "kvm": config.use_kvm(),
             "extra_args": config.extra_args,
@@ -553,6 +866,7 @@ def _handle_config_show(args: argparse.Namespace) -> int:
         lines.append(f"  KVM:         {config.use_kvm()}")
         lines.append(f"  Memory:      {config.memory}")
         lines.append(f"  CPUs:        {config.cpus}")
+        lines.append(f"  CPU model:   {config.cpu_model or '(qemu default)'}")
         lines.append(f"  Rootfs:      {config.rootfs or '(not set)'}")
         lines.append(f"  Drive fmt:   {config.drive_format}")
         lines.append(f"  SSH key:     {config.ssh_key or '(not set)'}")
@@ -573,7 +887,7 @@ def _handle_config_init(args: argparse.Namespace) -> int:
     if target.exists():
         sys.stderr.write(f"[qmu] {target} already exists\n")
         return 1
-    target.write_text(STARTER_CONFIG)
+    target.write_text(render_starter_config())
     print(f"Created {target}")
     return 0
 
@@ -706,6 +1020,7 @@ def _add_push(sub: argparse._SubParsersAction) -> None:
 
 def _handle_push(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
+    _require_ssh(inst)
     ssh = _make_ssh(inst)
     ssh.push(args.local, args.remote)
     if args.format == "text":
@@ -729,6 +1044,7 @@ def _add_pull(sub: argparse._SubParsersAction) -> None:
 
 def _handle_pull(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
+    _require_ssh(inst)
     ssh = _make_ssh(inst)
     ssh.pull(args.remote, args.local)
     if args.format == "text":
@@ -785,6 +1101,7 @@ def _emit_ssh_lost(args: argparse.Namespace, command: str, inst: VMInstance) -> 
 
 def _handle_exec(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
+    _require_ssh(inst)
     ssh = _make_ssh(inst)
     command = " ".join(args.command)
 
@@ -847,6 +1164,7 @@ def _add_compile(sub: argparse._SubParsersAction) -> None:
 
 def _handle_compile(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
+    _require_ssh(inst)
     ssh = _make_ssh(inst)
     source = Path(args.source)
 
@@ -954,6 +1272,7 @@ def _add_dmesg(sub: argparse._SubParsersAction) -> None:
 
 def _handle_dmesg(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
+    _require_ssh(inst)
     ssh = _make_ssh(inst)
     cmd = "dmesg"
     if args.tail:
@@ -994,7 +1313,7 @@ def _add_crash(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_crash(args: argparse.Namespace) -> int:
-    inst = choose_instance(args.vm)
+    inst = find_instance(args.vm)
     crash = extract_crash(inst.serial_log)
 
     # L2: distinguish "serial log missing" from "log present but no crash match"
@@ -1044,7 +1363,7 @@ def _add_log(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_log(args: argparse.Namespace) -> int:
-    inst = choose_instance(args.vm)
+    inst = find_instance(args.vm)
     text = tail_log(inst.serial_log, lines=args.tail)
     if args.format == "text":
         _output(text if text else "Serial log is empty or missing.", args, stem="log")
@@ -1218,35 +1537,91 @@ def _handle_monitor(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# rootfs (libguestfs)
+# ---------------------------------------------------------------------------
+
+
+def _add_rootfs(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("rootfs", help="Manipulate rootfs images via libguestfs")
+    sp = p.add_subparsers(dest="rootfs_cmd")
+
+    s = sp.add_parser("inject", help="Copy local files into a rootfs image")
+    s.add_argument("image", help="Path to rootfs image")
+    s.add_argument("mappings", nargs="+", metavar="LOCAL:GUEST",
+                   help="One or more LOCAL:GUEST pairs (GUEST is a directory)")
+    s.add_argument("--partition", type=int, default=1,
+                   help="Partition number (default: 1; use 0 for whole-disk image)")
+    _add_common_opts(s)
+    s.set_defaults(handler=_handle_rootfs_inject)
+
+    s = sp.add_parser("shell", help="Drop into a guestfish interactive shell")
+    s.add_argument("image", help="Path to rootfs image")
+    s.add_argument("--partition", type=int, default=1)
+    s.set_defaults(handler=_handle_rootfs_shell)
+
+
+def _handle_rootfs_inject(args: argparse.Namespace) -> int:
+    parsed = [rootfs_mod.parse_mapping(m) for m in args.mappings]
+    rootfs_mod.inject(args.image, parsed, partition=args.partition)
+
+    summary = {
+        "image": args.image,
+        "partition": args.partition,
+        "injected": [{"local": l, "guest": g} for l, g in parsed],
+    }
+    if args.format == "text":
+        lines = [f"Injected into {args.image} (partition {args.partition}):"]
+        for local, guest in parsed:
+            lines.append(f"  {local} -> {guest}")
+        _output("\n".join(lines), args, stem="rootfs-inject")
+    else:
+        _output(summary, args, stem="rootfs-inject")
+    return 0
+
+
+def _handle_rootfs_shell(args: argparse.Namespace) -> int:
+    return rootfs_mod.shell(args.image, partition=args.partition)
+
+
+# ---------------------------------------------------------------------------
 # skill install
 # ---------------------------------------------------------------------------
 
 
 def _add_skill(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("skill", help="Manage Claude Code skill")
+    p = sub.add_parser("skill", help="Manage Claude Code / Codex skill")
     sp = p.add_subparsers(dest="skill_cmd")
-    s = sp.add_parser("install", help="Install Claude Code skill")
+    s = sp.add_parser("install", help="Install skill into ~/.claude (and ~/.codex if present)")
     s.set_defaults(handler=_handle_skill_install)
+
+
+def _skill_install_roots() -> list[Path]:
+    """Return the destination dirs for `qmu skill install`.
+
+    Always installs into ~/.claude/skills/. Additionally installs into
+    ~/.codex/skills/ when ~/.codex/ exists.
+    """
+    roots = [claude_skills_dir()]
+    if codex_home().is_dir():
+        roots.append(codex_skills_dir())
+    return roots
 
 
 def _handle_skill_install(args: argparse.Namespace) -> int:
     src = skill_source_dir()
-    dst = skill_install_dir()
-
     if not src.exists():
         raise QMUError(f"Skill source not found: {src}")
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
-
-    # Remove existing (symlink or dir)
-    if dst.is_symlink() or dst.exists():
-        if dst.is_symlink():
-            dst.unlink()
-        else:
-            shutil.rmtree(dst)
-
-    dst.symlink_to(src)
-    print(f"Skill installed: {dst} -> {src}")
+    for root in _skill_install_roots():
+        dst = root / "qmu"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_symlink() or dst.exists():
+            if dst.is_symlink():
+                dst.unlink()
+            else:
+                shutil.rmtree(dst)
+        dst.symlink_to(src)
+        print(f"Skill installed: {dst} -> {src}")
     return 0
 
 
@@ -1284,6 +1659,8 @@ def main(argv: list[str] | None = None) -> int:
 
     _add_launch(sub)
     _add_kill(sub)
+    _add_prune(sub)
+    _add_wait(sub)
     _add_list(sub)
     _add_status(sub)
     _add_doctor(sub)
@@ -1300,6 +1677,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_cont(sub)
     _add_qmp(sub)
     _add_monitor(sub)
+    _add_rootfs(sub)
     _add_skill(sub)
     _add_version(sub)
 

@@ -17,6 +17,8 @@ class QMPClient:
         self.socket_path = str(socket_path)
         self._sock: socket.socket | None = None
         self._buf = b""
+        # Buffered async events received while waiting for command responses.
+        self._events: list[dict] = []
 
     def connect(self) -> dict:
         """Connect to QMP socket and negotiate capabilities. Returns greeting."""
@@ -109,7 +111,7 @@ class QMPClient:
             self._buf += chunk
 
     def _recv_response(self) -> Any:
-        """Read responses, skip async events, return on return/error."""
+        """Read responses, buffer async events, return on return/error."""
         while True:
             msg = self._recv_json()
             if "return" in msg:
@@ -118,7 +120,45 @@ class QMPClient:
                 err = msg["error"]
                 desc = err.get("desc", err.get("class", "unknown error"))
                 raise QMPError(f"QMP error: {desc}")
-            # Skip async events: {"event": ..., "timestamp": ..., "data": ...}
+            if "event" in msg:
+                # Buffer for later wait_event() calls.
+                self._events.append(msg)
+                continue
+
+    def wait_event(
+        self,
+        event_names: set[str] | str,
+        timeout: float | None = None,
+    ) -> dict | None:
+        """Block until any named QMP event fires. Returns the event dict, or None on timeout.
+
+        Drains previously-buffered events first, then reads from the socket.
+        Caller must not interleave execute() with wait_event() — buffered command
+        responses would be discarded.
+        """
+        if isinstance(event_names, str):
+            event_names = {event_names}
+
+        # First scan the buffer for an already-queued match.
+        for i, ev in enumerate(self._events):
+            if ev.get("event") in event_names:
+                return self._events.pop(i)
+
+        if self._sock is None:
+            raise QMPError("Not connected")
+        self._sock.settimeout(timeout)
+        try:
+            while True:
+                msg = self._recv_json()
+                if "event" in msg:
+                    if msg["event"] in event_names:
+                        return msg
+                    self._events.append(msg)
+                    continue
+                # Stray return/error (no execute() in flight) — drop it; caller
+                # should not be interleaving execute() with wait_event().
+        except (socket.timeout, TimeoutError):
+            return None
 
     def __enter__(self) -> QMPClient:
         self.connect()
