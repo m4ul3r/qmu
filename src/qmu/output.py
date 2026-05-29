@@ -1,20 +1,21 @@
 from __future__ import annotations
 
-import functools
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import tiktoken
-
 from .paths import spill_root
 
 
 DEFAULT_SPILL_TOKEN_LIMIT = 10_000
-GPT_5_4_TOKENIZER = "o200k_base"
+# Tokenizer-agnostic estimate: a conservative chars-per-token heuristic that
+# does not depend on any model-specific (and network/first-use) tokenizer.
+TOKEN_ESTIMATOR = "chars/4"
+_CHARS_PER_TOKEN = 4
 
 
 @dataclass(frozen=True)
@@ -64,9 +65,8 @@ def _spill_path(stem: str, suffix: str) -> Path:
     return directory / f"{stem}-{now.strftime('%H%M%S')}{suffix}"
 
 
-@functools.cache
-def _token_encoding() -> tiktoken.Encoding:
-    return tiktoken.get_encoding(GPT_5_4_TOKENIZER)
+def _estimate_tokens(rendered: str) -> int:
+    return math.ceil(len(rendered) / _CHARS_PER_TOKEN)
 
 
 def _artifact_payload(
@@ -74,7 +74,7 @@ def _artifact_payload(
     artifact_path: Path,
     fmt: str,
     encoded: bytes,
-    token_count: int,
+    token_estimate: int,
     value: Any,
 ) -> dict[str, Any]:
     return {
@@ -82,8 +82,8 @@ def _artifact_payload(
         "artifact_path": str(artifact_path),
         "format": fmt,
         "bytes": len(encoded),
-        "tokens": token_count,
-        "tokenizer": GPT_5_4_TOKENIZER,
+        "token_estimate": token_estimate,
+        "estimator": TOKEN_ESTIMATOR,
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "summary": _summary(value),
     }
@@ -103,7 +103,7 @@ def write_output_result(
 ) -> OutputWriteResult:
     rendered = render_value(value, fmt)
     encoded = rendered.encode("utf-8")
-    token_count = len(_token_encoding().encode(rendered))
+    token_estimate = _estimate_tokens(rendered)
 
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,7 +112,7 @@ def write_output_result(
             artifact_path=out_path,
             fmt=fmt,
             encoded=encoded,
-            token_count=token_count,
+            token_estimate=token_estimate,
             value=value,
         )
         return OutputWriteResult(
@@ -121,7 +121,7 @@ def write_output_result(
             spilled=False,
         )
 
-    if token_count <= spill_token_limit:
+    if token_estimate <= spill_token_limit:
         return OutputWriteResult(rendered=rendered)
 
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
@@ -131,7 +131,7 @@ def write_output_result(
         artifact_path=spill_path,
         fmt=fmt,
         encoded=encoded,
-        token_count=token_count,
+        token_estimate=token_estimate,
         value=value,
     )
     return OutputWriteResult(

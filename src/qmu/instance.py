@@ -13,13 +13,16 @@ class QMUError(RuntimeError):
     pass
 
 
-@dataclass
+@dataclass(kw_only=True)
 class VMInstance:
     vm_id: str
     pid: int
     qmp_socket: str
     ssh_port: int
     ssh_key: str
+    # Defaulted so instance JSON written before ssh_user existed still loads
+    # (VMInstance(**data) supplies "root" when the key is absent).
+    ssh_user: str = "root"
     gdb_port: int | None
     serial_log: str
     kernel: str

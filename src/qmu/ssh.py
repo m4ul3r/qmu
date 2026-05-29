@@ -9,6 +9,32 @@ class SSHError(RuntimeError):
     pass
 
 
+# Markers written by the *local* ssh/scp client (not the guest) when the
+# transport is lost — e.g. the guest kernel panicked and the connection was
+# dropped by the keepalive. ssh exits 255 in these cases.
+SSH_TRANSPORT_ERROR_MARKERS = (
+    "Connection timed out during banner exchange",
+    "Connection reset by peer",
+    "Connection closed by remote host",
+    "Connection refused",
+    "client_loop: send disconnect",
+    "kex_exchange_identification",
+    "Timeout, server",
+    "banner exchange",
+    "Broken pipe",
+)
+
+
+def is_transport_failure(rc: int, stderr: str) -> bool:
+    """True if (rc, stderr) look like an ssh transport loss rather than a
+    guest process exit. ssh exits 255 on transport failure; we additionally
+    require a recognizable transport marker on stderr so a guest that genuinely
+    returns exit(255) is not misclassified."""
+    if rc != 255:
+        return False
+    return any(m in stderr for m in SSH_TRANSPORT_ERROR_MARKERS)
+
+
 class SSHClient:
     """Wraps system ssh/scp for guest communication."""
 
@@ -113,7 +139,12 @@ class SSHClient:
             str(local),
             f"{self._target()}:{remote_path}",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            raise SSHError(
+                f"SCP push timed out after 30s: {local_path} -> {remote_path}"
+            ) from exc
         if result.returncode != 0:
             raise SSHError(f"SCP push failed: {result.stderr.strip()}")
 
@@ -123,6 +154,11 @@ class SSHClient:
             f"{self._target()}:{remote_path}",
             local_path,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            raise SSHError(
+                f"SCP pull timed out after 30s: {remote_path} -> {local_path}"
+            ) from exc
         if result.returncode != 0:
             raise SSHError(f"SCP pull failed: {result.stderr.strip()}")

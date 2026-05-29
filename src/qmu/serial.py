@@ -40,6 +40,11 @@ CRASH_END_PATTERNS = [
 
 
 def _is_crash_start(line: str) -> bool:
+    # An end-trace banner (e.g. "---[ end Kernel panic ... ]---") contains the
+    # substring "Kernel panic" and would otherwise match a start pattern. Treat
+    # any end-marker line as END-only so it can never be mistaken for a start.
+    if _is_crash_end(line):
+        return False
     return any(p.search(line) for p in CRASH_START_PATTERNS)
 
 
@@ -70,23 +75,33 @@ def extract_crash(log_path: str | Path, max_context_lines: int = 500) -> str | N
     # Only scan the tail for performance
     tail = lines[-max_context_lines:]
 
-    # Find the last crash start
+    # Walk backwards to find the FIRST line of the LAST crash block. Going
+    # backwards, keep moving the anchor earlier across start lines; stop only
+    # when an end-marker appears *before* a start we have already found — that
+    # marker terminates the *previous* crash. Crucially, end-pattern lines that
+    # are part of THIS crash's epilogue (a relocatable kernel prints
+    # "Kernel Offset:" and then "---[ end Kernel panic ]---") are encountered
+    # while crash_start is still None and so never split the block.
     crash_start = None
-    for i, line in enumerate(tail):
-        if _is_crash_start(line):
+    for i in range(len(tail) - 1, -1, -1):
+        if _is_crash_start(tail[i]):
             crash_start = i
+        elif crash_start is not None and _is_crash_end(tail[i]):
+            break
 
     if crash_start is None:
         return None
 
-    # Capture from crash start to crash end (or end of tail)
-    crash_lines = []
-    for line in tail[crash_start:]:
-        crash_lines.append(line)
-        if _is_crash_end(line):
+    # Capture through the LAST end-marker at or after the start (the epilogue may
+    # have several end lines); fall back to end-of-tail for a crash still in
+    # progress (no end banner yet).
+    end = len(tail)
+    for i in range(len(tail) - 1, crash_start, -1):
+        if _is_crash_end(tail[i]):
+            end = i + 1
             break
 
-    return "\n".join(crash_lines) + "\n"
+    return "\n".join(tail[crash_start:end]) + "\n"
 
 
 def tail_log(log_path: str | Path, lines: int = 50) -> str | None:

@@ -36,14 +36,14 @@ format = "raw"
 
 [ssh]
 key = "/path/to/ssh.id_rsa"
-user = "root"
+user = "root"           # SSH login user — honored by exec/push/pull (default: root)
 port_start = 10021
 
 [profiles.exploit-dev]
 cmdline = "console=ttyS0 root=/dev/sda selinux=0 apparmor=0 kasan.fault=panic"
 ```
 
-The `arch` field drives which `qemu-system-*` binary is used and whether KVM is enabled (only when guest arch matches host). Use `extra_args` for arch-specific machine flags.
+The `arch` field drives which `qemu-system-*` binary is used and whether KVM is enabled (only when guest arch matches host). Use `extra_args` for arch-specific machine flags. The `[ssh] user` field sets the guest login user for `exec`/`push`/`pull`/`compile`; it is recorded on the VM at launch time, so change it before `qmu launch` (default `root`).
 
 ## Quick Start
 
@@ -53,8 +53,6 @@ qmu doctor                                  # Verify everything is healthy
 qmu exec "uname -a"                        # Run a command in the guest
 qmu compile exploit.c --run                 # Push, compile, and run C code in guest
 qmu crash                                   # Extract crash report (works even when SSH is dead)
-qmu snapshot save clean                     # Save VM state
-qmu snapshot load clean                     # Restore VM state
 qmu kill                                    # Stop the VM
 ```
 
@@ -79,13 +77,15 @@ Rootfs, SSH key, and other settings come from `qmu.toml` config. Override any se
 
 ### Multiple VMs
 
-Each VM gets its own SSH port (auto-allocated from 10021+), QMP socket, and serial log. When only one VM is running, commands auto-select it. With multiple VMs, use `--vm <id>`:
+Each VM gets its own SSH port (auto-allocated from 10021+), QMP socket, and serial log. When only one VM is running, commands auto-select it. With multiple VMs, select one with `--vm <id>`.
+
+**Important — flag placement matters.** `--vm` (like `--format` and `--out`) is a per-subcommand flag. It must appear **after** the subcommand, not before it. `qmu --vm <id> exec ...` is rejected by argparse (`error: argument subcommand: invalid choice: '<id>'`, exit 2). Always put `--vm`/`--format`/`--out` after the subcommand name.
 
 ```bash
 qmu launch --kernel /path/to/bzImage-kasan --name kasan-vm
 qmu launch --kernel /path/to/bzImage-nokasan --name exploit-vm
-qmu --vm kasan-vm exec "uname -r"
-qmu --vm exploit-vm compile exploit.c --run
+qmu exec --vm kasan-vm "uname -r"
+qmu compile --vm exploit-vm exploit.c --run
 qmu kill --vm kasan-vm
 ```
 
@@ -116,7 +116,7 @@ qmu exec "cat /proc/slabinfo | grep kmalloc-192"
 qmu exec "./exploit" --timeout 120          # Long-running with custom timeout
 ```
 
-If SSH dies during execution (kernel crash), qmu automatically extracts the crash report from the serial log and includes it in the output.
+If a command crashes the kernel and SSH dies, qmu makes a **best-effort** attempt to extract the crash report from the serial log and include it in the output. This auto-extraction fires both when the command exceeds qmu's `--timeout` and when the SSH connection is torn down (rc=255) by a panic. It is best-effort only: after **any** suspected panic — including a bare `[exit code: 255]` — always run `qmu crash` (and `qmu log --tail 200`) to confirm. Do not rely solely on the exit code to detect a crash.
 
 ## Compile and Run
 
@@ -131,7 +131,7 @@ qmu compile exploit.c --cflags "-static -lpthread -DDEBUG"   # Custom compiler f
 
 Default CFLAGS: `-static -lpthread`
 
-If the exploit crashes the kernel during `--run`, the crash report is automatically extracted from the serial log.
+If the exploit crashes the kernel during `--run`, qmu makes a best-effort attempt to extract the crash report from the serial log. As with `exec`, always run `qmu crash` after any suspected panic to confirm — do not trust the exit code alone.
 
 ## Crash Extraction
 
@@ -143,26 +143,36 @@ qmu log --tail 100     # View last 100 lines of serial console
 qmu log --tail 500     # More context
 ```
 
-Detected crash patterns: KASAN reports, BUG/Oops, kernel panic, general protection fault, UBSAN, slab-use-after-free, and more.
+Detected crash patterns: KASAN reports, BUG/Oops, kernel panic, general protection fault, UBSAN, slab-use-after-free, and more. If `qmu crash` reports nothing but you suspect a panic, fall back to `qmu log --tail 200` to read the raw serial log directly.
 
 ## Snapshots
 
-Save and restore VM state within a session. Snapshots are ephemeral (lost when VM exits) but ideal for exploit iteration:
+Save and restore VM state within a session. Snapshots are ephemeral (lost when the VM exits):
 
 ```bash
-qmu snapshot save clean        # Save after boot, before exploit
+qmu snapshot save clean        # Save VM state
 qmu snapshot list              # List saved snapshots
-qmu snapshot load clean        # Restore to known-good state after crash
+qmu snapshot load clean        # Restore a saved state
 qmu snapshot delete clean      # Remove a snapshot
 ```
 
-Typical workflow:
+**Limitation — snapshot load is incompatible with the default networking.** qmu's default `-net user`
+(slirp) backend cannot be serialized by `savevm`, so `savevm` prints slirp warnings and `loadvm`
+typically fails with `Section footer error` / `Missing section footer for slirp` and does **not** restore
+the VM (SSH stays dead afterward). `qmu snapshot load` now returns a **non-zero exit code** and a stderr
+message when `loadvm` reports such an error — check the exit code, do not assume success. For reliable
+crash iteration with the default networking, prefer **relaunching** the VM over snapshot restore.
+
+Recommended iteration loop (relaunch-based, robust):
 1. `qmu launch --kernel ...`
-2. `qmu snapshot save clean`
-3. `qmu compile exploit.c --run` — crashes kernel
-4. `qmu crash` — read the crash
-5. `qmu snapshot load clean` — restore, SSH comes back
-6. Edit exploit, repeat from step 3
+2. `qmu compile exploit.c --run` — may crash the kernel
+3. `qmu crash` — read the crash (always confirm; auto-extraction is best-effort)
+4. `qmu kill` then `qmu launch --kernel ...` — fresh known-good VM
+5. Edit the exploit, repeat from step 2
+
+(If you have configured a snapshot-compatible NIC via `extra_args`, the `snapshot save`/`snapshot load`
+loop can replace step 4 — but verify `qmu exec` works after `snapshot load`, and always check the exit
+code of `snapshot load`, before relying on it.)
 
 ## Kernel Logs
 
@@ -180,10 +190,16 @@ qmu launch --kernel /path/to/bzImage --gdb
 qmu gdb --symbols /path/to/vmlinux         # Launches pry connected to GDB stub
 ```
 
+**Gotcha — `qmu gdb` halts the vCPU.** Attaching to the QEMU GDB stub halts the guest CPU. While the CPU
+is halted, every `qmu exec`/`push`/`pull`/`compile`/`dmesg` will fail with a banner/connect timeout
+(exit 255) because sshd is frozen. **Resume the guest before running SSH-based commands** with
+`qmu cont` (or `pry continue`, or `qmu monitor cont`). If `qmu exec` starts timing out right after
+`qmu gdb`, the guest is almost certainly paused — resume it first.
+
 Now use pry commands for kernel debugging:
 ```bash
 pry break set commit_creds
-pry continue
+pry continue                # REQUIRED to resume the halted guest before the parallel exec below
 # In parallel: qmu exec "./exploit"
 pry backtrace
 pry print current_cred
@@ -199,11 +215,12 @@ qmu qmp query-block                        # Query block devices
 qmu monitor "info registers"               # HMP command via QMP
 qmu monitor "info mem"                     # Memory mappings
 qmu monitor "x /16xg 0xffffffff81000000"   # Examine memory
+qmu monitor "cont"                         # Resume a paused/halted guest (e.g. after qmu gdb)
 ```
 
 ## Output Formats
 
-All commands support `--format text|json|ndjson`:
+All commands support `--format text|json|ndjson` (placed **after** the subcommand, like `--vm`):
 
 ```bash
 qmu status --format json          # Machine-readable status
@@ -211,16 +228,37 @@ qmu exec "uname -a" --format json # Structured output with exit code
 qmu list --format json            # List as JSON array
 ```
 
-Large outputs (>10k tokens) are automatically spilled to `/tmp/qmu-spills/` to prevent context overflow.
+Large outputs (>10k estimated tokens) are automatically spilled to a file under `$TMPDIR/qmu-spills/`
+(default `/tmp/qmu-spills/` when `TMPDIR` is unset) to prevent context overflow. **Do not hardcode or
+reconstruct the spill directory** — the exact file path is always reported in the result envelope's
+`artifact_path` field and on the `[qmu] Output spilled to <path>` stderr line. Read it from there.
+
+The spill envelope reports `{"token_estimate": <int>, "estimator": "chars/4"}` — the token figure is a
+tokenizer-agnostic chars-per-token heuristic, not an authoritative model token count. Treat it as an
+approximation for sizing only.
 
 ## Health Check
 
 ```bash
-qmu doctor      # Checks: QEMU binary, rootfs, SSH key, KVM, running VMs, skill
+qmu doctor      # Checks: QEMU binary, rootfs, SSH key, KVM, pry, running VMs, skill
 ```
+
+`pry` is reported as an informational check (it is only required for `qmu gdb`); a missing `pry` does not
+fail the overall health check.
 
 ## Known Limitations
 
-- **Snapshots are ephemeral**: `savevm`/`loadvm` use a temporary COW overlay. Snapshots disappear when the VM exits. This is by design — the base image stays clean.
-- **SSH may be slow after snapshot load**: The guest's network stack needs a moment to recover. If `qmu exec` fails immediately after `qmu snapshot load`, wait 1-2 seconds and retry.
-- **Serial log is write-only**: The serial console is captured to a log file. There is no interactive console mode — use SSH for interactive work.
+- **Snapshot load is incompatible with the default networking**: with `-net user` (slirp),
+  `savevm`/`loadvm` cannot serialize NIC state; `loadvm` fails (`Section footer error` /
+  `Missing section footer for slirp`) and does not restore the VM. `qmu snapshot load` returns a non-zero
+  exit code and a stderr message in this case. Prefer relaunching the VM for crash iteration (see
+  Snapshots), or configure a migratable NIC via `extra_args`.
+- **Snapshots are ephemeral**: `savevm`/`loadvm` use a temporary COW overlay. Snapshots disappear when the
+  VM exits. This is by design — the base image stays clean.
+- **`qmu gdb` halts the guest**: attaching the debugger pauses the vCPU; resume with `qmu cont` /
+  `pry continue` / `qmu monitor cont` before running SSH-based commands.
+- **Crash auto-extraction is best-effort**: it fires when a command exceeds `--timeout`, or returns
+  rc=255 and a liveness probe finds SSH no longer reachable (a genuine guest exit 255 with the VM still
+  up is left as a normal result). Always confirm with `qmu crash` / `qmu log --tail 200` after a suspected panic.
+- **Serial log is write-only**: The serial console is captured to a log file. There is no interactive
+  console mode — use SSH for interactive work.
