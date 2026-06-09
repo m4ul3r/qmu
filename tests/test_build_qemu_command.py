@@ -35,8 +35,11 @@ def test_default_invocation_unchanged():
     assert any("hostfwd=tcp:127.0.0.1:10022-:22" in a for a in cmd)
     # Implicit rootfs drive present
     assert any("file=/r/rootfs.img" in a for a in cmd)
-    # NIC model defaults to virtio-net-pci
-    assert any(a == "nic,model=virtio-net-pci" for a in cmd)
+    # NIC model defaults to virtio-net-pci (modern -netdev/-device form)
+    assert any(a == "virtio-net-pci,netdev=net0" for a in cmd)
+    assert any(a.startswith("user,id=net0,host=10.0.2.10,") for a in cmd)
+    assert "-netdev" in cmd and "-device" in cmd
+    assert "-net" not in cmd
     # No initrd
     assert "-initrd" not in cmd
 
@@ -97,15 +100,15 @@ def test_harness_style_no_ssh_no_net():
 
 def test_nic_model_override_propagates():
     cmd = build_qemu_command(**_kwargs(nic_model="e1000"))
-    assert any(a == "nic,model=e1000" for a in cmd)
-    assert not any(a == "nic,model=virtio-net-pci" for a in cmd)
+    assert any(a == "e1000,netdev=net0" for a in cmd)
+    assert not any(a == "virtio-net-pci,netdev=net0" for a in cmd)
 
 
 def test_nic_model_from_config():
     cfg = _base_config()
     cfg.nic_model = "rtl8139"
     cmd = build_qemu_command(**_kwargs(config=cfg))
-    assert any(a == "nic,model=rtl8139" for a in cmd)
+    assert any(a == "rtl8139,netdev=net0" for a in cmd)
 
 
 def test_cpu_model_absent_by_default():

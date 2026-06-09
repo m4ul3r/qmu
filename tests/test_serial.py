@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import pytest
 
-from qmu.serial import _is_crash_start, _is_crash_end, extract_crash
+from qmu.serial import _is_crash_start, _is_crash_end, extract_crash, tail_log
 
 
 # A realistic KASAN slab-use-after-free report, exactly as it appears on the
@@ -291,3 +291,42 @@ def test_extract_crash_empty_file_returns_none(tmp_path):
     """An empty serial log yields None."""
     log = _write(tmp_path, "empty.serial.log", "")
     assert extract_crash(log) is None
+
+
+# --- tail_log ---
+
+def test_tail_log_zero_lines_returns_empty_string(tmp_path):
+    """Regression: `qmu log --tail 0` must print NOTHING. all_lines[-0:] is the
+    WHOLE list, so an unguarded slice dumps the entire serial log. Like
+    `tail -n 0`, lines=0 returns "" — and "" stays distinguishable from a
+    missing file (None)."""
+    log = _write(tmp_path, "tail.serial.log", CLEAN_BOOT_LOG)
+    out = tail_log(log, lines=0)
+
+    assert out is not None, "lines=0 on an existing file must not look like a missing file"
+    assert out == "", (
+        "tail_log(lines=0) dumped content instead of nothing: " + repr(out)
+    )
+    # Negative values must not dump the whole file either:
+    assert tail_log(log, lines=-3) == ""
+
+
+def test_tail_log_positive_lines_returns_last_n(tmp_path):
+    """A normal positive tail returns exactly the last N lines, newline-terminated."""
+    log = _write(tmp_path, "tail.serial.log", CLEAN_BOOT_LOG)
+    out = tail_log(log, lines=2)
+
+    assert out is not None
+    assert out == (
+        "[    2.000000] Debian GNU/Linux 12 qmu ttyS0\n"
+        "[    2.100000] qmu login: root (automatic login)\n"
+    )
+    # Asking for more lines than exist returns the whole file's lines:
+    assert tail_log(log, lines=500) == CLEAN_BOOT_LOG
+
+
+def test_tail_log_missing_file_returns_none(tmp_path):
+    """A nonexistent log path yields None — including with lines=0, so the
+    empty-tail case ("") never masks a missing file (None)."""
+    assert tail_log(tmp_path / "does-not-exist.log") is None
+    assert tail_log(tmp_path / "does-not-exist.log", lines=0) is None

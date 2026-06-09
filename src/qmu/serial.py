@@ -134,7 +134,13 @@ def extract_crash(log_path: str | Path, max_context_lines: int = 500) -> str | N
 
 
 def tail_log(log_path: str | Path, lines: int = 50) -> str | None:
-    """Return the last N lines of the serial log."""
+    """Return the last N lines of the serial log.
+
+    Like ``tail -n``, ``lines <= 0`` yields no output: it returns "" (empty
+    string), which stays distinguishable from a missing/unreadable file
+    (None). NOTE: ``all_lines[-0:]`` would be the WHOLE list, so the
+    ``lines <= 0`` case must be handled before slicing.
+    """
     path = Path(log_path)
     if not path.exists():
         return None
@@ -143,6 +149,9 @@ def tail_log(log_path: str | Path, lines: int = 50) -> str | None:
         text = path.read_text(errors="replace")
     except OSError:
         return None
+
+    if lines <= 0:
+        return ""
 
     all_lines = text.splitlines()
     selected = all_lines[-lines:] if len(all_lines) > lines else all_lines

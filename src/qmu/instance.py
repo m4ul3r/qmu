@@ -34,6 +34,10 @@ class VMInstance:
     started_at: str
     harness: bool = False
     nic_model: str | None = None
+    # Kernel start-time of the QEMU process (jiffies since boot, from
+    # /proc/<pid>/stat field 22). Used to detect PID recycling across reboots.
+    # Defaulted so instance JSON written before this field existed still loads.
+    pid_start: str | None = None
 
 
 def _instance_from_dict(data: dict) -> VMInstance:
@@ -61,11 +65,63 @@ def load_instance(vm_id: str) -> VMInstance | None:
 
 
 def is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        # pid 0 signals our own process group; negatives signal a group by id.
+        # Neither identifies a single VM process — treat as not alive.
+        return False
     try:
         os.kill(pid, 0)
         return True
     except OSError:
         return False
+
+
+def proc_pid_start(pid: int) -> str | None:
+    """Return the kernel start-time of `pid` (field 22 of /proc/<pid>/stat).
+
+    The comm field (2) is in parentheses and may itself contain spaces or
+    parens, so we split on the LAST ')' before tokenizing. Returns None if
+    /proc is unavailable (non-Linux) or the process is gone/unreadable.
+    """
+    if pid <= 0:
+        return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    try:
+        rest = stat.rsplit(")", 1)[1].split()
+        # rest[0] is field 3 (state); field 22 (starttime) is rest[19].
+        return rest[19]
+    except IndexError:
+        return None
+
+
+def instance_alive(inst: VMInstance) -> bool:
+    """Liveness check that guards against PID recycling.
+
+    A recorded pid can be reused by an unrelated process after a reboot (the
+    instance JSON outlives the kernel's pid namespace). When the instance has
+    a recorded pid_start, require the current /proc start-time to match; if
+    /proc is unavailable (non-Linux) or pid_start was never recorded (old
+    JSON), fall back to pid-only liveness.
+    """
+    if inst.pid <= 0:
+        return False
+    if not is_pid_alive(inst.pid):
+        return False
+    if inst.pid_start is None:
+        return True
+    current = proc_pid_start(inst.pid)
+    if current is None:
+        if not os.path.isdir("/proc"):
+            # Non-Linux: /proc not available, cannot verify identity.
+            # Fall back to pid-only liveness (already confirmed above).
+            return True
+        # /proc exists but the stat entry is gone/unreadable: the process
+        # most likely exited between the kill(0) probe and this read.
+        return False
+    return current == inst.pid_start
 
 
 def _iter_instance_records() -> list[VMInstance]:
@@ -85,7 +141,7 @@ def _iter_instance_records() -> list[VMInstance]:
 
 def list_instances() -> list[VMInstance]:
     """Return VMInstance records whose process is still alive."""
-    return [inst for inst in _iter_instance_records() if is_pid_alive(inst.pid)]
+    return [inst for inst in _iter_instance_records() if instance_alive(inst)]
 
 
 def list_stopped_instances() -> list[VMInstance]:
@@ -95,7 +151,7 @@ def list_stopped_instances() -> list[VMInstance]:
     so users can still recover forensics from a stale .serial.log.
     """
     records = _iter_instance_records()
-    stopped = [inst for inst in records if not is_pid_alive(inst.pid)]
+    stopped = [inst for inst in records if not instance_alive(inst)]
     known_ids = {inst.vm_id for inst in records}
 
     idir = instances_dir()

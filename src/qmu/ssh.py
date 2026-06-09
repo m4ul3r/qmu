@@ -1,12 +1,41 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
 
 class SSHError(RuntimeError):
     pass
+
+
+# Directory holding OpenSSH ControlMaster sockets for connection multiplexing.
+# Lives under the system temp dir; socket names use %C (OpenSSH's hash of the
+# connection parameters) to stay well under the ~104-char Unix socket path
+# limit.
+_CONTROL_DIR = Path(tempfile.gettempdir()) / "qmu-ssh-cm"
+
+
+def _control_opts() -> list[str]:
+    """ssh/scp options enabling ControlMaster connection reuse.
+
+    Repeated connections to the same VM (is_ready probes, run, push, pull)
+    share one transport instead of paying a full handshake each time. The
+    master expires on its own after 60s idle (ControlPersist=60).
+
+    Returns [] (no multiplexing) if the control directory cannot be created,
+    so importing the module / constructing a client never fails.
+    """
+    try:
+        _CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return []
+    return [
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=60",
+        "-o", f"ControlPath={_CONTROL_DIR / 'cm-%C'}",
+    ]
 
 
 # Markers written by the *local* ssh/scp client (not the guest) when the
@@ -61,7 +90,7 @@ class SSHClient:
             "-o", "ServerAliveInterval=5",
             "-o", "ServerAliveCountMax=3",
             "-o", "LogLevel=ERROR",
-        ]
+        ] + _control_opts()
 
     def _scp_base(self) -> list[str]:
         return [
@@ -72,7 +101,7 @@ class SSHClient:
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "ConnectTimeout=5",
             "-o", "LogLevel=ERROR",
-        ]
+        ] + _control_opts()
 
     def _target(self) -> str:
         return f"{self.user}@{self.host}"

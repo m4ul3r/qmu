@@ -4,11 +4,12 @@ import os
 import socket
 import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import QMUConfig
-from .instance import QMUError, VMInstance, save_instance
+from .instance import QMUError, VMInstance, proc_pid_start, save_instance
 from .paths import instances_dir, qmp_socket_path, serial_log_path
 from .qmp import QMPClient
 
@@ -81,8 +82,8 @@ def build_qemu_command(
         cmd.extend(["-nic", f"user,model={nic}"])
     else:
         cmd.extend([
-            "-net", f"user,host=10.0.2.10,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
-            "-net", f"nic,model={nic}",
+            "-netdev", f"user,id=net0,host=10.0.2.10,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
+            "-device", f"{nic},netdev=net0",
         ])
 
     cmd.extend([
@@ -204,7 +205,9 @@ def launch_vm(
         elif ssh_port is not None:
             vm_id = f"vm-{ssh_port}"
         else:
-            vm_id = f"vm-h{int(time.time())}"
+            # uuid suffix: timestamp-based ids collide when two harness VMs
+            # launch within the same second (parallel agent workflows).
+            vm_id = f"vm-h{uuid.uuid4().hex[:8]}"
         qmp_sock = str(qmp_socket_path(vm_id))
         serial_path = str(serial_log_path(vm_id))
         Path(qmp_sock).unlink(missing_ok=True)  # remove stale socket if present
@@ -233,6 +236,10 @@ def launch_vm(
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
+        # Record the kernel start-time of the child immediately so liveness
+        # checks can detect PID recycling across host reboots. None on
+        # platforms without /proc (pid-only fallback applies there).
+        pid_start = proc_pid_start(proc.pid)
 
         # Wait for the QMP socket to appear (or QEMU to exit immediately).
         deadline = time.monotonic() + 10
@@ -289,6 +296,7 @@ def launch_vm(
         started_at=datetime.now(timezone.utc).isoformat(),
         harness=harness,
         nic_model=resolved_nic,
+        pid_start=pid_start,
     )
     save_instance(inst)
 

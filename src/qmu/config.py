@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import platform
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .instance import QMUError
 from .paths import global_config_path
 
 
@@ -155,26 +157,34 @@ def resolve_config(
     cfg = QMUConfig()
     cfg._sources.append("built-in defaults")
 
-    # Layer 1: global config
+    # Layer 1: global config — non-fatal, but never silently ignored
     gpath = global_config_path()
     if gpath.is_file():
         try:
             raw = load_config_file(gpath)
             _apply_toml(cfg, raw, f"global: {gpath}")
-        except Exception:
-            pass  # Skip broken global config
+        except (tomllib.TOMLDecodeError, OSError, ValueError, TypeError) as exc:
+            sys.stderr.write(
+                f"[qmu] Warning: ignoring unreadable global config {gpath}: {exc}\n"
+            )
 
-    # Layer 2: project config (or explicit --config)
+    # Layer 2: project config (or explicit --config) — fatal if broken
     if config_path_override is not None:
         ppath = Path(config_path_override).resolve()
         if ppath.is_file():
-            raw = load_config_file(ppath)
-            _apply_toml(cfg, raw, f"config: {ppath}")
+            try:
+                raw = load_config_file(ppath)
+                _apply_toml(cfg, raw, f"config: {ppath}")
+            except Exception as exc:
+                raise QMUError(f"Failed to parse config {ppath}: {exc}") from exc
     else:
         ppath = find_project_config()
         if ppath is not None:
-            raw = load_config_file(ppath)
-            _apply_toml(cfg, raw, f"project: {ppath}")
+            try:
+                raw = load_config_file(ppath)
+                _apply_toml(cfg, raw, f"project: {ppath}")
+            except Exception as exc:
+                raise QMUError(f"Failed to parse config {ppath}: {exc}") from exc
 
     # Layer 3: CLI overrides
     if cli_overrides:

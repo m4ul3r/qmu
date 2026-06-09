@@ -2,17 +2,22 @@
 
 EXIT CODES:
   0   success
-  1   operation failed (guest command non-zero, doctor unhealthy, snapshot fail)
-  2   usage / argparse error
+  1   operation failed (guest command non-zero, doctor unhealthy, snapshot fail,
+      QMUError operational failures like "no running VM"/"kernel not found")
+  2   usage / argparse error — RESERVED for argparse alone (argparse itself
+      calls sys.exit(2)); no library error may reuse it
   3   guest kernel crash OR SSH transport-loss
-  4   internal / unexpected qmu error (the main() catch-all AND infra-subprocess
-      failures like a pry/gdb hang)
+  4   infrastructure / internal error: QMPError/SSHError escaping a handler,
+      the main() catch-all, and infra-subprocess failures like a pry/gdb hang
   124 wait timeout
 
 This module pins the boundaries that the task asks to be split/clarified — most
 importantly that the main() CATCH-ALL now yields 4 (internal), distinct from 3
-(crash). It also re-pins the already-correct 2 (usage) and 124 (wait timeout) so
-a regression that renumbers them is caught here.
+(crash), and that QMUError/QMPError/SSHError no longer collide with argparse's
+exit 2: an agent can now distinguish a user typo (2) from an operational
+failure (1) and an infrastructure failure (4). It also re-pins the
+already-correct 2 (usage) and 124 (wait timeout) so a regression that renumbers
+them is caught here.
 
 The catch-all test monkeypatches a handler-internal call (cli.choose_instance)
 to raise a *generic* Exception (RuntimeError) that is neither QMUError/QMPError/
@@ -76,6 +81,45 @@ def test_argparse_error_is_exit_2():
     with pytest.raises(SystemExit) as exc:
         cli.main(["exec", "--format", "not-a-format", "uname"])
     assert exc.value.code == 2
+
+
+# --- 1 / 4: library errors must NOT collide with argparse's 2 ---------------
+
+def test_qmu_error_operational_failure_is_exit_1(capsys):
+    """QMUError (operational failure, e.g. 'no running VM') -> exit 1, NOT 2.
+
+    With the autouse isolate_qmu_env fixture there are no instances, so
+    choose_instance raises QMUError on the common path."""
+    rc = cli.main(["status"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "[qmu] Error:" in err
+
+
+def test_qmp_error_infra_failure_is_exit_4(monkeypatch, capsys):
+    """QMPError escaping a handler (infrastructure failure) -> exit 4, NOT 2."""
+    from qmu.qmp import QMPError
+
+    def boom(vm=None):
+        raise QMPError("qmp socket vanished")
+
+    monkeypatch.setattr(cli, "choose_instance", boom)
+    rc = cli.main(["status"])
+    assert rc == 4
+    assert "qmp socket vanished" in capsys.readouterr().err
+
+
+def test_ssh_error_infra_failure_is_exit_4(monkeypatch, capsys):
+    """SSHError escaping a handler (infrastructure failure) -> exit 4, NOT 2."""
+    from qmu.ssh import SSHError
+
+    def boom(vm=None):
+        raise SSHError("ssh transport gone")
+
+    monkeypatch.setattr(cli, "choose_instance", boom)
+    rc = cli.main(["status"])
+    assert rc == 4
+    assert "ssh transport gone" in capsys.readouterr().err
 
 
 # --- 124: wait timeout ------------------------------------------------------
