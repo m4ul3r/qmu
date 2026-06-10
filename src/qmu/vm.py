@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import subprocess
 import time
@@ -48,10 +49,12 @@ def build_qemu_command(
     drives: list[str] | None = None,
     no_net: bool = False,
     nic_model: str | None = None,
+    net_backend: str | None = None,
     extra_args: list[str] | None = None,
 ) -> list[str]:
     """Build the qemu-system command line from config."""
     nic = nic_model or config.nic_model
+    backend = net_backend or config.net_backend
 
     cmd = [
         config.qemu_binary(),
@@ -80,6 +83,26 @@ def build_qemu_command(
     elif ssh_port is None:
         # No SSH hostfwd, but still provide a NIC (rare: --no-wait-ssh without --no-net).
         cmd.extend(["-nic", f"user,model={nic}"])
+    elif backend == "passt":
+        # passt is a migration-capable, rootless slirp replacement. Unlike the
+        # default `user` (slirp) backend — whose vmstate is broken in QEMU 11 and
+        # makes savevm/loadvm fail with "Section footer error" — passt serializes
+        # cleanly, so snapshots round-trip while keeping SSH (verified live).
+        # address/gateway mirror slirp's well-known 10.0.2.x convention that qmu
+        # rootfs images already use; tcp-ports forwards the host SSH port to
+        # guest :22 (slirp's hostfwd equivalent).
+        if shutil.which("passt") is None:
+            raise QMUError(
+                "net_backend=passt requires the 'passt' binary on PATH "
+                "(e.g. 'apt install passt' / 'pacman -S passt'). "
+                "Use the default 'user' backend, or --no-net, if passt is unavailable."
+            )
+        cmd.extend([
+            "-netdev",
+            f"passt,id=net0,address=10.0.2.15,gateway=10.0.2.2,"
+            f"tcp-ports=127.0.0.1/{ssh_port}:22,quiet=on",
+            "-device", f"{nic},netdev=net0",
+        ])
     else:
         cmd.extend([
             "-netdev", f"user,id=net0,host=10.0.2.10,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
@@ -127,6 +150,7 @@ def launch_vm(
     drives: list[str] | None = None,
     no_net: bool = False,
     nic_model: str | None = None,
+    net_backend: str | None = None,
     harness: bool = False,
 ) -> VMInstance:
     """Launch a QEMU VM and return the instance."""
@@ -225,6 +249,7 @@ def launch_vm(
             drives=drives,
             no_net=no_net,
             nic_model=nic_model,
+            net_backend=net_backend,
             extra_args=extra_args,
         )
 

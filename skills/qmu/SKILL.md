@@ -204,15 +204,26 @@ qmu snapshot load clean
 qmu snapshot delete clean
 ```
 
-**Limitation — snapshot load is incompatible with the default networking.** qmu's default `-net user` (slirp) backend can't be serialized by `savevm`, so `loadvm` typically fails (`Section footer error` / `Missing section footer for slirp`) and does **not** restore (SSH stays dead). `qmu snapshot load` returns a **non-zero exit code** and a stderr message in this case — check it, don't assume success.
+**Snapshots need the `passt` network backend.** The default `-net user` (slirp) backend can't be serialized by `savevm` (QEMU writes a corrupt section), so `loadvm` fails with `Section footer error` / `Missing section footer for slirp` and does **not** restore — `qmu snapshot load` returns a **non-zero exit code** in this case. Launch with **`--net-backend passt`** (or set `[machine] net_backend = "passt"`) to use [passt](https://passt.top/), a rootless, migration-capable slirp replacement: with it, `save`/`load` round-trip while SSH keeps working. Needs the `passt` binary on PATH (`qmu doctor` checks it; `apt install passt` / `pacman -S passt`).
 
-**For reliable crash iteration with default networking, relaunch instead of snapshotting:**
+**Snapshot-rewind loop (with passt) — the fast way to run a crash-prone PoC repeatedly:**
+```bash
+qmu launch --kernel ./bzImage --net-backend passt --name dev
+qmu push exploit /tmp/x
+qmu snapshot save clean              # clean pre-PoC state
+for i in 1 2 3 4 5; do
+  qmu exec /tmp/x                    # run the PoC (may crash/corrupt the kernel)
+  qmu log --tail 200 > runs/run-$i.log
+  qmu snapshot load clean            # rewind to clean — far faster than a full reboot
+done
+```
+After `snapshot load`, the first SSH command may print a one-off `Broken pipe` on stderr (the pre-snapshot SSH control connection was rewound); the command itself still succeeds. Harness-mode VMs have no qcow2 drive, so `savevm` fails there unless you pass an explicit `--drive`.
+
+**Without passt, iterate by relaunching instead of snapshotting:**
 1. `qmu launch --kernel ...`
 2. `qmu compile exploit.c --run` (may crash)
 3. `qmu crash` (confirm — extraction is best-effort)
 4. `qmu kill` then `qmu launch ...` for a fresh known-good VM; edit and repeat from 2.
-
-If you configure a migratable NIC via `extra_args`, the `snapshot save`/`load` loop can replace step 4 — but verify `qmu exec` works after `load`, and always check `load`'s exit code, before relying on it. (Harness-mode VMs have no qcow2 drive, so `savevm` fails there unless you pass an explicit `--drive`.)
 
 ## Kernel Logs
 
@@ -290,7 +301,7 @@ Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
 
 ## Known Limitations
 
-- **Snapshot load vs default networking** — slirp can't be serialized; `loadvm` fails and `snapshot load` returns non-zero. Prefer relaunching for crash iteration, or configure a migratable NIC via `extra_args` (see Snapshots).
+- **Snapshots require `--net-backend passt`** — the default slirp backend can't be serialized, so `loadvm` fails and `snapshot load` returns non-zero. Use passt for a working `save`/`load` loop, or relaunch instead (see Snapshots).
 - **Snapshots are ephemeral** — a temporary COW overlay, gone when the VM exits (by design; base image stays clean).
 - **`qmu gdb` halts the guest** — resume with `qmu cont` / `pry continue` / `qmu monitor cont` before SSH commands (see GDB Integration).
 - **Crash auto-extraction is best-effort** — confirm with `qmu crash` / `qmu log --tail 200` after any suspected panic (see Compile and Run).

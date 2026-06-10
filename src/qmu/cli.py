@@ -302,6 +302,10 @@ def _add_launch(sub: argparse._SubParsersAction) -> None:
                    help="NIC model (default: virtio-net-pci)")
     p.add_argument("--no-net", action="store_true",
                    help="Disable networking entirely (-nic none)")
+    p.add_argument("--net-backend", default=None, dest="net_backend",
+                   choices=["user", "passt"],
+                   help="Network backend: 'user' (slirp, default) or 'passt' "
+                        "(rootless + migratable, so snapshots work). Overrides config.")
     p.add_argument("--harness", action="store_true",
                    help="Harness/judge VM mode: implies --no-wait-ssh + --no-net; "
                         "skips rootfs/ssh-key requirement")
@@ -343,6 +347,7 @@ def _handle_launch(args: argparse.Namespace) -> int:
         drives=args.drives,
         no_net=args.no_net,
         nic_model=args.nic_model,
+        net_backend=args.net_backend,
         harness=args.harness,
     )
 
@@ -856,6 +861,21 @@ def _handle_doctor(args: argparse.Namespace) -> int:
         "status": "ok" if pry else "info",
         "detail": pry or "Not found in PATH — required only for `qmu gdb`. "
                          "Install pry and ensure it is on PATH.",
+    })
+
+    # passt (required only when net_backend = "passt"; enables snapshots)
+    passt = shutil.which("passt")
+    passt_required = config.net_backend == "passt"
+    checks.append({
+        "check": "passt (net_backend=passt)",
+        "status": ("ok" if passt else "MISSING") if passt_required else "info",
+        "detail": passt or (
+            "Not found in PATH — REQUIRED because net_backend=passt. "
+            "Install passt (e.g. 'pacman -S passt' / 'apt install passt')."
+            if passt_required else
+            "Not found — only needed if you set net_backend=passt "
+            "(rootless backend that makes snapshots work)."
+        ),
     })
 
     # Running instances

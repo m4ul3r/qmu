@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import shutil
+
+import pytest
+
 from qmu.config import QMUConfig
+from qmu.instance import QMUError
 from qmu.vm import build_qemu_command
 
 
@@ -114,6 +119,56 @@ def test_nic_model_from_config():
 def test_cpu_model_absent_by_default():
     cmd = build_qemu_command(**_kwargs())
     assert "-cpu" not in cmd
+
+
+# --- net_backend = "passt" (migratable backend so snapshots work) -------------
+
+def _fake_passt(monkeypatch):
+    """Pretend `passt` is installed on PATH for build_qemu_command's check."""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+
+def test_default_net_backend_is_user():
+    cmd = build_qemu_command(**_kwargs())
+    assert any(a.startswith("user,id=net0,") for a in cmd)
+    assert not any(a.startswith("passt,") for a in cmd)
+
+
+def test_passt_backend_param(monkeypatch):
+    _fake_passt(monkeypatch)
+    cmd = build_qemu_command(**_kwargs(net_backend="passt"))
+    # passt netdev with SSH port forwarded to guest :22, no slirp hostfwd.
+    assert any(
+        a.startswith("passt,id=net0,") and "tcp-ports=127.0.0.1/10022:22" in a
+        for a in cmd
+    )
+    assert any(a == "virtio-net-pci,netdev=net0" for a in cmd)
+    assert not any("hostfwd" in a for a in cmd)
+    assert not any(a.startswith("user,id=net0,") for a in cmd)
+
+
+def test_passt_backend_from_config(monkeypatch):
+    _fake_passt(monkeypatch)
+    cfg = _base_config()
+    cfg.net_backend = "passt"
+    cmd = build_qemu_command(**_kwargs(config=cfg))
+    assert any(a.startswith("passt,id=net0,") for a in cmd)
+
+
+def test_passt_param_overrides_config(monkeypatch):
+    _fake_passt(monkeypatch)
+    cfg = _base_config()
+    cfg.net_backend = "passt"
+    # Explicit param "user" wins over config "passt".
+    cmd = build_qemu_command(**_kwargs(config=cfg, net_backend="user"))
+    assert any(a.startswith("user,id=net0,") for a in cmd)
+    assert not any(a.startswith("passt,") for a in cmd)
+
+
+def test_passt_missing_binary_raises(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    with pytest.raises(QMUError, match="passt"):
+        build_qemu_command(**_kwargs(net_backend="passt"))
 
 
 def test_cpu_model_from_config_emits_flag():

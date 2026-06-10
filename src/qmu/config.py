@@ -39,6 +39,7 @@ class QMUConfig:
     cpus: int = 2
     cpu_model: str | None = None
     nic_model: str = "virtio-net-pci"
+    net_backend: str = "user"  # "user" (slirp) or "passt" (migratable → snapshots work)
     extra_args: list[str] = field(default_factory=list)
 
     # drive
@@ -102,6 +103,13 @@ def _apply_toml(cfg: QMUConfig, raw: dict[str, Any], source: str) -> None:
         cfg.cpu_model = machine["cpu"]
     if "nic_model" in machine:
         cfg.nic_model = machine["nic_model"]
+    if "net_backend" in machine:
+        backend = str(machine["net_backend"])
+        if backend not in ("user", "passt"):
+            raise QMUError(
+                f"Invalid net_backend '{backend}': must be 'user' or 'passt'"
+            )
+        cfg.net_backend = backend
     if "extra_args" in machine:
         cfg.extra_args = list(machine["extra_args"])
 
@@ -226,6 +234,10 @@ memory = "4G"
 cpus = 2
 # cpu = "host"                   # passes -cpu to QEMU; "host" is recommended with KVM
 # nic_model = "virtio-net-pci"   # or "e1000", "rtl8139", ...
+# net_backend = "passt"          # "user" (default, slirp) or "passt"; passt is a
+#                                #   rootless, migratable backend so `snapshot save/load`
+#                                #   works (slirp cannot be snapshotted). Needs the
+#                                #   `passt` binary on PATH.
 {machine_extras}
 
 [drive]
