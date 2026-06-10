@@ -1281,13 +1281,23 @@ def _emit_ssh_lost(args: argparse.Namespace, command: str, inst: VMInstance) -> 
     return 3
 
 
+def _join_exec_command(command: list[str]) -> str:
+    """Build the guest command string from `qmu exec` positionals.
+
+    A single argument is passed to the guest login shell verbatim, so the
+    documented shell forms work: `qmu exec "uname -a"` and
+    `qmu exec "cat /proc/slabinfo | grep kmalloc-192"` (pipes/redirects rely on
+    the guest shell). Multiple args keep the token-per-arg model via shlex.join:
+    `qmu exec grep "two words" f` runs `grep 'two words' f`, not `grep two words f`.
+    """
+    return command[0] if len(command) == 1 else shlex.join(command)
+
+
 def _handle_exec(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
     ssh = _make_ssh(inst)
-    # shlex.join preserves the token-per-arg model: `qmu exec grep "two words" f`
-    # runs `grep 'two words' f` in the guest, not `grep two words f`.
-    command = shlex.join(args.command)
+    command = _join_exec_command(args.command)
 
     try:
         rc, stdout, stderr = ssh.run(command, timeout=args.timeout)

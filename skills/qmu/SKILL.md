@@ -257,13 +257,13 @@ Use the exit code (not log scraping) to branch:
 | Code | Meaning |
 |------|---------|
 | `0`  | Success |
-| `1`  | Operation failed — guest command non-zero, `doctor` unhealthy, or a snapshot op failed |
-| `2`  | Usage/argument error, or a runtime `QMUError`/`QMPError`/`SSHError` (no running VM, bad `--vm`, SSH/SCP/QMP failure) |
+| `1`  | Operational failure — no running VM, bad `--vm`, kernel not found, guest command non-zero, `doctor` unhealthy, or a snapshot op failed (any `QMUError`) |
+| `2`  | Usage / argument-parse error (argparse) |
 | `3`  | Guest kernel crash, or SSH transport loss under a panic |
-| `4`  | Internal/unexpected qmu error (the `main()` catch-all, hung helper subprocess) |
+| `4`  | QMP or SSH transport-layer failure (`QMPError`/`SSHError`), or an internal/unexpected qmu error (the `main()` catch-all, a hung helper subprocess) |
 | `124`| `qmu wait` timed out |
 
-Exit `3` is guest-side; an internal qmu fault is `4`, so a tooling bug is never mistaken for a kernel panic.
+Exit `3` is guest-side; an internal qmu/transport fault is `4`, so a tooling bug is never mistaken for a kernel panic. (Matches `qmu --help`.)
 
 **Output spilling.** Large outputs (>10k estimated tokens) auto-spill to a file under `$TMPDIR/qmu-spills/` (default `/tmp/qmu-spills/`). **Do not reconstruct the path** — read it from the result envelope's `artifact_path` field or the `[qmu] Output spilled to <path>` stderr line. The envelope's `{"token_estimate": <int>, "estimator": "chars/4"}` is a tokenizer-agnostic heuristic for sizing only.
 
