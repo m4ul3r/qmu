@@ -7,7 +7,7 @@ description: Build Debian rootfs images for QEMU exploit development via Docker 
 
 Use this skill when the user needs a rootfs image for `qmu launch` and does not have one, needs a cross-architecture rootfs, or is setting up a fresh exploit-dev project. The script builds a Debian-based rootfs via Docker with systemd + SSH + networking pre-configured for qmu.
 
-The script lives at `/opt/qmu/tools/mkrootfs.sh`.
+The script ships in the qmu project's `tools/` directory. It is not on `PATH`; resolve it relative to the install location — from this skill's directory that is `../../tools/mkrootfs.sh`, or from a checkout of the qmu repo just `tools/mkrootfs.sh` (the form used in the examples below).
 
 ## Quick reference
 
