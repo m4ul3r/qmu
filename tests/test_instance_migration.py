@@ -31,6 +31,7 @@ def test_old_schema_fills_defaults():
     inst = _instance_from_dict(raw)
     assert inst.harness is False
     assert inst.nic_model is None
+    assert inst.pid_start is None
     assert inst.ssh_port == 10022
     assert inst.rootfs == "/var/rootfs.img"
 

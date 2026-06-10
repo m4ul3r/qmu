@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -23,13 +24,13 @@ from .instance import (
     load_instance,
     remove_instance,
 )
-from .output import render_value, write_output_result
+from .output import write_output_result
 from .paths import (
+    all_skill_source_dirs,
     claude_skills_dir,
     codex_home,
     codex_skills_dir,
     global_config_path,
-    skill_source_dir,
 )
 from .qmp import QMPClient, QMPError
 from . import rootfs as rootfs_mod
@@ -104,6 +105,30 @@ def _output(value: Any, args: argparse.Namespace, stem: str = "qmu") -> None:
         sys.stderr.write(f"[qmu] Output spilled to {result.artifact['artifact_path']}\n")
 
 
+def _emit(
+    args: argparse.Namespace,
+    *,
+    data: Any,
+    text: str | list[str],
+    stem: str,
+) -> None:
+    """Dispatch a handler result through the one ``--format`` fork.
+
+    In text mode the ``text`` payload is rendered (a list is joined with "\n");
+    otherwise the ``data`` payload (typically a dict) is rendered. Both paths
+    funnel into the existing :func:`_output`, so spilling / file-out behavior is
+    unchanged. This collapses the per-handler ``if args.format == "text"`` fork
+    into a single place. ``format`` is read defensively so leaf commands that use
+    ``_add_format_opts`` (which may leave the attribute unset before defaults)
+    behave exactly as the prior ``getattr(args, "format", "text")`` checks.
+    """
+    if getattr(args, "format", "text") == "text":
+        rendered = "\n".join(text) if isinstance(text, list) else text
+        _output(rendered, args, stem=stem)
+    else:
+        _output(data, args, stem=stem)
+
+
 def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) -> None:
     """Emit an error honoring --format (ERG-1).
 
@@ -131,11 +156,29 @@ def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) 
         )
 
 
+def _wait_pid_exit(pid: int, timeout: float) -> bool:
+    """Poll until `pid` exits or `timeout` elapses. Returns True if it exited.
+
+    Returns immediately when the process is already dead, so callers never
+    sleep for a process that has already gone away.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if not is_pid_alive(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def _kill_vm(inst: VMInstance, force: bool = False, clean: bool = True) -> None:
     """Kill a VM instance: QMP quit → SIGTERM → SIGKILL → optional cleanup.
 
     With clean=False, the process is terminated but instance files are left
     in place so the caller can still read .serial.log post-mortem.
+
+    Each escalation step only waits while the process is actually still
+    alive (poll-with-timeout), so killing an already-dead VM is instant.
     """
     if not force:
         try:
@@ -143,20 +186,20 @@ def _kill_vm(inst: VMInstance, force: bool = False, clean: bool = True) -> None:
                 qmp.execute("quit", timeout=5)
         except (QMPError, OSError):
             pass
-        time.sleep(1)
+        _wait_pid_exit(inst.pid, 1.0)
 
-    try:
-        os.kill(inst.pid, 0)
+    if is_pid_alive(inst.pid):
         sig = signal.SIGKILL if force else signal.SIGTERM
-        os.kill(inst.pid, sig)
-        time.sleep(1)
         try:
-            os.kill(inst.pid, 0)
-            os.kill(inst.pid, signal.SIGKILL)
+            os.kill(inst.pid, sig)
         except OSError:
-            pass
-    except OSError:
-        pass  # Already dead
+            pass  # Died between the liveness check and the signal
+        else:
+            if not _wait_pid_exit(inst.pid, 1.0):
+                try:
+                    os.kill(inst.pid, signal.SIGKILL)
+                except OSError:
+                    pass  # Already dead
 
     if clean:
         remove_instance(inst.vm_id)
@@ -328,25 +371,22 @@ def _handle_launch(args: argparse.Namespace) -> int:
         "arch": config.arch,
     }
 
-    if args.format == "text":
-        lines = [
-            f"VM '{inst.vm_id}' launched (pid={inst.pid})",
-            f"  Arch:    {config.arch}",
-        ]
-        if inst.harness:
-            lines.append(f"  Mode:    harness (no SSH)")
-        elif inst.ssh_port is not None:
-            lines.append(f"  SSH:     port {inst.ssh_port} ({ssh_status})")
-        else:
-            lines.append(f"  SSH:     {ssh_status}")
-        if inst.gdb_port:
-            lines.append(f"  GDB:     port {inst.gdb_port}")
-        lines.append(f"  Kernel:  {inst.kernel}")
-        lines.append(f"  Profile: {inst.profile}")
-        lines.append(f"  Serial:  {inst.serial_log}")
-        _output("\n".join(lines), args, stem="launch")
+    lines = [
+        f"VM '{inst.vm_id}' launched (pid={inst.pid})",
+        f"  Arch:    {config.arch}",
+    ]
+    if inst.harness:
+        lines.append(f"  Mode:    harness (no SSH)")
+    elif inst.ssh_port is not None:
+        lines.append(f"  SSH:     port {inst.ssh_port} ({ssh_status})")
     else:
-        _output(result, args, stem="launch")
+        lines.append(f"  SSH:     {ssh_status}")
+    if inst.gdb_port:
+        lines.append(f"  GDB:     port {inst.gdb_port}")
+    lines.append(f"  Kernel:  {inst.kernel}")
+    lines.append(f"  Profile: {inst.profile}")
+    lines.append(f"  Serial:  {inst.serial_log}")
+    _emit(args, data=result, text=lines, stem="launch")
     return 0
 
 
@@ -371,19 +411,17 @@ def _handle_kill(args: argparse.Namespace) -> int:
         msg = f"VM '{inst.vm_id}' stopped. State preserved at {inst.serial_log}"
     else:
         msg = f"VM '{inst.vm_id}' stopped."
-    if args.format == "text":
-        _output(msg, args, stem="kill")
-    else:
-        _output(
-            {
-                "ok": True,
-                "vm_id": inst.vm_id,
-                "cleaned": not args.no_clean,
-                "serial_log": inst.serial_log,
-            },
-            args,
-            stem="kill",
-        )
+    _emit(
+        args,
+        data={
+            "ok": True,
+            "vm_id": inst.vm_id,
+            "cleaned": not args.no_clean,
+            "serial_log": inst.serial_log,
+        },
+        text=msg,
+        stem="kill",
+    )
     return 0
 
 
@@ -430,16 +468,17 @@ def _handle_prune(args: argparse.Namespace) -> int:
         remove_instance(inst.vm_id, keep_logs=args.keep_logs)
         pruned.append(inst.vm_id)
 
-    if args.format == "text":
-        if not pruned:
-            _output("No stopped VMs to prune.", args, stem="prune")
-        else:
-            verb = "kept logs for" if args.keep_logs else "removed"
-            _output(f"Pruned {len(pruned)} VM(s) ({verb}): {', '.join(pruned)}",
-                    args, stem="prune")
+    if not pruned:
+        text = "No stopped VMs to prune."
     else:
-        _output({"ok": True, "pruned": pruned, "keep_logs": args.keep_logs},
-                args, stem="prune")
+        verb = "kept logs for" if args.keep_logs else "removed"
+        text = f"Pruned {len(pruned)} VM(s) ({verb}): {', '.join(pruned)}"
+    _emit(
+        args,
+        data={"ok": True, "pruned": pruned, "keep_logs": args.keep_logs},
+        text=text,
+        stem="prune",
+    )
     return 0
 
 
@@ -465,7 +504,9 @@ def _handle_wait(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
 
     start = time.monotonic()
-    deadline: float | None = (start + args.timeout) if args.timeout else None
+    # `is not None` so --timeout 0 means "check once, then time out immediately"
+    # rather than being treated as "no timeout".
+    deadline: float | None = (start + args.timeout) if args.timeout is not None else None
     reason = "unknown"
     qemu_status = "unknown"
     event_data: Any = None
@@ -539,18 +580,15 @@ def _handle_wait(args: argparse.Namespace) -> int:
             pass
     result["cleaned"] = cleaned
 
-    if args.format == "text":
-        lines = [
-            f"VM '{inst.vm_id}' {'stopped' if stopped else 'still running'} "
-            f"({reason}, elapsed={elapsed:.2f}s)"
-        ]
-        if crash:
-            lines.append("\nCrash from serial log:\n" + crash)
-        if cleaned:
-            lines.append("[qmu] Instance metadata cleaned up.")
-        _output("\n".join(lines), args, stem="wait")
-    else:
-        _output(result, args, stem="wait")
+    lines = [
+        f"VM '{inst.vm_id}' {'stopped' if stopped else 'still running'} "
+        f"({reason}, elapsed={elapsed:.2f}s)"
+    ]
+    if crash:
+        lines.append("\nCrash from serial log:\n" + crash)
+    if cleaned:
+        lines.append("[qmu] Instance metadata cleaned up.")
+    _emit(args, data=result, text=lines, stem="wait")
 
     if not stopped:
         return 124  # timeout
@@ -572,10 +610,7 @@ def _handle_list(args: argparse.Namespace) -> int:
     running = list_instances()
     stopped = list_stopped_instances()
     if not running and not stopped:
-        if args.format == "text":
-            _output("No VMs.", args, stem="list")
-        else:
-            _output({"ok": True, "vms": []}, args, stem="list")
+        _emit(args, data={"ok": True, "vms": []}, text="No VMs.", stem="list")
         return 0
 
     if args.format != "text":
@@ -684,33 +719,30 @@ def _handle_status(args: argparse.Namespace) -> int:
         "started_at": inst.started_at,
     }
 
-    if args.format == "text":
-        lines = [
-            f"VM '{inst.vm_id}'",
-            f"  PID:       {inst.pid}",
-            f"  QMP:       {'connected' if qmp_ok else 'unreachable'}",
-            f"  QEMU:      {qemu_status}",
-        ]
-        if inst.harness or inst.ssh_port is None:
-            lines.append(f"  Mode:      harness")
-            lines.append(f"  SSH:       n/a")
-        else:
-            lines.append(f"  SSH:       port {inst.ssh_port} ({ssh_state})")
-        if inst.gdb_port:
-            lines.append(f"  GDB:       port {inst.gdb_port}")
-        lines.extend([
-            f"  Kernel:    {inst.kernel}",
-            f"  Rootfs:    {inst.rootfs}",
-            f"  Memory:    {inst.memory}",
-            f"  CPUs:      {inst.cpus}",
-            f"  Profile:   {inst.profile}",
-            f"  Cmdline:   {inst.cmdline}",
-            f"  Serial:    {inst.serial_log}",
-            f"  Started:   {inst.started_at}",
-        ])
-        _output("\n".join(lines), args, stem="status")
+    lines = [
+        f"VM '{inst.vm_id}'",
+        f"  PID:       {inst.pid}",
+        f"  QMP:       {'connected' if qmp_ok else 'unreachable'}",
+        f"  QEMU:      {qemu_status}",
+    ]
+    if inst.harness or inst.ssh_port is None:
+        lines.append(f"  Mode:      harness")
+        lines.append(f"  SSH:       n/a")
     else:
-        _output(result, args, stem="status")
+        lines.append(f"  SSH:       port {inst.ssh_port} ({ssh_state})")
+    if inst.gdb_port:
+        lines.append(f"  GDB:       port {inst.gdb_port}")
+    lines.extend([
+        f"  Kernel:    {inst.kernel}",
+        f"  Rootfs:    {inst.rootfs}",
+        f"  Memory:    {inst.memory}",
+        f"  CPUs:      {inst.cpus}",
+        f"  Profile:   {inst.profile}",
+        f"  Cmdline:   {inst.cmdline}",
+        f"  Serial:    {inst.serial_log}",
+        f"  Started:   {inst.started_at}",
+    ])
+    _emit(args, data=result, text=lines, stem="status")
     return 0
 
 
@@ -834,50 +866,53 @@ def _handle_doctor(args: argparse.Namespace) -> int:
         "detail": f"{len(instances)} instance(s)",
     })
 
-    # Skill installed — check Claude root, plus Codex root when ~/.codex/ exists
-    claude_skill = claude_skills_dir() / "qmu"
-    skill_paths = [claude_skill]
+    # Skills installed — check all skills in each install root
+    skill_names = [d.name for d in all_skill_source_dirs()]
+    if not skill_names:
+        skill_names = ["qmu"]
+    roots = [claude_skills_dir()]
     if codex_home().is_dir():
-        skill_paths.append(codex_skills_dir() / "qmu")
-    installed = [p for p in skill_paths if p.exists()]
-    missing = [p for p in skill_paths if not p.exists()]
+        roots.append(codex_skills_dir())
+    installed: list[Path] = []
+    missing: list[Path] = []
+    for name in skill_names:
+        for root in roots:
+            p = root / name
+            (installed if p.exists() else missing).append(p)
     if not missing:
         checks.append({
-            "check": "skill",
+            "check": "skills",
             "status": "ok",
             "detail": ", ".join(str(p) for p in installed),
         })
     elif installed:
         checks.append({
-            "check": "skill",
+            "check": "skills",
             "status": "warn",
-            "detail": f"installed at {installed[0]}; missing at {missing[0]} (run: qmu skill install)",
+            "detail": f"partial: {len(installed)} installed, {len(missing)} missing (run: qmu skill install)",
         })
     else:
         checks.append({
-            "check": "skill",
+            "check": "skills",
             "status": "not installed",
             "detail": "Run: qmu skill install",
         })
 
     healthy = ("ok", "info")
     all_ok = all(c["status"] in healthy for c in checks)
-    if args.format == "text":
-        lines = ["qmu doctor:"]
-        for c in checks:
-            if c["status"] in healthy:
-                mark = "+"
-            elif c["status"] == "warn":
-                mark = "~"
-            else:
-                mark = "!"
-            lines.append(f"  [{mark}] {c['check']}: {c['detail']}")
-        if not file_sources and config.rootfs is None and config.ssh_key is None:
-            lines.append("")
-            lines.append("Tip: run `qmu config init` to create a starter qmu.toml in this directory.")
-        _output("\n".join(lines), args, stem="doctor")
-    else:
-        _output({"ok": all_ok, "checks": checks}, args, stem="doctor")
+    lines = ["qmu doctor:"]
+    for c in checks:
+        if c["status"] in healthy:
+            mark = "+"
+        elif c["status"] == "warn":
+            mark = "~"
+        else:
+            mark = "!"
+        lines.append(f"  [{mark}] {c['check']}: {c['detail']}")
+    if not file_sources and config.rootfs is None and config.ssh_key is None:
+        lines.append("")
+        lines.append("Tip: run `qmu config init` to create a starter qmu.toml in this directory.")
+    _emit(args, data={"ok": all_ok, "checks": checks}, text=lines, stem="doctor")
 
     return 0 if all_ok else 1
 
@@ -939,26 +974,23 @@ def _handle_config_show(args: argparse.Namespace) -> int:
         "profiles": config.profiles,
     }
 
-    if args.format == "text":
-        lines = ["Resolved qmu config:"]
-        lines.append(f"  Sources: {' -> '.join(config._sources)}")
-        lines.append(f"  Arch:        {config.arch} ({config.qemu_binary()})")
-        lines.append(f"  KVM:         {config.use_kvm()}")
-        lines.append(f"  Memory:      {config.memory}")
-        lines.append(f"  CPUs:        {config.cpus}")
-        lines.append(f"  CPU model:   {config.cpu_model or '(qemu default)'}")
-        lines.append(f"  Rootfs:      {config.rootfs or '(not set)'}")
-        lines.append(f"  Drive fmt:   {config.drive_format}")
-        lines.append(f"  SSH key:     {config.ssh_key or '(not set)'}")
-        lines.append(f"  SSH user:    {config.ssh_user}")
-        lines.append(f"  SSH port:    {config.ssh_port_start}+")
-        lines.append(f"  GDB port:    {config.gdb_port_start}+")
-        if config.extra_args:
-            lines.append(f"  Extra args:  {' '.join(config.extra_args)}")
-        lines.append(f"  Profiles:    {', '.join(config.profiles.keys())}")
-        _output("\n".join(lines), args, stem="config-show")
-    else:
-        _output(data, args, stem="config-show")
+    lines = ["Resolved qmu config:"]
+    lines.append(f"  Sources: {' -> '.join(config._sources)}")
+    lines.append(f"  Arch:        {config.arch} ({config.qemu_binary()})")
+    lines.append(f"  KVM:         {config.use_kvm()}")
+    lines.append(f"  Memory:      {config.memory}")
+    lines.append(f"  CPUs:        {config.cpus}")
+    lines.append(f"  CPU model:   {config.cpu_model or '(qemu default)'}")
+    lines.append(f"  Rootfs:      {config.rootfs or '(not set)'}")
+    lines.append(f"  Drive fmt:   {config.drive_format}")
+    lines.append(f"  SSH key:     {config.ssh_key or '(not set)'}")
+    lines.append(f"  SSH user:    {config.ssh_user}")
+    lines.append(f"  SSH port:    {config.ssh_port_start}+")
+    lines.append(f"  GDB port:    {config.gdb_port_start}+")
+    if config.extra_args:
+        lines.append(f"  Extra args:  {' '.join(config.extra_args)}")
+    lines.append(f"  Profiles:    {', '.join(config.profiles.keys())}")
+    _emit(args, data=data, text=lines, stem="config-show")
     return 0
 
 
@@ -968,47 +1000,41 @@ def _handle_config_init(args: argparse.Namespace) -> int:
     # (exit 0), not a failure. The file is never overwritten.
     if target.exists():
         msg = f"{target} already exists, not overwritten"
-        if getattr(args, "format", "text") == "text":
-            _output(msg, args, stem="config-init")
-        else:
-            _output(
-                {"ok": True, "path": str(target), "created": False, "message": msg},
-                args,
-                stem="config-init",
-            )
-        return 0
-    target.write_text(render_starter_config())
-    if getattr(args, "format", "text") == "text":
-        _output(f"Created {target}", args, stem="config-init")
-    else:
-        _output(
-            {"ok": True, "path": str(target), "created": True},
+        _emit(
             args,
+            data={"ok": True, "path": str(target), "created": False, "message": msg},
+            text=msg,
             stem="config-init",
         )
+        return 0
+    target.write_text(render_starter_config())
+    _emit(
+        args,
+        data={"ok": True, "path": str(target), "created": True},
+        text=f"Created {target}",
+        stem="config-init",
+    )
     return 0
 
 
 def _handle_config_path(args: argparse.Namespace) -> int:
     gpath = global_config_path()
     ppath = find_project_config()
-    if getattr(args, "format", "text") == "text":
-        lines = [
-            f"Global config:  {gpath} ({'exists' if gpath.is_file() else 'not found'})",
-            f"Project config: {ppath or '(none found — searched up from CWD)'}",
-        ]
-        _output("\n".join(lines), args, stem="config-path")
-    else:
-        _output(
-            {
-                "ok": True,
-                "global_config": str(gpath),
-                "global_config_exists": gpath.is_file(),
-                "project_config": str(ppath) if ppath else None,
-            },
-            args,
-            stem="config-path",
-        )
+    lines = [
+        f"Global config:  {gpath} ({'exists' if gpath.is_file() else 'not found'})",
+        f"Project config: {ppath or '(none found — searched up from CWD)'}",
+    ]
+    _emit(
+        args,
+        data={
+            "ok": True,
+            "global_config": str(gpath),
+            "global_config_exists": gpath.is_file(),
+            "project_config": str(ppath) if ppath else None,
+        },
+        text=lines,
+        stem="config-path",
+    )
     return 0
 
 
@@ -1066,14 +1092,12 @@ def _handle_snapshot_save(args: argparse.Namespace) -> int:
     with _qmp_ctx(inst) as qmp:
         msg = save_snapshot(qmp, args.name)
     failed = _snapshot_failed(msg)
-    if args.format == "text":
-        _output(msg, args, stem="snapshot-save")
-    else:
-        _output(
-            {"ok": not failed, "name": args.name, "message": msg},
-            args,
-            stem="snapshot-save",
-        )
+    _emit(
+        args,
+        data={"ok": not failed, "name": args.name, "message": msg},
+        text=msg,
+        stem="snapshot-save",
+    )
     if failed:
         sys.stderr.write(f"[qmu] snapshot save failed: {msg}\n")
         return 1
@@ -1085,14 +1109,12 @@ def _handle_snapshot_load(args: argparse.Namespace) -> int:
     with _qmp_ctx(inst) as qmp:
         msg = load_snapshot(qmp, args.name)
     failed = _snapshot_failed(msg)
-    if args.format == "text":
-        _output(msg, args, stem="snapshot-load")
-    else:
-        _output(
-            {"ok": not failed, "name": args.name, "message": msg},
-            args,
-            stem="snapshot-load",
-        )
+    _emit(
+        args,
+        data={"ok": not failed, "name": args.name, "message": msg},
+        text=msg,
+        stem="snapshot-load",
+    )
     if failed:
         sys.stderr.write(
             f"[qmu] snapshot load failed: {msg}\n"
@@ -1108,15 +1130,14 @@ def _handle_snapshot_list(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     with _qmp_ctx(inst) as qmp:
         snaps = list_snapshots(qmp)
-    if args.format != "text":
-        _output({"ok": True, "snapshots": snaps}, args, stem="snapshot-list")
-    elif not snaps:
-        _output("No snapshots.", args, stem="snapshot-list")
+    if not snaps:
+        text: str | list[str] = "No snapshots."
     else:
         lines = ["Snapshots:"]
         for s in snaps:
             lines.append(f"  {s['id']}  {s['tag']}  size={s['vm_size']}  {s['date']} {s['time']}")
-        _output("\n".join(lines), args, stem="snapshot-list")
+        text = lines
+    _emit(args, data={"ok": True, "snapshots": snaps}, text=text, stem="snapshot-list")
     return 0
 
 
@@ -1125,14 +1146,12 @@ def _handle_snapshot_delete(args: argparse.Namespace) -> int:
     with _qmp_ctx(inst) as qmp:
         msg = delete_snapshot(qmp, args.name)
     failed = _snapshot_failed(msg)
-    if args.format == "text":
-        _output(msg, args, stem="snapshot-delete")
-    else:
-        _output(
-            {"ok": not failed, "name": args.name, "message": msg},
-            args,
-            stem="snapshot-delete",
-        )
+    _emit(
+        args,
+        data={"ok": not failed, "name": args.name, "message": msg},
+        text=msg,
+        stem="snapshot-delete",
+    )
     if failed:
         sys.stderr.write(f"[qmu] snapshot delete failed: {msg}\n")
         return 1
@@ -1157,14 +1176,12 @@ def _handle_push(args: argparse.Namespace) -> int:
     _require_ssh(inst)
     ssh = _make_ssh(inst)
     ssh.push(args.local, args.remote)
-    if args.format == "text":
-        _output(f"Pushed {args.local} -> guest:{args.remote}", args, stem="push")
-    else:
-        _output(
-            {"ok": True, "local": args.local, "remote": args.remote},
-            args,
-            stem="push",
-        )
+    _emit(
+        args,
+        data={"ok": True, "local": args.local, "remote": args.remote},
+        text=f"Pushed {args.local} -> guest:{args.remote}",
+        stem="push",
+    )
     return 0
 
 
@@ -1181,14 +1198,12 @@ def _handle_pull(args: argparse.Namespace) -> int:
     _require_ssh(inst)
     ssh = _make_ssh(inst)
     ssh.pull(args.remote, args.local)
-    if args.format == "text":
-        _output(f"Pulled guest:{args.remote} -> {args.local}", args, stem="pull")
-    else:
-        _output(
-            {"ok": True, "local": args.local, "remote": args.remote},
-            args,
-            stem="pull",
-        )
+    _emit(
+        args,
+        data={"ok": True, "local": args.local, "remote": args.remote},
+        text=f"Pulled guest:{args.remote} -> {args.local}",
+        stem="pull",
+    )
     return 0
 
 
@@ -1217,7 +1232,9 @@ def _transport_lost(ssh: SSHClient) -> bool:
     """
     if ssh.is_ready(timeout=3):
         return False
-    # Retry once: a busy guest may have missed the first short probe.
+    # Retry once after a short backoff: a busy guest may have missed the first
+    # short probe, and an immediate re-probe would just fail the same way.
+    time.sleep(0.5)
     if ssh.is_ready(timeout=3):
         return False
     return True
@@ -1255,11 +1272,12 @@ def _emit_ssh_lost(args: argparse.Namespace, command: str, inst: VMInstance) -> 
         "crash": crash,
         "hint": hint,
     }
-    if args.format == "text":
-        lines = [f"SSH connection lost while running: {command}", text_msg]
-        _output("\n".join(lines), args, stem="exec")
-    else:
-        _output(result, args, stem="exec")
+    _emit(
+        args,
+        data=result,
+        text=[f"SSH connection lost while running: {command}", text_msg],
+        stem="exec",
+    )
     return 3
 
 
@@ -1267,7 +1285,9 @@ def _handle_exec(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
     ssh = _make_ssh(inst)
-    command = " ".join(args.command)
+    # shlex.join preserves the token-per-arg model: `qmu exec grep "two words" f`
+    # runs `grep 'two words' f` in the guest, not `grep two words f`.
+    command = shlex.join(args.command)
 
     try:
         rc, stdout, stderr = ssh.run(command, timeout=args.timeout)
@@ -1285,31 +1305,29 @@ def _handle_exec(args: argparse.Namespace) -> int:
     if rc == 255 and _transport_lost(ssh):
         return _emit_ssh_lost(args, command, inst)
 
-    if args.format == "text":
-        output_parts = []
-        if stdout.strip():
-            output_parts.append(stdout.rstrip())
-        if stderr.strip():
-            output_parts.append(f"[stderr] {stderr.rstrip()}")
-        if rc != 0:
-            output_parts.append(f"[exit code: {rc}]")
-        text = "\n".join(output_parts) if output_parts else f"[exit code: {rc}]"
-        _output(text, args, stem="exec")
-    else:
-        # L1: always include ssh_error/crash_detected so consumers have a stable,
-        # explicit contract (not an implicit "key omitted on success").
-        _output(
-            {
-                "ok": rc == 0,
-                "exit_code": rc,
-                "stdout": stdout,
-                "stderr": stderr,
-                "ssh_error": False,
-                "crash_detected": False,
-            },
-            args,
-            stem="exec",
-        )
+    output_parts = []
+    if stdout.strip():
+        output_parts.append(stdout.rstrip())
+    if stderr.strip():
+        output_parts.append(f"[stderr] {stderr.rstrip()}")
+    if rc != 0:
+        output_parts.append(f"[exit code: {rc}]")
+    text = "\n".join(output_parts) if output_parts else f"[exit code: {rc}]"
+    # L1: always include ssh_error/crash_detected so consumers have a stable,
+    # explicit contract (not an implicit "key omitted on success").
+    _emit(
+        args,
+        data={
+            "ok": rc == 0,
+            "exit_code": rc,
+            "stdout": stdout,
+            "stderr": stderr,
+            "ssh_error": False,
+            "crash_detected": False,
+        },
+        text=text,
+        stem="exec",
+    )
     return 0 if rc == 0 else 1
 
 
@@ -1344,8 +1362,12 @@ def _handle_compile(args: argparse.Namespace) -> int:
     # Push source
     ssh.push(str(source), remote_src)
 
-    # Compile
-    compile_cmd = f"gcc {args.cflags} -o {remote_bin} {remote_src}"
+    # Compile. The remote paths are quoted (a source name with a space or shell
+    # metacharacter must not detonate the root shell); --cflags is intentionally
+    # left unquoted — it is a list of shell flags.
+    compile_cmd = (
+        f"gcc {args.cflags} -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)}"
+    )
     rc, stdout, stderr = ssh.run(compile_cmd, timeout=30)
 
     result: dict[str, Any] = {
@@ -1362,25 +1384,29 @@ def _handle_compile(args: argparse.Namespace) -> int:
 
     if rc != 0:
         result["ok"] = False
-        if args.format == "text":
-            _output(f"Compilation failed:\n{stderr.strip()}", args, stem="compile")
-        else:
-            _output(result, args, stem="compile")
+        _emit(
+            args,
+            data=result,
+            text=f"Compilation failed:\n{stderr.strip()}",
+            stem="compile",
+        )
         return 1
 
     result["compiled"] = True
 
     if not args.run:
         result["ok"] = True
-        if args.format == "text":
-            _output(f"Compiled {source.name} -> {remote_bin}", args, stem="compile")
-        else:
-            _output(result, args, stem="compile")
+        _emit(
+            args,
+            data=result,
+            text=f"Compiled {source.name} -> {remote_bin}",
+            stem="compile",
+        )
         return 0
 
-    # Run
+    # Run (quoted: the binary path is interpolated into a root shell command)
     try:
-        rc, stdout, stderr = ssh.run(remote_bin, timeout=args.timeout)
+        rc, stdout, stderr = ssh.run(shlex.quote(remote_bin), timeout=args.timeout)
         # A kernel panic during the run drops the connection and ssh exits 255
         # (often with empty stderr). rc=255 is also a legal guest exit code, so
         # confirm with a liveness probe (retried once to avoid a false positive
@@ -1395,16 +1421,13 @@ def _handle_compile(args: argparse.Namespace) -> int:
             "run_stdout": stdout,
             "run_stderr": stderr,
         })
-        if args.format == "text":
-            lines = [f"Compiled and ran {source.name}:"]
-            if stdout.strip():
-                lines.append(stdout.rstrip())
-            if stderr.strip():
-                lines.append(f"[stderr] {stderr.rstrip()}")
-            lines.append(f"[exit code: {rc}]")
-            _output("\n".join(lines), args, stem="compile")
-        else:
-            _output(result, args, stem="compile")
+        lines = [f"Compiled and ran {source.name}:"]
+        if stdout.strip():
+            lines.append(stdout.rstrip())
+        if stderr.strip():
+            lines.append(f"[stderr] {stderr.rstrip()}")
+        lines.append(f"[exit code: {rc}]")
+        _emit(args, data=result, text=lines, stem="compile")
         return 0 if rc == 0 else 1
 
     except SSHError:
@@ -1415,20 +1438,17 @@ def _handle_compile(args: argparse.Namespace) -> int:
             "crash_detected": crash is not None,
             "crash": crash,
         })
-        if args.format == "text":
-            lines = [f"SSH connection lost while running {name}."]
-            # CORR-5: only the strong "Kernel may have crashed" wording when a
-            # crash report was actually extracted; otherwise report unreachable.
-            if crash:
-                lines.append(f"\nKernel may have crashed. Crash from serial log:\n{crash}")
-            else:
-                lines.append(
-                    "\nSSH connection lost; VM may be unreachable. "
-                    "No crash report in serial log. Check: qmu log --tail 100"
-                )
-            _output("\n".join(lines), args, stem="compile")
+        lines = [f"SSH connection lost while running {name}."]
+        # CORR-5: only the strong "Kernel may have crashed" wording when a
+        # crash report was actually extracted; otherwise report unreachable.
+        if crash:
+            lines.append(f"\nKernel may have crashed. Crash from serial log:\n{crash}")
         else:
-            _output(result, args, stem="compile")
+            lines.append(
+                "\nSSH connection lost; VM may be unreachable. "
+                "No crash report in serial log. Check: qmu log --tail 100"
+            )
+        _emit(args, data=result, text=lines, stem="compile")
         # Exit 3 = crash/transport-loss (distinct from exit 1 for an ordinary
         # non-zero guest command), consistent with _emit_ssh_lost in exec.
         return 3
@@ -1451,29 +1471,30 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
     _require_ssh(inst)
     ssh = _make_ssh(inst)
     cmd = "dmesg"
-    if args.tail:
-        cmd = f"dmesg | tail -{args.tail}"
+    if args.tail is not None:
+        # `is not None` so --tail 0 is honored rather than silently dropped.
+        # Clamp negatives to 0: like `tail -n 0`, both emit nothing (a negative
+        # count would otherwise be misparsed as a tail option).
+        cmd = f"dmesg | tail -n {max(args.tail, 0)}"
     rc, stdout, stderr = ssh.run(cmd, timeout=15)
 
     # L3: honor the guest exit code; do not silently render stderr as if it were
     # the kernel log. The kernel log is stdout; stderr is labelled distinctly.
-    if args.format == "text":
-        if rc == 0:
-            _output(stdout if stdout.strip() else "(empty dmesg)", args, stem="dmesg")
-        else:
-            text = stdout.rstrip()
-            err = stderr.rstrip()
-            if err:
-                text = (text + "\n" if text else "") + f"[dmesg failed, exit {rc}] {err}"
-            elif not text:
-                text = f"[dmesg failed, exit {rc}]"
-            _output(text, args, stem="dmesg")
+    if rc == 0:
+        text = stdout if stdout.strip() else "(empty dmesg)"
     else:
-        _output(
-            {"ok": rc == 0, "exit_code": rc, "text": stdout, "stderr": stderr},
-            args,
-            stem="dmesg",
-        )
+        text = stdout.rstrip()
+        err = stderr.rstrip()
+        if err:
+            text = (text + "\n" if text else "") + f"[dmesg failed, exit {rc}] {err}"
+        elif not text:
+            text = f"[dmesg failed, exit {rc}]"
+    _emit(
+        args,
+        data={"ok": rc == 0, "exit_code": rc, "text": stdout, "stderr": stderr},
+        text=text,
+        stem="dmesg",
+    )
     return 0 if rc == 0 else 1
 
 
@@ -1505,23 +1526,19 @@ def _handle_crash(args: argparse.Namespace) -> int:
         detected = False
         reason = "no crash markers found in serial log"
 
-    if args.format == "text":
-        if crash is not None:
-            _output(crash, args, stem="crash")
-        else:
-            _output(f"No crash detected: {reason}.", args, stem="crash")
-    else:
-        _output(
-            {
-                "ok": detected,
-                "detected": detected,
-                "reason": reason,
-                "serial_log": inst.serial_log,
-                "crash": crash,
-            },
-            args,
-            stem="crash",
-        )
+    text = crash if crash is not None else f"No crash detected: {reason}."
+    _emit(
+        args,
+        data={
+            "ok": detected,
+            "detected": detected,
+            "reason": reason,
+            "serial_log": inst.serial_log,
+            "crash": crash,
+        },
+        text=text,
+        stem="crash",
+    )
 
     # L2: non-zero when no crash was found (either missing log or no match).
     return 0 if detected else 1
@@ -1542,14 +1559,12 @@ def _add_log(sub: argparse._SubParsersAction) -> None:
 def _handle_log(args: argparse.Namespace) -> int:
     inst = find_instance(args.vm)
     text = tail_log(inst.serial_log, lines=args.tail)
-    if args.format == "text":
-        _output(text if text else "Serial log is empty or missing.", args, stem="log")
-    else:
-        _output(
-            {"ok": text is not None, "text": text or ""},
-            args,
-            stem="log",
-        )
+    _emit(
+        args,
+        data={"ok": text is not None, "text": text or ""},
+        text=text if text else "Serial log is empty or missing.",
+        stem="log",
+    )
     return 0
 
 
@@ -1591,31 +1606,27 @@ def _handle_gdb(args: argparse.Namespace) -> int:
             "pull/compile) will hang until you resume it. Resume with `pry "
             "continue` (in the debugger) or `qmu cont`."
         )
-        if args.format == "text":
-            _output(
-                f"pry connected to VM '{inst.vm_id}' GDB stub on port "
-                f"{inst.gdb_port}\n{warning}",
-                args,
-                stem="gdb",
-            )
-        else:
-            _output(
-                {
-                    "ok": True,
-                    "vm_id": inst.vm_id,
-                    "gdb_port": inst.gdb_port,
-                    "cpu_state": "halted",
-                    "warning": warning,
-                },
-                args,
-                stem="gdb",
-            )
+        _emit(
+            args,
+            data={
+                "ok": True,
+                "vm_id": inst.vm_id,
+                "gdb_port": inst.gdb_port,
+                "cpu_state": "halted",
+                "warning": warning,
+            },
+            text=f"pry connected to VM '{inst.vm_id}' GDB stub on port "
+            f"{inst.gdb_port}\n{warning}",
+            stem="gdb",
+        )
     else:
         output = result.stderr.strip() or result.stdout.strip()
-        if args.format == "text":
-            _output(f"pry launch failed: {output}", args, stem="gdb")
-        else:
-            _output({"ok": False, "error": output}, args, stem="gdb")
+        _emit(
+            args,
+            data={"ok": False, "error": output},
+            text=f"pry launch failed: {output}",
+            stem="gdb",
+        )
         return 1
     return 0
 
@@ -1644,18 +1655,12 @@ def _handle_cont(args: argparse.Namespace) -> int:
     run_state = (
         status.get("status", "unknown") if isinstance(status, dict) else str(status)
     )
-    if args.format == "text":
-        _output(
-            f"VM '{inst.vm_id}' resumed (status: {run_state})",
-            args,
-            stem="cont",
-        )
-    else:
-        _output(
-            {"ok": True, "vm_id": inst.vm_id, "status": run_state},
-            args,
-            stem="cont",
-        )
+    _emit(
+        args,
+        data={"ok": True, "vm_id": inst.vm_id, "status": run_state},
+        text=f"VM '{inst.vm_id}' resumed (status: {run_state})",
+        stem="cont",
+    )
     return 0
 
 
@@ -1685,12 +1690,10 @@ def _handle_qmp(args: argparse.Namespace) -> int:
         qmp_args = None
     with _qmp_ctx(inst) as qmp:
         result = qmp.execute(args.command, qmp_args)
-    if args.format == "text":
-        _output(result, args, stem="qmp")
-    else:
-        # Wrap the raw QMP return (which may be any JSON type) so the universal
-        # {"ok": ...} contract holds; the original payload stays under "result".
-        _output({"ok": True, "result": result}, args, stem="qmp")
+    # Text mode passes the raw QMP return (any JSON type) straight to _output;
+    # json mode wraps it so the universal {"ok": ...} contract holds, with the
+    # original payload under "result".
+    _emit(args, data={"ok": True, "result": result}, text=result, stem="qmp")
     return 0
 
 
@@ -1711,10 +1714,12 @@ def _handle_monitor(args: argparse.Namespace) -> int:
     command = " ".join(args.command)
     with _qmp_ctx(inst) as qmp:
         result = qmp.execute_hmp(command)
-    if args.format == "text":
-        _output(result if result.strip() else "(no output)", args, stem="monitor")
-    else:
-        _output({"ok": True, "output": result}, args, stem="monitor")
+    _emit(
+        args,
+        data={"ok": True, "output": result},
+        text=result if result.strip() else "(no output)",
+        stem="monitor",
+    )
     return 0
 
 
@@ -1753,13 +1758,10 @@ def _handle_rootfs_inject(args: argparse.Namespace) -> int:
         "partition": args.partition,
         "injected": [{"local": l, "guest": g} for l, g in parsed],
     }
-    if args.format == "text":
-        lines = [f"Injected into {args.image} (partition {args.partition}):"]
-        for local, guest in parsed:
-            lines.append(f"  {local} -> {guest}")
-        _output("\n".join(lines), args, stem="rootfs-inject")
-    else:
-        _output(summary, args, stem="rootfs-inject")
+    lines = [f"Injected into {args.image} (partition {args.partition}):"]
+    for local, guest in parsed:
+        lines.append(f"  {local} -> {guest}")
+    _emit(args, data=summary, text=lines, stem="rootfs-inject")
     return 0
 
 
@@ -1793,20 +1795,22 @@ def _skill_install_roots() -> list[Path]:
 
 
 def _handle_skill_install(args: argparse.Namespace) -> int:
-    src = skill_source_dir()
-    if not src.exists():
-        raise QMUError(f"Skill source not found: {src}")
+    skill_dirs = all_skill_source_dirs()
+    if not skill_dirs:
+        raise QMUError("No skill sources found under skills/")
 
-    for root in _skill_install_roots():
-        dst = root / "qmu"
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.is_symlink() or dst.exists():
-            if dst.is_symlink():
-                dst.unlink()
-            else:
-                shutil.rmtree(dst)
-        dst.symlink_to(src)
-        print(f"Skill installed: {dst} -> {src}")
+    for src in skill_dirs:
+        name = src.name
+        for root in _skill_install_roots():
+            dst = root / name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.is_symlink() or dst.exists():
+                if dst.is_symlink():
+                    dst.unlink()
+                else:
+                    shutil.rmtree(dst)
+            dst.symlink_to(src)
+            print(f"Skill installed: {dst} -> {src}")
     return 0
 
 
@@ -1822,10 +1826,7 @@ def _add_version(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_version(args: argparse.Namespace) -> int:
-    if getattr(args, "format", "text") == "text":
-        _output(f"qmu {VERSION}", args, stem="version")
-    else:
-        _output({"ok": True, "version": VERSION}, args, stem="version")
+    _emit(args, data={"ok": True, "version": VERSION}, text=f"qmu {VERSION}", stem="version")
     return 0
 
 
@@ -1843,11 +1844,13 @@ def main(argv: list[str] | None = None) -> int:
             "exit codes:\n"
             "  0    success\n"
             "  1    operation failed (guest command non-zero, doctor unhealthy,\n"
-            "       snapshot op failed, no crash found)\n"
-            "  2    usage / argparse error (also QMUError/QMPError/SSHError)\n"
+            "       snapshot op failed, no crash found, qmu operational errors\n"
+            "       such as 'no running VM' or 'kernel not found')\n"
+            "  2    usage / argparse error (bad flags or arguments) — ONLY\n"
             "  3    guest kernel crash or SSH transport-loss\n"
-            "  4    internal / unexpected qmu error (catch-all; infra-subprocess\n"
-            "       failures such as a pry/gdb hang)\n"
+            "  4    infrastructure / internal error (QMP or SSH layer failures,\n"
+            "       unexpected qmu errors, infra-subprocess failures such as a\n"
+            "       pry/gdb hang)\n"
             "  124  wait timeout\n"
             "\n"
             "json contract:\n"
@@ -1901,14 +1904,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return handler(args)
     except QMUError as exc:
+        # Exit-code contract: 2 is reserved for argparse usage errors (argparse
+        # itself calls sys.exit(2)). Library errors get distinct codes so an
+        # agent can tell a typo from an operational/infra failure:
+        #   QMUError (operational, e.g. "no running VM", "kernel not found") -> 1
+        #   QMPError/SSHError (infrastructure transport failures)            -> 4
         _emit_error(args, exc, "[qmu] Error:")
-        return 2
+        return 1
     except QMPError as exc:
         _emit_error(args, exc, "[qmu] QMP error:")
-        return 2
+        return 4
     except SSHError as exc:
         _emit_error(args, exc, "[qmu] SSH error:")
-        return 2
+        return 4
     except KeyboardInterrupt:
         return 130
     except Exception as exc:  # noqa: BLE001 — agent-facing catch-all

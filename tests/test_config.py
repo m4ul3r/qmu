@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import pytest
 
-from qmu.config import DEFAULT_PROFILES, resolve_config
+from qmu.config import CONFIG_FILENAME, DEFAULT_PROFILES, resolve_config
+from qmu.instance import QMUError
 
 
 @pytest.fixture(autouse=True)
@@ -160,12 +161,61 @@ def test_profile_override_existing_name(isolate_config):
     assert cfg.profiles["trigger-test"] == DEFAULT_PROFILES["trigger-test"]
 
 
-def test_broken_global_config_is_skipped(isolate_config):
+def test_broken_global_config_is_skipped(isolate_config, capsys):
     """Malformed global TOML must not raise; resolve_config falls back to
-    lower layers (pins config.py:154-159)."""
-    _global_config(isolate_config, "this is = = not valid toml [[[\n")
+    lower layers but emits a one-line stderr warning naming the file."""
+    gpath = _global_config(isolate_config, "this is = = not valid toml [[[\n")
     project = _write_toml(
         isolate_config / "project.toml", '[machine]\nmemory = "16G"\n'
     )
     cfg = resolve_config(config_path_override=project)  # must not raise
     assert cfg.memory == "16G"
+    # global layer skipped -> not recorded as a source
+    assert not any(s.startswith("global:") for s in cfg._sources)
+    err = capsys.readouterr().err
+    assert "Warning" in err
+    assert str(gpath) in err
+
+
+def test_broken_global_config_alone_yields_defaults(isolate_config, capsys):
+    """With ONLY a broken global config present, resolve_config still returns
+    built-in defaults (non-fatal) and warns on stderr."""
+    _global_config(isolate_config, "not [ valid = toml\n")
+    cfg = resolve_config()  # must not raise
+    assert cfg.memory == "4G"
+    assert cfg.arch == "x86_64"
+    assert cfg._sources == ["built-in defaults"]
+    assert "Warning" in capsys.readouterr().err
+
+
+def test_broken_explicit_config_raises_qmu_error(isolate_config):
+    """A broken --config file is FATAL: QMUError naming the file, not a raw
+    tomllib traceback."""
+    project = _write_toml(
+        isolate_config / "project.toml", "this is = = not valid toml [[[\n"
+    )
+    with pytest.raises(QMUError, match="Failed to parse config"):
+        resolve_config(config_path_override=project)
+
+
+def test_broken_explicit_config_error_names_file(isolate_config):
+    project = _write_toml(isolate_config / "project.toml", "broken = [\n")
+    with pytest.raises(QMUError) as excinfo:
+        resolve_config(config_path_override=project)
+    assert str(project.resolve()) in str(excinfo.value)
+    # original parse error chained for debugging
+    assert excinfo.value.__cause__ is not None
+
+
+def test_broken_discovered_project_config_raises_qmu_error(
+    isolate_config, monkeypatch
+):
+    """A broken qmu.toml discovered via the CWD walk-up is also FATAL with a
+    QMUError naming the file."""
+    projdir = isolate_config / "proj"
+    projdir.mkdir()
+    broken = _write_toml(projdir / CONFIG_FILENAME, "broken = = toml [[[\n")
+    monkeypatch.chdir(projdir)
+    with pytest.raises(QMUError, match="Failed to parse config") as excinfo:
+        resolve_config()
+    assert str(broken) in str(excinfo.value)
