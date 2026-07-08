@@ -57,3 +57,52 @@ def test_plain_success_message_is_not_failure():
     assert _snapshot_failed("Snapshot 'clean' loaded.") is False
     assert _snapshot_failed("Snapshot 'clean' saved.") is False
     assert _snapshot_failed("") is False
+
+
+# --- Fix #4: `snapshot save` failure emits an actionable qcow2/passt hint ----
+
+
+import argparse
+import contextlib
+
+
+class _FakeInst:
+    vm_id = "dev"
+    qmp_socket = "/tmp/nonexistent.sock"
+
+
+def _patch_save(monkeypatch, msg):
+    """Stub the handler's collaborators so _handle_snapshot_save runs offline:
+    choose_instance returns a dummy inst, _qmp_ctx is a no-op CM, and
+    save_snapshot returns the HMP `msg` verbatim (as snapshot.py does)."""
+    monkeypatch.setattr(cli, "choose_instance", lambda vm: _FakeInst())
+    monkeypatch.setattr(cli, "_qmp_ctx", lambda inst: contextlib.nullcontext(None))
+    monkeypatch.setattr(cli, "save_snapshot", lambda qmp, name: msg)
+
+
+def _save_args():
+    return argparse.Namespace(vm=None, name="clean", format="text", out=None)
+
+
+def test_snapshot_save_failure_hint_mentions_qcow2_and_passt(monkeypatch, capsys):
+    # savevm against the default raw disk fails; the stderr hint must explain the
+    # real requirement (writable qcow2 rootfs) and the networking caveat (passt),
+    # mirroring the load handler's actionable hint.
+    _patch_save(monkeypatch, "Error: Could not open 'savevm' section")
+    rc = cli._handle_snapshot_save(_save_args())
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "qcow2" in err
+    assert "raw" in err
+    assert "passt" in err
+    assert "savevm" in err
+
+
+def test_snapshot_save_success_emits_no_hint(monkeypatch, capsys):
+    # A clean save must not print the failure hint or exit non-zero.
+    _patch_save(monkeypatch, "Snapshot 'clean' saved.")
+    rc = cli._handle_snapshot_save(_save_args())
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "qcow2" not in captured.err
+    assert "snapshot save failed" not in captured.err

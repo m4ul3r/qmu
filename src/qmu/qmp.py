@@ -50,7 +50,10 @@ class QMPClient:
         if self._sock is None:
             raise QMPError("Not connected")
         msg: dict[str, Any] = {"execute": command}
-        if arguments:
+        # Distinguish "no arguments" (None) from an explicitly-empty dict: a
+        # caller passing {} wants "arguments": {} on the wire, e.g. `qmp <cmd>
+        # --args '{}'`. Only the default None omits the key entirely.
+        if arguments is not None:
             msg["arguments"] = arguments
         self._sock.settimeout(timeout)
         self._send_json(msg)

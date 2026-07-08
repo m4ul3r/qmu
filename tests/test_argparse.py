@@ -91,3 +91,55 @@ class TestJoinExecCommand:
 
     def test_multiple_simple_args(self):
         assert cli._join_exec_command(["uname", "-a"]) == "uname -a"
+
+
+class TestPruneVmPlacement:
+    """`qmu --vm X prune` must target X (fix #2).
+
+    prune declares its own `--vm` in a mutually_exclusive_group. Previously it
+    used default=None, which clobbered a top-level `--vm X` given BEFORE the
+    subcommand, so `qmu --vm foo prune` fell through to the bare
+    "Specify either --vm <name> or --all." path. With default=argparse.SUPPRESS
+    (matching every other subcommand) the pre-subcommand value survives.
+
+    No VM state is touched: list_instances / list_stopped_instances are stubbed
+    empty so the handler reaches its name-lookup branch deterministically.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_vms(self, monkeypatch):
+        monkeypatch.setattr(cli, "list_instances", lambda: [])
+        monkeypatch.setattr(cli, "list_stopped_instances", lambda: [])
+
+    def test_vm_before_subcommand_targets_name(self, capsys):
+        # Reaches the specific "No stopped VM named 'foo'." branch (target
+        # lookup) — proof the top-level --vm reached _handle_prune.
+        rc = cli.main(["--vm", "foo", "prune"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "No stopped VM named 'foo'." in err
+        assert "Specify either" not in err
+
+    def test_vm_after_subcommand_targets_name(self, capsys):
+        rc = cli.main(["prune", "--vm", "foo"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "No stopped VM named 'foo'." in err
+
+    def test_no_vm_no_all_still_prompts(self, capsys):
+        # The bare form (neither --vm nor --all) must still hit the guidance.
+        rc = cli.main(["prune"])
+        assert rc == 1
+        assert "Specify either --vm <name> or --all." in capsys.readouterr().err
+
+    def test_all_flag_still_works(self, capsys):
+        # --all path is unaffected; empty stopped list => benign no-op, exit 0.
+        rc = cli.main(["prune", "--all"])
+        assert rc == 0
+        assert "No stopped VMs to prune." in capsys.readouterr().out
+
+    def test_vm_and_all_are_mutually_exclusive(self):
+        # argparse enforces the mutual exclusion -> usage error (SystemExit / 2).
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["prune", "--vm", "foo", "--all"])
+        assert exc.value.code == 2

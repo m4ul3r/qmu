@@ -204,7 +204,9 @@ qmu snapshot load clean
 qmu snapshot delete clean
 ```
 
-**Snapshots need the `passt` network backend.** The default `-net user` (slirp) backend can't be serialized by `savevm` (QEMU writes a corrupt section), so `loadvm` fails with `Section footer error` / `Missing section footer for slirp` and does **not** restore — `qmu snapshot load` returns a **non-zero exit code** in this case. Launch with **`--net-backend passt`** (or set `[machine] net_backend = "passt"`) to use [passt](https://passt.top/), a rootless, migration-capable slirp replacement: with it, `save`/`load` round-trip while SSH keeps working. Needs the `passt` binary on PATH (`qmu doctor` checks it; `apt install passt` / `pacman -S passt`).
+**Snapshots need a qcow2 rootfs disk.** `savevm` stores *internal* snapshots, which QEMU can only write into a **writable qcow2** disk. The default `[drive] format = "raw"` image (and the implicit `snapshot=on` overlay) cannot hold them, so `qmu snapshot save` fails out of the box. Convert the rootfs and switch formats: `qemu-img convert -O qcow2 rootfs.img rootfs.qcow2`, then set `[drive] format = "qcow2"`.
+
+**Snapshots also need the `passt` network backend.** The default `-net user` (slirp) backend can't be serialized by `savevm` (QEMU writes a corrupt section), so `loadvm` fails with `Section footer error` / `Missing section footer for slirp` and does **not** restore — `qmu snapshot load` returns a **non-zero exit code** in this case. Launch with **`--net-backend passt`** (or set `[machine] net_backend = "passt"`) to use [passt](https://passt.top/), a rootless, migration-capable slirp replacement: with it, `save`/`load` round-trip while SSH keeps working. Needs the `passt` binary on PATH (`qmu doctor` checks it; `apt install passt` / `pacman -S passt`).
 
 **Snapshot-rewind loop (with passt) — the fast way to run a crash-prone PoC repeatedly:**
 ```bash
@@ -301,7 +303,7 @@ Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
 
 ## Known Limitations
 
-- **Snapshots require `--net-backend passt`** — the default slirp backend can't be serialized, so `loadvm` fails and `snapshot load` returns non-zero. Use passt for a working `save`/`load` loop, or relaunch instead (see Snapshots).
+- **Snapshots require a qcow2 rootfs AND `--net-backend passt`** — `savevm` needs a writable qcow2 disk (the default `format = "raw"` image cannot store internal snapshots, so `snapshot save` fails), and the default slirp backend can't be serialized (so `loadvm` fails and `snapshot load` returns non-zero). Convert to qcow2 and use passt for a working `save`/`load` loop, or relaunch instead (see Snapshots).
 - **Snapshots are ephemeral** — a temporary COW overlay, gone when the VM exits (by design; base image stays clean).
 - **`qmu gdb` halts the guest** — resume with `qmu cont` / `pry continue` / `qmu monitor cont` before SSH commands (see GDB Integration).
 - **Crash auto-extraction is best-effort** — confirm with `qmu crash` / `qmu log --tail 200` after any suspected panic (see Compile and Run).
