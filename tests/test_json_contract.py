@@ -25,6 +25,7 @@ import json
 import pytest
 
 from qmu import cli
+from qmu.commands import lifecycle
 from qmu.instance import QMUError
 
 
@@ -70,7 +71,7 @@ def test_qmp_error_json_carries_error_type(monkeypatch, capsys):
     def boom(vm=None):
         raise QMPError("qmp socket vanished")
 
-    monkeypatch.setattr(cli, "choose_instance", boom)
+    monkeypatch.setattr(lifecycle, "choose_instance", boom)
     rc = cli.main(["--format", "json", "status"])
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
@@ -87,7 +88,7 @@ def test_ssh_error_json_carries_error_type(monkeypatch, capsys):
     def boom(vm=None):
         raise SSHError("ssh transport gone")
 
-    monkeypatch.setattr(cli, "choose_instance", boom)
+    monkeypatch.setattr(lifecycle, "choose_instance", boom)
     rc = cli.main(["--format", "json", "status"])
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False

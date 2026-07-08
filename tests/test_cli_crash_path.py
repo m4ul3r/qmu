@@ -32,6 +32,7 @@ import json
 import pytest
 
 from qmu import cli
+from qmu.commands import guest
 from qmu.instance import VMInstance
 
 
@@ -95,8 +96,8 @@ def patch_exec(monkeypatch, tmp_path):
             serial.write_text(crash_text or "boot ok\n")
         inst = _fake_instance(str(serial))
         fake = FakeSSH(rc=rc, stdout="", stderr="", ready=ready)
-        monkeypatch.setattr(cli, "choose_instance", lambda vm=None: inst)
-        monkeypatch.setattr(cli, "_make_ssh", lambda i: fake)
+        monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
+        monkeypatch.setattr(guest, "_make_ssh", lambda i: fake)
         return fake
 
     return install
