@@ -18,6 +18,7 @@ from .instance import (
     VMInstance,
     choose_instance,
     find_instance,
+    instance_alive,
     is_pid_alive,
     list_instances,
     list_stopped_instances,
@@ -325,7 +326,7 @@ def _handle_launch(args: argparse.Namespace) -> int:
     # Replace existing VM with the same name (default behavior)
     if args.name and not args.no_replace:
         existing = load_instance(args.name)
-        if existing is not None and is_pid_alive(existing.pid):
+        if existing is not None and instance_alive(existing):
             sys.stderr.write(f"[qmu] Replacing existing VM '{args.name}' (pid={existing.pid})\n")
             _kill_vm(existing)
         elif existing is not None:
@@ -438,7 +439,9 @@ def _handle_kill(args: argparse.Namespace) -> int:
 def _add_prune(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("prune", help="Remove state files for stopped VMs")
     g = p.add_mutually_exclusive_group()
-    g.add_argument("--vm", default=None, help="Prune a specific stopped VM")
+    # SUPPRESS (like _add_common_opts) so a top-level `--vm X` given before the
+    # subcommand is not clobbered by this subparser's own default.
+    g.add_argument("--vm", default=argparse.SUPPRESS, help="Prune a specific stopped VM")
     g.add_argument("--all", dest="prune_all", action="store_true",
                    help="Prune every stopped VM")
     p.add_argument("--keep-logs", action="store_true",
@@ -454,14 +457,18 @@ def _handle_prune(args: argparse.Namespace) -> int:
     running = list_instances()
     running_ids = {inst.vm_id for inst in running}
 
-    if args.vm is not None:
-        if args.vm in running_ids:
+    # SUPPRESS default (fix #2) means the attribute may be absent when --vm is
+    # not given after the subcommand; the top-level parser default of None
+    # guarantees it otherwise exists.
+    vm = getattr(args, "vm", None)
+    if vm is not None:
+        if vm in running_ids:
             raise QMUError(
-                f"VM '{args.vm}' is running. Use 'qmu kill --vm {args.vm}' first."
+                f"VM '{vm}' is running. Use 'qmu kill --vm {vm}' first."
             )
-        target = next((inst for inst in stopped if inst.vm_id == args.vm), None)
+        target = next((inst for inst in stopped if inst.vm_id == vm), None)
         if target is None:
-            raise QMUError(f"No stopped VM named '{args.vm}'.")
+            raise QMUError(f"No stopped VM named '{vm}'.")
         targets = [target]
     elif args.prune_all:
         targets = stopped
@@ -1119,7 +1126,21 @@ def _handle_snapshot_save(args: argparse.Namespace) -> int:
         stem="snapshot-save",
     )
     if failed:
-        sys.stderr.write(f"[qmu] snapshot save failed: {msg}\n")
+        # savevm stores *internal* snapshots, which QEMU can only write into a
+        # writable qcow2 disk. The default implicit rootfs drive is
+        # format=raw,snapshot=on (see vm.py): raw images cannot hold internal
+        # snapshots, and the snapshot=on overlay is a throwaway that savevm
+        # refuses too. Give the actionable requirement rather than the raw HMP
+        # error (mirrors the load handler's hint).
+        sys.stderr.write(
+            f"[qmu] snapshot save failed: {msg}\n"
+            "[qmu] `savevm` requires a writable qcow2 rootfs disk to store "
+            "internal snapshots; the default format=raw image (and any "
+            "snapshot=on overlay) cannot hold them. Rebuild/convert the rootfs "
+            "to qcow2 (e.g. `qemu-img convert -O qcow2 rootfs.img rootfs.qcow2`), "
+            "set [drive] format = \"qcow2\", and launch with net_backend=passt "
+            "(not the default slirp) so the saved state round-trips.\n"
+        )
         return 1
     return 0
 
@@ -1604,7 +1625,11 @@ def _handle_log(args: argparse.Namespace) -> int:
 
 
 def _add_gdb(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("gdb", help="Launch pry connected to VM's GDB stub")
+    p = sub.add_parser(
+        "gdb",
+        help="Connect pry (headless GDB bridge) to the VM's GDB stub; "
+             "non-interactive, does not open a debugger session",
+    )
     p.add_argument("--symbols", default=None, help="Path to vmlinux with debug symbols")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_gdb)
@@ -1625,6 +1650,11 @@ def _handle_gdb(args: argparse.Namespace) -> int:
     if args.symbols:
         cmd.extend(["--symbols", str(Path(args.symbols).expanduser().resolve())])
 
+    # `pry launch` is non-interactive: it spins up a headless GDB + bridge in the
+    # background, connects to the stub, and returns — it does NOT hand back an
+    # interactive debugger session. So capturing output and capping at 15s (pry's
+    # own bridge-start wait defaults to 10s) is correct; the agent drives the
+    # halted session afterwards via the `pry` CLI.
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     if result.returncode == 0:
         # H4: attaching to the gdb stub HALTS the vCPU. If the agent does not

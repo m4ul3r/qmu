@@ -65,3 +65,28 @@ qmu rootfs shell  ./rootfs.img --partition 1   # interactive guestfish
 
 `GUEST` is interpreted as a directory; the local filename is preserved.
 `--partition 0` selects the whole disk for unpartitioned images.
+
+## Snapshots
+
+```bash
+qmu snapshot save clean
+qmu snapshot list
+qmu snapshot load clean
+qmu snapshot delete clean
+```
+
+`snapshot save` uses QEMU's HMP `savevm`, which can only store *internal*
+snapshots in a **writable qcow2** rootfs disk. The default `[drive] format =
+"raw"` image (and the implicit `snapshot=on` overlay) cannot hold them, so
+`snapshot save` fails out of the box — convert the rootfs and switch formats:
+
+```bash
+qemu-img convert -O qcow2 rootfs.img rootfs.qcow2   # then set [drive] format = "qcow2"
+```
+
+Snapshots also require **`--net-backend passt`** (or `[machine] net_backend =
+"passt"`). The default `-net user` (slirp) backend can't be serialized by
+`savevm`/`loadvm`, so snapshot state does not round-trip. `passt` is a rootless,
+migration-capable slirp replacement (`apt install passt` / `pacman -S passt`;
+`qmu doctor` checks it). Without both a qcow2 disk and passt, iterate by
+relaunching instead of snapshotting.

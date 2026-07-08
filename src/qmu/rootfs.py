@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import shlex
 import shutil
 import subprocess
@@ -61,12 +60,10 @@ def inject(image: str, mappings: list[tuple[str, str]], partition: int = 1) -> N
 
     script_lines: list[str] = []
     for local, guest in mappings:
-        # If guest looks like a directory (trailing /), copy into it directly.
-        # Otherwise treat parent directory as the destination.
-        if guest.endswith("/"):
-            guest_dir = guest.rstrip("/") or "/"
-        else:
-            guest_dir = os.path.dirname(guest) or "/"
+        # GUEST is always a directory (documented contract); a trailing slash is
+        # optional. Normalizing here keeps `/root` and `/root/` identical instead
+        # of silently diverging to `/` via dirname().
+        guest_dir = guest.rstrip("/") or "/"
         script_lines.append(f"-mkdir-p {shlex.quote(guest_dir)}")
         script_lines.append(
             f"copy-in {shlex.quote(str(Path(local).resolve()))} {shlex.quote(guest_dir)}"

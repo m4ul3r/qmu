@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import tempfile
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -49,7 +50,22 @@ def _instance_from_dict(data: dict) -> VMInstance:
 def save_instance(inst: VMInstance) -> Path:
     path = instance_json_path(inst.vm_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(inst), indent=2) + "\n")
+    # Write to a temp file in the SAME dir and os.replace() onto the target so a
+    # crash mid-write can never leave a truncated .json that makes a live VM
+    # vanish from `qmu list`. os.replace is atomic when src/dst share a fs.
+    payload = json.dumps(asdict(inst), indent=2) + "\n"
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+        os.replace(tmp, path)
+    except BaseException:
+        # Don't litter the instances dir with partial temp files on failure.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -187,11 +203,16 @@ def _synthesize_orphan(vm_id: str, log_path: Path) -> VMInstance:
 
 
 def remove_instance(vm_id: str, *, keep_logs: bool = False) -> None:
-    """Remove instance state files. With keep_logs=True, preserve .serial.log."""
+    """Remove instance state files. With keep_logs=True, preserve the logs.
+
+    Both the guest serial log (.serial.log) and QEMU's own stdout/stderr log
+    (.qemu.log, written by launch_vm) are treated as logs: dropped by default,
+    kept together under keep_logs so post-mortem forensics stay intact.
+    """
     idir = instances_dir()
     suffixes = [".json", ".qmp.sock"]
     if not keep_logs:
-        suffixes.append(".serial.log")
+        suffixes.extend([".serial.log", ".qemu.log"])
     for suffix in suffixes:
         (idir / f"{vm_id}{suffix}").unlink(missing_ok=True)
 

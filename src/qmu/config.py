@@ -237,12 +237,17 @@ cpus = 2
 # net_backend = "passt"          # "user" (default, slirp) or "passt"; passt is a
 #                                #   rootless, migratable backend so `snapshot save/load`
 #                                #   works (slirp cannot be snapshotted). Needs the
-#                                #   `passt` binary on PATH.
+#                                #   `passt` binary on PATH. Snapshots also require a
+#                                #   qcow2 rootfs (see [drive] format below).
 {machine_extras}
 
 [drive]
 rootfs = "./rootfs.img"          # CHANGE ME — path to a kernel rootfs image
-format = "raw"
+format = "raw"                   # "raw" or "qcow2". `qmu snapshot save` (HMP savevm)
+                                 #   needs a writable qcow2 disk to store internal
+                                 #   snapshots; raw images cannot hold them. Convert with
+                                 #   `qemu-img convert -O qcow2 rootfs.img rootfs.qcow2`
+                                 #   and set format = "qcow2" to use snapshots.
 
 [ssh]
 key = "~/.ssh/qmu_id_rsa"        # CHANGE ME — private key matching the rootfs

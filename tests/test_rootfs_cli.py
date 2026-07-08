@@ -53,3 +53,39 @@ def test_mount_args_partition_one_default():
 def test_inject_image_missing_raises():
     with pytest.raises(QMUError):
         rootfs_mod.inject("/nonexistent/img", [], partition=1)
+
+
+def _run_inject_capture_script(tmp_path, guest):
+    """Run inject with guestfish/image stubbed out and return the script text
+    piped to guestfish. Lets us assert on the generated commands directly."""
+    local = tmp_path / "exploit"
+    local.write_text("payload")
+    image = tmp_path / "rootfs.img"
+    image.write_text("disk")
+
+    completed = mock.Mock(returncode=0, stderr="", stdout="")
+    with mock.patch.object(rootfs_mod, "_require_guestfish", return_value="guestfish"):
+        with mock.patch.object(
+            rootfs_mod.subprocess, "run", return_value=completed
+        ) as run:
+            rootfs_mod.inject(str(image), [(str(local), guest)], partition=1)
+    return run.call_args.kwargs["input"]
+
+
+def test_inject_treats_guest_without_trailing_slash_as_dir(tmp_path):
+    # Regression: `/root` used to collapse to `/` via dirname().
+    script = _run_inject_capture_script(tmp_path, "/root")
+    assert "-mkdir-p /root\n" in script
+    assert "copy-in " in script and script.rstrip().endswith("/root")
+
+
+def test_inject_trailing_slash_matches_no_slash(tmp_path):
+    with_slash = _run_inject_capture_script(tmp_path, "/root/")
+    no_slash = _run_inject_capture_script(tmp_path, "/root")
+    assert with_slash == no_slash
+    assert "-mkdir-p /root\n" in with_slash
+
+
+def test_inject_root_guest_stays_root(tmp_path):
+    script = _run_inject_capture_script(tmp_path, "/")
+    assert "-mkdir-p /\n" in script
