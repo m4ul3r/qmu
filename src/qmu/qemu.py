@@ -38,7 +38,11 @@ def probe_qemu_netdevs(
             error=f"Selected QEMU binary '{binary}' was not found in PATH",
         )
 
-    argv = [path, "-netdev", "help"]
+    # `-machine none` is required: arches without a default machine
+    # (aarch64, arm, riscv, …) abort with "No machine specified" before
+    # reaching netdev enumeration, producing a false-negative capability
+    # result. `none` is universally accepted and still lists backends.
+    argv = [path, "-machine", "none", "-netdev", "help"]
     try:
         result = subprocess.run(
             argv,

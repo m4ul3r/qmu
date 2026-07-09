@@ -39,12 +39,31 @@ def test_probe_reads_exact_netdev_names_from_selected_qemu(monkeypatch, stream):
     assert caps.available is True
     assert caps.supports("passt") is True
     run.assert_called_once_with(
-        ["/opt/qemu/bin/qemu-system-aarch64", "-netdev", "help"],
+        ["/opt/qemu/bin/qemu-system-aarch64", "-machine", "none", "-netdev", "help"],
         capture_output=True,
         text=True,
         timeout=5.0,
         check=False,
     )
+
+
+def test_probe_forces_machine_none_for_arches_without_a_default(monkeypatch):
+    # Regression: aarch64/arm/riscv abort with "No machine specified" before
+    # enumerating netdev backends unless a machine is selected, which produced
+    # a false-negative native-passt result. `-machine none` must always be
+    # passed so the probe reaches backend enumeration on every arch.
+    monkeypatch.setattr(qemu.shutil, "which", lambda name: "/opt/qemu/bin/" + name)
+    run = Mock(
+        return_value=_result(
+            stdout="Available netdev backend types:\nuser\npasst\n"
+        )
+    )
+    monkeypatch.setattr(qemu.subprocess, "run", run)
+
+    probe_qemu_netdevs("qemu-system-aarch64")
+
+    argv = run.call_args.args[0]
+    assert argv[1:3] == ["-machine", "none"]
 
 
 def test_probe_does_not_accept_passt_as_a_substring(monkeypatch):
