@@ -175,7 +175,7 @@ def test_explicit_out_inside_spill_tree_is_not_marked():
     assert not spill_marker_path(out).exists()
 
 
-def test_explicit_out_overwrite_invalidates_existing_ownership_marker():
+def test_explicit_out_invalidates_only_valid_identity_bound_ownership_marker():
     automatic = write_output_result(
         _text_with_estimate(51),
         fmt="text",
@@ -185,7 +185,18 @@ def test_explicit_out_overwrite_invalidates_existing_ownership_marker():
     )
     artifact = Path(automatic.artifact["artifact_path"])
     marker = spill_marker_path(artifact)
-    assert marker.exists()
+    payload = json.loads(marker.read_text())
+    artifact_stat = artifact.stat()
+    assert payload["schema"] == 1
+    assert payload["kind"] == "spill"
+    assert payload["artifact"] == artifact.name
+    assert {
+        field: payload[field]
+        for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    } == {
+        field: getattr(artifact_stat, field)
+        for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    }
 
     user_value = {"source": "explicit --out"}
     explicit = write_output_result(
@@ -199,6 +210,125 @@ def test_explicit_out_overwrite_invalidates_existing_ownership_marker():
     assert explicit.spilled is False
     assert artifact.read_bytes() == render_value(user_value, "json").encode("utf-8")
     assert not marker.exists()
+
+
+def test_explicit_out_preserves_malformed_adjacent_marker():
+    automatic = write_output_result(
+        _text_with_estimate(51),
+        fmt="text",
+        out_path=None,
+        stem="exec",
+        spill_token_limit=50,
+    )
+    artifact = Path(automatic.artifact["artifact_path"])
+    marker = spill_marker_path(artifact)
+    malformed_marker = b'{"schema":'
+    marker.write_bytes(malformed_marker)
+
+    explicit_value = {"source": "explicit --out"}
+    result = write_output_result(
+        explicit_value,
+        fmt="json",
+        out_path=artifact,
+        stem="exec",
+        spill_token_limit=1,
+    )
+
+    assert result.spilled is False
+    assert artifact.read_bytes() == render_value(explicit_value, "json").encode("utf-8")
+    assert marker.read_bytes() == malformed_marker
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        pytest.param("schema", 2, id="wrong-schema"),
+        pytest.param("kind", "user-output", id="wrong-kind"),
+        pytest.param("artifact", "someone-elses-file", id="wrong-artifact"),
+    ],
+)
+def test_explicit_out_preserves_marker_with_invalid_ownership_field(
+    field, invalid_value
+):
+    automatic = write_output_result(
+        _text_with_estimate(51),
+        fmt="text",
+        out_path=None,
+        stem="exec",
+        spill_token_limit=50,
+    )
+    artifact = Path(automatic.artifact["artifact_path"])
+    marker = spill_marker_path(artifact)
+    payload = json.loads(marker.read_text())
+    payload[field] = invalid_value
+    invalid_marker = json.dumps(payload, sort_keys=True).encode("utf-8")
+    marker.write_bytes(invalid_marker)
+
+    explicit_value = {"source": "explicit --out"}
+    result = write_output_result(
+        explicit_value,
+        fmt="json",
+        out_path=artifact,
+        stem="exec",
+        spill_token_limit=1,
+    )
+
+    assert result.spilled is False
+    assert marker.read_bytes() == invalid_marker
+
+
+def test_explicit_out_preserves_identity_mismatched_marker():
+    automatic = write_output_result(
+        _text_with_estimate(51),
+        fmt="text",
+        out_path=None,
+        stem="exec",
+        spill_token_limit=50,
+    )
+    artifact = Path(automatic.artifact["artifact_path"])
+    marker = spill_marker_path(artifact)
+    original_marker = marker.read_bytes()
+    artifact.write_bytes(b"user replacement before explicit overwrite")
+
+    explicit_value = {"source": "explicit --out"}
+    result = write_output_result(
+        explicit_value,
+        fmt="json",
+        out_path=artifact,
+        stem="exec",
+        spill_token_limit=1,
+    )
+
+    assert result.spilled is False
+    assert marker.read_bytes() == original_marker
+
+
+def test_explicit_out_preserves_symlink_sidecar(tmp_path):
+    automatic = write_output_result(
+        _text_with_estimate(51),
+        fmt="text",
+        out_path=None,
+        stem="exec",
+        spill_token_limit=50,
+    )
+    artifact = Path(automatic.artifact["artifact_path"])
+    marker = spill_marker_path(artifact)
+    marker.unlink()
+    user_sidecar = tmp_path / "user-sidecar.json"
+    user_sidecar.write_text("user-owned sidecar")
+    marker.symlink_to(user_sidecar)
+
+    result = write_output_result(
+        {"source": "explicit --out"},
+        fmt="json",
+        out_path=artifact,
+        stem="exec",
+        spill_token_limit=1,
+    )
+
+    assert result.spilled is False
+    assert marker.is_symlink()
+    assert marker.read_text() == "user-owned sidecar"
 
 
 def test_marker_failure_removes_partial_auto_spill_transaction(monkeypatch):
