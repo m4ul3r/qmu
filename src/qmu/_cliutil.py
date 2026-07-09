@@ -123,18 +123,13 @@ def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) 
     if fmt == "text":
         sys.stderr.write(f"{text_prefix} {exc}\n")
     else:
-        sys.stdout.write(
-            json.dumps(
-                {
-                    "ok": False,
-                    "error": str(exc),
-                    "error_type": exc.__class__.__name__,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n"
-        )
+        payload = {
+            "ok": False,
+            "error": str(exc),
+            "error_type": exc.__class__.__name__,
+        }
+        indent = None if fmt == "ndjson" else 2
+        sys.stdout.write(json.dumps(payload, indent=indent, sort_keys=True) + "\n")
 
 
 def _wait_pid_exit(pid: int, timeout: float) -> bool:
