@@ -342,8 +342,11 @@ def _handle_gdb(args: argparse.Namespace) -> int:
         raise QMUError("pry not found in PATH. Install pry and ensure it is on PATH.")
 
     cmd = ["pry", "launch", "--connect", f"localhost:{inst.gdb_port}"]
-    if args.symbols:
-        cmd.extend(["--symbols", str(Path(args.symbols).expanduser().resolve())])
+    symbols_path = (
+        Path(args.symbols).expanduser().resolve() if args.symbols else None
+    )
+    if symbols_path is not None:
+        cmd.extend(["--symbols", str(symbols_path)])
 
     # `pry launch` is non-interactive: it spins up a headless GDB + bridge in the
     # background, connects to the stub, and returns — it does NOT hand back an
@@ -361,17 +364,36 @@ def _handle_gdb(args: argparse.Namespace) -> int:
             "pull/compile) will hang until you resume it. Resume with `pry "
             "continue` (in the debugger) or `qmu cont`."
         )
+        data = {
+            "ok": True,
+            "vm_id": inst.vm_id,
+            "gdb_port": inst.gdb_port,
+            "cpu_state": "halted",
+            "warning": warning,
+        }
+        text = (
+            f"pry connected to VM '{inst.vm_id}' GDB stub on port "
+            f"{inst.gdb_port}\n{warning}"
+        )
+        if symbols_path is not None:
+            symbol_warning = (
+                f"WARNING: symbols from '{symbols_path}' were loaded at ELF link-time "
+                "addresses; qmu gdb did not apply runtime rebasing. Obtain the runtime "
+                f"base with `qmu kbase --vm {inst.vm_id} --symbols {symbols_path}`, then "
+                f"reload with `pry load {symbols_path} --base <KBASE>`."
+            )
+            data.update({
+                "symbols": str(symbols_path),
+                "symbols_rebased": False,
+                "symbol_base": "elf-link-time",
+                "kaslr_status": "unknown",
+                "symbol_warning": symbol_warning,
+            })
+            text = f"{text}\n{symbol_warning}"
         _emit(
             args,
-            data={
-                "ok": True,
-                "vm_id": inst.vm_id,
-                "gdb_port": inst.gdb_port,
-                "cpu_state": "halted",
-                "warning": warning,
-            },
-            text=f"pry connected to VM '{inst.vm_id}' GDB stub on port "
-            f"{inst.gdb_port}\n{warning}",
+            data=data,
+            text=text,
             stem="gdb",
         )
     else:
