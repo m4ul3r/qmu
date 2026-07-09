@@ -151,3 +151,33 @@ class TestPruneVmPlacement:
         with pytest.raises(SystemExit) as exc:
             cli.main(["prune", "--vm", "foo", "--all"])
         assert exc.value.code == 2
+
+
+@pytest.fixture
+def captured_crash_args(monkeypatch):
+    captured = {}
+
+    def _capture(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(guest, "_handle_crash", _capture)
+    return captured
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [(["crash"], False), (["crash", "--full-history"], True)],
+)
+def test_crash_full_history_parser(argv, expected, captured_crash_args):
+    assert cli.main(argv) == 0
+    assert captured_crash_args["args"].full_history is expected
+
+
+def test_crash_full_history_help(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["crash", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--full-history" in help_text
+    assert "previous guest epochs" in help_text
