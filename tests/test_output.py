@@ -129,6 +129,38 @@ def test_auto_spill_writes_valid_ownership_marker():
     assert isinstance(payload["created_at"], float)
 
 
+def test_marker_binds_identity_and_preserves_replacement_mismatch():
+    result = write_output_result(
+        _text_with_estimate(51),
+        fmt="text",
+        out_path=None,
+        stem="exec",
+        spill_token_limit=50,
+    )
+    artifact = Path(result.artifact["artifact_path"])
+    payload = json.loads(spill_marker_path(artifact).read_text())
+    recorded_identity = {
+        field: payload[field]
+        for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    }
+    artifact_stat = artifact.stat()
+    artifact_identity = {
+        field: getattr(artifact_stat, field)
+        for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    }
+    assert recorded_identity == artifact_identity
+
+    artifact.unlink()
+    artifact.write_bytes(b"explicit user replacement")
+    replacement_stat = artifact.stat()
+    replacement_identity = {
+        field: getattr(replacement_stat, field)
+        for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    }
+
+    assert recorded_identity != replacement_identity
+
+
 def test_explicit_out_inside_spill_tree_is_not_marked():
     out = spill_root() / "manual.json"
     result = write_output_result(
@@ -143,11 +175,39 @@ def test_explicit_out_inside_spill_tree_is_not_marked():
     assert not spill_marker_path(out).exists()
 
 
-def test_marker_failure_removes_incomplete_auto_spill(monkeypatch):
-    def fail_marker(_artifact):
+def test_explicit_out_overwrite_invalidates_existing_ownership_marker():
+    automatic = write_output_result(
+        _text_with_estimate(51),
+        fmt="text",
+        out_path=None,
+        stem="exec",
+        spill_token_limit=50,
+    )
+    artifact = Path(automatic.artifact["artifact_path"])
+    marker = spill_marker_path(artifact)
+    assert marker.exists()
+
+    user_value = {"source": "explicit --out"}
+    explicit = write_output_result(
+        user_value,
+        fmt="json",
+        out_path=artifact,
+        stem="exec",
+        spill_token_limit=1,
+    )
+
+    assert explicit.spilled is False
+    assert artifact.read_bytes() == render_value(user_value, "json").encode("utf-8")
+    assert not marker.exists()
+
+
+def test_marker_failure_removes_partial_auto_spill_transaction(monkeypatch):
+
+    def write_partial_then_raise(path, *_args, **_kwargs):
+        path.write_bytes(b'{"schema":')
         raise OSError("marker full")
 
-    monkeypatch.setattr("qmu.output.mark_spill_artifact", fail_marker)
+    monkeypatch.setattr(Path, "write_text", write_partial_then_raise)
     with pytest.raises(OSError, match="marker full"):
         write_output_result(
             _text_with_estimate(51),
