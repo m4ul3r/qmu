@@ -168,6 +168,57 @@ def _handle_snapshot_delete(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _parse_nm_text(stdout: str) -> int:
+    addresses: list[int] = []
+    for line in stdout.splitlines():
+        fields = line.split()
+        if not fields or fields[0] != "_text":
+            continue
+        if len(fields) < 3:
+            raise QMUError("local symbol tool returned malformed _text output")
+        try:
+            addresses.append(int(fields[2], 16))
+        except ValueError as exc:
+            raise QMUError(
+                f"local symbol tool returned invalid _text address: {fields[2]!r}"
+            ) from exc
+    if not addresses:
+        raise QMUError("local vmlinux is missing _text")
+    if len(addresses) != 1:
+        raise QMUError("local vmlinux contains multiple _text symbols")
+    if addresses[0] == 0:
+        raise QMUError("local vmlinux has a zero _text address")
+    return addresses[0]
+
+
+def _parse_kallsyms_text(stdout: str) -> int:
+    addresses: list[int] = []
+    for line in stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or fields[2] != "_text":
+            continue
+        try:
+            addresses.append(int(fields[0], 16))
+        except ValueError as exc:
+            raise QMUError(
+                f"guest returned invalid _text address: {fields[0]!r}"
+            ) from exc
+    if not addresses:
+        raise QMUError("guest /proc/kallsyms is missing _text")
+    if len(addresses) != 1:
+        raise QMUError("guest /proc/kallsyms contains multiple _text symbols")
+    if addresses[0] == 0:
+        raise QMUError(
+            "guest has restricted /proc/kallsyms: _text address is zero; "
+            "use a root SSH user or set kernel.kptr_restrict=0"
+        )
+    return addresses[0]
+
+
+def _format_hex(value: int) -> str:
+    return f"-0x{-value:x}" if value < 0 else f"0x{value:x}"
+
+
 def _add_gdb(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "gdb",
