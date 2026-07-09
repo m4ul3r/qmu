@@ -7,7 +7,16 @@ from pathlib import Path
 
 
 class SSHError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        returncode: int | None = None,
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.returncode = returncode
+        self.stderr = stderr
 
 
 # Directory holding OpenSSH ControlMaster sockets for connection multiplexing.
@@ -175,7 +184,11 @@ class SSHClient:
                 f"SCP push timed out after 30s: {local_path} -> {remote_path}"
             ) from exc
         if result.returncode != 0:
-            raise SSHError(f"SCP push failed: {result.stderr.strip()}")
+            raise SSHError(
+                f"SCP push failed: {result.stderr.strip()}",
+                returncode=result.returncode,
+                stderr=result.stderr,
+            )
 
     def pull(self, remote_path: str, local_path: str = ".") -> None:
         """Copy a file from the guest."""
@@ -190,4 +203,8 @@ class SSHClient:
                 f"SCP pull timed out after 30s: {remote_path} -> {local_path}"
             ) from exc
         if result.returncode != 0:
-            raise SSHError(f"SCP pull failed: {result.stderr.strip()}")
+            raise SSHError(
+                f"SCP pull failed: {result.stderr.strip()}",
+                returncode=result.returncode,
+                stderr=result.stderr,
+            )
