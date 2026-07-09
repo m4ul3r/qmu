@@ -198,10 +198,19 @@ Default CFLAGS: `-static -lpthread`.
 The headline feature — works even when SSH is dead, and **after** a VM exits (state files survive until prune):
 
 ```bash
-qmu crash                   # extract last KASAN/BUG/Oops/panic from serial log
-qmu crash --vm run-3        # works on a stopped VM too
-qmu log --tail 100          # last 100 lines of serial console
+qmu crash                   # last crash in the current restored guest epoch
+qmu crash --vm run-3        # current epoch; works on a stopped VM too
+qmu crash --full-history    # retained-log forensics across snapshot/reset epochs
+qmu log --tail 100          # raw serial tail, without provenance filtering
 ```
+
+Command-attributed crashes from `exec` and `compile --run` are extracted only
+from serial bytes appended after that command began. A stale panic already in
+the log never sets `crash_detected` for the new command. Standalone `qmu crash`
+defaults to the persisted current guest epoch; use `--full-history` explicitly
+when older retained crashes are desired. In structured output, inspect
+`crash_detected` and `scope`; `ok: true`/exit 0 means the selected crash query
+found a report, not that the VM is healthy.
 
 Detects KASAN, BUG/Oops, kernel panic, general protection fault, UBSAN, slab-use-after-free, and more. If `qmu crash` reports nothing but you suspect a panic, fall back to `qmu log --tail 200`.
 
