@@ -313,6 +313,7 @@ def launch_vm(
         gdb_port=gdb_port,
         serial_log=serial_path,
         kernel=str(kernel_path),
+        arch=config.arch,
         rootfs=str(rootfs_path) if rootfs_path else None,
         memory=config.memory,
         cpus=config.cpus,

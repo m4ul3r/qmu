@@ -27,6 +27,9 @@ class VMInstance:
     gdb_port: int | None
     serial_log: str
     kernel: str
+    # Guest/QEMU architecture recorded at launch. None keeps instance JSON
+    # written before this field existed loadable without guessing from the host.
+    arch: str | None = None
     rootfs: str | None
     memory: str
     cpus: int
