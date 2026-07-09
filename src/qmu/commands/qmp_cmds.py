@@ -90,23 +90,21 @@ def _handle_snapshot_save(args: argparse.Namespace) -> int:
         stem="snapshot-save",
     )
     if failed:
-        # savevm stores *internal* snapshots, which QEMU can only write into a
-        # writable qcow2 disk. The default implicit rootfs drive is
-        # format=raw,snapshot=on (see vm.py): raw images cannot hold internal
-        # snapshots, and the snapshot=on overlay is a throwaway that savevm
-        # refuses too. Give the actionable requirement rather than the raw HMP
-        # error (mirrors the load handler's hint).
         sys.stderr.write(
             f"[qmu] snapshot save failed: {msg}\n"
-            "[qmu] `savevm` requires a writable qcow2 rootfs disk to store "
-            "internal snapshots; the default format=raw image (and any "
-            "snapshot=on overlay) cannot hold them. Rebuild/convert the rootfs "
-            "to qcow2 (e.g. `qemu-img convert -O qcow2 rootfs.img rootfs.qcow2`), "
-            "set [drive] format = \"qcow2\", and launch with net_backend=passt "
-            "(not the default slirp) so the saved state round-trips.\n"
+            "[qmu] qmu's implicit rootfs uses a temporary snapshot=on overlay; "
+            "that overlay can hold in-session checkpoints with a raw or qcow2 base, "
+            "and those checkpoints disappear when QEMU exits. For durable internal "
+            "snapshots, attach a writable qcow2 drive without snapshot=on, for example "
+            "`--drive 'file=./rootfs.qcow2,format=qcow2'`. Changing [drive] format "
+            "alone remains temporary because qmu still adds snapshot=on.\n"
         )
         return 1
     return 0
+
+
+def _snapshot_load_mentions_slirp(msg: str) -> bool:
+    return "slirp" in msg.lower()
 
 
 def _handle_snapshot_load(args: argparse.Namespace) -> int:
@@ -121,12 +119,16 @@ def _handle_snapshot_load(args: argparse.Namespace) -> int:
         stem="snapshot-load",
     )
     if failed:
-        sys.stderr.write(
-            f"[qmu] snapshot load failed: {msg}\n"
-            "[qmu] The VM was NOT restored. With the default -net user (slirp) "
-            "networking, savevm/loadvm cannot serialize NIC state; relaunch the "
-            "VM instead of relying on snapshot restore.\n"
-        )
+        sys.stderr.write(f"[qmu] snapshot load failed: {msg}\n")
+        if _snapshot_load_mentions_slirp(msg):
+            sys.stderr.write(
+                "[qmu] This loadvm error names slirp. The user backend often works for "
+                "in-session restore, but this QEMU/build/device combination could not "
+                "restore its network state. Use native passt networking only with a selected "
+                "QEMU that advertises native '-netdev passt' (documented since QEMU 10.1 but "
+                "may be build-optional), or use a manually managed external passt process "
+                "with QEMU's stream backend. qmu does not manage that external process.\n"
+            )
         return 1
     return 0
 

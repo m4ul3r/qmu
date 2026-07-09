@@ -88,7 +88,8 @@ def _add_launch(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--net-backend", default=None, dest="net_backend",
                    choices=["user", "passt"],
                    help="Network backend: 'user' (slirp, default) or 'passt' "
-                        "(rootless + migratable, so snapshots work). Overrides config.")
+                        "(migration-compatible when the selected QEMU advertises native passt). "
+                        "Overrides config.")
     p.add_argument("--harness", action="store_true",
                    help="Harness/judge VM mode: implies --no-wait-ssh + --no-net; "
                         "skips rootfs/ssh-key requirement")
