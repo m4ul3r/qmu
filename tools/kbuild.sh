@@ -207,15 +207,15 @@ fi
 SRCDIR="$CACHE/kernels/src/linux-$VERSION"
 
 emit_config_output() {
-  echo "CONFIG=$OUTDIR/.config"
+  printf 'CONFIG=%q\n' "$OUTDIR/.config"
 }
 
 emit_build_outputs() {
-  echo "KERNEL=$OUTDIR/$IMAGE_NAME"
-  echo "VMLINUX=$OUTDIR/vmlinux"
-  echo "CONFIG=$OUTDIR/.config"
-  echo "KERNEL_SRC=$SRCDIR"
-  echo "VMLINUX_GDB=$OUTDIR/vmlinux-gdb.py"
+  printf 'KERNEL=%q\n' "$OUTDIR/$IMAGE_NAME"
+  printf 'VMLINUX=%q\n' "$OUTDIR/vmlinux"
+  printf 'CONFIG=%q\n' "$OUTDIR/.config"
+  printf 'KERNEL_SRC=%q\n' "$SRCDIR"
+  printf 'VMLINUX_GDB=%q\n' "$OUTDIR/vmlinux-gdb.py"
 }
 
 config_cache_complete() {
