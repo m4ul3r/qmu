@@ -53,6 +53,18 @@ key requirements. SSH-using commands (`push`, `pull`, `exec`, `compile`,
 `qmu wait` blocks on QMP `STOP`/`SHUTDOWN`/`POWERDOWN` events, falling back to
 PID-liveness polling. Exit code `0` on clean stop, `124` on `--timeout`.
 
+## Runtime cleanup
+
+```bash
+qmu prune --runtime --older-than 86400
+```
+
+Idempotent, age-gated cleanup of **qmu-owned** runtime artifacts only (marked
+automatic output spills and stale SSH ControlMaster sockets under the
+centralized runtime root). It never scans arbitrary `/tmp/qmu-*` names. See
+the qmu skill for ownership markers, root precedence (`QMU_TEMP_DIR` /
+`XDG_RUNTIME_DIR` / platform temp), and safety boundaries.
+
 ## Rootfs injection (no root needed)
 
 For read-only rootfs images, inject files via libguestfs (`apt install
