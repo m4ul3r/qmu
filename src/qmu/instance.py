@@ -6,7 +6,7 @@ import os
 import stat
 import tempfile
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 from .paths import instance_json_path, instances_dir, qemu_log_path, serial_log_path
@@ -44,6 +44,9 @@ class VMInstance:
     # /proc/<pid>/stat field 22). Used to detect PID recycling across reboots.
     # Defaulted so instance JSON written before this field existed still loads.
     pid_start: str | None = None
+    # Byte offset at which the currently restored guest generation begins.
+    # Zero preserves old instance JSON and includes all bytes from a new launch.
+    guest_epoch_serial_offset: int = 0
 
 
 def _instance_from_dict(data: dict) -> VMInstance:
@@ -72,6 +75,16 @@ def save_instance(inst: VMInstance) -> Path:
             pass
         raise
     return path
+
+def save_guest_epoch_serial_offset(inst: VMInstance, offset: int) -> VMInstance:
+    """Atomically persist an explicitly captured guest-generation boundary."""
+    if type(offset) is not int:
+        raise TypeError("offset must be an integer")
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+    updated = replace(inst, guest_epoch_serial_offset=offset)
+    save_instance(updated)
+    return updated
 
 
 def load_instance(vm_id: str) -> VMInstance | None:

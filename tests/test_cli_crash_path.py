@@ -34,6 +34,7 @@ import pytest
 from qmu import cli
 from qmu.commands import guest
 from qmu.instance import VMInstance
+from qmu.ssh import SSHError
 
 
 def _fake_instance(serial_log: str) -> VMInstance:
@@ -58,23 +59,37 @@ def _fake_instance(serial_log: str) -> VMInstance:
 
 
 class FakeSSH:
-    """Stand-in for cli._make_ssh's SSHClient.
+    """Stand-in for the SSH client with serial output synchronized to run()."""
 
-    run() always returns the supplied (rc, stdout, stderr); is_ready() returns
-    the supplied liveness verdict. Both calls are recorded so a test can assert
-    the liveness probe actually fired on the rc=255 path.
-    """
-
-    def __init__(self, *, rc: int, stdout: str, stderr: str, ready: bool):
+    def __init__(
+        self,
+        *,
+        rc: int,
+        stdout: str,
+        stderr: str,
+        ready: bool,
+        serial_path,
+        serial_during_run: str,
+        run_error: SSHError | None = None,
+    ):
         self._rc = rc
         self._stdout = stdout
         self._stderr = stderr
         self._ready = ready
+        self._serial_path = serial_path
+        self._serial_during_run = serial_during_run
+        self._run_error = run_error
         self.run_calls: list[str] = []
         self.is_ready_calls: int = 0
 
     def run(self, command, timeout=30.0, check=False):
         self.run_calls.append(command)
+        if self._serial_during_run:
+            with self._serial_path.open("a") as stream:
+                stream.write(self._serial_during_run)
+            self._serial_during_run = ""
+        if self._run_error is not None:
+            raise self._run_error
         return self._rc, self._stdout, self._stderr
 
     def is_ready(self, timeout: int = 2) -> bool:
@@ -84,20 +99,31 @@ class FakeSSH:
 
 @pytest.fixture
 def patch_exec(monkeypatch, tmp_path):
-    """Wire choose_instance + _make_ssh so `qmu exec` runs without a real VM.
-
-    Returns a function: install(rc, ready, *, crash_text=None, serial_present)
-    -> the FakeSSH, after writing/omitting a serial log so extract_crash() has a
-    real file (or not) to read on the crash path.
-    """
-    def install(rc, ready, *, crash_text=None, serial_present=True):
+    """Wire exec with serial bytes written before and during the SSH command."""
+    def install(
+        rc,
+        ready,
+        *,
+        initial_serial="boot ok\n",
+        serial_during_run="",
+        run_error=None,
+    ):
         serial = tmp_path / "crash-vm.serial.log"
-        if serial_present:
-            serial.write_text(crash_text or "boot ok\n")
+        serial.write_text(initial_serial)
         inst = _fake_instance(str(serial))
-        fake = FakeSSH(rc=rc, stdout="", stderr="", ready=ready)
+        fake = FakeSSH(
+            rc=rc,
+            stdout="",
+            stderr="",
+            ready=ready,
+            serial_path=serial,
+            serial_during_run=serial_during_run,
+            run_error=run_error,
+        )
         monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
         monkeypatch.setattr(guest, "_make_ssh", lambda i: fake)
+        monkeypatch.setattr(guest, "_preflight_ssh_guest", lambda *a, **kw: None)
+        monkeypatch.setattr(guest.time, "sleep", lambda _: None)
         return fake
 
     return install
@@ -112,30 +138,54 @@ PANIC_LOG = (
 )
 
 
-def test_rc255_ssh_down_is_crash_exit3_json(patch_exec, capsys):
-    """rc=255 AND is_ready()==False -> SSH-lost / probable crash -> exit 3.
-
-    Under --format json the result envelope must carry ssh_error=True and
-    crash_detected=True (a panic is present in the serial log)."""
-    fake = patch_exec(255, ready=False, crash_text=PANIC_LOG)
-
+def test_rc255_ssh_down_reports_crash_appended_during_command(patch_exec, capsys):
+    fake = patch_exec(
+        255,
+        ready=False,
+        initial_serial="old boot\n",
+        serial_during_run=PANIC_LOG,
+    )
     rc = cli.main(["--format", "json", "exec", "trigger"])
-
+    payload = json.loads(capsys.readouterr().out)
     assert rc == 3
-    # The liveness probe MUST have fired to disambiguate rc=255.
     assert fake.is_ready_calls >= 1
-    out = capsys.readouterr().out
-    payload = json.loads(out)
     assert payload["ssh_error"] is True
     assert payload["crash_detected"] is True
-    assert payload["crash"] is not None
     assert "panic" in payload["crash"].lower()
+
+
+def test_rc255_ssh_down_ignores_precommand_crash(patch_exec, capsys):
+    patch_exec(255, ready=False, initial_serial=PANIC_LOG, serial_during_run="")
+    rc = cli.main(["--format", "json", "exec", "trigger"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 3
+    assert payload["ok"] is False
+    assert payload["ssh_error"] is True
+    assert payload["crash_detected"] is False
+    assert payload["crash"] is None
+    assert "unreachable" in payload["hint"].lower()
+
+
+def test_exec_timeout_ignores_precommand_crash(patch_exec, capsys):
+    patch_exec(
+        255,
+        ready=False,
+        initial_serial=PANIC_LOG,
+        run_error=SSHError("command timed out"),
+    )
+    rc = cli.main(["--format", "json", "exec", "trigger"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 3
+    assert payload["ok"] is False
+    assert payload["ssh_error"] is True
+    assert payload["crash_detected"] is False
+    assert payload["crash"] is None
 
 
 def test_rc255_ssh_down_no_crash_in_log_still_exit3(patch_exec, capsys):
     """SSH lost but no panic markers in the log: still the crash/SSH-lost path
     (exit 3), but crash_detected=False so the agent knows to look elsewhere."""
-    fake = patch_exec(255, ready=False, crash_text="ordinary boot log, no panic\n")
+    fake = patch_exec(255, ready=False, initial_serial="ordinary boot log\n")
 
     rc = cli.main(["--format", "json", "exec", "trigger"])
 
@@ -153,7 +203,7 @@ def test_rc255_ssh_up_is_normal_nonzero_exit1(patch_exec, capsys):
     This is the NO-false-positive case: exit 1 (ordinary non-zero), NOT a crash.
     The JSON envelope must report ssh_error=False / crash_detected=False and
     surface the actual exit_code 255."""
-    fake = patch_exec(255, ready=True, crash_text=PANIC_LOG)
+    fake = patch_exec(255, ready=True, initial_serial=PANIC_LOG)
 
     rc = cli.main(["--format", "json", "exec", "exit 255"])
 
@@ -168,7 +218,12 @@ def test_rc255_ssh_up_is_normal_nonzero_exit1(patch_exec, capsys):
 
 def test_rc255_ssh_down_text_mode_reports_crash(patch_exec, capsys):
     """Text mode for the crash path: exit 3 and the crash report is rendered."""
-    patch_exec(255, ready=False, crash_text=PANIC_LOG)
+    patch_exec(
+        255,
+        ready=False,
+        initial_serial="old boot\n",
+        serial_during_run=PANIC_LOG,
+    )
 
     rc = cli.main(["exec", "trigger"])
 
@@ -176,3 +231,72 @@ def test_rc255_ssh_down_text_mode_reports_crash(patch_exec, capsys):
     out = capsys.readouterr().out
     assert "SSH connection lost" in out
     assert "panic" in out.lower()
+
+
+class FakeCompileSSH:
+    def __init__(self, serial_path, serial_during_run):
+        self._serial_path = serial_path
+        self._serial_during_run = serial_during_run
+        self._run_count = 0
+
+    def push(self, local, remote):
+        pass
+
+    def run(self, command, timeout=30.0, check=False):
+        self._run_count += 1
+        if self._run_count == 1:
+            return 0, "", ""
+        if self._serial_during_run:
+            with self._serial_path.open("a") as stream:
+                stream.write(self._serial_during_run)
+            self._serial_during_run = ""
+        return 255, "", ""
+
+    def is_ready(self, timeout=2):
+        return False
+
+
+def _run_compile_crash_case(
+    monkeypatch, tmp_path, capsys, *, initial_serial, serial_during_run
+):
+    source = tmp_path / "poc.c"
+    source.write_text("int main(void) { return 0; }\n")
+    serial = tmp_path / "compile.serial.log"
+    serial.write_text(initial_serial)
+    inst = _fake_instance(str(serial))
+    fake = FakeCompileSSH(serial, serial_during_run)
+    monkeypatch.setattr(guest, "_preflight_ssh_guest", lambda *a, **kw: None)
+    monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(guest, "_make_ssh", lambda selected: fake)
+    monkeypatch.setattr(guest.time, "sleep", lambda _: None)
+
+    rc = cli.main(["--format", "json", "compile", str(source), "--run"])
+    return rc, json.loads(capsys.readouterr().out)
+
+
+def test_compile_run_ignores_precommand_crash(monkeypatch, tmp_path, capsys):
+    rc, payload = _run_compile_crash_case(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        initial_serial=PANIC_LOG,
+        serial_during_run="",
+    )
+    assert rc == 3
+    assert payload["crash_detected"] is False
+    assert payload["crash"] is None
+
+
+def test_compile_run_reports_crash_appended_during_executable(
+    monkeypatch, tmp_path, capsys
+):
+    rc, payload = _run_compile_crash_case(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        initial_serial="old boot\n",
+        serial_during_run=PANIC_LOG,
+    )
+    assert rc == 3
+    assert payload["crash_detected"] is True
+    assert "panic" in payload["crash"].lower()

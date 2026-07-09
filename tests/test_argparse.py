@@ -65,6 +65,13 @@ def test_both_orders_resolve_identically(captured_exec_args):
     assert before == after == "X"
 
 
+def test_wait_help_names_qemu_process_exit(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["wait", "--help"])
+    assert exc.value.code == 0
+    assert "Block until the QEMU process exits" in capsys.readouterr().out
+
+
 class TestJoinExecCommand:
     """_join_exec_command turns `qmu exec` positionals into the guest command.
 
@@ -187,3 +194,33 @@ class TestPruneVmPlacement:
             capsys.readouterr().out
             == "No eligible qmu-owned runtime artifacts to prune.\n"
         )
+
+
+@pytest.fixture
+def captured_crash_args(monkeypatch):
+    captured = {}
+
+    def _capture(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(guest, "_handle_crash", _capture)
+    return captured
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [(["crash"], False), (["crash", "--full-history"], True)],
+)
+def test_crash_full_history_parser(argv, expected, captured_crash_args):
+    assert cli.main(argv) == 0
+    assert captured_crash_args["args"].full_history is expected
+
+
+def test_crash_full_history_help(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["crash", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--full-history" in help_text
+    assert "previous guest epochs" in help_text

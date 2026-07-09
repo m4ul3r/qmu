@@ -3,8 +3,10 @@
 Everything here talks to the guest over SSH (exec/compile/dmesg/push/pull) or
 reads the serial log (crash/log). Shared helpers come from :mod:`.._cliutil`.
 
-The patchable collaborators (``choose_instance``, ``_make_ssh``, ``_require_ssh``,
-``extract_crash``) are imported directly into this module's namespace, and
+The patchable collaborators (``choose_instance``, ``_make_ssh``,
+``_preflight_ssh_guest``, ``_require_ssh``, ``extract_crash``, and
+``serial_log_offset``) are imported
+directly into this module's namespace, and
 ``_add_exec`` binds the module-global ``_handle_exec``. The test suite drives the
 production seams with ``monkeypatch.setattr(guest, ...)`` (e.g.
 ``guest.choose_instance`` / ``guest._make_ssh`` / ``guest._handle_exec``); the
@@ -21,12 +23,13 @@ from pathlib import Path
 from typing import Any
 
 from ..instance import QMUError, VMInstance, choose_instance, find_instance
-from ..serial import extract_crash, tail_log
+from ..serial import extract_crash, serial_log_offset, tail_log
 from ..ssh import SSHClient, SSHError
 from .._cliutil import (
     _add_common_opts,
     _emit,
     _make_ssh,
+    _preflight_ssh_guest,
     _require_ssh,
 )
 
@@ -47,6 +50,8 @@ def _add_push(sub: argparse._SubParsersAction) -> None:
 def _handle_push(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
+    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="push")) is not None:
+        return preflight_rc
     ssh = _make_ssh(inst)
     ssh.push(args.local, args.remote)
     _emit(
@@ -69,6 +74,8 @@ def _add_pull(sub: argparse._SubParsersAction) -> None:
 def _handle_pull(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
+    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="pull")) is not None:
+        return preflight_rc
     ssh = _make_ssh(inst)
     ssh.pull(args.remote, args.local)
     _emit(
@@ -113,7 +120,13 @@ def _transport_lost(ssh: SSHClient) -> bool:
     return True
 
 
-def _emit_ssh_lost(args: argparse.Namespace, command: str, inst: VMInstance) -> int:
+def _emit_ssh_lost(
+    args: argparse.Namespace,
+    command: str,
+    inst: VMInstance,
+    *,
+    start_offset: int,
+) -> int:
     """Emit the SSH-lost / probable-crash envelope and return exit 3.
 
     Used for both an SSH timeout (TimeoutExpired -> SSHError) and a transport
@@ -121,7 +134,7 @@ def _emit_ssh_lost(args: argparse.Namespace, command: str, inst: VMInstance) -> 
     likely panicked and dropped the connection. Exit 3 distinguishes a
     crash/transport-loss from an ordinary non-zero guest command (exit 1).
     """
-    crash = extract_crash(inst.serial_log)
+    crash = extract_crash(inst.serial_log, start_offset=start_offset)
     # CORR-5: only assert a kernel crash when a crash report was actually
     # extracted; otherwise the connection merely dropped (VM unreachable) and we
     # must not send the agent chasing a phantom panic.
@@ -169,14 +182,19 @@ def _join_exec_command(command: list[str]) -> str:
 def _handle_exec(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
+    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="exec")) is not None:
+        return preflight_rc
     ssh = _make_ssh(inst)
     command = _join_exec_command(args.command)
 
+    command_start_offset = serial_log_offset(inst.serial_log)
     try:
         rc, stdout, stderr = ssh.run(command, timeout=args.timeout)
     except SSHError:
         # SSH command exceeded qmu's own timeout — likely a hung/crashed guest.
-        return _emit_ssh_lost(args, command, inst)
+        return _emit_ssh_lost(
+            args, command, inst, start_offset=command_start_offset
+        )
 
     # A kernel panic during the command drops the connection and ssh exits 255 —
     # often with EMPTY stderr (LogLevel=ERROR suppresses the keepalive message),
@@ -186,7 +204,9 @@ def _handle_exec(args: argparse.Namespace) -> int:
     # the guest vanished (crash); if it answers, the guest genuinely returned 255
     # and we take the normal path.
     if rc == 255 and _transport_lost(ssh):
-        return _emit_ssh_lost(args, command, inst)
+        return _emit_ssh_lost(
+            args, command, inst, start_offset=command_start_offset
+        )
 
     output_parts = []
     if stdout.strip():
@@ -232,6 +252,8 @@ def _add_compile(sub: argparse._SubParsersAction) -> None:
 def _handle_compile(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
+    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="compile")) is not None:
+        return preflight_rc
     ssh = _make_ssh(inst)
     source = Path(args.source)
 
@@ -288,6 +310,7 @@ def _handle_compile(args: argparse.Namespace) -> int:
         return 0
 
     # Run (quoted: the binary path is interpolated into a root shell command)
+    run_start_offset = serial_log_offset(inst.serial_log)
     try:
         rc, stdout, stderr = ssh.run(shlex.quote(remote_bin), timeout=args.timeout)
         # A kernel panic during the run drops the connection and ssh exits 255
@@ -314,7 +337,7 @@ def _handle_compile(args: argparse.Namespace) -> int:
         return 0 if rc == 0 else 1
 
     except SSHError:
-        crash = extract_crash(inst.serial_log)
+        crash = extract_crash(inst.serial_log, start_offset=run_start_offset)
         result.update({
             "ok": False,
             "ssh_error": True,
@@ -352,6 +375,8 @@ def _add_dmesg(sub: argparse._SubParsersAction) -> None:
 def _handle_dmesg(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
+    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="dmesg")) is not None:
+        return preflight_rc
     ssh = _make_ssh(inst)
     cmd = "dmesg"
     if args.tail is not None:
@@ -388,33 +413,48 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
 
 def _add_crash(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("crash", help="Extract crash from serial log")
+    p.add_argument(
+        "--full-history",
+        action="store_true",
+        help=(
+            "Search the entire retained serial log, including previous guest epochs"
+        ),
+    )
     _add_common_opts(p)
     p.set_defaults(handler=_handle_crash)
 
 
 def _handle_crash(args: argparse.Namespace) -> int:
     inst = find_instance(args.vm)
-    crash = extract_crash(inst.serial_log)
+    history = args.full_history
+    scope = "history" if history else "current"
+    start_offset = 0 if history else inst.guest_epoch_serial_offset
+    crash = extract_crash(inst.serial_log, start_offset=start_offset)
 
-    # L2: distinguish "serial log missing" from "log present but no crash match"
-    # so an agent can tell a dead/never-booted VM apart from a clean run.
     log_exists = Path(inst.serial_log).exists()
-    if crash is not None:
-        detected = True
-        reason = "crash report extracted from serial log"
+    scope_reason = "retained serial history" if history else "current guest epoch"
+    scope_text = (
+        "retained serial history (forensics; may predate current guest epoch)"
+        if history
+        else "current guest epoch"
+    )
+    detected = crash is not None
+    if detected:
+        reason = f"crash report extracted from {scope_reason}"
+        text = f"Crash detected in {scope_text}:\n{crash}"
     elif not log_exists:
-        detected = False
         reason = "serial log not found"
+        text = f"No crash detected in {scope_text}: {reason}."
     else:
-        detected = False
-        reason = "no crash markers found in serial log"
+        reason = f"no crash markers found in {scope_reason}"
+        text = f"No crash detected in {scope_text}: {reason}."
 
-    text = crash if crash is not None else f"No crash detected: {reason}."
     _emit(
         args,
         data={
             "ok": detected,
-            "detected": detected,
+            "crash_detected": detected,
+            "scope": scope,
             "reason": reason,
             "serial_log": inst.serial_log,
             "crash": crash,
@@ -422,8 +462,6 @@ def _handle_crash(args: argparse.Namespace) -> int:
         text=text,
         stem="crash",
     )
-
-    # L2: non-zero when no crash was found (either missing log or no match).
     return 0 if detected else 1
 
 
