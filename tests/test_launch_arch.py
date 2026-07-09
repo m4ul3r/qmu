@@ -12,13 +12,19 @@ class _ConnectedQMP:
     def __init__(self, socket_path):
         self.socket_path = socket_path
 
+    def connect(self):
+        return {"QMP": {}}
+
+    def close(self):
+        return None
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, traceback):
         return False
 
-    def execute(self, command):
+    def execute(self, command, **kwargs):
         return {"status": "running"}
 
 
@@ -40,7 +46,26 @@ def test_launch_persists_configured_guest_architecture(monkeypatch, tmp_path):
         qmp_socket = qmp_arg.removeprefix("unix:").split(",", 1)[0]
         Path(qmp_socket).touch()
         kwargs["stdout"].close()
-        return SimpleNamespace(pid=4242, poll=lambda: None)
+
+        class _FakeProc:
+            pid = 4242
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+        return _FakeProc()
 
     monkeypatch.setattr(vm.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(vm, "QMPClient", _ConnectedQMP)
