@@ -504,3 +504,8 @@ def test_tail_log_missing_file_returns_none(tmp_path):
     empty-tail case ("") never masks a missing file (None)."""
     assert tail_log(tmp_path / "does-not-exist.log") is None
     assert tail_log(tmp_path / "does-not-exist.log", lines=0) is None
+
+
+def test_tail_log_zero_byte_file_returns_empty_string(tmp_path):
+    log = _write(tmp_path, "empty-tail.serial.log", "")
+    assert tail_log(log, lines=50) == ""

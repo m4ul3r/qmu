@@ -567,11 +567,18 @@ def _add_log(sub: argparse._SubParsersAction) -> None:
 
 def _handle_log(args: argparse.Namespace) -> int:
     inst = find_instance(args.vm)
-    text = tail_log(inst.serial_log, lines=args.tail)
+    log = tail_log(inst.serial_log, lines=args.tail)
+    value = log or ""
+    available = bool(value)
     _emit(
         args,
-        data={"ok": text is not None, "text": text or ""},
-        text=text if text else "Serial log is empty or missing.",
+        data={
+            "ok": True,
+            "log": value,
+            "available": available,
+            "empty": not available,
+        },
+        text=value if value else "Serial log is empty or missing.",
         stem="log",
     )
     return 0
