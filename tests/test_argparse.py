@@ -65,6 +65,13 @@ def test_both_orders_resolve_identically(captured_exec_args):
     assert before == after == "X"
 
 
+def test_wait_help_names_qemu_process_exit(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["wait", "--help"])
+    assert exc.value.code == 0
+    assert "Block until the QEMU process exits" in capsys.readouterr().out
+
+
 class TestJoinExecCommand:
     """_join_exec_command turns `qmu exec` positionals into the guest command.
 

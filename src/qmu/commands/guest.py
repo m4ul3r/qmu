@@ -3,8 +3,9 @@
 Everything here talks to the guest over SSH (exec/compile/dmesg/push/pull) or
 reads the serial log (crash/log). Shared helpers come from :mod:`.._cliutil`.
 
-The patchable collaborators (``choose_instance``, ``_make_ssh``, ``_require_ssh``,
-``extract_crash``) are imported directly into this module's namespace, and
+The patchable collaborators (``choose_instance``, ``_make_ssh``,
+``_preflight_ssh_guest``, ``_require_ssh``, ``extract_crash``) are imported
+directly into this module's namespace, and
 ``_add_exec`` binds the module-global ``_handle_exec``. The test suite drives the
 production seams with ``monkeypatch.setattr(guest, ...)`` (e.g.
 ``guest.choose_instance`` / ``guest._make_ssh`` / ``guest._handle_exec``); the
@@ -27,6 +28,7 @@ from .._cliutil import (
     _add_common_opts,
     _emit,
     _make_ssh,
+    _preflight_ssh_guest,
     _require_ssh,
 )
 
@@ -47,6 +49,8 @@ def _add_push(sub: argparse._SubParsersAction) -> None:
 def _handle_push(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
+    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="push")) is not None:
+        return preflight_rc
     ssh = _make_ssh(inst)
     ssh.push(args.local, args.remote)
     _emit(
@@ -69,6 +73,8 @@ def _add_pull(sub: argparse._SubParsersAction) -> None:
 def _handle_pull(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
+    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="pull")) is not None:
+        return preflight_rc
     ssh = _make_ssh(inst)
     ssh.pull(args.remote, args.local)
     _emit(
@@ -169,6 +175,8 @@ def _join_exec_command(command: list[str]) -> str:
 def _handle_exec(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
+    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="exec")) is not None:
+        return preflight_rc
     ssh = _make_ssh(inst)
     command = _join_exec_command(args.command)
 
@@ -232,6 +240,8 @@ def _add_compile(sub: argparse._SubParsersAction) -> None:
 def _handle_compile(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
+    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="compile")) is not None:
+        return preflight_rc
     ssh = _make_ssh(inst)
     source = Path(args.source)
 
@@ -352,6 +362,8 @@ def _add_dmesg(sub: argparse._SubParsersAction) -> None:
 def _handle_dmesg(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
+    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="dmesg")) is not None:
+        return preflight_rc
     ssh = _make_ssh(inst)
     cmd = "dmesg"
     if args.tail is not None:

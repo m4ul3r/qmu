@@ -50,8 +50,11 @@ key requirements. SSH-using commands (`push`, `pull`, `exec`, `compile`,
 `dmesg`) error out with a clear message; serial-only commands (`log`, `crash`,
 `wait`, `qmp`, `monitor`, `kill`) work as usual.
 
-`qmu wait` blocks on QMP `STOP`/`SHUTDOWN`/`POWERDOWN` events, falling back to
-PID-liveness polling. Exit code `0` on clean stop, `124` on `--timeout`.
+`qmu wait` retains QMP `RESET`/`STOP`/`SHUTDOWN`/`POWERDOWN` events and
+non-running QEMU states as observations, but reports `stopped:true` and exits
+`0` only after the recorded QEMU process identity has exited. If `--timeout`
+elapses while that process is still alive, it exits `124` with
+`stopped:false` and preserves the latest QMP observation.
 
 ## Rootfs injection (no root needed)
 
