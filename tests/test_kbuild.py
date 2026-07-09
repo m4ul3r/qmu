@@ -289,3 +289,102 @@ def test_fresh_output_is_shell_evaluable_in_stable_order(kbuild_env):
     assert list(values) == [
         "KERNEL", "VMLINUX", "CONFIG", "KERNEL_SRC", "VMLINUX_GDB"
     ]
+
+
+def _with_hostile_cache(kbuild_env, tmp_path):
+    cache = tmp_path / "$(touch injected-cache) cache with spaces;dollar$HOME-glob*"
+    source = cache / "kernels/src/linux-7.0"
+    source.mkdir(parents=True)
+    (source / "Makefile").write_text("VERSION = 7\nPATCHLEVEL = 0\n")
+    (cache / "kernels/src/linux-7.0.tar.xz").write_bytes(b"")
+    env = kbuild_env.env.copy()
+    env["QMU_CACHE_DIR"] = str(cache)
+    return KbuildEnv(cache, env, kbuild_env.docker_log)
+
+
+def _evaluate_build_output(stdout, cwd):
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'set -u; eval "$1"; printf "%s\\n" '
+            '"$KERNEL" "$VMLINUX" "$CONFIG" "$KERNEL_SRC" "$VMLINUX_GDB"',
+            "bash",
+            stdout,
+        ],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _evaluate_config_output(stdout, cwd):
+    return subprocess.run(
+        ["bash", "-c", 'set -u; eval "$1"; printf "%s\\n" "$CONFIG"', "bash", stdout],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_fresh_output_shell_quotes_literal_hostile_paths(kbuild_env, tmp_path):
+    hostile = _with_hostile_cache(kbuild_env, tmp_path)
+    output = tmp_path / "$(touch injected-out) output with spaces;dollar$HOME-glob*"
+
+    result = hostile.run("--outdir", str(output))
+    evaluated = _evaluate_build_output(result.stdout, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert not (tmp_path / "injected-out").exists()
+    assert not (tmp_path / "injected-cache").exists()
+    assert evaluated.returncode == 0, evaluated.stderr
+    assert evaluated.stdout.splitlines() == [
+        str(output / "bzImage"),
+        str(output / "vmlinux"),
+        str(output / ".config"),
+        str(hostile.cache / "kernels/src/linux-7.0"),
+        str(output / "vmlinux-gdb.py"),
+    ]
+
+
+def test_cached_output_shell_quotes_literal_hostile_paths(kbuild_env, tmp_path):
+    hostile = _with_hostile_cache(kbuild_env, tmp_path)
+    output = tmp_path / "$(touch injected-out) output with spaces;dollar$HOME-glob*"
+    fresh = hostile.run("--outdir", str(output))
+    assert fresh.returncode == 0, fresh.stderr
+    hostile.clear_docker_log()
+
+    cached = hostile.run(
+        "--outdir", str(output), fail_if_docker_runs=True
+    )
+    evaluated = _evaluate_build_output(cached.stdout, tmp_path)
+
+    assert cached.returncode == 0, cached.stderr
+    assert hostile.docker_runs() == []
+    assert cached.stdout == fresh.stdout
+    assert not (tmp_path / "injected-out").exists()
+    assert not (tmp_path / "injected-cache").exists()
+    assert evaluated.returncode == 0, evaluated.stderr
+    assert evaluated.stdout.splitlines() == [
+        str(output / "bzImage"),
+        str(output / "vmlinux"),
+        str(output / ".config"),
+        str(hostile.cache / "kernels/src/linux-7.0"),
+        str(output / "vmlinux-gdb.py"),
+    ]
+
+
+def test_config_only_output_shell_quotes_literal_hostile_cache_path(
+    kbuild_env, tmp_path
+):
+    hostile = _with_hostile_cache(kbuild_env, tmp_path)
+
+    result = hostile.run("--config-only")
+    evaluated = _evaluate_config_output(result.stdout, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert not (tmp_path / "injected-cache").exists()
+    assert evaluated.returncode == 0, evaluated.stderr
+    assert evaluated.stdout == str(hostile.cache / "kernels/7.0/x86_64/.config") + "\n"
