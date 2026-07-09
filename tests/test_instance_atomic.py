@@ -66,6 +66,32 @@ def test_save_guest_epoch_offset_returns_new_persisted_record():
     assert load_instance("vm-10022") == updated
 
 
+@pytest.mark.parametrize(
+    ("offset", "expected_error"),
+    (
+        pytest.param(-1, ValueError, id="negative"),
+        pytest.param(True, TypeError, id="bool"),
+        pytest.param(1.5, TypeError, id="float"),
+        pytest.param("99", TypeError, id="string"),
+        pytest.param(None, TypeError, id="none"),
+    ),
+)
+def test_save_guest_epoch_offset_rejects_invalid_without_persisting(
+    offset, expected_error
+):
+    original = _make("vm-10022", guest_epoch_serial_offset=7)
+    record = save_instance(original)
+    original_json = record.read_bytes()
+
+    with pytest.raises(expected_error):
+        save_guest_epoch_serial_offset(original, offset)
+
+    assert original.guest_epoch_serial_offset == 7
+    assert record.read_bytes() == original_json
+    assert load_instance("vm-10022") == original
+    assert list(instances_dir().glob("*.tmp")) == []
+
+
 def test_failed_epoch_replace_preserves_old_record_and_caller(monkeypatch):
     original = _make("vm-10022", guest_epoch_serial_offset=7)
     save_instance(original)
