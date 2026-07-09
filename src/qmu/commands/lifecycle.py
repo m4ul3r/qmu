@@ -4,7 +4,8 @@ These manage the QEMU process and its instance metadata. Shared helpers come
 from :mod:`.._cliutil`.
 
 The patchable collaborators (``choose_instance``, ``_qmp_ctx``,
-``instance_alive``, ``extract_crash``) are imported directly into this module's
+``instance_alive``, ``extract_crash``, ``serial_log_offset``, and
+``save_guest_epoch_serial_offset``) are imported directly into this module's
 namespace. The test suite drives the production seams via
 ``monkeypatch.setattr(lifecycle, ...)`` (e.g. ``lifecycle.choose_instance`` /
 ``lifecycle._qmp_ctx`` / ``lifecycle.instance_alive``); the patches take effect
@@ -30,6 +31,7 @@ from ..instance import (
     list_stopped_instances,
     load_instance,
     remove_instance,
+    save_guest_epoch_serial_offset,
 )
 from ..paths import (
     all_skill_source_dirs,
@@ -38,7 +40,7 @@ from ..paths import (
     codex_skills_dir,
 )
 from ..qmp import QMPError
-from ..serial import extract_crash
+from ..serial import extract_crash, serial_log_offset
 from ..vm import launch_vm
 from .._cliutil import (
     _add_common_opts,
@@ -306,6 +308,7 @@ def _handle_wait(args: argparse.Namespace) -> int:
     last_event: str | None = None
     event_data: Any = None
     stopped = False
+    reset_persistence_in_progress = False
 
     try:
         with _qmp_ctx(inst) as qmp:
@@ -345,10 +348,17 @@ def _handle_wait(args: argparse.Namespace) -> int:
                         else "unknown"
                     )
                     event_data = event.get("data")
+                    if last_event == "RESET":
+                        reset_persistence_in_progress = True
+                        reset_offset = serial_log_offset(inst.serial_log)
+                        inst = save_guest_epoch_serial_offset(inst, reset_offset)
+                        reset_persistence_in_progress = False
                     # Continue immediately so identity is checked after every
                     # observation; an event alone is never terminal.
                     continue
     except (QMPError, OSError) as exc:
+        if reset_persistence_in_progress:
+            raise
         if not instance_alive(inst):
             stopped = True
             reason = "process_exited"
@@ -356,7 +366,15 @@ def _handle_wait(args: argparse.Namespace) -> int:
             raise QMUError(f"QMP error during wait: {exc}") from exc
 
     elapsed = time.monotonic() - start
-    crash = extract_crash(inst.serial_log) if stopped else None
+    crash = None
+    if stopped:
+        if inst.guest_epoch_serial_offset == 0:
+            crash = extract_crash(inst.serial_log)
+        else:
+            crash = extract_crash(
+                inst.serial_log,
+                start_offset=inst.guest_epoch_serial_offset,
+            )
 
     result = {
         "ok": stopped,
