@@ -225,9 +225,9 @@ def _emit_ssh_lost(
     else:
         hint = (
             "SSH connection lost; VM may be unreachable. "
-            "No crash report in serial log. Check: qmu log --tail 100"
+            "No fresh crash report in serial log. Check: qmu log --tail 100"
         )
-        text_msg = "\nNo crash detected in serial log. Check: qmu log --tail 100"
+        text_msg = "\nNo fresh crash detected in serial log. Check: qmu log --tail 100"
     result = {
         "ok": False,
         "ssh_error": True,
@@ -286,6 +286,9 @@ def _handle_exec(args: argparse.Namespace) -> int:
             args, command, inst, start_offset=command_start_offset
         )
 
+    kernel_warning = extract_crash(
+        inst.serial_log, start_offset=command_start_offset
+    )
     output_parts = []
     if stdout.strip():
         output_parts.append(stdout.rstrip())
@@ -293,6 +296,11 @@ def _handle_exec(args: argparse.Namespace) -> int:
         output_parts.append(f"[stderr] {stderr.rstrip()}")
     if rc != 0:
         output_parts.append(f"[exit code: {rc}]")
+    if kernel_warning is not None:
+        output_parts.append(
+            "Kernel warning from command serial output:\n"
+            + kernel_warning.rstrip()
+        )
     text = "\n".join(output_parts) if output_parts else f"[exit code: {rc}]"
     # L1: always include ssh_error/crash_detected so consumers have a stable,
     # explicit contract (not an implicit "key omitted on success").
@@ -305,6 +313,8 @@ def _handle_exec(args: argparse.Namespace) -> int:
             "stderr": stderr,
             "ssh_error": False,
             "crash_detected": False,
+            "kernel_warning_detected": kernel_warning is not None,
+            "kernel_warning": kernel_warning,
         },
         text=text,
         stem="exec",
