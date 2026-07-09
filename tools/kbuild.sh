@@ -62,11 +62,12 @@ Environment:
   QMU_CACHE_DIR          Override ~/.cache/qmu
   QMU_KBUILD_MIRROR      Kernel mirror (default: cdn.kernel.org)
 
-Output (eval-able):
+Output (eval-able; --config-only outputs only CONFIG and does not generate debugger helpers):
   KERNEL=/path/to/bzImage
   VMLINUX=/path/to/vmlinux
   CONFIG=/path/to/.config
-
+  KERNEL_SRC=/path/to/linux-source
+  VMLINUX_GDB=/path/to/vmlinux-gdb.py
 Example:
   eval $(tools/kbuild.sh --version 6.6.75 --arch arm64)
   qmu launch --kernel "$KERNEL"
@@ -203,21 +204,56 @@ else
   OUTDIR="$CACHE/kernels/$VERSION/$ARCH"
 fi
 
-# idempotency check
-if [[ "$NO_CACHE" == false && -f "$OUTDIR/$IMAGE_NAME" ]]; then
-  log "cached build found at $OUTDIR/$IMAGE_NAME"
+SRCDIR="$CACHE/kernels/src/linux-$VERSION"
+
+emit_config_output() {
+  echo "CONFIG=$OUTDIR/.config"
+}
+
+emit_build_outputs() {
   echo "KERNEL=$OUTDIR/$IMAGE_NAME"
-  [[ -f "$OUTDIR/vmlinux" ]] && echo "VMLINUX=$OUTDIR/vmlinux"
-  [[ -f "$OUTDIR/.config" ]] && echo "CONFIG=$OUTDIR/.config"
-  exit 0
+  echo "VMLINUX=$OUTDIR/vmlinux"
+  echo "CONFIG=$OUTDIR/.config"
+  echo "KERNEL_SRC=$SRCDIR"
+  echo "VMLINUX_GDB=$OUTDIR/vmlinux-gdb.py"
+}
+
+config_cache_complete() {
+  [[ -f "$OUTDIR/.config" ]]
+}
+
+build_cache_complete() {
+  [[ -f "$OUTDIR/$IMAGE_NAME" ]] &&
+  [[ -f "$OUTDIR/vmlinux" ]] &&
+  [[ -f "$OUTDIR/.config" ]] &&
+  [[ -f "$SRCDIR/Makefile" ]] &&
+  [[ -f "$OUTDIR/vmlinux-gdb.py" ]] &&
+  [[ -f "$OUTDIR/scripts/gdb/vmlinux-gdb.py" ]] &&
+  [[ -f "$OUTDIR/scripts/gdb/linux/constants.py" ]]
+}
+
+if [[ "$NO_CACHE" == false ]]; then
+  if [[ "$CONFIG_ONLY" == true ]] && config_cache_complete; then
+    log "cached config found at $OUTDIR/.config"
+    emit_config_output
+    exit 0
+  fi
+  if [[ "$CONFIG_ONLY" == false ]] && build_cache_complete; then
+    log "cached build found at $OUTDIR/$IMAGE_NAME"
+    emit_build_outputs
+    exit 0
+  fi
+  if [[ "$CONFIG_ONLY" == false && -e "$OUTDIR/$IMAGE_NAME" ]]; then
+    log "cached build is incomplete; rebuilding debugger artifacts"
+  fi
 fi
+
 
 mkdir -p "$OUTDIR"
 
 # ---------------------------------------------------------------------------
 # kernel source
 # ---------------------------------------------------------------------------
-SRCDIR="$CACHE/kernels/src/linux-$VERSION"
 
 if [[ ! -f "$SRCDIR/Makefile" ]]; then
   TARBALL="$CACHE/kernels/src/linux-$VERSION.tar.xz"
@@ -300,6 +336,11 @@ if [[ "$VERBOSE" == false ]]; then
   MAKE_VERBOSE="-s"
 fi
 
+GDB_TARGET=""
+if [[ "$CONFIG_ONLY" == false ]]; then
+  GDB_TARGET="scripts_gdb"
+fi
+
 docker run --rm \
   --user "$(id -u):$(id -g)" \
   -e HOME=/tmp \
@@ -319,6 +360,7 @@ docker run --rm \
     MINOR='$MINOR'
     ARCH_ARG='$ARCH'
     CONFIG_ONLY='$CONFIG_ONLY'
+    GDB_TARGET='$GDB_TARGET'
     MAKE_VERBOSE='$MAKE_VERBOSE'
 
     version_ge() {
@@ -412,12 +454,21 @@ docker run --rm \
     fi
 
     # build
-    make ARCH=\$MAKE_ARCH CROSS_COMPILE=\$CROSS_COMPILE \$MAKE_VERBOSE -j\"\$JOBS\" \$MAKE_TARGET 2>&1 | tee /output/build.log >&2
+    make ARCH=\$MAKE_ARCH CROSS_COMPILE=\$CROSS_COMPILE \
+      \$MAKE_VERBOSE -j"\$JOBS" \$MAKE_TARGET \
+      2>&1 | tee /output/build.log >&2
+    make ARCH=\$MAKE_ARCH CROSS_COMPILE=\$CROSS_COMPILE \
+      \$MAKE_VERBOSE \$GDB_TARGET \
+      2>&1 | tee -a /output/build.log >&2
 
-    # copy artifacts
-    cp \"\$IMAGE_SUBPATH\" /output/
-    cp vmlinux /output/ 2>/dev/null || true
+    # copy artifacts and preserve the upstream relative GDB-loader layout
+    cp "\$IMAGE_SUBPATH" /output/
+    cp vmlinux /output/vmlinux
     cp .config /output/.config
+    rm -rf /output/scripts/gdb /output/vmlinux-gdb.py
+    mkdir -p /output/scripts
+    cp -a scripts/gdb /output/scripts/gdb
+    cp -a vmlinux-gdb.py /output/vmlinux-gdb.py
   "
 
 RC=$?
@@ -430,14 +481,24 @@ fi
 # output
 # ---------------------------------------------------------------------------
 if [[ "$CONFIG_ONLY" == true ]]; then
-  echo "CONFIG=$OUTDIR/.config"
+  config_cache_complete || die "build appeared to succeed but $OUTDIR/.config not found"
+  emit_config_output
 else
-  if [[ -f "$OUTDIR/$IMAGE_NAME" ]]; then
-    step "Build complete: $OUTDIR/$IMAGE_NAME"
-    echo "KERNEL=$OUTDIR/$IMAGE_NAME"
-    [[ -f "$OUTDIR/vmlinux" ]] && echo "VMLINUX=$OUTDIR/vmlinux"
-    echo "CONFIG=$OUTDIR/.config"
-  else
-    die "build appeared to succeed but $OUTDIR/$IMAGE_NAME not found"
+  if ! build_cache_complete; then
+    required_products=(
+      "$OUTDIR/$IMAGE_NAME"
+      "$OUTDIR/vmlinux"
+      "$OUTDIR/.config"
+      "$SRCDIR/Makefile"
+      "$OUTDIR/vmlinux-gdb.py"
+      "$OUTDIR/scripts/gdb/vmlinux-gdb.py"
+      "$OUTDIR/scripts/gdb/linux/constants.py"
+    )
+    for product in "${required_products[@]}"; do
+      [[ -f "$product" ]] || die "build appeared to succeed but required product not found: $product"
+    done
+    die "build appeared to succeed but required products are incomplete"
   fi
+  step "Build complete: $OUTDIR/$IMAGE_NAME"
+  emit_build_outputs
 fi
