@@ -130,7 +130,7 @@ def test_wait_timeout_is_exit_124(monkeypatch, tmp_path, capsys):
 
     Driven without a VM: choose_instance returns a fake still-alive instance, the
     QMP context is stubbed so query-status reports 'running' and wait_event never
-    fires, and is_pid_alive stays True so the loop runs to the deadline."""
+    fires, and instance_alive stays True so the loop runs to the deadline."""
     from qmu.instance import VMInstance
 
     inst = VMInstance(
@@ -168,7 +168,13 @@ def test_wait_timeout_is_exit_124(monkeypatch, tmp_path, capsys):
 
     monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
     monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda i: FakeQMP())
-    monkeypatch.setattr(lifecycle, "is_pid_alive", lambda pid: True)
+    monkeypatch.setattr(lifecycle, "instance_alive", lambda selected: True)
 
-    rc = cli.main(["wait", "--timeout", "0.05"])
+    rc = cli.main(["wait", "--timeout", "0.05", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
     assert rc == 124
+    assert payload["ok"] is False
+    assert payload["stopped"] is False
+    assert payload["reason"] == "timeout"
+    assert payload["crash"] is None
+    assert payload["cleaned"] is False
