@@ -18,6 +18,14 @@ NEW_CRASH = (
     "[ 2.2] ---[ end Kernel panic - not syncing: new_bug panic ]---\n"
 )
 CLEAN_RESTORED_OUTPUT = "[ 2.0] restored guest booted cleanly\n"
+RESUMED_WARNING_THEN_SYSRQ = (
+    "[ 1.0] WARNING: CPU: old_warning at old_root_cause\n"
+    "[ 1.1] old warning body\n"
+    "[ 1.2] ---[ end trace 111 ]---\n"
+    "[ 1.3] service resumed normally\n"
+    "[ 2.0] sysrq: Trigger a crash\n"
+    "[ 2.1] Kernel panic - not syncing: sysrq triggered crash\n"
+)
 EXPECTED_KEYS = {
     "ok",
     "crash_detected",
@@ -169,3 +177,28 @@ def test_crash_ndjson_is_one_scope_aware_object(monkeypatch, tmp_path, capsys):
     assert payload["ok"] is True
     assert payload["crash_detected"] is True
     assert "old_bug" in payload["crash"]
+
+
+def test_crash_current_excludes_resumed_warning_before_sysrq_panic(
+    monkeypatch, tmp_path, capsys
+):
+    log = tmp_path / "crash-vm.serial.log"
+    log.write_text(RESUMED_WARNING_THEN_SYSRQ)
+    inst = _instance(str(log), boundary=0)
+
+    def find_instance(vm):
+        assert vm == "crash-vm"
+        return inst
+
+    monkeypatch.setattr(guest, "find_instance", find_instance)
+
+    rc = cli.main(["crash", "--vm", "crash-vm", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["scope"] == "current"
+    assert payload["crash_detected"] is True
+    assert "Kernel panic - not syncing: sysrq triggered crash" in payload["crash"]
+    assert "old_warning" not in payload["crash"]
+    assert "old_root_cause" not in payload["crash"]
+    assert "end trace 111" not in payload["crash"]

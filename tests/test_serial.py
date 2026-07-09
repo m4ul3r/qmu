@@ -325,6 +325,28 @@ def test_extract_crash_does_not_bridge_close_independent_events(tmp_path):
     assert "end trace 111" not in report
 
 
+def test_extract_crash_sysrq_panic_does_not_bridge_resumed_warning(tmp_path):
+    log = _write(
+        tmp_path,
+        "resumed-sysrq.serial.log",
+        "[ 1.0] WARNING: CPU: old_warning at old_root_cause\n"
+        "[ 1.1] old warning body\n"
+        "[ 1.2] ---[ end trace 111 ]---\n"
+        "[ 1.3] service resumed normally\n"
+        "[ 2.0] sysrq: Trigger a crash\n"
+        "[ 2.1] Kernel panic - not syncing: sysrq triggered crash\n",
+    )
+
+    report = extract_crash(log)
+
+    assert report is not None
+    assert "Kernel panic - not syncing: sysrq triggered crash" in report
+    assert "old_warning" not in report
+    assert "old_root_cause" not in report
+    assert "end trace 111" not in report
+
+
+
 def test_extract_crash_final_panic_banner_is_hard_boundary(tmp_path):
     log = _write(
         tmp_path,
