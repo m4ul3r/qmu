@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 import json
 import math
@@ -237,6 +238,7 @@ def _valid_spill_marker(
     expected_name = marker.name[:-len(SPILL_MARKER_SUFFIX)]
     if (
         not isinstance(artifact_name, str)
+        or not artifact_name
         or artifact_name != Path(artifact_name).name
         or artifact_name != expected_name
     ):
@@ -279,7 +281,17 @@ def _artifact_matches_marker(
 
 
 def _remove_empty_owned_date_directory(parent: Path, root: Path) -> None:
-    if parent.parent != root or len(parent.name) != 8 or not parent.name.isdigit():
+    name = parent.name
+    if (
+        parent.parent != root
+        or len(name) != 8
+        or not name.isascii()
+        or not name.isdigit()
+    ):
+        return
+    try:
+        datetime.strptime(name, "%Y%m%d")
+    except ValueError:
         return
     try:
         parent.rmdir()
