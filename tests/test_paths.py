@@ -75,7 +75,8 @@ def test_runtime_children_derive_from_override_and_are_private(tmp_path, monkeyp
 
 
 def test_control_path_expansion_stays_inside_portable_budget(tmp_path, monkeypatch):
-    monkeypatch.setenv("QMU_TEMP_DIR", str(tmp_path / "r"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QMU_TEMP_DIR", "r")
     path = ssh_control_path()
     assert path is not None
     expanded = os.fsencode(str(path).replace("%C", "0" * 40))
