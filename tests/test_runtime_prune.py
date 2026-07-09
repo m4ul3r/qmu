@@ -171,14 +171,15 @@ def test_prune_runtime_does_not_follow_artifact_or_marker_symlink(tmp_path):
 def test_prune_runtime_preserves_modified_or_replaced_spill(replacement):
     artifact = _marked_spill("replaced.txt", created_at=1.0)
     marker = spill_marker_path(artifact)
+    replacement_text = f"user {replacement} with different size"
     if replacement == "replace":
         artifact.unlink()
-    artifact.write_text(f"user {replacement}")
+    artifact.write_text(replacement_text)
 
     result = prune_runtime_artifacts(older_than_seconds=0.0, now=1000.0)
 
     assert result.removed == ()
-    assert artifact.read_text() == f"user {replacement}"
+    assert artifact.read_text() == replacement_text
     assert marker.exists()
 
 

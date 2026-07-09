@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from qmu import ssh
 
 
@@ -20,8 +22,9 @@ def _options(command: list[str]) -> set[str]:
 
 
 def test_control_opts_uses_current_runtime_override(tmp_path, monkeypatch):
-    first = tmp_path / "a"
-    second = tmp_path / "b"
+    monkeypatch.chdir(tmp_path)
+    first = Path("a")
+    second = Path("b")
     monkeypatch.setenv("QMU_TEMP_DIR", str(first))
     first_path = _control_path(ssh._control_opts())
     monkeypatch.setenv("QMU_TEMP_DIR", str(second))
@@ -46,7 +49,8 @@ def test_control_directory_creation_failure_disables_multiplexing(monkeypatch):
 def test_ssh_and_scp_builders_share_current_bounded_control_options(
     tmp_path, monkeypatch
 ):
-    runtime = tmp_path / "runtime"
+    monkeypatch.chdir(tmp_path)
+    runtime = Path("runtime")
     monkeypatch.setenv("QMU_TEMP_DIR", str(runtime))
     client = ssh.SSHClient(port=2222, key_path="test-key")
     expected = {
