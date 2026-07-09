@@ -100,6 +100,19 @@ def test_launch_arch_and_backend_overrides_reach_launch_vm(monkeypatch):
     assert captured["net_backend"] == "passt"
 
 
+def test_launch_help_describes_passt_as_conditional_migration_backend(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["launch", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "migration-compatible" in help_text
+    assert "selected QEMU" in help_text
+    assert "advertises" in help_text
+    assert "snapshots work" not in help_text
+    assert "10.1+" not in help_text
+    assert "QEMU 9" not in help_text
+
+
 class TestJoinExecCommand:
     """_join_exec_command turns `qmu exec` positionals into the guest command.
 
