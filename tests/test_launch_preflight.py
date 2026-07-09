@@ -58,7 +58,8 @@ def test_unsupported_native_passt_fails_before_spawn_or_artifacts(monkeypatch, t
     cfg, kernel = _launch_fixture(tmp_path)
     probe = Mock(return_value=_caps("qemu-system-x86_64", passt=False))
     monkeypatch.setattr(vm, "probe_qemu_netdevs", probe, raising=False)
-    monkeypatch.setattr(vm.shutil, "which", lambda name: "/usr/bin/passt")
+    passt_lookup = Mock(return_value="/usr/bin/passt")
+    monkeypatch.setattr(vm.shutil, "which", passt_lookup)
     port_allocator, popen = _watch_launch_side_effects(monkeypatch)
 
     with pytest.raises(QMUError, match="does not advertise.*-netdev passt") as exc:
@@ -67,6 +68,7 @@ def test_unsupported_native_passt_fails_before_spawn_or_artifacts(monkeypatch, t
     assert "QEMU 10.1" in str(exc.value)
     assert "build-optional" in str(exc.value)
     probe.assert_called_once_with("qemu-system-x86_64")
+    passt_lookup.assert_not_called()
     _assert_no_launch_side_effects(port_allocator, popen)
 
 
@@ -81,13 +83,15 @@ def test_missing_selected_qemu_fails_without_probe_subprocess_or_spawn(monkeypat
         )
     )
     monkeypatch.setattr(vm, "probe_qemu_netdevs", probe, raising=False)
-    monkeypatch.setattr(vm.shutil, "which", lambda name: "/usr/bin/passt")
+    passt_lookup = Mock(return_value="/usr/bin/passt")
+    monkeypatch.setattr(vm.shutil, "which", passt_lookup)
     port_allocator, popen = _watch_launch_side_effects(monkeypatch)
 
     with pytest.raises(QMUError, match="qemu-system-aarch64.*not found in PATH"):
         vm.launch_vm(config=cfg, kernel=str(kernel), name="missing")
 
     probe.assert_called_once_with("qemu-system-aarch64")
+    passt_lookup.assert_not_called()
     _assert_no_launch_side_effects(port_allocator, popen)
 
 
@@ -95,13 +99,15 @@ def test_native_capability_failure_precedes_missing_external_passt(monkeypatch, 
     cfg, kernel = _launch_fixture(tmp_path)
     probe = Mock(return_value=_caps("qemu-system-x86_64", passt=False))
     monkeypatch.setattr(vm, "probe_qemu_netdevs", probe, raising=False)
-    monkeypatch.setattr(vm.shutil, "which", lambda name: None)
+    passt_lookup = Mock(return_value=None)
+    monkeypatch.setattr(vm.shutil, "which", passt_lookup)
     port_allocator, popen = _watch_launch_side_effects(monkeypatch)
 
     with pytest.raises(QMUError, match="does not advertise"):
         vm.launch_vm(config=cfg, kernel=str(kernel))
 
     probe.assert_called_once_with("qemu-system-x86_64")
+    passt_lookup.assert_not_called()
     _assert_no_launch_side_effects(port_allocator, popen)
 
 
@@ -109,13 +115,15 @@ def test_supported_native_passt_still_requires_external_passt(monkeypatch, tmp_p
     cfg, kernel = _launch_fixture(tmp_path)
     probe = Mock(return_value=_caps("qemu-system-x86_64"))
     monkeypatch.setattr(vm, "probe_qemu_netdevs", probe, raising=False)
-    monkeypatch.setattr(vm.shutil, "which", lambda name: None)
+    passt_lookup = Mock(return_value=None)
+    monkeypatch.setattr(vm.shutil, "which", passt_lookup)
     port_allocator, popen = _watch_launch_side_effects(monkeypatch)
 
     with pytest.raises(QMUError, match="requires the 'passt' binary on PATH"):
         vm.launch_vm(config=cfg, kernel=str(kernel))
 
     probe.assert_called_once_with("qemu-system-x86_64")
+    passt_lookup.assert_called_once_with("passt")
     _assert_no_launch_side_effects(port_allocator, popen)
 
 
@@ -190,17 +198,37 @@ def test_passt_override_probes_and_checks_external_passt(monkeypatch):
     passt_lookup.assert_called_once_with("passt")
 
 
-def test_launch_uses_probed_resolved_qemu_for_spawn(monkeypatch, tmp_path):
+def test_launch_probes_once_and_reuses_resolved_qemu_across_port_retry(
+    monkeypatch, tmp_path
+):
     cfg, kernel = _launch_fixture(tmp_path)
     resolved = "/opt/qemu/bin/qemu-system-x86_64"
     probe = Mock(return_value=_caps("qemu-system-x86_64"))
+    passt_lookup = Mock(return_value="/usr/bin/passt")
+    port_allocator = Mock(side_effect=[10022, 10023])
+    commands = []
+    process_specs = iter([
+        (4242, "Address already in use"),
+        (4243, "intentional test stop"),
+    ])
+
+    def fake_popen(cmd, *, stdout, **kwargs):
+        pid, output = next(process_specs)
+        stdout.write(output)
+        stdout.flush()
+        proc = Mock(pid=pid, returncode=1)
+        proc.poll.return_value = 1
+        commands.append(cmd)
+        return proc
+
     monkeypatch.setattr(vm, "probe_qemu_netdevs", probe, raising=False)
-    monkeypatch.setattr(vm.shutil, "which", lambda name: "/usr/bin/passt")
-    popen = _exited_popen()
-    monkeypatch.setattr(vm.subprocess, "Popen", popen)
+    monkeypatch.setattr(vm.shutil, "which", passt_lookup)
+    monkeypatch.setattr(vm, "find_free_port", port_allocator)
+    monkeypatch.setattr(vm.subprocess, "Popen", fake_popen)
 
     with pytest.raises(QMUError, match="QEMU exited immediately"):
         vm.launch_vm(config=cfg, kernel=str(kernel), name="resolved-binary")
 
     probe.assert_called_once_with("qemu-system-x86_64")
-    assert popen.call_args.args[0][0] == resolved
+    passt_lookup.assert_called_once_with("passt")
+    assert [cmd[0] for cmd in commands] == [resolved, resolved]
