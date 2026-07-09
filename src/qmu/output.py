@@ -69,6 +69,14 @@ def _estimate_tokens(rendered: str) -> int:
     return math.ceil(len(rendered) / _CHARS_PER_TOKEN)
 
 
+def _source_ok(value: Any, explicit: bool | None) -> bool:
+    if explicit is not None:
+        return explicit
+    if isinstance(value, dict) and isinstance(value.get("ok"), bool):
+        return value["ok"]
+    return True
+
+
 def _artifact_payload(
     *,
     artifact_path: Path,
@@ -76,9 +84,10 @@ def _artifact_payload(
     encoded: bytes,
     token_estimate: int,
     value: Any,
+    source_ok: bool,
 ) -> dict[str, Any]:
     return {
-        "ok": True,
+        "ok": source_ok,
         "artifact_path": str(artifact_path),
         "format": fmt,
         "bytes": len(encoded),
@@ -89,8 +98,8 @@ def _artifact_payload(
     }
 
 
-def _artifact_envelope(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+def _artifact_envelope(payload: dict[str, Any], fmt: str) -> str:
+    return render_value(payload, "ndjson" if fmt == "ndjson" else "json")
 
 
 def write_output_result(
@@ -99,11 +108,13 @@ def write_output_result(
     fmt: str,
     out_path: Path | None,
     stem: str,
+    source_ok: bool | None = None,
     spill_token_limit: int = DEFAULT_SPILL_TOKEN_LIMIT,
 ) -> OutputWriteResult:
     rendered = render_value(value, fmt)
     encoded = rendered.encode("utf-8")
     token_estimate = _estimate_tokens(rendered)
+    artifact_ok = _source_ok(value, source_ok)
 
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,9 +125,10 @@ def write_output_result(
             encoded=encoded,
             token_estimate=token_estimate,
             value=value,
+            source_ok=artifact_ok,
         )
         return OutputWriteResult(
-            rendered=_artifact_envelope(artifact),
+            rendered=_artifact_envelope(artifact, fmt),
             artifact=artifact,
             spilled=False,
         )
@@ -133,9 +145,10 @@ def write_output_result(
         encoded=encoded,
         token_estimate=token_estimate,
         value=value,
+        source_ok=artifact_ok,
     )
     return OutputWriteResult(
-        rendered=_artifact_envelope(artifact),
+        rendered=_artifact_envelope(artifact, fmt),
         artifact=artifact,
         spilled=True,
     )

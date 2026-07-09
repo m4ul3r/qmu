@@ -12,7 +12,6 @@ modules import their shared helpers from here verbatim.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import signal
 import sys
@@ -75,12 +74,24 @@ def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
     )
 
 
-def _output(value: Any, args: argparse.Namespace, stem: str = "qmu") -> None:
+def _output(
+    value: Any,
+    args: argparse.Namespace,
+    stem: str = "qmu",
+    *,
+    source_ok: bool | None = None,
+) -> None:
     """Render output with optional spilling."""
     fmt = getattr(args, "format", "text")
     out = getattr(args, "out", None)
     out_path = Path(out) if out else None
-    result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem)
+    result = write_output_result(
+        value,
+        fmt=fmt,
+        out_path=out_path,
+        stem=stem,
+        source_ok=source_ok,
+    )
     sys.stdout.write(result.rendered)
     if result.spilled:
         sys.stderr.write(f"[qmu] Output spilled to {result.artifact['artifact_path']}\n")
@@ -103,11 +114,16 @@ def _emit(
     ``_add_format_opts`` (which may leave the attribute unset before defaults)
     behave exactly as the prior ``getattr(args, "format", "text")`` checks.
     """
+    source_ok = (
+        data["ok"]
+        if isinstance(data, dict) and isinstance(data.get("ok"), bool)
+        else None
+    )
     if getattr(args, "format", "text") == "text":
         rendered = "\n".join(text) if isinstance(text, list) else text
-        _output(rendered, args, stem=stem)
+        _output(rendered, args, stem=stem, source_ok=source_ok)
     else:
-        _output(data, args, stem=stem)
+        _output(data, args, stem=stem, source_ok=source_ok)
 
 
 _SSH_BLOCKED_QEMU_STATUSES = frozenset({"paused", "debug"})
@@ -176,19 +192,13 @@ def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) 
     fmt = getattr(args, "format", "text") or "text"
     if fmt == "text":
         sys.stderr.write(f"{text_prefix} {exc}\n")
-    else:
-        sys.stdout.write(
-            json.dumps(
-                {
-                    "ok": False,
-                    "error": str(exc),
-                    "error_type": exc.__class__.__name__,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n"
-        )
+        return
+    payload = {
+        "ok": False,
+        "error": str(exc),
+        "error_type": exc.__class__.__name__,
+    }
+    _output(payload, args, stem="error", source_ok=False)
 
 
 def _wait_pid_exit(pid: int, timeout: float) -> bool:

@@ -21,6 +21,7 @@ Findings exercised: H3 (JSON error contract) / universal-ok / M2.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -121,3 +122,43 @@ def test_success_json_results_carry_ok(argv, capsys):
     assert isinstance(payload, dict), f"{argv} did not emit a JSON object: {out!r}"
     assert "ok" in payload, f"{argv} result missing 'ok': {payload!r}"
     assert isinstance(payload["ok"], bool)
+
+
+def test_qmu_error_ndjson_is_one_false_record(capsys):
+    rc = cli.main(["--format", "ndjson", "status"])
+    lines = capsys.readouterr().out.splitlines()
+
+    assert rc == 1
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["ok"] is False
+    assert payload["error_type"] == "QMUError"
+
+
+def test_qmu_error_forced_out_envelope_preserves_false_status(tmp_path, capsys):
+    out = tmp_path / "error.json"
+
+    rc = cli.main(["--format", "json", "--out", str(out), "status"])
+
+    envelope = json.loads(capsys.readouterr().out)
+    stored = json.loads(out.read_text())
+    assert rc == 1
+    assert envelope["ok"] is False
+    assert stored["ok"] is False
+    assert stored["error_type"] == "QMUError"
+
+
+def test_qmu_error_ndjson_spill_envelope_preserves_false_status(monkeypatch, capsys):
+    def boom(vm=None):
+        raise QMUError("x" * 50000)
+
+    monkeypatch.setattr(lifecycle, "choose_instance", boom)
+    rc = cli.main(["--format", "ndjson", "status"])
+
+    lines = capsys.readouterr().out.splitlines()
+    assert rc == 1
+    assert len(lines) == 1
+    envelope = json.loads(lines[0])
+    assert envelope["ok"] is False
+    stored = json.loads(Path(envelope["artifact_path"]).read_text())
+    assert stored["ok"] is False
