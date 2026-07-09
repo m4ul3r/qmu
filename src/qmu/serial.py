@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -52,19 +53,30 @@ def _is_crash_end(line: str) -> bool:
     return any(p.search(line) for p in CRASH_END_PATTERNS)
 
 
-def extract_crash(log_path: str | Path, max_context_lines: int = 500) -> str | None:
-    """Extract the last crash/KASAN report from the serial log.
-
-    Reads the last max_context_lines of the file, finds the start of the
-    last crash block, and captures everything from that point to a crash
-    end marker (or end of file).
-    """
-    path = Path(log_path)
-    if not path.exists():
-        return None
-
+def serial_log_offset(log_path: str | Path) -> int:
+    """Return the readable serial stream's current byte size, or zero."""
     try:
-        text = path.read_text(errors="replace")
+        with Path(log_path).open("rb") as stream:
+            return os.fstat(stream.fileno()).st_size
+    except OSError:
+        return 0
+
+
+def extract_crash(
+    log_path: str | Path,
+    max_context_lines: int = 500,
+    *,
+    start_offset: int = 0,
+) -> str | None:
+    """Return the last crash wholly discoverable at or after a byte boundary."""
+    try:
+        with Path(log_path).open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            offset = start_offset
+            if offset < 0 or offset > size:
+                offset = 0
+            stream.seek(offset)
+            text = stream.read().decode("utf-8", errors="replace")
     except OSError:
         return None
 
