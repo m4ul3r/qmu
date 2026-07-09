@@ -118,6 +118,28 @@ def test_prune_runtime_skips_malformed_marker():
     assert marker.read_bytes() == b'{"schema":'
 
 
+def test_prune_runtime_preserves_empty_basename_marker_without_aborting():
+    marker = spill_root() / ".qmu-owned.json"
+    marker_payload = {
+        "schema": 1,
+        "kind": "spill",
+        "artifact": "",
+        "created_at": 1.0,
+        "st_dev": 0,
+        "st_ino": 0,
+        "st_size": 0,
+        "st_mtime_ns": 0,
+    }
+    marker_bytes = json.dumps(marker_payload, sort_keys=True).encode()
+    marker.write_bytes(marker_bytes)
+    valid_artifact = _marked_spill("valid.txt", created_at=1.0)
+
+    result = prune_runtime_artifacts(older_than_seconds=0.0, now=1000.0)
+
+    assert _artifact_pairs(result.removed) == [("spill", valid_artifact)]
+    assert marker.read_bytes() == marker_bytes
+
+
 @pytest.mark.parametrize(
     ("field", "invalid_value"),
     [
@@ -456,6 +478,24 @@ def test_prune_runtime_removes_only_empty_owned_date_directories():
     assert sentinel.read_text() == "preserve"
     assert unrelated_empty.is_dir()
     assert root.is_dir()
+
+
+@pytest.mark.parametrize(
+    "directory_name",
+    [
+        pytest.param("\u0662\u0660\u0662\u0666\u0660\u0667\u0660\u0661", id="unicode-digits"),
+        pytest.param("20260230", id="impossible-date"),
+    ],
+)
+def test_prune_runtime_preserves_nonproducer_date_directory(directory_name):
+    artifact = _marked_spill(f"{directory_name}/old.txt", created_at=1.0)
+    parent = artifact.parent
+
+    result = prune_runtime_artifacts(older_than_seconds=0.0, now=1000.0)
+
+    assert _artifact_pairs(result.removed) == [("spill", artifact)]
+    assert parent.is_dir()
+    assert list(parent.iterdir()) == []
 
 
 def test_prune_runtime_is_idempotent():
