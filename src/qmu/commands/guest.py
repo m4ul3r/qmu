@@ -413,33 +413,48 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
 
 def _add_crash(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("crash", help="Extract crash from serial log")
+    p.add_argument(
+        "--full-history",
+        action="store_true",
+        help=(
+            "Search the entire retained serial log, including previous guest epochs"
+        ),
+    )
     _add_common_opts(p)
     p.set_defaults(handler=_handle_crash)
 
 
 def _handle_crash(args: argparse.Namespace) -> int:
     inst = find_instance(args.vm)
-    crash = extract_crash(inst.serial_log)
+    history = args.full_history
+    scope = "history" if history else "current"
+    start_offset = 0 if history else inst.guest_epoch_serial_offset
+    crash = extract_crash(inst.serial_log, start_offset=start_offset)
 
-    # L2: distinguish "serial log missing" from "log present but no crash match"
-    # so an agent can tell a dead/never-booted VM apart from a clean run.
     log_exists = Path(inst.serial_log).exists()
-    if crash is not None:
-        detected = True
-        reason = "crash report extracted from serial log"
+    scope_reason = "retained serial history" if history else "current guest epoch"
+    scope_text = (
+        "retained serial history (forensics; may predate current guest epoch)"
+        if history
+        else "current guest epoch"
+    )
+    detected = crash is not None
+    if detected:
+        reason = f"crash report extracted from {scope_reason}"
+        text = f"Crash detected in {scope_text}:\n{crash}"
     elif not log_exists:
-        detected = False
         reason = "serial log not found"
+        text = f"No crash detected in {scope_text}: {reason}."
     else:
-        detected = False
-        reason = "no crash markers found in serial log"
+        reason = f"no crash markers found in {scope_reason}"
+        text = f"No crash detected in {scope_text}: {reason}."
 
-    text = crash if crash is not None else f"No crash detected: {reason}."
     _emit(
         args,
         data={
             "ok": detected,
-            "detected": detected,
+            "crash_detected": detected,
+            "scope": scope,
             "reason": reason,
             "serial_log": inst.serial_log,
             "crash": crash,
@@ -447,8 +462,6 @@ def _handle_crash(args: argparse.Namespace) -> int:
         text=text,
         stem="crash",
     )
-
-    # L2: non-zero when no crash was found (either missing log or no match).
     return 0 if detected else 1
 
 
