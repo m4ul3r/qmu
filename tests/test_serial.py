@@ -26,9 +26,17 @@ captured. The assertions below pin that FIXED behavior:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from qmu.serial import _is_crash_start, _is_crash_end, extract_crash, tail_log
+from qmu.serial import (
+    _is_crash_end,
+    _is_crash_start,
+    extract_crash,
+    serial_log_offset,
+    tail_log,
+)
 
 
 # A realistic KASAN slab-use-after-free report, exactly as it appears on the
@@ -161,6 +169,30 @@ def _write(tmp_path, name, content):
     return p
 
 
+def test_serial_log_offset_is_binary_byte_size(tmp_path):
+    log = tmp_path / "bytes.serial.log"
+    text = "µboot\n"
+    log.write_text(text)
+    assert serial_log_offset(log) == len(text.encode("utf-8"))
+
+
+def test_serial_log_offset_missing_or_unreadable_is_zero(tmp_path, monkeypatch):
+    missing = tmp_path / "missing.serial.log"
+    assert serial_log_offset(missing) == 0
+
+    log = tmp_path / "denied.serial.log"
+    log.write_text("boot\n")
+    original_open = Path.open
+
+    def deny_open(self, *args, **kwargs):
+        if self == log:
+            raise PermissionError("denied")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_open)
+    assert serial_log_offset(log) == 0
+
+
 def test_extract_crash_kasan_full_report(tmp_path):
     """The KASAN report (BUG/Call Trace/RIP) must be returned in full, not just
     the trailing '---[ end Kernel panic ... ]---' banner."""
@@ -272,6 +304,92 @@ def test_extract_crash_returns_only_last_distinct_crash(tmp_path):
         "last crash event"
     )
     assert "---[ end trace 1111111111111111 ]---" not in report
+
+
+def test_extract_crash_ignores_complete_preboundary_crash(tmp_path):
+    log = _write(tmp_path, "stale.serial.log", KASAN_UAF_LOG)
+    boundary = serial_log_offset(log)
+    assert extract_crash(log, start_offset=boundary) is None
+
+
+def test_extract_crash_finds_only_postboundary_crash(tmp_path):
+    log = _write(tmp_path, "fresh.serial.log", KASAN_UAF_LOG)
+    boundary = serial_log_offset(log)
+    with log.open("a") as stream:
+        stream.write(SYSRQ_PANIC_LOG)
+
+    report = extract_crash(log, start_offset=boundary)
+    assert report is not None
+    assert "sysrq triggered crash" in report
+    assert "uaf_init" not in report
+
+
+def test_extract_crash_uses_byte_not_character_offset(tmp_path):
+    prefix = "µ restored epoch\n"
+    log = _write(tmp_path, "utf8.serial.log", prefix + SYSRQ_PANIC_LOG)
+    boundary = len(prefix.encode("utf-8"))
+    report = extract_crash(log, start_offset=boundary)
+    assert report is not None
+    assert "sysrq triggered crash" in report
+
+
+def test_extract_crash_tolerates_offset_inside_utf8_and_invalid_bytes(tmp_path):
+    log = tmp_path / "invalid.serial.log"
+    prefix = "µ".encode("utf-8")
+    log.write_bytes(prefix + b"\xff\n" + SYSRQ_PANIC_LOG.encode())
+    report = extract_crash(log, start_offset=1)
+    assert report is not None
+    assert "sysrq triggered crash" in report
+
+
+def test_extract_crash_stale_offset_resets_after_truncation(tmp_path):
+    log = _write(tmp_path, "truncated.serial.log", KASAN_UAF_LOG + KASAN_UAF_LOG)
+    stale = serial_log_offset(log)
+    log.write_text(SYSRQ_PANIC_LOG)
+    assert stale > serial_log_offset(log)
+
+    report = extract_crash(log, start_offset=stale)
+    assert report is not None
+    assert "sysrq triggered crash" in report
+
+
+def test_extract_crash_stale_offset_resets_after_smaller_rotation(tmp_path):
+    log = _write(tmp_path, "rotated.serial.log", KASAN_UAF_LOG + KASAN_UAF_LOG)
+    stale = serial_log_offset(log)
+    log.rename(tmp_path / "rotated.serial.log.1")
+    log.write_text(SYSRQ_PANIC_LOG)
+
+    report = extract_crash(log, start_offset=stale)
+    assert report is not None
+    assert "sysrq triggered crash" in report
+
+
+def test_extract_crash_negative_offset_scans_from_zero(tmp_path):
+    log = _write(tmp_path, "negative.serial.log", SYSRQ_PANIC_LOG)
+    assert extract_crash(log, start_offset=-1) == extract_crash(log)
+
+
+def test_extract_crash_does_not_attribute_event_started_before_boundary(tmp_path):
+    start = "[ 1.0] Kernel panic - not syncing: old event\n"
+    ending = "[ 1.1] ---[ end Kernel panic - not syncing: old event ]---\n"
+    log = _write(tmp_path, "partial.serial.log", start)
+    boundary = serial_log_offset(log)
+    with log.open("a") as stream:
+        stream.write(ending)
+    assert extract_crash(log, start_offset=boundary) is None
+
+
+def test_extract_crash_unreadable_returns_none(tmp_path, monkeypatch):
+    log = _write(tmp_path, "denied.serial.log", SYSRQ_PANIC_LOG)
+    original_open = Path.open
+
+    def deny_open(self, *args, **kwargs):
+        if self == log:
+            raise PermissionError("denied")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_open)
+    assert extract_crash(log, start_offset=0) is None
 
 
 # --- These guard the None / no-crash branches ---
