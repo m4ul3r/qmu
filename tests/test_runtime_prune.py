@@ -298,6 +298,46 @@ def test_prune_runtime_removes_stale_control_socket_when_old():
     assert not path.exists()
 
 
+def test_prune_runtime_preserves_same_socket_that_becomes_live_between_probes(
+    monkeypatch,
+):
+    path = ssh_control_dir() / "cm-becomes-live"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(path))
+        os.utime(path, (1.0, 1.0))
+        initial_stat = path.lstat()
+        real_probe = runtime.probe_unix_socket
+        transitioned = False
+
+        def become_live_after_refusal(candidate):
+            nonlocal transitioned
+            state = real_probe(candidate, timeout=0.1)
+            if not transitioned:
+                assert state == "stale"
+                listener.listen()
+                transitioned = True
+            return state
+
+        monkeypatch.setattr(runtime, "probe_unix_socket", become_live_after_refusal)
+        result = prune_runtime_artifacts(older_than_seconds=0.0, now=1000.0)
+        current_stat = path.lstat()
+
+        assert _artifact_pairs(result.skipped_live) == [("ssh-control", path)]
+        assert result.removed == ()
+        assert (
+            current_stat.st_dev,
+            current_stat.st_ino,
+            current_stat.st_mode,
+        ) == (
+            initial_stat.st_dev,
+            initial_stat.st_ino,
+            initial_stat.st_mode,
+        )
+    finally:
+        listener.close()
+
+
 def test_prune_runtime_keeps_stale_control_socket_when_young():
     path = _stale_control("cm-young", mtime=900.1)
 
@@ -430,6 +470,48 @@ def test_prune_runtime_is_idempotent():
         ("ssh-control", control),
     }
     assert second == RuntimePruneResult((), (), ())
+
+
+@pytest.mark.parametrize(
+    "invalid_age",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_prune_runtime_rejects_nonfinite_age_without_removing_artifacts(invalid_age):
+    artifact = _marked_spill("preserved.txt", created_at=1.0)
+    marker = spill_marker_path(artifact)
+    control = _stale_control("cm-preserved", mtime=1.0)
+
+    with pytest.raises(ValueError):
+        prune_runtime_artifacts(older_than_seconds=invalid_age, now=1000.0)
+
+    assert artifact.read_text() == "owned spill"
+    assert marker.exists()
+    assert control.exists()
+
+
+@pytest.mark.parametrize(
+    "invalid_now",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_prune_runtime_rejects_nonfinite_now_without_removing_artifacts(invalid_now):
+    artifact = _marked_spill("preserved.txt", created_at=1.0)
+    marker = spill_marker_path(artifact)
+    control = _stale_control("cm-preserved", mtime=1.0)
+
+    with pytest.raises(ValueError):
+        prune_runtime_artifacts(older_than_seconds=0.0, now=invalid_now)
+
+    assert artifact.read_text() == "owned spill"
+    assert marker.exists()
+    assert control.exists()
 
 
 def test_prune_runtime_rejects_negative_age():
