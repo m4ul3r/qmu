@@ -355,6 +355,8 @@ def test_empty_explicit_config_is_a_valid_recorded_layer(isolate_config):
     path = _write_toml(isolate_config / "empty.toml", "")
     cfg = resolve_config(config_path_override=path)
     assert cfg._sources == ["built-in defaults", f"config: {path.resolve()}"]
+    assert cfg.rootfs is None
+    assert cfg.ssh_key is None
 
 
 @pytest.mark.parametrize(
@@ -401,6 +403,8 @@ def test_partial_layers_preserve_precedence_and_omitted_values(
     assert cfg.cpus == 6
     assert cfg.drive_format == "qcow2"
     assert cfg.ssh_user == "builder"
+    assert cfg.rootfs is None
+    assert cfg.ssh_key is None
     assert cfg._sources == [
         "built-in defaults",
         f"global: {global_path.resolve()}",

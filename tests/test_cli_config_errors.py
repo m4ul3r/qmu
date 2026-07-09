@@ -216,4 +216,6 @@ def test_harness_launch_accepts_machine_only_config(
     assert payload["ok"] is True
     assert seen["harness"] is True
     assert seen["no_net"] is True
+    assert seen["config"].rootfs is None
+    assert seen["config"].ssh_key is None
     assert f"config: {source}" in seen["config"]._sources
