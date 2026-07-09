@@ -42,7 +42,8 @@ qmu launch --harness \
 
 qmu wait --vm kctf-test --timeout 60
 qmu log  --vm kctf-test --tail 100
-qmu crash --vm kctf-test
+qmu crash --vm kctf-test                 # current guest epoch only
+qmu crash --vm kctf-test --full-history  # retained-log forensics
 ```
 
 `--harness` implies `--no-wait-ssh` and `--no-net`, and skips the rootfs/SSH
@@ -55,6 +56,13 @@ non-running QEMU states as observations, but reports `stopped:true` and exits
 `0` only after the recorded QEMU process identity has exited. If `--timeout`
 elapses while that process is still alive, it exits `124` with
 `stopped:false` and preserves the latest QMP observation.
+
+`qmu crash` searches only the current guest epoch by default. A successful
+`snapshot load` or an observed guest reset advances that epoch, so an older
+panic retained in the serial log is not presented as current. Use
+`--full-history` only for forensics across previous epochs. JSON/NDJSON results
+identify the selected `scope` (`current` or `history`) and report detection in
+`crash_detected`.
 
 ## Rootfs injection (no root needed)
 

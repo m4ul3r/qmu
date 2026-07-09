@@ -14,13 +14,18 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ..instance import QMUError, choose_instance
+from ..instance import (
+    QMUError,
+    choose_instance,
+    save_guest_epoch_serial_offset,
+)
 from ..snapshot import (
     delete_snapshot,
     list_snapshots,
     load_snapshot,
     save_snapshot,
 )
+from ..serial import serial_log_offset
 from .._cliutil import (
     _add_common_opts,
     _emit,
@@ -112,8 +117,11 @@ def _handle_snapshot_save(args: argparse.Namespace) -> int:
 def _handle_snapshot_load(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     with _qmp_ctx(inst) as qmp:
+        epoch_offset = serial_log_offset(inst.serial_log)
         msg = load_snapshot(qmp, args.name)
     failed = _snapshot_failed(msg)
+    if not failed:
+        inst = save_guest_epoch_serial_offset(inst, epoch_offset)
     _emit(
         args,
         data={"ok": not failed, "name": args.name, "message": msg},

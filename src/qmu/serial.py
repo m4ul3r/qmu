@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -39,6 +40,10 @@ CRASH_END_PATTERNS = [
 ]
 
 
+_SOFT_END_TRACE = re.compile(r"---\[ end trace")
+_FATAL_PANIC_START = re.compile(r"Kernel panic - not syncing", re.IGNORECASE)
+
+
 def _is_crash_start(line: str) -> bool:
     # An end-trace banner (e.g. "---[ end Kernel panic ... ]---") contains the
     # substring "Kernel panic" and would otherwise match a start pattern. Treat
@@ -52,19 +57,41 @@ def _is_crash_end(line: str) -> bool:
     return any(p.search(line) for p in CRASH_END_PATTERNS)
 
 
-def extract_crash(log_path: str | Path, max_context_lines: int = 500) -> str | None:
-    """Extract the last crash/KASAN report from the serial log.
+def _soft_end_links_to_fatal_panic(lines: list[str], end_index: int) -> bool:
+    """Return whether the next nonblank line is the fatal panic continuation."""
+    for line in lines[end_index + 1:]:
+        if not line.strip():
+            continue
+        return bool(
+            _FATAL_PANIC_START.search(line) and not _is_crash_end(line)
+        )
+    return False
 
-    Reads the last max_context_lines of the file, finds the start of the
-    last crash block, and captures everything from that point to a crash
-    end marker (or end of file).
-    """
-    path = Path(log_path)
-    if not path.exists():
-        return None
 
+def serial_log_offset(log_path: str | Path) -> int:
+    """Return the readable serial stream's current byte size, or zero."""
     try:
-        text = path.read_text(errors="replace")
+        with Path(log_path).open("rb") as stream:
+            return os.fstat(stream.fileno()).st_size
+    except OSError:
+        return 0
+
+
+def extract_crash(
+    log_path: str | Path,
+    max_context_lines: int = 500,
+    *,
+    start_offset: int = 0,
+) -> str | None:
+    """Return the last crash wholly discoverable at or after a byte boundary."""
+    try:
+        with Path(log_path).open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            offset = start_offset
+            if offset < 0 or offset > size:
+                offset = 0
+            stream.seek(offset)
+            text = stream.read().decode("utf-8", errors="replace")
     except OSError:
         return None
 
@@ -75,46 +102,16 @@ def extract_crash(log_path: str | Path, max_context_lines: int = 500) -> str | N
     # Only scan the tail for performance
     tail = lines[-max_context_lines:]
 
-    # Walk backwards to find the FIRST line of the LAST crash event. Going
-    # backwards, keep moving the anchor earlier across start lines. An
-    # end-marker does NOT necessarily terminate the block: a single logical
-    # crash event commonly contains INTERIOR end-markers. The canonical case is
-    # a WARNING/BUG that, under panic_on_warn, prints its own report epilogue
-    # ("---[ end trace ]---") and is then IMMEDIATELY followed by a fatal
-    # "Kernel panic - not syncing" + final "---[ end Kernel panic ]---" banner.
-    # The interior "---[ end trace ]---" must not truncate the report (it would
-    # drop the WARNING/BUG root cause, RIP and Call Trace — the only useful
-    # part). A call trace can be arbitrarily long, so we cannot bound the
-    # distance from a start line ABOVE the marker; instead we look just BELOW
-    # the marker: an interior epilogue end-marker is followed almost immediately
-    # by the next crash-start of the SAME event (the panic banner), whereas an
-    # end-marker that closed a *previous, distinct* crash is followed by a run
-    # of ordinary resumed kernel/boot output before any later crash. Epilogue
-    # end-markers that precede the first start (a relocatable kernel prints
-    # "Kernel Offset:" then the banner) are seen while the anchor is still None
-    # and never split the block either.
-    #
-    # EPILOGUE_GAP: how soon below an interior end-marker the next crash-start
-    # of the same event appears. Real panic_on_warn output goes from
-    # "---[ end trace ]---" to "Kernel panic - not syncing" within a couple of
-    # lines; a distinct prior crash is followed by far more resumed output.
-    EPILOGUE_GAP = 8
+    # Walk backwards to find the first line of the last crash event. A soft
+    # WARNING "end trace" remains part of the same event only when it leads
+    # directly to a fatal panic continuation. Every other end marker is a hard
+    # boundary between discrete events.
     crash_start = None
     for i in range(len(tail) - 1, -1, -1):
         if _is_crash_start(tail[i]):
             crash_start = i
         elif crash_start is not None and _is_crash_end(tail[i]):
-            # Is the next crash-start within EPILOGUE_GAP lines BELOW this
-            # marker (i.e. between it and content we have already anchored)? If
-            # so, the marker is interior to one event — don't split. Blank
-            # lines do not count against the gap.
-            window_end = min(len(tail), i + 1 + EPILOGUE_GAP)
-            interior = False
-            for j in range(i + 1, window_end):
-                if _is_crash_start(tail[j]):
-                    interior = True
-                    break
-            if interior:
+            if _SOFT_END_TRACE.search(tail[i]) and _soft_end_links_to_fatal_panic(tail, i):
                 continue
             break
 
