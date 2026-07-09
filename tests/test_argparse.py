@@ -127,11 +127,13 @@ class TestPruneVmPlacement:
         err = capsys.readouterr().err
         assert "No stopped VM named 'foo'." in err
 
-    def test_no_vm_no_all_still_prompts(self, capsys):
-        # The bare form (neither --vm nor --all) must still hit the guidance.
+    def test_no_selector_guidance_mentions_runtime(self, capsys):
         rc = cli.main(["prune"])
         assert rc == 1
-        assert "Specify either --vm <name> or --all." in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "--vm" in err
+        assert "--all" in err
+        assert "--runtime" in err
 
     def test_all_flag_still_works(self, capsys):
         # --all path is unaffected; empty stopped list => benign no-op, exit 0.
@@ -144,3 +146,44 @@ class TestPruneVmPlacement:
         with pytest.raises(SystemExit) as exc:
             cli.main(["prune", "--vm", "foo", "--all"])
         assert exc.value.code == 2
+
+    def test_runtime_is_mutually_exclusive_with_vm(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["prune", "--vm", "foo", "--runtime"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "not allowed with argument" in err
+        assert "--runtime" in err
+        assert "--vm" in err
+
+    def test_runtime_is_mutually_exclusive_with_all(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["prune", "--all", "--runtime"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "not allowed with argument" in err
+        assert "--runtime" in err
+        assert "--all" in err
+
+    def test_negative_older_than_is_usage_error(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["prune", "--runtime", "--older-than", "-0.1"])
+        assert exc.value.code == 2
+        assert "must be non-negative" in capsys.readouterr().err
+
+    def test_runtime_empty_is_success(self, capsys):
+        rc = cli.main(
+            [
+                "prune",
+                "--runtime",
+                "--older-than",
+                "0",
+                "--format",
+                "text",
+            ]
+        )
+        assert rc == 0
+        assert (
+            capsys.readouterr().out
+            == "No eligible qmu-owned runtime artifacts to prune.\n"
+        )
