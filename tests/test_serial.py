@@ -306,6 +306,40 @@ def test_extract_crash_returns_only_last_distinct_crash(tmp_path):
     assert "---[ end trace 1111111111111111 ]---" not in report
 
 
+def test_extract_crash_does_not_bridge_close_independent_events(tmp_path):
+    log = _write(
+        tmp_path,
+        "close.serial.log",
+        "[ 1.0] WARNING: CPU: old_warn\n"
+        "[ 1.1] old body\n"
+        "[ 1.2] ---[ end trace 111 ]---\n"
+        "[ 1.3] service resumed\n"
+        "[ 2.0] BUG: KASAN: slab-use-after-free in new_bug\n"
+        "[ 2.1] Kernel panic - not syncing: new panic\n"
+        "[ 2.2] ---[ end Kernel panic - not syncing: new panic ]---\n",
+    )
+    report = extract_crash(log)
+    assert report is not None
+    assert "new_bug" in report
+    assert "old_warn" not in report
+    assert "end trace 111" not in report
+
+
+def test_extract_crash_final_panic_banner_is_hard_boundary(tmp_path):
+    log = _write(
+        tmp_path,
+        "adjacent-panics.serial.log",
+        "[ 1.0] Kernel panic - not syncing: first\n"
+        "[ 1.1] ---[ end Kernel panic - not syncing: first ]---\n"
+        "[ 2.0] Kernel panic - not syncing: second\n"
+        "[ 2.1] ---[ end Kernel panic - not syncing: second ]---\n",
+    )
+    report = extract_crash(log)
+    assert report is not None
+    assert "second" in report
+    assert "first" not in report
+
+
 def test_extract_crash_ignores_complete_preboundary_crash(tmp_path):
     log = _write(tmp_path, "stale.serial.log", KASAN_UAF_LOG)
     boundary = serial_log_offset(log)
