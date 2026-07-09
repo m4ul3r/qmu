@@ -73,6 +73,10 @@ def save_instance(inst: VMInstance) -> Path:
 
 def save_guest_epoch_serial_offset(inst: VMInstance, offset: int) -> VMInstance:
     """Atomically persist an explicitly captured guest-generation boundary."""
+    if type(offset) is not int:
+        raise TypeError("offset must be an integer")
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
     updated = replace(inst, guest_epoch_serial_offset=offset)
     save_instance(updated)
     return updated
