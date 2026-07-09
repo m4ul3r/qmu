@@ -70,6 +70,8 @@ import contextlib
 class _FakeInst:
     vm_id = "dev"
     qmp_socket = "/tmp/nonexistent.sock"
+    serial_log = "/tmp/nonexistent.serial.log"
+    guest_epoch_serial_offset = 0
 
 
 def _patch_save(monkeypatch, msg):
