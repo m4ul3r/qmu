@@ -25,6 +25,9 @@ from .._cliutil import (
     _add_common_opts,
     _emit,
     _make_group_help_handler,
+    _make_ssh,
+    _preflight_ssh_guest,
+    _require_ssh,
     _qmp_ctx,
 )
 
@@ -217,6 +220,103 @@ def _parse_kallsyms_text(stdout: str) -> int:
 
 def _format_hex(value: int) -> str:
     return f"-0x{-value:x}" if value < 0 else f"0x{value:x}"
+
+
+_KBASE_ARCHES = frozenset({"x86_64", "i386", "aarch64", "arm"})
+_KALLSYMS_QUERY = "awk '$3 == \"_text\" { print $1, $2, $3 }' /proc/kallsyms"
+
+
+def _read_link_text(symbols: str) -> tuple[Path, int]:
+    path = Path(symbols).expanduser().resolve()
+    if not path.is_file():
+        raise QMUError(f"vmlinux symbols file not found: {path}")
+
+    tool = shutil.which("nm") or shutil.which("llvm-nm")
+    if tool is None:
+        raise QMUError(
+            "no local symbol tool found; install GNU nm (binutils) or llvm-nm"
+        )
+
+    result = subprocess.run(
+        [tool, "-P", "--defined-only", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        diagnostic = (result.stderr or result.stdout or "no diagnostic").strip()
+        raise QMUError(
+            f"{Path(tool).name} failed to read {path} "
+            f"(exit {result.returncode}): {diagnostic}"
+        )
+    return path, _parse_nm_text(result.stdout)
+
+
+def _add_kbase(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "kbase",
+        help="Read the guest runtime kernel base and KASLR slide",
+    )
+    p.add_argument(
+        "--symbols",
+        required=True,
+        help="Path to the matching vmlinux ELF",
+    )
+    _add_common_opts(p)
+    p.set_defaults(handler=_handle_kbase)
+
+
+def _handle_kbase(args: argparse.Namespace) -> int:
+    inst = choose_instance(args.vm)
+    _require_ssh(inst)
+
+    if (preflight_rc := _preflight_ssh_guest(
+        args, inst, stem="kbase"
+    )) is not None:
+        return preflight_rc
+
+    if inst.arch is None:
+        raise QMUError(
+            f"VM '{inst.vm_id}' predates architecture metadata; relaunch it "
+            "before using qmu kbase"
+        )
+    if inst.arch not in _KBASE_ARCHES:
+        raise QMUError(
+            f"qmu kbase does not support guest architecture {inst.arch!r}; "
+            f"supported: {', '.join(sorted(_KBASE_ARCHES))}"
+        )
+
+    symbols_path, link_base = _read_link_text(args.symbols)
+    ssh = _make_ssh(inst)
+    rc, stdout, stderr = ssh.run(_KALLSYMS_QUERY, timeout=10.0)
+    if rc != 0:
+        diagnostic = (stderr or stdout or "no diagnostic").strip()
+        raise QMUError(
+            f"failed to read guest /proc/kallsyms (exit {rc}): {diagnostic}"
+        )
+
+    runtime_base = _parse_kallsyms_text(stdout)
+    slide = runtime_base - link_base
+    data = {
+        "ok": True,
+        "vm_id": inst.vm_id,
+        "arch": inst.arch,
+        "symbols": str(symbols_path),
+        "kbase": _format_hex(runtime_base),
+        "link_base": _format_hex(link_base),
+        "slide": _format_hex(slide),
+    }
+    _emit(
+        args,
+        data=data,
+        text=(
+            f"KBASE={data['kbase']}\n"
+            f"LINK_BASE={data['link_base']}\n"
+            f"SLIDE={data['slide']}"
+        ),
+        stem="kbase",
+    )
+    return 0
 
 
 def _add_gdb(sub: argparse._SubParsersAction) -> None:

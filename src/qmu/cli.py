@@ -83,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     guest._add_crash(sub)
     guest._add_log(sub)
     qmp_cmds._add_gdb(sub)
+    qmp_cmds._add_kbase(sub)
     qmp_cmds._add_cont(sub)
     qmp_cmds._add_qmp(sub)
     qmp_cmds._add_monitor(sub)
