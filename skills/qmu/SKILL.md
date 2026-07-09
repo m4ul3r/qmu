@@ -52,7 +52,14 @@ canonical destination.
 Each layer may be empty or partial. `[drive]` and `[ssh]` are not universally
 required: another layer or CLI flags may provide their values, and harness mode
 intentionally runs without them. Later valid layers still win according to the
-precedence above; a higher layer never hides an invalid lower layer.
+precedence above.
+
+An invalid **global** config (`~/.config/qmu/config.toml`) is non-fatal: qmu
+prints a one-line `[qmu] Warning:` naming the file and continues from built-in
+defaults and any valid project/CLI layers, so a single stale global file never
+bricks every command (including `qmu doctor`, which diagnoses it). An invalid
+**project** (`qmu.toml`) or explicit `--config` file is fatal (exit 1) with the
+source path and offending key.
 
 `qmu config init` writes `[machine]` (arch/memory/cpus, with commented `cpu`/`nic_model`/`extra_args`), `[drive]`, `[ssh]`, `[gdb]`, three `[profiles.*]` blocks, and a commented harness-mode block. Notes:
 

@@ -67,7 +67,7 @@ def _assert_error(captured, rc, fmt, source, key_path=None, hint=None):
 
 @pytest.mark.parametrize("fmt", ["text", "json"])
 @pytest.mark.parametrize("command", ["config-show", "doctor", "launch"])
-@pytest.mark.parametrize("source_kind", ["global", "project", "explicit"])
+@pytest.mark.parametrize("source_kind", ["project", "explicit"])
 def test_flat_rootfs_fails_every_command_and_source(
     config_cli_env,
     monkeypatch,
@@ -98,7 +98,7 @@ def test_flat_rootfs_fails_every_command_and_source(
 
 @pytest.mark.parametrize("fmt", ["text", "json"])
 @pytest.mark.parametrize("command", ["config-show", "doctor", "launch"])
-@pytest.mark.parametrize("source_kind", ["global", "project", "explicit"])
+@pytest.mark.parametrize("source_kind", ["project", "explicit"])
 def test_malformed_toml_fails_every_command_and_source(
     config_cli_env,
     monkeypatch,
@@ -118,6 +118,27 @@ def test_malformed_toml_fails_every_command_and_source(
     )
     rc = cli.main(["--format", fmt, *_command_argv(command, config_cli_env, explicit_args)])
     _assert_error(capsys.readouterr(), rc, fmt, source)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize("bad", ['rootfs = "/tmp/rootfs.img"\n', "broken = [\n"])
+def test_broken_global_config_does_not_fail_commands(
+    config_cli_env, capsys, fmt, bad
+):
+    """A broken GLOBAL config (schema-invalid or malformed) must warn and be
+    skipped, not turn every command into an exit-1 failure. Regression guard
+    for the CLAUDE.md contract: only project/explicit configs are fatal."""
+    source, _ = _install_source(config_cli_env, "global", bad)
+
+    rc = cli.main(["--format", fmt, "config", "show"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "[qmu] Warning:" in captured.err
+    assert str(source) in captured.err
+    if fmt == "json":
+        payload = json.loads(captured.out)
+        assert payload["ok"] is True
 
 
 @pytest.mark.parametrize("command", ["config-show", "doctor", "launch"])

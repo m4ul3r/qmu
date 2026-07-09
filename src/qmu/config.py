@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import platform
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -376,10 +377,18 @@ def resolve_config(
     cfg = QMUConfig()
     cfg._sources.append("built-in defaults")
 
-    # Layer 1: global config
+    # Layer 1: global config — non-fatal, but never silently ignored.
+    # A broken global config warns and is skipped so a single stale
+    # `~/.config/qmu/config.toml` never bricks every command (including
+    # `doctor`, whose job is to diagnose it). Validation happens inside
+    # load_config_file before any mutation, so a rejected layer leaves cfg
+    # untouched. Project/explicit configs below stay fatal.
     gpath = global_config_path().resolve()
     if gpath.is_file():
-        _apply_config_file(cfg, gpath, "global")
+        try:
+            _apply_config_file(cfg, gpath, "global")
+        except ConfigError as exc:
+            sys.stderr.write(f"[qmu] Warning: ignoring global config: {exc}\n")
 
     # Layer 2: project config (or explicit --config)
     if config_path_override is not None:

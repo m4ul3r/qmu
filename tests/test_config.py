@@ -304,7 +304,7 @@ def _install_source(isolate_config, monkeypatch, source_kind, text):
     return path, {"config_path_override": path}
 
 
-@pytest.mark.parametrize("source_kind", ["global", "project", "explicit"])
+@pytest.mark.parametrize("source_kind", ["project", "explicit"])
 def test_malformed_toml_is_fatal_and_source_aware(
     isolate_config, monkeypatch, source_kind
 ):
@@ -319,7 +319,7 @@ def test_malformed_toml_is_fatal_and_source_aware(
     assert isinstance(excinfo.value.__cause__, tomllib.TOMLDecodeError)
 
 
-@pytest.mark.parametrize("source_kind", ["global", "project", "explicit"])
+@pytest.mark.parametrize("source_kind", ["project", "explicit"])
 def test_schema_invalid_toml_is_fatal_for_every_source(
     isolate_config, monkeypatch, source_kind
 ):
@@ -331,6 +331,39 @@ def test_schema_invalid_toml_is_fatal_for_every_source(
     assert excinfo.value.source == path.resolve()
     assert excinfo.value.key_path == "rootfs"
     assert "[drive] rootfs" in str(excinfo.value)
+
+
+def test_broken_global_config_is_skipped(isolate_config, monkeypatch, capsys):
+    """A malformed global config must NOT be fatal: resolve_config falls back to
+    lower layers, records no global source, and warns once on stderr. A single
+    stale ~/.config/qmu/config.toml must never brick every command."""
+    gpath = _global_config(isolate_config, "this is = = not valid toml [[[\n")
+    project_dir = isolate_config / "discovered"
+    project_dir.mkdir(exist_ok=True)
+    _write_toml(project_dir / CONFIG_FILENAME, '[machine]\nmemory = "16G"\n')
+    monkeypatch.chdir(project_dir)
+
+    cfg = resolve_config()  # must not raise
+
+    assert cfg.memory == "16G"
+    assert not any(s.startswith("global:") for s in cfg._sources)
+    err = capsys.readouterr().err
+    assert "Warning" in err
+    assert str(gpath.resolve()) in err
+
+
+def test_schema_invalid_global_config_is_skipped(isolate_config, capsys):
+    """A schema-invalid global config (flat migration key) is also non-fatal:
+    it warns and falls through to built-in defaults rather than raising."""
+    gpath = _global_config(isolate_config, 'rootfs = "/tmp/rootfs.img"\n')
+
+    cfg = resolve_config()  # must not raise
+
+    assert cfg.rootfs is None
+    assert cfg._sources == ["built-in defaults"]
+    err = capsys.readouterr().err
+    assert "Warning" in err
+    assert str(gpath.resolve()) in err
 
 
 def test_invalid_layer_is_not_applied_before_validation(
