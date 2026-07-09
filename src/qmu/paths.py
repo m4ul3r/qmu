@@ -9,6 +9,9 @@ from pathlib import Path
 SKILL_NAME = "qmu"
 
 
+SSH_CONTROL_PATH_MAX_BYTES = 100
+
+
 def repo_root() -> Path:
     """Root of a *source checkout*: two levels above this file (src/qmu/ -> repo).
 
@@ -70,10 +73,48 @@ def serial_log_path(vm_id: str) -> Path:
     return instances_dir() / f"{vm_id}.serial.log"
 
 
+def runtime_root() -> Path:
+    override = os.environ.get("QMU_TEMP_DIR")
+    if override:
+        return Path(override).expanduser()
+
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        candidate = Path(xdg).expanduser()
+        if (
+            candidate.is_absolute()
+            and candidate.is_dir()
+            and os.access(candidate, os.W_OK | os.X_OK)
+        ):
+            return candidate / "qmu"
+
+    return Path(tempfile.gettempdir()) / "qmu"
+
+
+def _runtime_child(name: str) -> Path:
+    child = runtime_root() / name
+    child.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return child
+
+
 def spill_root() -> Path:
-    root = Path(tempfile.gettempdir()) / "qmu-spills"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return _runtime_child("spills")
+
+
+def ssh_control_dir() -> Path:
+    return _runtime_child("ssh")
+
+
+def ssh_control_path() -> Path | None:
+    candidate = ssh_control_dir() / "cm-%C"
+    expanded = os.fsencode(str(candidate).replace("%C", "0" * 40))
+    if len(expanded) > SSH_CONTROL_PATH_MAX_BYTES:
+        return None
+    return candidate
+
+
+def qemu_log_path(vm_id: str) -> Path:
+    return instances_dir() / f"{vm_id}.qemu.log"
 
 
 def claude_skills_dir() -> Path:
