@@ -24,7 +24,7 @@ from typing import Any
 
 from ..instance import QMUError, VMInstance, choose_instance, find_instance
 from ..serial import extract_crash, serial_log_offset, tail_log
-from ..ssh import SSHClient, SSHError
+from ..ssh import SSHClient, SSHError, is_transport_failure
 from .._cliutil import (
     _add_common_opts,
     _emit,
@@ -37,6 +37,54 @@ from .._cliutil import (
 # ---------------------------------------------------------------------------
 # push / pull
 # ---------------------------------------------------------------------------
+
+
+def _emit_transfer_transport_lost(
+    args: argparse.Namespace,
+    *,
+    operation: str,
+    local: str,
+    remote: str,
+    inst: VMInstance,
+    start_offset: int,
+) -> int:
+    crash = extract_crash(inst.serial_log, start_offset=start_offset)
+    if crash is not None:
+        hint = (
+            "SCP transport lost. Kernel may have crashed. "
+            "See crash field or run: qmu crash"
+        )
+        detail = f"Crash from serial log:\n{crash}"
+        status = 3
+    else:
+        hint = (
+            "SCP transport lost; VM may be unreachable. "
+            "No fresh crash report in serial log. Check: qmu log --tail 100"
+        )
+        detail = "No fresh crash detected. Check: qmu log --tail 100"
+        status = 4
+    direction = (
+        f"{local} -> guest:{remote}"
+        if operation == "push"
+        else f"guest:{remote} -> {local}"
+    )
+    result = {
+        "ok": False,
+        "ssh_error": True,
+        "crash_detected": crash is not None,
+        "operation": operation,
+        "local": local,
+        "remote": remote,
+        "crash": crash,
+        "hint": hint,
+    }
+    _emit(
+        args,
+        data=result,
+        text=[f"SCP transport lost during {operation}: {direction}", detail],
+        stem=operation,
+    )
+    return status
 
 
 def _add_push(sub: argparse._SubParsersAction) -> None:
@@ -53,7 +101,22 @@ def _handle_push(args: argparse.Namespace) -> int:
     if (preflight_rc := _preflight_ssh_guest(args, inst, stem="push")) is not None:
         return preflight_rc
     ssh = _make_ssh(inst)
-    ssh.push(args.local, args.remote)
+    start_offset = serial_log_offset(inst.serial_log)
+    try:
+        ssh.push(args.local, args.remote)
+    except SSHError as exc:
+        if exc.returncode is None or not is_transport_failure(
+            exc.returncode, exc.stderr
+        ):
+            raise
+        return _emit_transfer_transport_lost(
+            args,
+            operation="push",
+            local=args.local,
+            remote=args.remote,
+            inst=inst,
+            start_offset=start_offset,
+        )
     _emit(
         args,
         data={"ok": True, "local": args.local, "remote": args.remote},
@@ -77,7 +140,22 @@ def _handle_pull(args: argparse.Namespace) -> int:
     if (preflight_rc := _preflight_ssh_guest(args, inst, stem="pull")) is not None:
         return preflight_rc
     ssh = _make_ssh(inst)
-    ssh.pull(args.remote, args.local)
+    start_offset = serial_log_offset(inst.serial_log)
+    try:
+        ssh.pull(args.remote, args.local)
+    except SSHError as exc:
+        if exc.returncode is None or not is_transport_failure(
+            exc.returncode, exc.stderr
+        ):
+            raise
+        return _emit_transfer_transport_lost(
+            args,
+            operation="pull",
+            local=args.local,
+            remote=args.remote,
+            inst=inst,
+            start_offset=start_offset,
+        )
     _emit(
         args,
         data={"ok": True, "local": args.local, "remote": args.remote},
