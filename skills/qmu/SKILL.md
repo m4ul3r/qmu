@@ -110,8 +110,13 @@ qmu kill --force        # SIGKILL
 qmu kill --no-clean     # Stop but keep .serial.log + .json for forensics
 qmu prune --vm <name>             # Remove a stopped VM's state files
 qmu prune --all                   # Remove every stopped VM's state files
-qmu prune --vm <name> --keep-logs # Drop .json + .qmp.sock but PRESERVE .serial.log
+qmu prune --vm <name> --keep-logs # Drop .json + .qmp.sock but PRESERVE .serial.log and .qemu.log
+qmu prune --runtime --older-than 86400  # Age-gated prune of qmu-owned runtime artifacts
 ```
+
+`--keep-logs` preserves both `.serial.log` and `.qemu.log` (metadata and QMP sockets are still removed).
+
+`qmu prune --runtime` removes only aged **marked** automatic output spills and aged definitely stale direct `cm-*` Unix sockets under the runtime root. It skips live/uncertain SSH controls, explicit `--out` files, unmarked lookalikes, symlinks, and unrelated temp names (including arbitrary `/tmp/qmu-*`). Default age is 86400 seconds; use `--older-than SECONDS` (non-negative). The command is idempotent and never recursively deletes the runtime root.
 
 State files are **never silently removed** except by `qmu wait`'s harness auto-clean (below). After `kill --no-clean`, or a harness VM that powered off without `wait`, the `.serial.log` survives — read it with `qmu log`/`qmu crash`, then `qmu prune` when done. See [Files on disk](#files-on-disk).
 
@@ -305,7 +310,7 @@ Use the exit code (not log scraping) to branch:
 
 Exit `3` is guest-side; an internal qmu/transport fault is `4`, so a tooling bug is never mistaken for a kernel panic. (Matches `qmu --help`.)
 
-**Output spilling.** Large outputs (>10k estimated tokens) auto-spill to a file under `$TMPDIR/qmu-spills/` (default `/tmp/qmu-spills/`). **Do not reconstruct the path** — read it from the result envelope's `artifact_path` field or the `[qmu] Output spilled to <path>` stderr line. The envelope's `{"token_estimate": <int>, "estimator": "chars/4"}` is a tokenizer-agnostic heuristic for sizing only.
+**Output spilling.** Large outputs (>10k estimated tokens) auto-spill to a file under the centralized spill root, in precedence order: `$QMU_TEMP_DIR/spills`, then `$XDG_RUNTIME_DIR/qmu/spills` when that XDG runtime directory is absolute/existing/writable/searchable, then `<platform temp>/qmu/spills`. Automatic spills are marked with an adjacent ownership sidecar; explicit `--out` paths are never marked as qmu-owned. **Callers must continue consuming `artifact_path`** — never reconstruct spill names or paths. Read the path from the result envelope's `artifact_path` field or the `[qmu] Output spilled to <path>` stderr line. The envelope's `{"token_estimate": <int>, "estimator": "chars/4"}` is a tokenizer-agnostic heuristic for sizing only.
 
 ## Health Check
 
@@ -324,7 +329,7 @@ Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
 | `<name>.json`       | VM metadata (pid, ports, kernel)     | `kill`, `prune`, `prune --keep-logs`, `wait` harness auto-clean |
 | `<name>.serial.log` | Serial console (read via `qmu log`)  | `kill`, `prune`, `wait` harness auto-clean — **kept** by `kill --no-clean`, `prune --keep-logs`, `wait --no-clean` |
 | `<name>.qmp.sock`   | QMP control socket                   | `kill`, `prune`, `prune --keep-logs`, `wait` harness auto-clean |
-| `<name>.qemu.log`   | QEMU stderr; rarely useful           | Never removed by qmu — delete by hand |
+| `<name>.qemu.log`   | QEMU stdout/stderr log               | `kill`, `prune`, `wait` harness auto-clean — **kept** by `kill --no-clean`, `prune --keep-logs`, `wait --no-clean` |
 
 `qmu list` shows running and stopped VMs with a status marker so you can see what's recoverable.
 

@@ -143,11 +143,13 @@ def test_remove_instance_clears_qemu_log_by_default():
     # kill/prune must not orphan it.
     _touch("vm-10022", ".serial.log")
     _touch("vm-10022", ".qemu.log")
+    _touch("vm-10022", ".qmp.sock")
 
     remove_instance("vm-10022")
 
     idir = instances_dir()
     assert not (idir / "vm-10022.json").exists()
+    assert not (idir / "vm-10022.qmp.sock").exists()
     assert not (idir / "vm-10022.serial.log").exists()
     assert not (idir / "vm-10022.qemu.log").exists()
 
@@ -156,10 +158,12 @@ def test_remove_instance_keep_logs_preserves_both_logs():
     save_instance(_make("vm-10022"))
     _touch("vm-10022", ".serial.log")
     _touch("vm-10022", ".qemu.log")
+    _touch("vm-10022", ".qmp.sock")
 
     remove_instance("vm-10022", keep_logs=True)
 
     idir = instances_dir()
     assert not (idir / "vm-10022.json").exists()
+    assert not (idir / "vm-10022.qmp.sock").exists()
     assert (idir / "vm-10022.serial.log").exists()
     assert (idir / "vm-10022.qemu.log").exists()
