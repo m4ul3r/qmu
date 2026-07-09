@@ -34,6 +34,7 @@ import json
 import pytest
 
 from qmu import cli
+from qmu.commands import lifecycle
 
 
 # --- 4: the main() catch-all (internal / unexpected) ------------------------
@@ -46,7 +47,7 @@ def test_catch_all_generic_exception_is_exit_4_text(monkeypatch, capsys):
     def boom(vm=None):
         raise RuntimeError("unexpected internal failure")
 
-    monkeypatch.setattr(cli, "choose_instance", boom)
+    monkeypatch.setattr(lifecycle, "choose_instance", boom)
     rc = cli.main(["status"])
     assert rc == 4
     # text mode: error on stderr, not stdout
@@ -60,7 +61,7 @@ def test_catch_all_generic_exception_is_exit_4_json(monkeypatch, capsys):
     def boom(vm=None):
         raise RuntimeError("unexpected internal failure")
 
-    monkeypatch.setattr(cli, "choose_instance", boom)
+    monkeypatch.setattr(lifecycle, "choose_instance", boom)
     rc = cli.main(["--format", "json", "status"])
     assert rc == 4
     payload = json.loads(capsys.readouterr().out)
@@ -103,7 +104,7 @@ def test_qmp_error_infra_failure_is_exit_4(monkeypatch, capsys):
     def boom(vm=None):
         raise QMPError("qmp socket vanished")
 
-    monkeypatch.setattr(cli, "choose_instance", boom)
+    monkeypatch.setattr(lifecycle, "choose_instance", boom)
     rc = cli.main(["status"])
     assert rc == 4
     assert "qmp socket vanished" in capsys.readouterr().err
@@ -116,7 +117,7 @@ def test_ssh_error_infra_failure_is_exit_4(monkeypatch, capsys):
     def boom(vm=None):
         raise SSHError("ssh transport gone")
 
-    monkeypatch.setattr(cli, "choose_instance", boom)
+    monkeypatch.setattr(lifecycle, "choose_instance", boom)
     rc = cli.main(["status"])
     assert rc == 4
     assert "ssh transport gone" in capsys.readouterr().err
@@ -165,9 +166,9 @@ def test_wait_timeout_is_exit_124(monkeypatch, tmp_path, capsys):
         def wait_event(self, events, timeout=1.0):
             return None  # never a stop event
 
-    monkeypatch.setattr(cli, "choose_instance", lambda vm=None: inst)
-    monkeypatch.setattr(cli, "_qmp_ctx", lambda i: FakeQMP())
-    monkeypatch.setattr(cli, "is_pid_alive", lambda pid: True)
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda i: FakeQMP())
+    monkeypatch.setattr(lifecycle, "is_pid_alive", lambda pid: True)
 
     rc = cli.main(["wait", "--timeout", "0.05"])
     assert rc == 124

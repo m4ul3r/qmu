@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 
 from qmu import cli
+from qmu.commands import guest, lifecycle
 
 
 @pytest.fixture
@@ -28,7 +29,7 @@ def captured_exec_args(monkeypatch):
         captured["args"] = args
         return 0
 
-    monkeypatch.setattr(cli, "_handle_exec", _stub)
+    monkeypatch.setattr(guest, "_handle_exec", _stub)
     return captured
 
 
@@ -75,22 +76,22 @@ class TestJoinExecCommand:
 
     def test_single_multiword_arg_passed_verbatim(self):
         # The documented form: one quoted string -> guest shell runs it as-is.
-        assert cli._join_exec_command(["uname -a"]) == "uname -a"
+        assert guest._join_exec_command(["uname -a"]) == "uname -a"
 
     def test_single_arg_with_pipe_preserved(self):
         # Pipes/redirects must survive untouched for the guest shell to interpret.
         cmd = "cat /proc/slabinfo | grep kmalloc-192"
-        assert cli._join_exec_command([cmd]) == cmd
+        assert guest._join_exec_command([cmd]) == cmd
 
     def test_single_simple_arg(self):
-        assert cli._join_exec_command(["uname"]) == "uname"
+        assert guest._join_exec_command(["uname"]) == "uname"
 
     def test_multiple_args_use_shlex_join(self):
         # Token-per-arg: an arg with spaces stays one quoted shell token.
-        assert cli._join_exec_command(["grep", "two words", "f"]) == "grep 'two words' f"
+        assert guest._join_exec_command(["grep", "two words", "f"]) == "grep 'two words' f"
 
     def test_multiple_simple_args(self):
-        assert cli._join_exec_command(["uname", "-a"]) == "uname -a"
+        assert guest._join_exec_command(["uname", "-a"]) == "uname -a"
 
 
 class TestPruneVmPlacement:
@@ -108,8 +109,8 @@ class TestPruneVmPlacement:
 
     @pytest.fixture(autouse=True)
     def _no_vms(self, monkeypatch):
-        monkeypatch.setattr(cli, "list_instances", lambda: [])
-        monkeypatch.setattr(cli, "list_stopped_instances", lambda: [])
+        monkeypatch.setattr(lifecycle, "list_instances", lambda: [])
+        monkeypatch.setattr(lifecycle, "list_stopped_instances", lambda: [])
 
     def test_vm_before_subcommand_targets_name(self, capsys):
         # Reaches the specific "No stopped VM named 'foo'." branch (target

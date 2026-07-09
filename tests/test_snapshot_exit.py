@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 from qmu import cli
+from qmu.commands import qmp_cmds
 
 
 def _snapshot_failed(msg: str) -> bool:
@@ -75,9 +76,9 @@ def _patch_save(monkeypatch, msg):
     """Stub the handler's collaborators so _handle_snapshot_save runs offline:
     choose_instance returns a dummy inst, _qmp_ctx is a no-op CM, and
     save_snapshot returns the HMP `msg` verbatim (as snapshot.py does)."""
-    monkeypatch.setattr(cli, "choose_instance", lambda vm: _FakeInst())
-    monkeypatch.setattr(cli, "_qmp_ctx", lambda inst: contextlib.nullcontext(None))
-    monkeypatch.setattr(cli, "save_snapshot", lambda qmp, name: msg)
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: _FakeInst())
+    monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(None))
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: msg)
 
 
 def _save_args():
@@ -89,7 +90,7 @@ def test_snapshot_save_failure_hint_mentions_qcow2_and_passt(monkeypatch, capsys
     # real requirement (writable qcow2 rootfs) and the networking caveat (passt),
     # mirroring the load handler's actionable hint.
     _patch_save(monkeypatch, "Error: Could not open 'savevm' section")
-    rc = cli._handle_snapshot_save(_save_args())
+    rc = qmp_cmds._handle_snapshot_save(_save_args())
     assert rc == 1
     err = capsys.readouterr().err
     assert "qcow2" in err
@@ -101,7 +102,7 @@ def test_snapshot_save_failure_hint_mentions_qcow2_and_passt(monkeypatch, capsys
 def test_snapshot_save_success_emits_no_hint(monkeypatch, capsys):
     # A clean save must not print the failure hint or exit non-zero.
     _patch_save(monkeypatch, "Snapshot 'clean' saved.")
-    rc = cli._handle_snapshot_save(_save_args())
+    rc = qmp_cmds._handle_snapshot_save(_save_args())
     assert rc == 0
     captured = capsys.readouterr()
     assert "qcow2" not in captured.err
