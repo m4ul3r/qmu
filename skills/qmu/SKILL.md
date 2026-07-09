@@ -248,18 +248,50 @@ qmu dmesg --tail 50
 
 ## GDB Integration (with pry)
 
+Explicit attach → continue → discover base → manual rebase workflow (no
+implicit resume/re-halt, no automatic pry rebasing):
+
 ```bash
-qmu launch --kernel /path/to/bzImage --gdb
-qmu gdb --symbols /path/to/vmlinux         # launches pry connected to the GDB stub
+eval "$(tools/kbuild.sh --version 7.0 --arch x86_64)"
+qmu launch --kernel "$KERNEL" --gdb --name debug-vm
+qmu gdb --vm debug-vm --symbols "$VMLINUX"
+# Attaching halted the guest; kbase will refuse to resume it implicitly.
+qmu cont --vm debug-vm
+eval "$(qmu kbase --vm debug-vm --symbols "$VMLINUX")"
+pry load "$VMLINUX" --base "$KBASE"
 ```
 
+**`qmu gdb --symbols`** launches pry connected to the GDB stub and loads the
+ELF at its **link-time** addresses. Success reports `symbols_rebased:false`
+and `symbol_base:"elf-link-time"`; the link-time warning is valid whether the
+eventual KASLR slide is zero or nonzero. `kaslr_status` stays `"unknown"` —
+the warning describes loading behavior, not guest KASLR configuration. qmu
+never discovers a runtime base during `gdb` and never passes `--base` to pry.
+
+**`qmu kbase --vm NAME --symbols VMLINUX`** reads local ELF `_text` (via
+`nm`/`llvm-nm`) and runtime `_text` (via guest `/proc/kallsyms`), then prints
+eval-able `KBASE`, `LINK_BASE`, and `SLIDE` (JSON/NDJSON use the same values as
+hex-string fields). It requires normal guest SSH. It **does not** issue QMP
+`cont`, resume/re-halt the guest, invoke pry, or apply a symbol base.
+
 **Gotcha — `qmu gdb` halts the vCPU.** Attaching to the QEMU GDB stub halts
-the guest CPU. Before `qmu exec`/`push`/`pull`/`compile`/`dmesg` constructs an
-SSH client, qmu best-effort queries QMP; a positively observed `paused` or
-`debug` state fails immediately with operational exit `1`, not an SSH timeout
-or crash classification. **Resume before SSH commands** with
+the guest CPU. Before `qmu exec`/`push`/`pull`/`compile`/`dmesg`/`kbase`
+constructs an SSH client, qmu best-effort queries QMP; a positively observed
+`paused` or `debug` state fails immediately with operational exit `1`, not an
+SSH timeout or crash classification (`ssh_error:false`,
+`crash_detected:false`). **Resume before SSH / kbase** with
 `qmu cont --vm <id>` (or `pry continue`, or `qmu monitor cont`). If QMP
 introspection is unavailable, qmu preserves the existing SSH path.
+
+**kbase operational errors** (exit 1) include: harness/no-SSH instances,
+unsupported or legacy (`arch=None`) architecture metadata, restricted
+kallsyms (`kptr_restrict`), missing symbols/tools, and missing `_text`. A
+paused/debugger-stopped guest returns exit 1 immediately with
+`qmu cont`/`pry continue` guidance; kbase neither resumes nor re-halts it.
+
+**Non-goals:** qmu never invokes `pry load --base` automatically — the
+operator applies the reported base. Neither `gdb` nor `kbase` silently
+resumes or re-halts the guest.
 
 ```bash
 pry break set commit_creds
@@ -324,12 +356,16 @@ Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
 - **Snapshots require a qcow2 rootfs AND `--net-backend passt`** — `savevm` needs a writable qcow2 disk (the default `format = "raw"` image cannot store internal snapshots, so `snapshot save` fails), and the default slirp backend can't be serialized (so `loadvm` fails and `snapshot load` returns non-zero). Convert to qcow2 and use passt for a working `save`/`load` loop, or relaunch instead (see Snapshots).
 - **Snapshots are ephemeral** — a temporary COW overlay, gone when the VM exits (by design; base image stays clean).
 - **`qmu gdb` halts the guest** — resume with `qmu cont` / `pry continue` / `qmu monitor cont` before SSH commands (see GDB Integration).
-  Before `exec`, `push`, `pull`, `compile`, or `dmesg` constructs an SSH client,
+  Before `exec`, `push`, `pull`, `compile`, `dmesg`, or `kbase` constructs an SSH client,
   qmu best-effort queries QMP. A positively observed debugger/manual stop
   (`paused` or `debug`) fails immediately with operational exit `1`, reports
   `ssh_error:false` and `crash_detected:false`, and gives
   `qmu cont --vm <id>` / `pry continue` recovery guidance. If QMP introspection is
   unavailable, qmu preserves the existing SSH path rather than creating a new
   command outage.
+- **`qmu gdb --symbols` is link-time only** — symbols load at ELF link-time addresses
+  (`symbols_rebased:false`). Discover the runtime base with `qmu kbase`, then apply
+  it manually via `pry load ... --base "$KBASE"`. qmu never auto-rebases pry and
+  never resumes/re-halts the guest for you.
 - **Crash auto-extraction is best-effort** — confirm with `qmu crash` / `qmu log --tail 200` after any suspected panic (see Compile and Run).
 - **Serial log is write-only** — no interactive console; use SSH for interactive work.
