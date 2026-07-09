@@ -4,7 +4,8 @@ Everything here talks to the guest over SSH (exec/compile/dmesg/push/pull) or
 reads the serial log (crash/log). Shared helpers come from :mod:`.._cliutil`.
 
 The patchable collaborators (``choose_instance``, ``_make_ssh``,
-``_preflight_ssh_guest``, ``_require_ssh``, ``extract_crash``) are imported
+``_preflight_ssh_guest``, ``_require_ssh``, ``extract_crash``, and
+``serial_log_offset``) are imported
 directly into this module's namespace, and
 ``_add_exec`` binds the module-global ``_handle_exec``. The test suite drives the
 production seams with ``monkeypatch.setattr(guest, ...)`` (e.g.
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from ..instance import QMUError, VMInstance, choose_instance, find_instance
-from ..serial import extract_crash, tail_log
+from ..serial import extract_crash, serial_log_offset, tail_log
 from ..ssh import SSHClient, SSHError
 from .._cliutil import (
     _add_common_opts,
@@ -119,7 +120,13 @@ def _transport_lost(ssh: SSHClient) -> bool:
     return True
 
 
-def _emit_ssh_lost(args: argparse.Namespace, command: str, inst: VMInstance) -> int:
+def _emit_ssh_lost(
+    args: argparse.Namespace,
+    command: str,
+    inst: VMInstance,
+    *,
+    start_offset: int,
+) -> int:
     """Emit the SSH-lost / probable-crash envelope and return exit 3.
 
     Used for both an SSH timeout (TimeoutExpired -> SSHError) and a transport
@@ -127,7 +134,7 @@ def _emit_ssh_lost(args: argparse.Namespace, command: str, inst: VMInstance) -> 
     likely panicked and dropped the connection. Exit 3 distinguishes a
     crash/transport-loss from an ordinary non-zero guest command (exit 1).
     """
-    crash = extract_crash(inst.serial_log)
+    crash = extract_crash(inst.serial_log, start_offset=start_offset)
     # CORR-5: only assert a kernel crash when a crash report was actually
     # extracted; otherwise the connection merely dropped (VM unreachable) and we
     # must not send the agent chasing a phantom panic.
@@ -180,11 +187,14 @@ def _handle_exec(args: argparse.Namespace) -> int:
     ssh = _make_ssh(inst)
     command = _join_exec_command(args.command)
 
+    command_start_offset = serial_log_offset(inst.serial_log)
     try:
         rc, stdout, stderr = ssh.run(command, timeout=args.timeout)
     except SSHError:
         # SSH command exceeded qmu's own timeout — likely a hung/crashed guest.
-        return _emit_ssh_lost(args, command, inst)
+        return _emit_ssh_lost(
+            args, command, inst, start_offset=command_start_offset
+        )
 
     # A kernel panic during the command drops the connection and ssh exits 255 —
     # often with EMPTY stderr (LogLevel=ERROR suppresses the keepalive message),
@@ -194,7 +204,9 @@ def _handle_exec(args: argparse.Namespace) -> int:
     # the guest vanished (crash); if it answers, the guest genuinely returned 255
     # and we take the normal path.
     if rc == 255 and _transport_lost(ssh):
-        return _emit_ssh_lost(args, command, inst)
+        return _emit_ssh_lost(
+            args, command, inst, start_offset=command_start_offset
+        )
 
     output_parts = []
     if stdout.strip():
@@ -298,6 +310,7 @@ def _handle_compile(args: argparse.Namespace) -> int:
         return 0
 
     # Run (quoted: the binary path is interpolated into a root shell command)
+    run_start_offset = serial_log_offset(inst.serial_log)
     try:
         rc, stdout, stderr = ssh.run(shlex.quote(remote_bin), timeout=args.timeout)
         # A kernel panic during the run drops the connection and ssh exits 255
@@ -324,7 +337,7 @@ def _handle_compile(args: argparse.Namespace) -> int:
         return 0 if rc == 0 else 1
 
     except SSHError:
-        crash = extract_crash(inst.serial_log)
+        crash = extract_crash(inst.serial_log, start_offset=run_start_offset)
         result.update({
             "ok": False,
             "ssh_error": True,
