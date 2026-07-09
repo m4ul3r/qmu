@@ -104,6 +104,9 @@ def build_qemu_command(
         for spec in drives:
             cmd.extend(["-drive", spec])
     elif rootfs is not None:
+        # Configured raw or qcow2 rootfs images sit behind this temporary overlay:
+        # in-session checkpoints disappear with QEMU. A durable internal snapshot
+        # needs an explicit writable qcow2 drive above, without snapshot=on.
         cmd.extend(["-drive", f"file={rootfs},format={config.drive_format},snapshot=on"])
 
     # Networking

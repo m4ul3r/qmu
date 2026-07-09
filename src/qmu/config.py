@@ -39,7 +39,7 @@ class QMUConfig:
     cpus: int = 2
     cpu_model: str | None = None
     nic_model: str = "virtio-net-pci"
-    net_backend: str = "user"  # "user" (slirp) or "passt" (migratable → snapshots work)
+    net_backend: str = "user"  # "user" (slirp) or native "passt" when advertised by QEMU
     extra_args: list[str] = field(default_factory=list)
 
     # drive
@@ -234,20 +234,27 @@ memory = "4G"
 cpus = 2
 # cpu = "host"                   # passes -cpu to QEMU; "host" is recommended with KVM
 # nic_model = "virtio-net-pci"   # or "e1000", "rtl8139", ...
-# net_backend = "passt"          # "user" (default, slirp) or "passt"; passt is a
-#                                #   rootless, migratable backend so `snapshot save/load`
-#                                #   works (slirp cannot be snapshotted). Needs the
-#                                #   `passt` binary on PATH. Snapshots also require a
-#                                #   qcow2 rootfs (see [drive] format below).
+# net_backend = "passt"          # Optional migration-compatible backend. The selected
+#                                #   QEMU must advertise native passt; qmu probes whether it
+#                                #   advertises native passt (documented since QEMU 10.1 but
+#                                #   build-optional), and `passt` must be on PATH. Default
+#                                #   user/slirp often restores successfully.
+#                                #   Switch only if loadvm reports slirp/footer errors.
+#                                #   A manually managed external passt + QEMU stream setup
+#                                #   is outside qmu process management; qmu does not manage
+#                                #   that external process.
 {machine_extras}
 
 [drive]
 rootfs = "./rootfs.img"          # CHANGE ME — path to a kernel rootfs image
-format = "raw"                   # "raw" or "qcow2". `qmu snapshot save` (HMP savevm)
-                                 #   needs a writable qcow2 disk to store internal
-                                 #   snapshots; raw images cannot hold them. Convert with
-                                 #   `qemu-img convert -O qcow2 rootfs.img rootfs.qcow2`
-                                 #   and set format = "qcow2" to use snapshots.
+format = "raw"                   # "raw" or "qcow2" base. qmu attaches this configured
+                                 #   rootfs through a temporary snapshot=on overlay, so
+                                 #   raw or qcow2 can support in-session savevm/loadvm;
+                                 #   checkpoints disappear when QEMU exits. For durable
+                                 #   internal snapshots, attach a writable qcow2 drive
+                                 #   without snapshot=on, e.g. launch with:
+                                 #   --drive 'file=./rootfs.qcow2,format=qcow2'
+                                 #   Changing [drive] format alone remains temporary.
 
 [ssh]
 key = "~/.ssh/qmu_id_rsa"        # CHANGE ME — private key matching the rootfs
