@@ -38,7 +38,7 @@ from qmu.output import (
 
 
 @pytest.fixture(autouse=True)
-def isolate_spill_tmpdir(tmp_path, monkeypatch):
+def isolate_spill_runtime(tmp_path, monkeypatch):
     """spill_root() = tempfile.gettempdir()/qmu-spills, which honors $TMPDIR."""
     spill_base = tmp_path / "tmp"
     spill_base.mkdir()
@@ -99,7 +99,7 @@ def test_below_limit_is_inline(tmp_path):
     assert res.artifact is None
 
 
-def test_above_limit_spills(isolate_spill_tmpdir):
+def test_above_limit_spills(isolate_spill_runtime):
     """token_estimate == limit+1 -> spills to a file under $TMPDIR/qmu-spills."""
     limit = 50
     value = _text_with_estimate(limit + 1)
@@ -113,11 +113,11 @@ def test_above_limit_spills(isolate_spill_tmpdir):
     assert envelope == res.artifact
     # the spill file actually exists, under the isolated TMPDIR
     artifact_path = res.artifact["artifact_path"]
-    assert str(isolate_spill_tmpdir) in artifact_path
-    assert str(isolate_spill_tmpdir / "qmu-spills") in artifact_path
+    assert str(isolate_spill_runtime) in artifact_path
+    assert str(isolate_spill_runtime / "qmu-spills") in artifact_path
 
 
-def test_artifact_envelope_fields_and_integrity(isolate_spill_tmpdir):
+def test_artifact_envelope_fields_and_integrity(isolate_spill_runtime):
     """The artifact envelope schema is the agent-facing contract: exact keys,
     ok True, the char-based estimator label, and a sha256/bytes that match the
     bytes actually written to disk."""
@@ -169,7 +169,7 @@ def test_out_path_writes_file_and_returns_envelope(tmp_path):
     assert res.artifact["summary"]["kind"] == "object"
 
 
-def test_ndjson_spill_uses_ndjson_suffix(isolate_spill_tmpdir):
+def test_ndjson_spill_uses_ndjson_suffix(isolate_spill_runtime):
     """A spilled ndjson list is written with a .ndjson suffix (output.py:127)."""
     limit = 5
     value = [{"i": i} for i in range(200)]  # well over 5*4 chars once rendered
@@ -211,7 +211,7 @@ def test_text_forced_out_uses_explicit_false_source_ok(tmp_path):
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
-def test_spill_preserves_false_source_ok(isolate_spill_tmpdir, fmt):
+def test_spill_preserves_false_source_ok(isolate_spill_runtime, fmt):
     value = {"ok": False, "error": "x" * 512}
 
     result = write_output_result(
