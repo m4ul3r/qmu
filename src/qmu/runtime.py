@@ -21,7 +21,7 @@ _SPILL_MARKER_FIELDS = frozenset(
 def spill_marker_path(artifact: Path) -> Path:
     return artifact.with_name(artifact.name + SPILL_MARKER_SUFFIX)
 
-def _same_marker_node(left: os.stat_result, right: os.stat_result) -> bool:
+def _same_file_node(left: os.stat_result, right: os.stat_result) -> bool:
     return all(
         getattr(left, field) == getattr(right, field)
         for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")
@@ -30,12 +30,12 @@ def _same_marker_node(left: os.stat_result, right: os.stat_result) -> bool:
 
 def _load_regular_marker(
     marker: Path, marker_stat: os.stat_result
-) -> dict[str, object] | None:
+) -> tuple[dict[str, object], os.stat_result] | None:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         with os.fdopen(os.open(marker, flags), encoding="utf-8") as marker_file:
             opened_stat = os.fstat(marker_file.fileno())
-            if not _same_marker_node(marker_stat, opened_stat):
+            if not _same_file_node(marker_stat, opened_stat):
                 return None
             payload = json.load(marker_file)
             opened_stat = os.fstat(marker_file.fileno())
@@ -46,12 +46,12 @@ def _load_regular_marker(
         current_stat = marker.lstat()
     except OSError:
         return None
-    if not _same_marker_node(opened_stat, current_stat):
+    if not _same_file_node(opened_stat, current_stat):
         return None
-    return payload if isinstance(payload, dict) else None
+    return (payload, current_stat) if isinstance(payload, dict) else None
 
 
-def is_owned_spill_artifact(artifact: Path) -> bool:
+def invalidate_owned_spill_marker(artifact: Path) -> bool:
     artifact_name = artifact.name
     if not artifact_name or artifact_name in {".", ".."}:
         return False
@@ -71,8 +71,11 @@ def is_owned_spill_artifact(artifact: Path) -> bool:
     except OSError:
         return False
 
-    payload = _load_regular_marker(marker, marker_stat)
-    if payload is None or set(payload) != _SPILL_MARKER_FIELDS:
+    loaded_marker = _load_regular_marker(marker, marker_stat)
+    if loaded_marker is None:
+        return False
+    payload, expected_marker_stat = loaded_marker
+    if set(payload) != _SPILL_MARKER_FIELDS:
         return False
     if type(payload["schema"]) is not int or payload["schema"] != 1:
         return False
@@ -89,11 +92,27 @@ def is_owned_spill_artifact(artifact: Path) -> bool:
         return False
     if not stat.S_ISREG(artifact_stat.st_mode):
         return False
-    return all(
+    if not all(
         type(payload[field]) is int
         and payload[field] == getattr(artifact_stat, field)
         for field in _SPILL_IDENTITY_FIELDS
-    )
+    ):
+        return False
+
+    try:
+        current_artifact_stat = artifact.lstat()
+        current_marker_stat = marker.lstat()
+    except OSError:
+        return False
+    if not _same_file_node(artifact_stat, current_artifact_stat):
+        return False
+    if not _same_file_node(expected_marker_stat, current_marker_stat):
+        return False
+    try:
+        marker.unlink()
+    except OSError:
+        return False
+    return True
 
 
 def mark_spill_artifact(

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import spill_root
-from .runtime import is_owned_spill_artifact, mark_spill_artifact, spill_marker_path
+from .runtime import invalidate_owned_spill_marker, mark_spill_artifact
 
 
 DEFAULT_SPILL_TOKEN_LIMIT = 10_000
@@ -108,8 +108,7 @@ def write_output_result(
 
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        if is_owned_spill_artifact(out_path):
-            spill_marker_path(out_path).unlink(missing_ok=True)
+        invalidate_owned_spill_marker(out_path)
         out_path.write_bytes(encoded)
         artifact = _artifact_payload(
             artifact_path=out_path,
