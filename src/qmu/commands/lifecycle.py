@@ -37,6 +37,7 @@ from ..paths import (
     codex_home,
     codex_skills_dir,
 )
+from ..qemu import native_passt_problem, probe_qemu_netdevs
 from ..qmp import QMPError
 from ..serial import extract_crash
 from ..vm import launch_vm
@@ -573,14 +574,36 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             "detail": "No qmu.toml or ~/.config/qmu/config.toml found. Run: qmu config init",
         })
 
-    # QEMU binary (arch-aware)
+    # QEMU binary (arch-aware). For configured passt, derive the reported path
+    # from the same result used for the native-backend capability check.
     binary = config.qemu_binary()
-    qemu = shutil.which(binary)
+    passt_required = config.net_backend == "passt"
+    qemu_caps = probe_qemu_netdevs(binary) if passt_required else None
+    qemu = qemu_caps.path if qemu_caps is not None else shutil.which(binary)
     checks.append({
         "check": binary,
         "status": "ok" if qemu else "MISSING",
         "detail": qemu or "Not found in PATH",
     })
+
+    if not passt_required:
+        checks.append({
+            "check": "QEMU native passt (-netdev passt)",
+            "status": "info",
+            "detail": "Not required for configured net_backend=user.",
+        })
+    else:
+        assert qemu_caps is not None
+        passt_problem = native_passt_problem(qemu_caps)
+        checks.append({
+            "check": "QEMU native passt (-netdev passt)",
+            "status": "ok" if passt_problem is None else "MISSING",
+            "detail": (
+                f"{qemu_caps.path} advertises native '-netdev passt'"
+                if passt_problem is None
+                else passt_problem
+            ),
+        })
 
     # Rootfs
     if config.rootfs:
@@ -651,9 +674,8 @@ def _handle_doctor(args: argparse.Namespace) -> int:
                          "Install pry and ensure it is on PATH.",
     })
 
-    # passt (required only when net_backend = "passt"; enables snapshots)
+    # External passt executable (required only when net_backend = "passt")
     passt = shutil.which("passt")
-    passt_required = config.net_backend == "passt"
     checks.append({
         "check": "passt (net_backend=passt)",
         "status": ("ok" if passt else "MISSING") if passt_required else "info",
@@ -661,8 +683,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             "Not found in PATH — REQUIRED because net_backend=passt. "
             "Install passt (e.g. 'pacman -S passt' / 'apt install passt')."
             if passt_required else
-            "Not found — only needed if you set net_backend=passt "
-            "(rootless backend that makes snapshots work)."
+            "Not found — not required for configured net_backend=user."
         ),
     })
 
