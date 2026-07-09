@@ -42,7 +42,6 @@ CRASH_END_PATTERNS = [
 
 _SOFT_END_TRACE = re.compile(r"---\[ end trace")
 _FATAL_PANIC_START = re.compile(r"Kernel panic - not syncing", re.IGNORECASE)
-_EPILOGUE_GAP = 8
 
 
 def _is_crash_start(line: str) -> bool:
@@ -59,17 +58,13 @@ def _is_crash_end(line: str) -> bool:
 
 
 def _soft_end_links_to_fatal_panic(lines: list[str], end_index: int) -> bool:
-    nonblank = 0
+    """Return whether the next nonblank line is the fatal panic continuation."""
     for line in lines[end_index + 1:]:
         if not line.strip():
             continue
-        nonblank += 1
-        if _FATAL_PANIC_START.search(line) and not _is_crash_end(line):
-            return True
-        if _is_crash_start(line) or _is_crash_end(line):
-            return False
-        if nonblank >= _EPILOGUE_GAP:
-            return False
+        return bool(
+            _FATAL_PANIC_START.search(line) and not _is_crash_end(line)
+        )
     return False
 
 
