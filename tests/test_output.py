@@ -331,6 +331,45 @@ def test_explicit_out_preserves_symlink_sidecar(tmp_path):
     assert marker.read_text() == "user-owned sidecar"
 
 
+def test_explicit_out_preserves_marker_replaced_after_validation(monkeypatch):
+    automatic = write_output_result(
+        _text_with_estimate(51),
+        fmt="text",
+        out_path=None,
+        stem="exec",
+        spill_token_limit=50,
+    )
+    artifact = Path(automatic.artifact["artifact_path"])
+    marker = spill_marker_path(artifact)
+    replacement_marker = b"user replacement after marker validation"
+    real_lstat = Path.lstat
+    marker_lstats = 0
+
+    def replace_marker_after_validation(path):
+        nonlocal marker_lstats
+        observed = real_lstat(path)
+        if path == marker:
+            marker_lstats += 1
+            if marker_lstats == 2:
+                marker.unlink()
+                marker.write_bytes(replacement_marker)
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", replace_marker_after_validation)
+    explicit_value = {"source": "explicit --out"}
+    result = write_output_result(
+        explicit_value,
+        fmt="json",
+        out_path=artifact,
+        stem="exec",
+        spill_token_limit=1,
+    )
+
+    assert result.spilled is False
+    assert artifact.read_bytes() == render_value(explicit_value, "json").encode("utf-8")
+    assert marker.read_bytes() == replacement_marker
+
+
 def test_marker_failure_removes_partial_auto_spill_transaction(monkeypatch):
 
     def write_partial_then_raise(path, *_args, **_kwargs):
