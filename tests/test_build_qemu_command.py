@@ -2,12 +2,7 @@
 
 from __future__ import annotations
 
-import shutil
-
-import pytest
-
 from qmu.config import QMUConfig
-from qmu.instance import QMUError
 from qmu.vm import build_qemu_command
 
 
@@ -32,6 +27,36 @@ def _kwargs(**over):
     )
     base.update(over)
     return base
+
+
+def test_explicit_resolved_qemu_binary_is_argv_zero():
+    cmd = build_qemu_command(
+        **_kwargs(qemu_binary="/opt/qemu/bin/qemu-system-aarch64")
+    )
+    assert cmd[0] == "/opt/qemu/bin/qemu-system-aarch64"
+
+
+def test_raw_implicit_drive_is_temporary_overlay():
+    cfg = _base_config()
+    cfg.drive_format = "raw"
+    cmd = build_qemu_command(**_kwargs(config=cfg))
+    drive_args = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-drive"]
+    assert drive_args == ["file=/r/rootfs.img,format=raw,snapshot=on"]
+
+
+def test_qcow2_configured_base_is_still_behind_temporary_overlay():
+    cfg = _base_config()
+    cfg.drive_format = "qcow2"
+    cmd = build_qemu_command(**_kwargs(config=cfg))
+    drive_args = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-drive"]
+    assert drive_args == ["file=/r/rootfs.img,format=qcow2,snapshot=on"]
+
+
+def test_explicit_writable_qcow2_drive_is_not_hidden_by_overlay():
+    spec = "file=/r/rootfs.qcow2,format=qcow2"
+    cmd = build_qemu_command(**_kwargs(drives=[spec]))
+    drive_args = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-drive"]
+    assert drive_args == [spec]
 
 
 def test_default_invocation_unchanged():
@@ -123,19 +148,13 @@ def test_cpu_model_absent_by_default():
 
 # --- net_backend = "passt" (migratable backend so snapshots work) -------------
 
-def _fake_passt(monkeypatch):
-    """Pretend `passt` is installed on PATH for build_qemu_command's check."""
-    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
-
-
 def test_default_net_backend_is_user():
     cmd = build_qemu_command(**_kwargs())
     assert any(a.startswith("user,id=net0,") for a in cmd)
     assert not any(a.startswith("passt,") for a in cmd)
 
 
-def test_passt_backend_param(monkeypatch):
-    _fake_passt(monkeypatch)
+def test_passt_backend_param():
     cmd = build_qemu_command(**_kwargs(net_backend="passt"))
     # passt netdev with SSH port forwarded to guest :22, no slirp hostfwd.
     assert any(
@@ -147,28 +166,20 @@ def test_passt_backend_param(monkeypatch):
     assert not any(a.startswith("user,id=net0,") for a in cmd)
 
 
-def test_passt_backend_from_config(monkeypatch):
-    _fake_passt(monkeypatch)
+def test_passt_backend_from_config():
     cfg = _base_config()
     cfg.net_backend = "passt"
     cmd = build_qemu_command(**_kwargs(config=cfg))
     assert any(a.startswith("passt,id=net0,") for a in cmd)
 
 
-def test_passt_param_overrides_config(monkeypatch):
-    _fake_passt(monkeypatch)
+def test_passt_param_overrides_config():
     cfg = _base_config()
     cfg.net_backend = "passt"
     # Explicit param "user" wins over config "passt".
     cmd = build_qemu_command(**_kwargs(config=cfg, net_backend="user"))
     assert any(a.startswith("user,id=net0,") for a in cmd)
     assert not any(a.startswith("passt,") for a in cmd)
-
-
-def test_passt_missing_binary_raises(monkeypatch):
-    monkeypatch.setattr(shutil, "which", lambda name: None)
-    with pytest.raises(QMUError, match="passt"):
-        build_qemu_command(**_kwargs(net_backend="passt"))
 
 
 def test_cpu_model_from_config_emits_flag():

@@ -12,6 +12,8 @@ Findings exercised: ARG-1 / H5.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from qmu import cli
@@ -63,6 +65,39 @@ def test_both_orders_resolve_identically(captured_exec_args):
     cli.main(["exec", "--vm", "X", "uname"])
     after = captured_exec_args["args"].vm
     assert before == after == "X"
+
+
+def test_launch_arch_and_backend_overrides_reach_launch_vm(monkeypatch):
+    captured = {}
+
+    def fake_launch_vm(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            harness=True,
+            ssh_port=None,
+            gdb_port=None,
+            vm_id="selection",
+            pid=4242,
+            kernel=kwargs["kernel"],
+            profile=kwargs["profile"],
+            serial_log="/tmp/selection.serial.log",
+        )
+
+    monkeypatch.setattr(lifecycle, "load_instance", lambda name: None)
+    monkeypatch.setattr(lifecycle, "launch_vm", fake_launch_vm)
+
+    rc = cli.main([
+        "launch",
+        "--kernel", "/not-opened-by-stub",
+        "--arch", "aarch64",
+        "--net-backend", "passt",
+        "--harness",
+        "--name", "selection",
+    ])
+
+    assert rc == 0
+    assert captured["config"].arch == "aarch64"
+    assert captured["net_backend"] == "passt"
 
 
 class TestJoinExecCommand:
