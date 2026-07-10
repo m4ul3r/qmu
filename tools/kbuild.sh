@@ -439,11 +439,12 @@ docker run --rm \
 
     # debug info
     ./scripts/config --enable DEBUG_INFO
-    # Full type info is required for Linux's vmlinux-gdb.py / lx_current helpers.
+    # Full type info is required for Linux vmlinux-gdb.py / lx helpers.
     # Some arch defconfigs (notably arm64) default DEBUG_INFO_REDUCED=y, which
-    # makes the lx scripts refuse to load ("Reduced debug information...").
+    # makes the lx scripts refuse to load (Reduced debug information error).
     # Note: do not write dollar-lx_current in this double-quoted -c body — host
     # set -u expands it before docker runs.
+    # Note: never put unescaped double-quotes in comments here either.
     ./scripts/config --disable DEBUG_INFO_REDUCED
     if version_ge \$MAJOR \$MINOR 5 18; then
       ./scripts/config --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
@@ -460,15 +461,18 @@ docker run --rm \
     fi
 
     # build
+    # NOTE: do not quote -j\$JOBS with double-quotes here; unescaped quotes end
+    # the host double-quoted docker -c string early and silently truncate the
+    # script (observed as: defconfig only, docker exit 0, no zImage).
     make ARCH=\$MAKE_ARCH CROSS_COMPILE=\$CROSS_COMPILE \
-      \$MAKE_VERBOSE -j"\$JOBS" \$MAKE_TARGET \
+      \$MAKE_VERBOSE -j\$JOBS \$MAKE_TARGET \
       2>&1 | tee /output/build.log >&2
     make ARCH=\$MAKE_ARCH CROSS_COMPILE=\$CROSS_COMPILE \
       \$MAKE_VERBOSE \$GDB_TARGET \
       2>&1 | tee -a /output/build.log >&2
 
     # copy artifacts and preserve the upstream relative GDB-loader layout
-    cp "\$IMAGE_SUBPATH" /output/
+    cp \$IMAGE_SUBPATH /output/
     cp vmlinux /output/vmlinux
     cp .config /output/.config
     rm -rf /output/scripts/gdb /output/vmlinux-gdb.py
@@ -477,8 +481,8 @@ docker run --rm \
     # The build tree's vmlinux-gdb.py is typically a symlink into scripts/gdb.
     # Docker leaves that link as /src/scripts/gdb/... which is meaningless on
     # the host, so dereference into a real file next to scripts/gdb/. With
-    # __file__ at the build-root path, the loader's sys.path insert of
-    # dirname(__file__)+"/scripts/gdb" resolves correctly on the host.
+    # __file__ at the build-root path, the loader sys.path insert of
+    # dirname(__file__)+/scripts/gdb resolves correctly on the host.
     if [[ -e vmlinux-gdb.py || -L vmlinux-gdb.py ]]; then
       cp -L vmlinux-gdb.py /output/vmlinux-gdb.py
     else
