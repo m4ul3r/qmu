@@ -439,9 +439,11 @@ docker run --rm \
 
     # debug info
     ./scripts/config --enable DEBUG_INFO
-    # Full type info is required for Linux's vmlinux-gdb.py / $lx_current().
+    # Full type info is required for Linux's vmlinux-gdb.py / lx_current helpers.
     # Some arch defconfigs (notably arm64) default DEBUG_INFO_REDUCED=y, which
     # makes the lx scripts refuse to load ("Reduced debug information...").
+    # Note: do not write dollar-lx_current in this double-quoted -c body — host
+    # set -u expands it before docker runs.
     ./scripts/config --disable DEBUG_INFO_REDUCED
     if version_ge \$MAJOR \$MINOR 5 18; then
       ./scripts/config --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
