@@ -8,10 +8,13 @@ QMU_CACHE_DIR at a per-test tmp dir, so instances_dir() is disposable here.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from qmu.instance import (
     VMInstance,
+    list_stopped_instances,
     load_instance,
     remove_instance,
     save_guest_epoch_serial_offset,
@@ -27,6 +30,7 @@ def _make(vm_id: str, **overrides) -> VMInstance:
         qmp_socket="/tmp/qmp.sock",
         ssh_port=10022,
         ssh_key="/home/u/.ssh/id_rsa",
+        arch="x86_64",
         gdb_port=None,
         serial_log="/tmp/serial.log",
         kernel="/boot/bzImage",
@@ -42,11 +46,34 @@ def _make(vm_id: str, **overrides) -> VMInstance:
 
 
 def test_save_load_roundtrip():
-    inst = _make("vm-10022")
+    inst = _make("vm-10022", arch="aarch64")
     path = save_instance(inst)
     assert path.exists()
     loaded = load_instance("vm-10022")
     assert loaded == inst
+    assert loaded is not None and loaded.arch == "aarch64"
+
+
+def test_load_legacy_instance_without_arch_uses_unknown_architecture():
+    path = save_instance(_make("legacy", arch="x86_64"))
+    payload = json.loads(path.read_text())
+    payload.pop("arch")
+    path.write_text(json.dumps(payload) + "\n")
+
+    loaded = load_instance("legacy")
+    assert loaded is not None
+    assert loaded.arch is None
+
+
+def test_orphan_serial_log_does_not_invent_guest_architecture():
+    instances_dir().mkdir(parents=True)
+    (instances_dir() / "orphan.serial.log").write_text("guest output")
+
+    stopped = list_stopped_instances()
+
+    assert len(stopped) == 1
+    assert stopped[0].vm_id == "orphan"
+    assert stopped[0].arch is None
 
 
 def test_guest_epoch_offset_roundtrips():
@@ -143,11 +170,13 @@ def test_remove_instance_clears_qemu_log_by_default():
     # kill/prune must not orphan it.
     _touch("vm-10022", ".serial.log")
     _touch("vm-10022", ".qemu.log")
+    _touch("vm-10022", ".qmp.sock")
 
     remove_instance("vm-10022")
 
     idir = instances_dir()
     assert not (idir / "vm-10022.json").exists()
+    assert not (idir / "vm-10022.qmp.sock").exists()
     assert not (idir / "vm-10022.serial.log").exists()
     assert not (idir / "vm-10022.qemu.log").exists()
 
@@ -156,10 +185,12 @@ def test_remove_instance_keep_logs_preserves_both_logs():
     save_instance(_make("vm-10022"))
     _touch("vm-10022", ".serial.log")
     _touch("vm-10022", ".qemu.log")
+    _touch("vm-10022", ".qmp.sock")
 
     remove_instance("vm-10022", keep_logs=True)
 
     idir = instances_dir()
     assert not (idir / "vm-10022.json").exists()
+    assert not (idir / "vm-10022.qmp.sock").exists()
     assert (idir / "vm-10022.serial.log").exists()
     assert (idir / "vm-10022.qemu.log").exists()

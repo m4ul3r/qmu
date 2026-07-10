@@ -30,6 +30,9 @@ from .._cliutil import (
     _add_common_opts,
     _emit,
     _make_group_help_handler,
+    _make_ssh,
+    _preflight_ssh_guest,
+    _require_ssh,
     _qmp_ctx,
 )
 
@@ -95,23 +98,21 @@ def _handle_snapshot_save(args: argparse.Namespace) -> int:
         stem="snapshot-save",
     )
     if failed:
-        # savevm stores *internal* snapshots, which QEMU can only write into a
-        # writable qcow2 disk. The default implicit rootfs drive is
-        # format=raw,snapshot=on (see vm.py): raw images cannot hold internal
-        # snapshots, and the snapshot=on overlay is a throwaway that savevm
-        # refuses too. Give the actionable requirement rather than the raw HMP
-        # error (mirrors the load handler's hint).
         sys.stderr.write(
             f"[qmu] snapshot save failed: {msg}\n"
-            "[qmu] `savevm` requires a writable qcow2 rootfs disk to store "
-            "internal snapshots; the default format=raw image (and any "
-            "snapshot=on overlay) cannot hold them. Rebuild/convert the rootfs "
-            "to qcow2 (e.g. `qemu-img convert -O qcow2 rootfs.img rootfs.qcow2`), "
-            "set [drive] format = \"qcow2\", and launch with net_backend=passt "
-            "(not the default slirp) so the saved state round-trips.\n"
+            "[qmu] qmu's implicit rootfs uses a temporary snapshot=on overlay; "
+            "that overlay can hold in-session checkpoints with a raw or qcow2 base, "
+            "and those checkpoints disappear when QEMU exits. For durable internal "
+            "snapshots, attach a writable qcow2 drive without snapshot=on, for example "
+            "`--drive 'file=./rootfs.qcow2,format=qcow2'`. Changing [drive] format "
+            "alone remains temporary because qmu still adds snapshot=on.\n"
         )
         return 1
     return 0
+
+
+def _snapshot_load_mentions_slirp(msg: str) -> bool:
+    return "slirp" in msg.lower()
 
 
 def _handle_snapshot_load(args: argparse.Namespace) -> int:
@@ -129,12 +130,16 @@ def _handle_snapshot_load(args: argparse.Namespace) -> int:
         stem="snapshot-load",
     )
     if failed:
-        sys.stderr.write(
-            f"[qmu] snapshot load failed: {msg}\n"
-            "[qmu] The VM was NOT restored. With the default -net user (slirp) "
-            "networking, savevm/loadvm cannot serialize NIC state; relaunch the "
-            "VM instead of relying on snapshot restore.\n"
-        )
+        sys.stderr.write(f"[qmu] snapshot load failed: {msg}\n")
+        if _snapshot_load_mentions_slirp(msg):
+            sys.stderr.write(
+                "[qmu] This loadvm error names slirp. The user backend often works for "
+                "in-session restore, but this QEMU/build/device combination could not "
+                "restore its network state. Use native passt networking only with a selected "
+                "QEMU that advertises native '-netdev passt' (documented since QEMU 10.1 but "
+                "may be build-optional), or use a manually managed external passt process "
+                "with QEMU's stream backend. qmu does not manage that external process.\n"
+            )
         return 1
     return 0
 
@@ -176,6 +181,154 @@ def _handle_snapshot_delete(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _parse_nm_text(stdout: str) -> int:
+    addresses: list[int] = []
+    for line in stdout.splitlines():
+        fields = line.split()
+        if not fields or fields[0] != "_text":
+            continue
+        if len(fields) < 3:
+            raise QMUError("local symbol tool returned malformed _text output")
+        try:
+            addresses.append(int(fields[2], 16))
+        except ValueError as exc:
+            raise QMUError(
+                f"local symbol tool returned invalid _text address: {fields[2]!r}"
+            ) from exc
+    if not addresses:
+        raise QMUError("local vmlinux is missing _text")
+    if len(addresses) != 1:
+        raise QMUError("local vmlinux contains multiple _text symbols")
+    if addresses[0] == 0:
+        raise QMUError("local vmlinux has a zero _text address")
+    return addresses[0]
+
+
+def _parse_kallsyms_text(stdout: str) -> int:
+    addresses: list[int] = []
+    for line in stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or fields[2] != "_text":
+            continue
+        try:
+            addresses.append(int(fields[0], 16))
+        except ValueError as exc:
+            raise QMUError(
+                f"guest returned invalid _text address: {fields[0]!r}"
+            ) from exc
+    if not addresses:
+        raise QMUError("guest /proc/kallsyms is missing _text")
+    if len(addresses) != 1:
+        raise QMUError("guest /proc/kallsyms contains multiple _text symbols")
+    if addresses[0] == 0:
+        raise QMUError(
+            "guest has restricted /proc/kallsyms: _text address is zero; "
+            "use a root SSH user or set kernel.kptr_restrict=0"
+        )
+    return addresses[0]
+
+
+def _format_hex(value: int) -> str:
+    return f"-0x{-value:x}" if value < 0 else f"0x{value:x}"
+
+
+_KBASE_ARCHES = frozenset({"x86_64", "i386", "aarch64", "arm"})
+_KALLSYMS_QUERY = "awk '$3 == \"_text\" { print $1, $2, $3 }' /proc/kallsyms"
+
+
+def _read_link_text(symbols: str) -> tuple[Path, int]:
+    path = Path(symbols).expanduser().resolve()
+    if not path.is_file():
+        raise QMUError(f"vmlinux symbols file not found: {path}")
+
+    tool = shutil.which("nm") or shutil.which("llvm-nm")
+    if tool is None:
+        raise QMUError(
+            "no local symbol tool found; install GNU nm (binutils) or llvm-nm"
+        )
+
+    result = subprocess.run(
+        [tool, "-P", "--defined-only", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        diagnostic = (result.stderr or result.stdout or "no diagnostic").strip()
+        raise QMUError(
+            f"{Path(tool).name} failed to read {path} "
+            f"(exit {result.returncode}): {diagnostic}"
+        )
+    return path, _parse_nm_text(result.stdout)
+
+
+def _add_kbase(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "kbase",
+        help="Read the guest runtime kernel base and KASLR slide",
+    )
+    p.add_argument(
+        "--symbols",
+        required=True,
+        help="Path to the matching vmlinux ELF",
+    )
+    _add_common_opts(p)
+    p.set_defaults(handler=_handle_kbase)
+
+
+def _handle_kbase(args: argparse.Namespace) -> int:
+    inst = choose_instance(args.vm)
+    _require_ssh(inst)
+
+    if (preflight_rc := _preflight_ssh_guest(
+        args, inst, stem="kbase"
+    )) is not None:
+        return preflight_rc
+
+    if inst.arch is None:
+        raise QMUError(
+            f"VM '{inst.vm_id}' predates architecture metadata; relaunch it "
+            "before using qmu kbase"
+        )
+    if inst.arch not in _KBASE_ARCHES:
+        raise QMUError(
+            f"qmu kbase does not support guest architecture {inst.arch!r}; "
+            f"supported: {', '.join(sorted(_KBASE_ARCHES))}"
+        )
+
+    symbols_path, link_base = _read_link_text(args.symbols)
+    ssh = _make_ssh(inst)
+    rc, stdout, stderr = ssh.run(_KALLSYMS_QUERY, timeout=10.0)
+    if rc != 0:
+        diagnostic = (stderr or stdout or "no diagnostic").strip()
+        raise QMUError(
+            f"failed to read guest /proc/kallsyms (exit {rc}): {diagnostic}"
+        )
+
+    runtime_base = _parse_kallsyms_text(stdout)
+    slide = runtime_base - link_base
+    data = {
+        "ok": True,
+        "vm_id": inst.vm_id,
+        "arch": inst.arch,
+        "symbols": str(symbols_path),
+        "kbase": _format_hex(runtime_base),
+        "link_base": _format_hex(link_base),
+        "slide": _format_hex(slide),
+    }
+    _emit(
+        args,
+        data=data,
+        text=(
+            f"KBASE={data['kbase']}\n"
+            f"LINK_BASE={data['link_base']}\n"
+            f"SLIDE={data['slide']}"
+        ),
+        stem="kbase",
+    )
+    return 0
+
+
 def _add_gdb(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "gdb",
@@ -199,8 +352,11 @@ def _handle_gdb(args: argparse.Namespace) -> int:
         raise QMUError("pry not found in PATH. Install pry and ensure it is on PATH.")
 
     cmd = ["pry", "launch", "--connect", f"localhost:{inst.gdb_port}"]
-    if args.symbols:
-        cmd.extend(["--symbols", str(Path(args.symbols).expanduser().resolve())])
+    symbols_path = (
+        Path(args.symbols).expanduser().resolve() if args.symbols else None
+    )
+    if symbols_path is not None:
+        cmd.extend(["--symbols", str(symbols_path)])
 
     # `pry launch` is non-interactive: it spins up a headless GDB + bridge in the
     # background, connects to the stub, and returns — it does NOT hand back an
@@ -218,17 +374,36 @@ def _handle_gdb(args: argparse.Namespace) -> int:
             "pull/compile) will hang until you resume it. Resume with `pry "
             "continue` (in the debugger) or `qmu cont`."
         )
+        data = {
+            "ok": True,
+            "vm_id": inst.vm_id,
+            "gdb_port": inst.gdb_port,
+            "cpu_state": "halted",
+            "warning": warning,
+        }
+        text = (
+            f"pry connected to VM '{inst.vm_id}' GDB stub on port "
+            f"{inst.gdb_port}\n{warning}"
+        )
+        if symbols_path is not None:
+            symbol_warning = (
+                f"WARNING: symbols from '{symbols_path}' were loaded at ELF link-time "
+                "addresses; qmu gdb did not apply runtime rebasing. Obtain the runtime "
+                f"base with `qmu kbase --vm {inst.vm_id} --symbols {symbols_path}`, then "
+                f"reload with `pry load {symbols_path} --base <KBASE>`."
+            )
+            data.update({
+                "symbols": str(symbols_path),
+                "symbols_rebased": False,
+                "symbol_base": "elf-link-time",
+                "kaslr_status": "unknown",
+                "symbol_warning": symbol_warning,
+            })
+            text = f"{text}\n{symbol_warning}"
         _emit(
             args,
-            data={
-                "ok": True,
-                "vm_id": inst.vm_id,
-                "gdb_port": inst.gdb_port,
-                "cpu_state": "halted",
-                "warning": warning,
-            },
-            text=f"pry connected to VM '{inst.vm_id}' GDB stub on port "
-            f"{inst.gdb_port}\n{warning}",
+            data=data,
+            text=text,
             stem="gdb",
         )
     else:

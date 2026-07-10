@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import spill_root
+from .runtime import invalidate_owned_spill_marker, mark_spill_artifact
 
 
 DEFAULT_SPILL_TOKEN_LIMIT = 10_000
@@ -118,6 +119,7 @@ def write_output_result(
 
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        invalidate_owned_spill_marker(out_path)
         out_path.write_bytes(encoded)
         artifact = _artifact_payload(
             artifact_path=out_path,
@@ -138,7 +140,12 @@ def write_output_result(
 
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
     spill_path = _spill_path(stem, suffix)
-    spill_path.write_bytes(encoded)
+    try:
+        spill_path.write_bytes(encoded)
+        mark_spill_artifact(spill_path)
+    except BaseException:
+        spill_path.unlink(missing_ok=True)
+        raise
     artifact = _artifact_payload(
         artifact_path=spill_path,
         fmt=fmt,

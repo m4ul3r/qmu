@@ -6,13 +6,87 @@ import socket
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import QMUConfig
 from .instance import QMUError, VMInstance, proc_pid_start, save_instance
-from .paths import instances_dir, qmp_socket_path, serial_log_path
+from .paths import instances_dir, qmp_socket_path, qemu_log_path, serial_log_path
+from .qemu import native_passt_problem, probe_qemu_netdevs
 from .qmp import QMPClient
+
+
+def _terminate_and_reap(
+    proc: subprocess.Popen,
+    *,
+    terminate_timeout: float = 1.0,
+    kill_timeout: float = 1.0,
+) -> None:
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=terminate_timeout)
+        return
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    proc.wait(timeout=kill_timeout)
+
+
+def _remove_attempt_artifacts(*paths: Path) -> None:
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
+def _validate_qmp(socket_path: Path) -> None:
+    qmp = QMPClient(socket_path)
+    try:
+        qmp.connect()
+        qmp.execute("query-status")
+    finally:
+        qmp.close()
+
+
+@dataclass
+class _LaunchAttempt:
+    proc: subprocess.Popen
+    vm_id: str
+    qmp_socket: Path
+    serial_log: Path
+    qemu_log: Path
+    committed: bool = False
+    _primary_error: BaseException | None = field(default=None, repr=False)
+
+    def rollback(self) -> None:
+        if self.committed:
+            return
+        cleanup_error: BaseException | None = None
+        try:
+            _terminate_and_reap(self.proc)
+        except BaseException as exc:
+            cleanup_error = exc
+        finally:
+            try:
+                _remove_attempt_artifacts(
+                    self.qmp_socket, self.serial_log, self.qemu_log
+                )
+            except BaseException as unlink_exc:
+                if cleanup_error is None:
+                    cleanup_error = unlink_exc
+        if cleanup_error is not None:
+            pid = getattr(self.proc, "pid", "?")
+            raise QMUError(
+                f"Launch cleanup failed for pid {pid}: could not reap child"
+            ) from cleanup_error
+
+    def commit(self) -> None:
+        self.committed = True
 
 
 def find_free_port(start: int, max_tries: int = 100) -> int:
@@ -35,6 +109,33 @@ def find_free_port(start: int, max_tries: int = 100) -> int:
     raise QMUError(f"No free port found in range {start}-{start + max_tries - 1}")
 
 
+def _preflight_native_passt(
+    *,
+    config: QMUConfig,
+    net_backend: str | None,
+    no_net: bool,
+    harness: bool,
+) -> str | None:
+    effective_backend = net_backend or config.net_backend
+    if no_net or harness or effective_backend != "passt":
+        return None
+
+    caps = probe_qemu_netdevs(config.qemu_binary())
+    problem = native_passt_problem(caps)
+    if problem is not None:
+        raise QMUError(problem)
+
+    if shutil.which("passt") is None:
+        raise QMUError(
+            "net_backend=passt requires the 'passt' binary on PATH "
+            "(e.g. 'apt install passt' / 'pacman -S passt'). "
+            "Use the default 'user' backend, or --no-net, if passt is unavailable."
+        )
+
+    assert caps.path is not None
+    return caps.path
+
+
 def build_qemu_command(
     *,
     config: QMUConfig,
@@ -50,6 +151,7 @@ def build_qemu_command(
     no_net: bool = False,
     nic_model: str | None = None,
     net_backend: str | None = None,
+    qemu_binary: str | None = None,
     extra_args: list[str] | None = None,
 ) -> list[str]:
     """Build the qemu-system command line from config."""
@@ -57,7 +159,7 @@ def build_qemu_command(
     backend = net_backend or config.net_backend
 
     cmd = [
-        config.qemu_binary(),
+        qemu_binary or config.qemu_binary(),
         "-m", config.memory,
         "-smp", str(config.cpus),
         "-kernel", kernel,
@@ -75,6 +177,9 @@ def build_qemu_command(
         for spec in drives:
             cmd.extend(["-drive", spec])
     elif rootfs is not None:
+        # Configured raw or qcow2 rootfs images sit behind this temporary overlay:
+        # in-session checkpoints disappear with QEMU. A durable internal snapshot
+        # needs an explicit writable qcow2 drive above, without snapshot=on.
         cmd.extend(["-drive", f"file={rootfs},format={config.drive_format},snapshot=on"])
 
     # Networking
@@ -84,19 +189,10 @@ def build_qemu_command(
         # No SSH hostfwd, but still provide a NIC (rare: --no-wait-ssh without --no-net).
         cmd.extend(["-nic", f"user,model={nic}"])
     elif backend == "passt":
-        # passt is a migration-capable, rootless slirp replacement. Unlike the
-        # default `user` (slirp) backend — whose vmstate is broken in QEMU 11 and
-        # makes savevm/loadvm fail with "Section footer error" — passt serializes
-        # cleanly, so snapshots round-trip while keeping SSH (verified live).
-        # address/gateway mirror slirp's well-known 10.0.2.x convention that qmu
-        # rootfs images already use; tcp-ports forwards the host SSH port to
-        # guest :22 (slirp's hostfwd equivalent).
-        if shutil.which("passt") is None:
-            raise QMUError(
-                "net_backend=passt requires the 'passt' binary on PATH "
-                "(e.g. 'apt install passt' / 'pacman -S passt'). "
-                "Use the default 'user' backend, or --no-net, if passt is unavailable."
-            )
+        # Native passt is migration-compatible when the selected QEMU advertises it.
+        # Some user/slirp QEMU/build/device combinations restore successfully; others
+        # report slirp section/footer errors on loadvm. Capability and external-binary
+        # validation happens once in launch_vm before artifacts or process creation.
         cmd.extend([
             "-netdev",
             f"passt,id=net0,address=10.0.2.15,gateway=10.0.2.2,"
@@ -198,6 +294,12 @@ def launch_vm(
     # Resolve command line
     if cmdline is None:
         cmdline = config.profiles[profile]
+    resolved_qemu = _preflight_native_passt(
+        config=config,
+        net_backend=net_backend,
+        no_net=no_net,
+        harness=harness,
+    )
 
     idir = instances_dir()
     idir.mkdir(parents=True, exist_ok=True)
@@ -216,9 +318,10 @@ def launch_vm(
     auto_gdb = gdb and gdb_port is None
     bind_markers = ("Address already in use", "Could not set up host forwarding", "Failed to bind")
 
-    proc = None
-    vm_id = qmp_sock = serial_path = None
-    for attempt in range(3):
+    attempt: _LaunchAttempt | None = None
+    pid_start: str | None = None
+    cmd: list[str] = []
+    for attempt_idx in range(3):
         if auto_ssh:
             ssh_port = find_free_port(config.ssh_port_start)
         if auto_gdb:
@@ -232,9 +335,10 @@ def launch_vm(
             # uuid suffix: timestamp-based ids collide when two harness VMs
             # launch within the same second (parallel agent workflows).
             vm_id = f"vm-h{uuid.uuid4().hex[:8]}"
-        qmp_sock = str(qmp_socket_path(vm_id))
-        serial_path = str(serial_log_path(vm_id))
-        Path(qmp_sock).unlink(missing_ok=True)  # remove stale socket if present
+        qmp_path = qmp_socket_path(vm_id)
+        serial_path = serial_log_path(vm_id)
+        qemu_log = qemu_log_path(vm_id)
+        qmp_path.unlink(missing_ok=True)  # remove stale socket if present
 
         cmd = build_qemu_command(
             config=config,
@@ -242,24 +346,37 @@ def launch_vm(
             rootfs=str(rootfs_path) if rootfs_path else None,
             ssh_port=ssh_port,
             gdb_port=gdb_port,
-            qmp_socket=qmp_sock,
-            serial_log=serial_path,
+            qmp_socket=str(qmp_path),
+            serial_log=str(serial_path),
             cmdline=cmdline,
             initrd=str(initrd_path) if initrd_path else None,
             drives=drives,
             no_net=no_net,
             nic_model=nic_model,
             net_backend=net_backend,
+            qemu_binary=resolved_qemu,
             extra_args=extra_args,
         )
 
-        log_fd = open(idir / f"{vm_id}.qemu.log", "w")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_fd,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
+        try:
+            with qemu_log.open("w") as log_fd:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_fd,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+        except BaseException:
+            qemu_log.unlink(missing_ok=True)
+            raise
+
+        attempt = _LaunchAttempt(
+            proc=proc,
+            vm_id=vm_id,
+            qmp_socket=qmp_path,
+            serial_log=serial_path,
+            qemu_log=qemu_log,
         )
         # Record the kernel start-time of the child immediately so liveness
         # checks can detect PID recycling across host reboots. None on
@@ -270,59 +387,95 @@ def launch_vm(
         deadline = time.monotonic() + 10
         exited = False
         while time.monotonic() < deadline:
-            if Path(qmp_sock).exists():
+            if qmp_path.exists():
                 break
             if proc.poll() is not None:
                 exited = True
                 break
             time.sleep(0.2)
         else:
-            proc.terminate()
-            log_fd.close()
-            raise QMUError("Timed out waiting for QMP socket to appear")
+            primary = QMUError("Timed out waiting for QMP socket to appear")
+            try:
+                attempt.rollback()
+            except QMUError as cleanup_exc:
+                raise cleanup_exc from primary
+            raise primary
 
         if exited:
-            log_fd.close()
-            qemu_log = (idir / f"{vm_id}.qemu.log").read_text(errors="replace")
-            if any(m in qemu_log for m in bind_markers) and (auto_ssh or auto_gdb) and attempt < 2:
+            # Reap before reading diagnostics so the log is fully flushed.
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+            log_text = ""
+            try:
+                log_text = qemu_log.read_text(errors="replace")
+            except OSError:
+                log_text = ""
+            retryable = (
+                any(m in log_text for m in bind_markers)
+                and (auto_ssh or auto_gdb)
+                and attempt_idx < 2
+            )
+            if retryable:
+                attempt.rollback()
+                attempt = None
                 continue  # lost a port race — retry with freshly allocated ports
-            raise QMUError(
+            primary = QMUError(
                 f"QEMU exited immediately (code {proc.returncode}).\n"
                 f"Command: {' '.join(cmd)}\n"
-                f"Output:\n{qemu_log[-2000:]}"
+                f"Output:\n{log_text[-2000:]}"
             )
+            try:
+                attempt.rollback()
+            except QMUError as cleanup_exc:
+                raise cleanup_exc from primary
+            raise primary
 
         # QMP socket appeared — verify connectivity.
         try:
-            with QMPClient(qmp_sock) as qmp:
-                qmp.execute("query-status")
+            _validate_qmp(qmp_path)
         except Exception as exc:
-            proc.terminate()
-            log_fd.close()
-            raise QMUError(f"QMP connection failed after launch: {exc}") from exc
-        break  # launched successfully
+            primary = QMUError(f"QMP connection failed after launch: {exc}")
+            primary.__cause__ = exc
+            try:
+                attempt.rollback()
+            except QMUError as cleanup_exc:
+                raise cleanup_exc from primary
+            raise primary from exc
 
-    # Build and save instance
-    inst = VMInstance(
-        vm_id=vm_id,
-        pid=proc.pid,
-        qmp_socket=qmp_sock,
-        ssh_port=ssh_port,
-        ssh_key=str(key_path) if key_path else None,
-        ssh_user=config.ssh_user,
-        gdb_port=gdb_port,
-        serial_log=serial_path,
-        kernel=str(kernel_path),
-        rootfs=str(rootfs_path) if rootfs_path else None,
-        memory=config.memory,
-        cpus=config.cpus,
-        cmdline=cmdline,
-        profile=profile,
-        started_at=datetime.now(timezone.utc).isoformat(),
-        harness=harness,
-        nic_model=resolved_nic,
-        pid_start=pid_start,
-    )
-    save_instance(inst)
+        # Build and save instance under the attempt transaction.
+        inst = VMInstance(
+            vm_id=vm_id,
+            pid=proc.pid,
+            qmp_socket=str(qmp_path),
+            ssh_port=ssh_port,
+            ssh_key=str(key_path) if key_path else None,
+            ssh_user=config.ssh_user,
+            gdb_port=gdb_port,
+            serial_log=str(serial_path),
+            kernel=str(kernel_path),
+            arch=config.arch,
+            rootfs=str(rootfs_path) if rootfs_path else None,
+            memory=config.memory,
+            cpus=config.cpus,
+            cmdline=cmdline,
+            profile=profile,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            harness=harness,
+            nic_model=resolved_nic,
+            pid_start=pid_start,
+        )
+        try:
+            save_instance(inst)
+        except BaseException as primary:
+            try:
+                attempt.rollback()
+            except QMUError as cleanup_exc:
+                raise cleanup_exc from primary
+            raise
+        attempt.commit()
+        return inst
 
-    return inst
+    # Unreachable: the loop always returns or raises. Keep mypy happy.
+    raise QMUError("VM launch failed after retries")

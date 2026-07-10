@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import subprocess
-import tempfile
 import time
 from pathlib import Path
+
+from .paths import ssh_control_path
 
 
 class SSHError(RuntimeError):
@@ -19,31 +20,18 @@ class SSHError(RuntimeError):
         self.stderr = stderr
 
 
-# Directory holding OpenSSH ControlMaster sockets for connection multiplexing.
-# Lives under the system temp dir; socket names use %C (OpenSSH's hash of the
-# connection parameters) to stay well under the ~104-char Unix socket path
-# limit.
-_CONTROL_DIR = Path(tempfile.gettempdir()) / "qmu-ssh-cm"
-
-
 def _control_opts() -> list[str]:
-    """ssh/scp options enabling ControlMaster connection reuse.
-
-    Repeated connections to the same VM (is_ready probes, run, push, pull)
-    share one transport instead of paying a full handshake each time. The
-    master expires on its own after 60s idle (ControlPersist=60).
-
-    Returns [] (no multiplexing) if the control directory cannot be created,
-    so importing the module / constructing a client never fails.
-    """
+    """Return current bounded ControlMaster options, or disable multiplexing."""
     try:
-        _CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+        path = ssh_control_path()
     except OSError:
+        return []
+    if path is None:
         return []
     return [
         "-o", "ControlMaster=auto",
         "-o", "ControlPersist=60",
-        "-o", f"ControlPath={_CONTROL_DIR / 'cm-%C'}",
+        "-o", f"ControlPath={path}",
     ]
 
 

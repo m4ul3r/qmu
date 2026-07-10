@@ -193,6 +193,9 @@ def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) 
     if fmt == "text":
         sys.stderr.write(f"{text_prefix} {exc}\n")
         return
+    # Route the error envelope through _output so ndjson renders as one object
+    # (output.py), spill/--out handling applies, and source_ok=False stamps the
+    # authoritative ok:false — superseding the earlier direct json.dumps path.
     payload = {
         "ok": False,
         "error": str(exc),

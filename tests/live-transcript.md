@@ -276,11 +276,11 @@ Error: Section footer error, section_id: 1
 [exit=1]
 ```
 
-> FINDING (snapshot): `qmu snapshot load clean` printed `Missing section footer for slirp /
-> Error: Section footer error` and did NOT restore the VM (SSH stayed dead), yet exited 0.
-> Cause: savevm cannot serialize the `-net user` (slirp) state qmu configures. The documented
-> save->crash->load iteration loop is broken with qmu's default networking, and the failure is
-> reported as success (exit 0).
+> FINDING (snapshot, contextual): In this captured QEMU 11 run/build/device state,
+> `loadvm` named slirp section/footer errors and did not restore the VM; the old CLI
+> also misreported that failure as exit 0. Other QEMU builds can restore raw +
+> user/slirp in-session checkpoints, so this transcript supports conditional
+> compatibility guidance rather than a universal passt prerequisite.
 
 ## Output spilling (>10k tokens auto-spills to /tmp/qmu-spills)
 
@@ -313,7 +313,48 @@ Error: Section footer error, section_id: 1
 ### $ qmu gdb --vm live --symbols tests/assets/vmlinux
 ```
 pry connected to VM 'live' GDB stub on port 1234
+WARNING: the vCPU is now HALTED by the debugger. SSH (exec/push/pull/compile) will hang until you resume it. Resume with `pry continue` (in the debugger) or `qmu cont`.
+WARNING: symbols from 'tests/assets/vmlinux' were loaded at ELF link-time addresses; qmu gdb did not apply runtime rebasing. Obtain the runtime base with `qmu kbase --vm live --symbols tests/assets/vmlinux`, then reload with `pry load tests/assets/vmlinux --base <KBASE>`.
 [exit=0]
+```
+
+## Kernel debug workflow (PR 4 expected; not a captured dogfood run)
+
+The following blocks document the **expected** attach → refuse-while-paused →
+continue → kbase → manual pry rebase sequence. They are not host-captured live
+results: ports, absolute symbol paths, and KASLR bases are illustrative, not
+measured.
+
+### $ qmu kbase --vm live --symbols /path/to/vmlinux --format json  (while paused after gdb)
+```
+{
+  "ok": false,
+  "vm_id": "live",
+  "qemu_status": "paused",
+  "ssh_error": false,
+  "crash_detected": false,
+  "hint": "VM 'live' is paused. Resume with: qmu cont --vm live. If a debugger halted the vCPU, use: pry continue."
+}
+[exit=1]
+```
+
+### $ qmu cont --vm live
+```
+VM 'live' resumed (status: running)
+[exit=0]
+```
+
+### $ qmu kbase --vm live --symbols /path/to/vmlinux
+```
+KBASE=0xffffffff81000000
+LINK_BASE=0xffffffff81000000
+SLIDE=0x0
+[exit=0]
+```
+
+### $ pry load /path/to/vmlinux --base "$KBASE"
+```
+# operator applies the base reported by qmu kbase; qmu never runs this automatically
 ```
 
 ## Crash extraction #2: plain sysrq panic (non-KASAN)
@@ -365,7 +406,8 @@ qmu: error: argument subcommand: invalid choice: 'live' (choose from 'launch', '
 
 > NOTE: the sysrq attempt above was CONFOUNDED — the preceding `qmu gdb` (pry) attached to the
 > GDB stub and left the CPU halted, so `qmu exec` could not reach sshd (banner timeout) and the
-> sysrq write never ran. Gotcha: `qmu gdb` can leave the VM paused. Clean redo below (no gdb).
+> sysrq write never ran. Gotcha: `qmu gdb` can leave the VM paused; resume with `qmu cont` /
+> `pry continue` before SSH or `qmu kbase`. Clean redo below (no gdb).
 
 ## Crash extraction #2 (clean, no gdb): plain sysrq panic
 
