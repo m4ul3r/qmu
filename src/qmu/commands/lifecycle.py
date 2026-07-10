@@ -4,7 +4,8 @@ These manage the QEMU process and its instance metadata. Shared helpers come
 from :mod:`.._cliutil`.
 
 The patchable collaborators (``choose_instance``, ``_qmp_ctx``,
-``instance_alive``, ``extract_crash``) are imported directly into this module's
+``instance_alive``, ``extract_crash``, ``serial_log_offset``, and
+``save_guest_epoch_serial_offset``) are imported directly into this module's
 namespace. The test suite drives the production seams via
 ``monkeypatch.setattr(lifecycle, ...)`` (e.g. ``lifecycle.choose_instance`` /
 ``lifecycle._qmp_ctx`` / ``lifecycle.instance_alive``); the patches take effect
@@ -27,18 +28,22 @@ from ..instance import (
     instance_alive,
     is_pid_alive,
     list_instances,
+    list_prunable_instance_ids,
     list_stopped_instances,
     load_instance,
     remove_instance,
+    save_guest_epoch_serial_offset,
 )
+from ..runtime import prune_runtime_artifacts
 from ..paths import (
     all_skill_source_dirs,
     claude_skills_dir,
     codex_home,
     codex_skills_dir,
 )
+from ..qemu import native_passt_problem, probe_qemu_netdevs
 from ..qmp import QMPError
-from ..serial import extract_crash
+from ..serial import extract_crash, serial_log_offset
 from ..vm import launch_vm
 from .._cliutil import (
     _add_common_opts,
@@ -87,7 +92,8 @@ def _add_launch(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--net-backend", default=None, dest="net_backend",
                    choices=["user", "passt"],
                    help="Network backend: 'user' (slirp, default) or 'passt' "
-                        "(rootless + migratable, so snapshots work). Overrides config.")
+                        "(migration-compatible when the selected QEMU advertises native passt). "
+                        "Overrides config.")
     p.add_argument("--harness", action="store_true",
                    help="Harness/judge VM mode: implies --no-wait-ssh + --no-net; "
                         "skips rootfs/ssh-key requirement")
@@ -217,16 +223,44 @@ def _handle_kill(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _nonnegative_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from exc
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return seconds
+
+
 def _add_prune(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("prune", help="Remove state files for stopped VMs")
+    p = sub.add_parser(
+        "prune",
+        help="Remove stopped-instance state or aged qmu runtime artifacts",
+    )
     g = p.add_mutually_exclusive_group()
     # SUPPRESS (like _add_common_opts) so a top-level `--vm X` given before the
     # subcommand is not clobbered by this subparser's own default.
     g.add_argument("--vm", default=argparse.SUPPRESS, help="Prune a specific stopped VM")
     g.add_argument("--all", dest="prune_all", action="store_true",
                    help="Prune every stopped VM")
-    p.add_argument("--keep-logs", action="store_true",
-                   help="Drop .json + .qmp.sock but preserve .serial.log")
+    g.add_argument(
+        "--runtime",
+        dest="prune_runtime",
+        action="store_true",
+        help="Prune aged qmu-owned runtime artifacts (spills and SSH controls)",
+    )
+    p.add_argument(
+        "--older-than",
+        type=_nonnegative_seconds,
+        default=86400.0,
+        help="Age threshold in seconds for runtime and remnant pruning (default: 86400)",
+    )
+    p.add_argument(
+        "--keep-logs",
+        action="store_true",
+        help="preserve .serial.log and .qemu.log",
+    )
     # _add_common_opts adds --vm too; we declared --vm above so add the rest manually.
     p.add_argument("--format", choices=["text", "json", "ndjson"], default="text")
     p.add_argument("--out", default=None, help="Write output to file instead of stdout")
@@ -234,32 +268,66 @@ def _add_prune(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_prune(args: argparse.Namespace) -> int:
-    stopped = list_stopped_instances()
-    running = list_instances()
-    running_ids = {inst.vm_id for inst in running}
-
     # SUPPRESS default (fix #2) means the attribute may be absent when --vm is
     # not given after the subcommand; the top-level parser default of None
     # guarantees it otherwise exists.
     vm = getattr(args, "vm", None)
+    prune_runtime = getattr(args, "prune_runtime", False)
+    prune_all = getattr(args, "prune_all", False)
+
+    if prune_runtime:
+        if args.keep_logs:
+            raise QMUError("--keep-logs applies only to instance pruning.")
+        result = prune_runtime_artifacts(older_than_seconds=args.older_than)
+
+        def _art(item: Any) -> dict[str, str]:
+            return {"kind": item.kind, "path": str(item.path)}
+
+        data = {
+            "ok": True,
+            "runtime": {
+                "older_than_seconds": float(args.older_than),
+                "removed": [_art(item) for item in result.removed],
+                "skipped_live": [_art(item) for item in result.skipped_live],
+                "skipped_indeterminate": [
+                    _art(item) for item in result.skipped_indeterminate
+                ],
+            },
+        }
+        removed_n = len(result.removed)
+        live_n = len(result.skipped_live)
+        indet_n = len(result.skipped_indeterminate)
+        if removed_n == 0:
+            text = "No eligible qmu-owned runtime artifacts to prune."
+        else:
+            text = (
+                f"Pruned {removed_n} qmu-owned runtime artifact(s); "
+                f"skipped {live_n} live and {indet_n} indeterminate."
+            )
+        _emit(args, data=data, text=text, stem="prune")
+        return 0
+
+    running = list_instances()
+    running_ids = {inst.vm_id for inst in running}
+    prunable = list_prunable_instance_ids(older_than_seconds=args.older_than)
+
     if vm is not None:
         if vm in running_ids:
             raise QMUError(
                 f"VM '{vm}' is running. Use 'qmu kill --vm {vm}' first."
             )
-        target = next((inst for inst in stopped if inst.vm_id == vm), None)
-        if target is None:
+        if vm not in prunable:
             raise QMUError(f"No stopped VM named '{vm}'.")
-        targets = [target]
-    elif args.prune_all:
-        targets = stopped
+        targets = [vm]
+    elif prune_all:
+        targets = prunable
     else:
-        raise QMUError("Specify either --vm <name> or --all.")
+        raise QMUError("Specify either --vm <name>, --all, or --runtime.")
 
     pruned: list[str] = []
-    for inst in targets:
-        remove_instance(inst.vm_id, keep_logs=args.keep_logs)
-        pruned.append(inst.vm_id)
+    for vm_id in targets:
+        remove_instance(vm_id, keep_logs=args.keep_logs)
+        pruned.append(vm_id)
 
     if not pruned:
         text = "No stopped VMs to prune."
@@ -306,6 +374,7 @@ def _handle_wait(args: argparse.Namespace) -> int:
     last_event: str | None = None
     event_data: Any = None
     stopped = False
+    reset_persistence_in_progress = False
 
     try:
         with _qmp_ctx(inst) as qmp:
@@ -345,10 +414,17 @@ def _handle_wait(args: argparse.Namespace) -> int:
                         else "unknown"
                     )
                     event_data = event.get("data")
+                    if last_event == "RESET":
+                        reset_persistence_in_progress = True
+                        reset_offset = serial_log_offset(inst.serial_log)
+                        inst = save_guest_epoch_serial_offset(inst, reset_offset)
+                        reset_persistence_in_progress = False
                     # Continue immediately so identity is checked after every
                     # observation; an event alone is never terminal.
                     continue
     except (QMPError, OSError) as exc:
+        if reset_persistence_in_progress:
+            raise
         if not instance_alive(inst):
             stopped = True
             reason = "process_exited"
@@ -356,7 +432,15 @@ def _handle_wait(args: argparse.Namespace) -> int:
             raise QMUError(f"QMP error during wait: {exc}") from exc
 
     elapsed = time.monotonic() - start
-    crash = extract_crash(inst.serial_log) if stopped else None
+    crash = None
+    if stopped:
+        if inst.guest_epoch_serial_offset == 0:
+            crash = extract_crash(inst.serial_log)
+        else:
+            crash = extract_crash(
+                inst.serial_log,
+                start_offset=inst.guest_epoch_serial_offset,
+            )
 
     result = {
         "ok": stopped,
@@ -581,14 +665,36 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             "detail": "No qmu.toml or ~/.config/qmu/config.toml found. Run: qmu config init",
         })
 
-    # QEMU binary (arch-aware)
+    # QEMU binary (arch-aware). For configured passt, derive the reported path
+    # from the same result used for the native-backend capability check.
     binary = config.qemu_binary()
-    qemu = shutil.which(binary)
+    passt_required = config.net_backend == "passt"
+    qemu_caps = probe_qemu_netdevs(binary) if passt_required else None
+    qemu = qemu_caps.path if qemu_caps is not None else shutil.which(binary)
     checks.append({
         "check": binary,
         "status": "ok" if qemu else "MISSING",
         "detail": qemu or "Not found in PATH",
     })
+
+    if not passt_required:
+        checks.append({
+            "check": "QEMU native passt (-netdev passt)",
+            "status": "info",
+            "detail": "Not required for configured net_backend=user.",
+        })
+    else:
+        assert qemu_caps is not None
+        passt_problem = native_passt_problem(qemu_caps)
+        checks.append({
+            "check": "QEMU native passt (-netdev passt)",
+            "status": "ok" if passt_problem is None else "MISSING",
+            "detail": (
+                f"{qemu_caps.path} advertises native '-netdev passt'"
+                if passt_problem is None
+                else passt_problem
+            ),
+        })
 
     # Rootfs
     if config.rootfs:
@@ -659,9 +765,8 @@ def _handle_doctor(args: argparse.Namespace) -> int:
                          "Install pry and ensure it is on PATH.",
     })
 
-    # passt (required only when net_backend = "passt"; enables snapshots)
+    # External passt executable (required only when net_backend = "passt")
     passt = shutil.which("passt")
-    passt_required = config.net_backend == "passt"
     checks.append({
         "check": "passt (net_backend=passt)",
         "status": ("ok" if passt else "MISSING") if passt_required else "info",
@@ -669,8 +774,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             "Not found in PATH — REQUIRED because net_backend=passt. "
             "Install passt (e.g. 'pacman -S passt' / 'apt install passt')."
             if passt_required else
-            "Not found — only needed if you set net_backend=passt "
-            "(rootless backend that makes snapshots work)."
+            "Not found — not required for configured net_backend=user."
         ),
     })
 

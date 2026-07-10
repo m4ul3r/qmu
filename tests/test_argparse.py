@@ -12,6 +12,8 @@ Findings exercised: ARG-1 / H5.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from qmu import cli
@@ -63,6 +65,52 @@ def test_both_orders_resolve_identically(captured_exec_args):
     cli.main(["exec", "--vm", "X", "uname"])
     after = captured_exec_args["args"].vm
     assert before == after == "X"
+
+
+def test_launch_arch_and_backend_overrides_reach_launch_vm(monkeypatch):
+    captured = {}
+
+    def fake_launch_vm(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            harness=True,
+            ssh_port=None,
+            gdb_port=None,
+            vm_id="selection",
+            pid=4242,
+            kernel=kwargs["kernel"],
+            profile=kwargs["profile"],
+            serial_log="/tmp/selection.serial.log",
+        )
+
+    monkeypatch.setattr(lifecycle, "load_instance", lambda name: None)
+    monkeypatch.setattr(lifecycle, "launch_vm", fake_launch_vm)
+
+    rc = cli.main([
+        "launch",
+        "--kernel", "/not-opened-by-stub",
+        "--arch", "aarch64",
+        "--net-backend", "passt",
+        "--harness",
+        "--name", "selection",
+    ])
+
+    assert rc == 0
+    assert captured["config"].arch == "aarch64"
+    assert captured["net_backend"] == "passt"
+
+
+def test_launch_help_describes_passt_as_conditional_migration_backend(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["launch", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "migration-compatible" in help_text
+    assert "selected QEMU" in help_text
+    assert "advertises" in help_text
+    assert "snapshots work" not in help_text
+    assert "10.1+" not in help_text
+    assert "QEMU 9" not in help_text
 
 
 def test_wait_help_names_qemu_process_exit(capsys):
@@ -134,11 +182,13 @@ class TestPruneVmPlacement:
         err = capsys.readouterr().err
         assert "No stopped VM named 'foo'." in err
 
-    def test_no_vm_no_all_still_prompts(self, capsys):
-        # The bare form (neither --vm nor --all) must still hit the guidance.
+    def test_no_selector_guidance_mentions_runtime(self, capsys):
         rc = cli.main(["prune"])
         assert rc == 1
-        assert "Specify either --vm <name> or --all." in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "--vm" in err
+        assert "--all" in err
+        assert "--runtime" in err
 
     def test_all_flag_still_works(self, capsys):
         # --all path is unaffected; empty stopped list => benign no-op, exit 0.
@@ -151,6 +201,47 @@ class TestPruneVmPlacement:
         with pytest.raises(SystemExit) as exc:
             cli.main(["prune", "--vm", "foo", "--all"])
         assert exc.value.code == 2
+
+    def test_runtime_is_mutually_exclusive_with_vm(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["prune", "--vm", "foo", "--runtime"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "not allowed with argument" in err
+        assert "--runtime" in err
+        assert "--vm" in err
+
+    def test_runtime_is_mutually_exclusive_with_all(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["prune", "--all", "--runtime"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "not allowed with argument" in err
+        assert "--runtime" in err
+        assert "--all" in err
+
+    def test_negative_older_than_is_usage_error(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["prune", "--runtime", "--older-than", "-0.1"])
+        assert exc.value.code == 2
+        assert "must be non-negative" in capsys.readouterr().err
+
+    def test_runtime_empty_is_success(self, capsys):
+        rc = cli.main(
+            [
+                "prune",
+                "--runtime",
+                "--older-than",
+                "0",
+                "--format",
+                "text",
+            ]
+        )
+        assert rc == 0
+        assert (
+            capsys.readouterr().out
+            == "No eligible qmu-owned runtime artifacts to prune.\n"
+        )
 
 
 @pytest.fixture
@@ -191,3 +282,33 @@ def test_kbase_requires_symbols(capsys):
     assert "--symbols" in error
     assert "required" in error
     assert "invalid choice" not in error
+
+
+@pytest.fixture
+def captured_crash_args(monkeypatch):
+    captured = {}
+
+    def _capture(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(guest, "_handle_crash", _capture)
+    return captured
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [(["crash"], False), (["crash", "--full-history"], True)],
+)
+def test_crash_full_history_parser(argv, expected, captured_crash_args):
+    assert cli.main(argv) == 0
+    assert captured_crash_args["args"].full_history is expected
+
+
+def test_crash_full_history_help(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["crash", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--full-history" in help_text
+    assert "previous guest epochs" in help_text

@@ -21,7 +21,7 @@ Project-local `./qmu.toml` is right for per-project rootfs/kernel paths; per-use
 
 ## Configuration
 
-TOML config holds machine settings (arch, rootfs, SSH key, profiles). Resolution order, later wins:
+Configuration combines built-in defaults with TOML sources and CLI flags. Resolution order, later wins:
 
 1. Built-in defaults — arch=x86_64, memory=4G, cpus=2
 2. Global config — `~/.config/qmu/config.toml`
@@ -33,6 +33,33 @@ qmu config show         # Resolved config and its sources
 qmu config init         # Write starter qmu.toml in CWD
 qmu config path         # Show config search paths
 ```
+
+TOML settings are table-scoped. The accepted schema is:
+
+- `[machine]`: `arch`, `memory`, `cpus`, `cpu`, `nic_model`, `net_backend`, `extra_args`
+- `[drive]`: `rootfs`, `format`
+- `[ssh]`: `key`, `user`, `port_start`
+- `[gdb]`: `port_start`
+- `[profiles.<name>]`: `cmdline`; `[profiles] name = "..."` is also accepted
+
+Every loaded global, project, or explicit `--config` file is validated before
+its values are applied. Malformed TOML, unknown keys, misplaced keys, wrong
+section shapes, and wrong value types fail with the source path and offending
+key. For example, use `[machine] arch`, `[drive] rootfs`, and `[ssh] key`; flat
+`arch`, `rootfs`, or `ssh_key` entries are invalid and the error names the
+canonical destination.
+
+Each layer may be empty or partial. `[drive]` and `[ssh]` are not universally
+required: another layer or CLI flags may provide their values, and harness mode
+intentionally runs without them. Later valid layers still win according to the
+precedence above.
+
+An invalid **global** config (`~/.config/qmu/config.toml`) is non-fatal: qmu
+prints a one-line `[qmu] Warning:` naming the file and continues from built-in
+defaults and any valid project/CLI layers, so a single stale global file never
+bricks every command (including `qmu doctor`, which diagnoses it). An invalid
+**project** (`qmu.toml`) or explicit `--config` file is fatal (exit 1) with the
+source path and offending key.
 
 `qmu config init` writes `[machine]` (arch/memory/cpus, with commented `cpu`/`nic_model`/`extra_args`), `[drive]`, `[ssh]`, `[gdb]`, three `[profiles.*]` blocks, and a commented harness-mode block. Notes:
 
@@ -110,8 +137,13 @@ qmu kill --force        # SIGKILL
 qmu kill --no-clean     # Stop but keep .serial.log + .json for forensics
 qmu prune --vm <name>             # Remove a stopped VM's state files
 qmu prune --all                   # Remove every stopped VM's state files
-qmu prune --vm <name> --keep-logs # Drop .json + .qmp.sock but PRESERVE .serial.log
+qmu prune --vm <name> --keep-logs # Drop .json + .qmp.sock but PRESERVE .serial.log and .qemu.log
+qmu prune --runtime --older-than 86400  # Age-gated prune of qmu-owned runtime artifacts
 ```
+
+`--keep-logs` preserves both `.serial.log` and `.qemu.log` (metadata and QMP sockets are still removed).
+
+`qmu prune --runtime` removes only aged **marked** automatic output spills and aged definitely stale direct `cm-*` Unix sockets under the runtime root. It skips live/uncertain SSH controls, explicit `--out` files, unmarked lookalikes, symlinks, and unrelated temp names (including arbitrary `/tmp/qmu-*`). Default age is 86400 seconds; use `--older-than SECONDS` (non-negative). The command is idempotent and never recursively deletes the runtime root.
 
 State files are **never silently removed** except by `qmu wait`'s harness auto-clean (below). After `kill --no-clean`, or a harness VM that powered off without `wait`, the `.serial.log` survives — read it with `qmu log`/`qmu crash`, then `qmu prune` when done. See [Files on disk](#files-on-disk).
 
@@ -198,16 +230,23 @@ Default CFLAGS: `-static -lpthread`.
 The headline feature — works even when SSH is dead, and **after** a VM exits (state files survive until prune):
 
 ```bash
-qmu crash                   # extract last KASAN/BUG/Oops/panic from serial log
-qmu crash --vm run-3        # works on a stopped VM too
-qmu log --tail 100          # last 100 lines of serial console
+qmu crash                   # last crash in the current restored guest epoch
+qmu crash --vm run-3        # current epoch; works on a stopped VM too
+qmu crash --full-history    # retained-log forensics across snapshot/reset epochs
+qmu log --tail 100          # raw serial tail, without provenance filtering
 ```
+
+Command-attributed crashes from `exec` and `compile --run` are extracted only
+from serial bytes appended after that command began. A stale panic already in
+the log never sets `crash_detected` for the new command. Standalone `qmu crash`
+defaults to the persisted current guest epoch; use `--full-history` explicitly
+when older retained crashes are desired. In structured output, inspect
+`crash_detected` and `scope`; `ok: true`/exit 0 means the selected crash query
+found a report, not that the VM is healthy.
 
 Detects KASAN, BUG/Oops, kernel panic, general protection fault, UBSAN, slab-use-after-free, and more. If `qmu crash` reports nothing but you suspect a panic, fall back to `qmu log --tail 200`.
 
 ## Snapshots
-
-Save/restore VM state within a session. Snapshots are ephemeral (a temporary COW overlay; lost when the VM exits — the base image stays clean):
 
 ```bash
 qmu snapshot save clean
@@ -216,13 +255,23 @@ qmu snapshot load clean
 qmu snapshot delete clean
 ```
 
-**Snapshots need a qcow2 rootfs disk.** `savevm` stores *internal* snapshots, which QEMU can only write into a **writable qcow2** disk. The default `[drive] format = "raw"` image (and the implicit `snapshot=on` overlay) cannot hold them, so `qmu snapshot save` fails out of the box. Convert the rootfs and switch formats: `qemu-img convert -O qcow2 rootfs.img rootfs.qcow2`, then set `[drive] format = "qcow2"`.
+**Ephemeral in-session rewind.** By default qmu attaches the configured rootfs through a temporary `snapshot=on` COW overlay. HMP `savevm`/`loadvm` checkpoints can therefore provide in-session rewind with a raw or qcow2 base. The base stays unchanged, and the checkpoints disappear when the QEMU process exits.
 
-**Snapshots also need the `passt` network backend.** The default `-net user` (slirp) backend can't be serialized by `savevm` (QEMU writes a corrupt section), so `loadvm` fails with `Section footer error` / `Missing section footer for slirp` and does **not** restore — `qmu snapshot load` returns a **non-zero exit code** in this case. Launch with **`--net-backend passt`** (or set `[machine] net_backend = "passt"`) to use [passt](https://passt.top/), a rootless, migration-capable slirp replacement: with it, `save`/`load` round-trip while SSH keeps working. Needs the `passt` binary on PATH (`qmu doctor` checks it; `apt install passt` / `pacman -S passt`).
+**Durable internal snapshots.** Attach a writable qcow2 drive without `snapshot=on`, for example:
 
-**Snapshot-rewind loop (with passt) — the fast way to run a crash-prone PoC repeatedly:**
 ```bash
-qmu launch --kernel ./bzImage --net-backend passt --name dev
+qemu-img convert -O qcow2 rootfs.img rootfs.qcow2
+qmu launch --kernel ./bzImage \
+  --drive 'file=./rootfs.qcow2,format=qcow2'
+```
+
+Changing `[drive] format` alone is not durable because qmu still places the configured rootfs behind its temporary overlay.
+
+**Migration/loadvm networking compatibility.** The default user/slirp backend often restores in-session checkpoints successfully. If `loadvm` reports slirp section/footer errors for a particular QEMU/build/device combination, use native passt only when the selected QEMU advertises it, or manually manage an external passt process with QEMU's `stream` backend. Native passt is documented since QEMU 10.1 but may be build-optional; qmu probes the capability instead of using the version as the decision. qmu does not manage an external passt process.
+
+**Snapshot-rewind loop — fast in-session iteration:**
+```bash
+qmu launch --kernel ./bzImage --name dev
 qmu push exploit /tmp/x
 qmu snapshot save clean              # clean pre-PoC state
 for i in 1 2 3 4 5; do
@@ -231,13 +280,7 @@ for i in 1 2 3 4 5; do
   qmu snapshot load clean            # rewind to clean — far faster than a full reboot
 done
 ```
-After `snapshot load`, the first SSH command may print a one-off `Broken pipe` on stderr (the pre-snapshot SSH control connection was rewound); the command itself still succeeds. Harness-mode VMs have no qcow2 drive, so `savevm` fails there unless you pass an explicit `--drive`.
-
-**Without passt, iterate by relaunching instead of snapshotting:**
-1. `qmu launch --kernel ...`
-2. `qmu compile exploit.c --run` (may crash)
-3. `qmu crash` (confirm — extraction is best-effort)
-4. `qmu kill` then `qmu launch ...` for a fresh known-good VM; edit and repeat from 2.
+After `snapshot load`, the first SSH command may print a one-off `Broken pipe` on stderr (the pre-snapshot SSH control connection was rewound); the command itself still succeeds. `savevm` needs an attached snapshot-capable writable layer; harness configurations with only readonly drives may not provide one.
 
 ## Kernel Logs
 
@@ -328,7 +371,7 @@ Use the exit code (not log scraping) to branch:
 
 Exit `3` is guest-side; an internal qmu/transport fault is `4`, so a tooling bug is never mistaken for a kernel panic. (Matches `qmu --help`.)
 
-**Output spilling.** Large outputs (>10k estimated tokens) auto-spill to a file under `$TMPDIR/qmu-spills/` (default `/tmp/qmu-spills/`). **Do not reconstruct the path** — read it from the result envelope's `artifact_path` field or the `[qmu] Output spilled to <path>` stderr line. The envelope's `{"token_estimate": <int>, "estimator": "chars/4"}` is a tokenizer-agnostic heuristic for sizing only.
+**Output spilling.** Large outputs (>10k estimated tokens) auto-spill to a file under the centralized spill root, in precedence order: `$QMU_TEMP_DIR/spills`, then `$XDG_RUNTIME_DIR/qmu/spills` when that XDG runtime directory is absolute/existing/writable/searchable, then `<platform temp>/qmu/spills`. Automatic spills are marked with an adjacent ownership sidecar; explicit `--out` paths are never marked as qmu-owned. **Callers must continue consuming `artifact_path`** — never reconstruct spill names or paths. Read the path from the result envelope's `artifact_path` field or the `[qmu] Output spilled to <path>` stderr line. The envelope's `{"token_estimate": <int>, "estimator": "chars/4"}` is a tokenizer-agnostic heuristic for sizing only.
 
 ## Health Check
 
@@ -347,14 +390,15 @@ Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
 | `<name>.json`       | VM metadata (pid, ports, kernel)     | `kill`, `prune`, `prune --keep-logs`, `wait` harness auto-clean |
 | `<name>.serial.log` | Serial console (read via `qmu log`)  | `kill`, `prune`, `wait` harness auto-clean — **kept** by `kill --no-clean`, `prune --keep-logs`, `wait --no-clean` |
 | `<name>.qmp.sock`   | QMP control socket                   | `kill`, `prune`, `prune --keep-logs`, `wait` harness auto-clean |
-| `<name>.qemu.log`   | QEMU stderr; rarely useful           | Never removed by qmu — delete by hand |
+| `<name>.qemu.log`   | QEMU stdout/stderr log               | `kill`, `prune`, `wait` harness auto-clean — **kept** by `kill --no-clean`, `prune --keep-logs`, `wait --no-clean` |
 
 `qmu list` shows running and stopped VMs with a status marker so you can see what's recoverable.
 
 ## Known Limitations
 
-- **Snapshots require a qcow2 rootfs AND `--net-backend passt`** — `savevm` needs a writable qcow2 disk (the default `format = "raw"` image cannot store internal snapshots, so `snapshot save` fails), and the default slirp backend can't be serialized (so `loadvm` fails and `snapshot load` returns non-zero). Convert to qcow2 and use passt for a working `save`/`load` loop, or relaunch instead (see Snapshots).
-- **Snapshots are ephemeral** — a temporary COW overlay, gone when the VM exits (by design; base image stays clean).
+- **Implicit snapshots are ephemeral** — the configured raw or qcow2 base is behind a temporary `snapshot=on` overlay, and in-session checkpoints disappear with the QEMU process.
+- **Durable internal snapshots need a direct writable qcow2 drive** — attach it explicitly without `snapshot=on`; changing `[drive] format` alone remains temporary.
+- **Network restore compatibility is QEMU/build/device dependent** — user/slirp often works; if `loadvm` names slirp/footer errors, use capability-advertised native passt or an operator-managed external passt + `stream` setup.
 - **`qmu gdb` halts the guest** — resume with `qmu cont` / `pry continue` / `qmu monitor cont` before SSH commands (see GDB Integration).
   Before `exec`, `push`, `pull`, `compile`, `dmesg`, or `kbase` constructs an SSH client,
   qmu best-effort queries QMP. A positively observed debugger/manual stop

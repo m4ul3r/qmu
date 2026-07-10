@@ -42,7 +42,8 @@ qmu launch --harness \
 
 qmu wait --vm kctf-test --timeout 60
 qmu log  --vm kctf-test --tail 100
-qmu crash --vm kctf-test
+qmu crash --vm kctf-test                 # current guest epoch only
+qmu crash --vm kctf-test --full-history  # retained-log forensics
 ```
 
 `--harness` implies `--no-wait-ssh` and `--no-net`, and skips the rootfs/SSH
@@ -55,6 +56,25 @@ non-running QEMU states as observations, but reports `stopped:true` and exits
 `0` only after the recorded QEMU process identity has exited. If `--timeout`
 elapses while that process is still alive, it exits `124` with
 `stopped:false` and preserves the latest QMP observation.
+
+`qmu crash` searches only the current guest epoch by default. A successful
+`snapshot load` or an observed guest reset advances that epoch, so an older
+panic retained in the serial log is not presented as current. Use
+`--full-history` only for forensics across previous epochs. JSON/NDJSON results
+identify the selected `scope` (`current` or `history`) and report detection in
+`crash_detected`.
+
+## Runtime cleanup
+
+```bash
+qmu prune --runtime --older-than 86400
+```
+
+Idempotent, age-gated cleanup of **qmu-owned** runtime artifacts only (marked
+automatic output spills and stale SSH ControlMaster sockets under the
+centralized runtime root). It never scans arbitrary `/tmp/qmu-*` names. See
+the qmu skill for ownership markers, root precedence (`QMU_TEMP_DIR` /
+`XDG_RUNTIME_DIR` / platform temp), and safety boundaries.
 
 ## Rootfs injection (no root needed)
 
@@ -78,18 +98,27 @@ qmu snapshot load clean
 qmu snapshot delete clean
 ```
 
-`snapshot save` uses QEMU's HMP `savevm`, which can only store *internal*
-snapshots in a **writable qcow2** rootfs disk. The default `[drive] format =
-"raw"` image (and the implicit `snapshot=on` overlay) cannot hold them, so
-`snapshot save` fails out of the box — convert the rootfs and switch formats:
+**Ephemeral in-session rewind.** By default qmu attaches the configured rootfs
+through a temporary `snapshot=on` COW overlay. HMP `savevm`/`loadvm` checkpoints
+can therefore provide in-session rewind with a raw or qcow2 base. The base stays
+unchanged, and the checkpoints disappear when the QEMU process exits.
+
+**Durable internal snapshots.** Attach a writable qcow2 drive without
+`snapshot=on`, for example:
 
 ```bash
-qemu-img convert -O qcow2 rootfs.img rootfs.qcow2   # then set [drive] format = "qcow2"
+qemu-img convert -O qcow2 rootfs.img rootfs.qcow2
+qmu launch --kernel ./bzImage \
+  --drive 'file=./rootfs.qcow2,format=qcow2'
 ```
 
-Snapshots also require **`--net-backend passt`** (or `[machine] net_backend =
-"passt"`). The default `-net user` (slirp) backend can't be serialized by
-`savevm`/`loadvm`, so snapshot state does not round-trip. `passt` is a rootless,
-migration-capable slirp replacement (`apt install passt` / `pacman -S passt`;
-`qmu doctor` checks it). Without both a qcow2 disk and passt, iterate by
-relaunching instead of snapshotting.
+Changing `[drive] format` alone is not durable because qmu still places the
+configured rootfs behind its temporary overlay.
+
+**Migration/loadvm networking compatibility.** The default user/slirp backend
+often restores in-session checkpoints successfully. If `loadvm` reports slirp
+section/footer errors for a particular QEMU/build/device combination, use native
+passt only when the selected QEMU advertises it, or manually manage an external
+passt process with QEMU's `stream` backend. Native passt is documented since
+QEMU 10.1 but may be build-optional; qmu probes the capability instead of using
+the version as the decision. qmu does not manage an external passt process.

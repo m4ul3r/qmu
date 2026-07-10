@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
+
 import json
 
 import pytest
@@ -379,3 +382,216 @@ def test_wait_process_exit_text_is_terminal(monkeypatch, capsys, tmp_path):
     assert "still running" not in text
     assert remove_calls == []
     assert len(crash_calls) == 1
+
+
+def test_wait_reset_advances_epoch_before_next_liveness_check(
+    monkeypatch, capsys, tmp_path
+):
+    old = b"old epoch\n"
+    inst = _instance(tmp_path)
+    Path(inst.serial_log).write_bytes(old)
+    clock = FakeClock()
+    qmp = FakeQMP(
+        clock,
+        events=[{"event": "RESET", "data": {"reason": "guest-reset"}}],
+    )
+    calls = []
+    saved_offsets = []
+    original_wait = qmp.wait_event
+
+    def wait_event(event_names, timeout=None):
+        event = original_wait(event_names, timeout)
+        if event is not None:
+            calls.append(f"event:{event['event']}")
+        return event
+
+    qmp.wait_event = wait_event
+    alive_checks = 0
+
+    def identity_alive(selected):
+        nonlocal alive_checks
+        calls.append(
+            "alive_before_reset" if alive_checks == 0 else "alive_after_reset"
+        )
+        alive_checks += 1
+        return True
+
+    def save_epoch(record, offset):
+        calls.append("save_epoch")
+        saved_offsets.append(offset)
+        return replace(record, guest_epoch_serial_offset=offset)
+
+    monkeypatch.setattr(lifecycle.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda selected: qmp)
+    monkeypatch.setattr(lifecycle, "instance_alive", identity_alive)
+    monkeypatch.setattr(
+        lifecycle,
+        "serial_log_offset",
+        lambda path: Path(path).stat().st_size,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "save_guest_epoch_serial_offset",
+        save_epoch,
+        raising=False,
+    )
+
+    rc = cli.main(["wait", "--vm", "wait-vm", "--timeout", "1", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 124
+    assert payload["stopped"] is False
+    assert payload["last_event"] == "RESET"
+    assert saved_offsets == [len(old)]
+    assert calls.index("event:RESET") < calls.index("save_epoch")
+    assert calls.index("save_epoch") < calls.index("alive_after_reset")
+
+
+@pytest.mark.parametrize("event", ["STOP", "SHUTDOWN", "POWERDOWN"])
+def test_wait_nonreset_observation_does_not_advance_epoch(
+    event, monkeypatch, capsys, tmp_path
+):
+    saved_offsets = []
+    monkeypatch.setattr(
+        lifecycle,
+        "save_guest_epoch_serial_offset",
+        lambda record, offset: saved_offsets.append(offset),
+        raising=False,
+    )
+    rc, payload, _, _, _, _ = _invoke_wait(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        events=[{"event": event, "data": {"source": "test"}}],
+        alive=[True],
+    )
+
+    assert rc == 124
+    assert payload["stopped"] is False
+    assert payload["last_event"] == event
+    assert saved_offsets == []
+
+
+def test_wait_repeated_reset_uses_latest_boundary(monkeypatch, capsys, tmp_path):
+    old = b"old epoch\n"
+    appended = b"new generation output\n"
+    inst = _instance(tmp_path)
+    log = Path(inst.serial_log)
+    log.write_bytes(old)
+    clock = FakeClock()
+    reset = {"event": "RESET", "data": {"reason": "guest-reset"}}
+    qmp = FakeQMP(clock, events=[reset, reset])
+    original_wait = qmp.wait_event
+    observed = 0
+    saved_offsets = []
+
+    def wait_event(event_names, timeout=None):
+        nonlocal observed
+        if qmp.events and observed == 1:
+            with log.open("ab") as stream:
+                stream.write(appended)
+        event = original_wait(event_names, timeout)
+        if event is not None:
+            observed += 1
+        return event
+
+    qmp.wait_event = wait_event
+
+    def save_epoch(record, offset):
+        saved_offsets.append(offset)
+        return replace(record, guest_epoch_serial_offset=offset)
+
+    monkeypatch.setattr(lifecycle.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda selected: qmp)
+    monkeypatch.setattr(lifecycle, "instance_alive", lambda selected: True)
+    monkeypatch.setattr(
+        lifecycle,
+        "serial_log_offset",
+        lambda path: Path(path).stat().st_size,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "save_guest_epoch_serial_offset",
+        save_epoch,
+        raising=False,
+    )
+
+    rc = cli.main(["wait", "--vm", "wait-vm", "--timeout", "1", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 124
+    assert payload["stopped"] is False
+    assert payload["last_event"] == "RESET"
+    assert saved_offsets == [len(old), len(old) + len(appended)]
+
+
+def test_wait_reset_persistence_failure_prevents_live_result(
+    monkeypatch, capsys, tmp_path
+):
+    inst = _instance(tmp_path)
+    Path(inst.serial_log).write_text("old epoch\n")
+    clock = FakeClock()
+    qmp = FakeQMP(clock, events=[{"event": "RESET", "data": {}}])
+    alive_checks = 0
+
+    def identity_alive(selected):
+        nonlocal alive_checks
+        alive_checks += 1
+        return True
+
+    monkeypatch.setattr(lifecycle.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda selected: qmp)
+    monkeypatch.setattr(lifecycle, "instance_alive", identity_alive)
+    monkeypatch.setattr(lifecycle, "serial_log_offset", lambda path: 10, raising=False)
+    monkeypatch.setattr(
+        lifecycle,
+        "save_guest_epoch_serial_offset",
+        lambda record, offset: (_ for _ in ()).throw(OSError("metadata failed")),
+        raising=False,
+    )
+
+    rc = cli.main(["wait", "--vm", "wait-vm", "--timeout", "1", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 4
+    assert payload["ok"] is False
+    assert payload["error_type"] == "OSError"
+    assert "metadata failed" in payload["error"]
+    assert "stopped" not in payload
+    assert alive_checks == 1
+
+
+def test_wait_terminal_crash_uses_current_epoch(monkeypatch, capsys, tmp_path):
+    old = (
+        "[ 1.0] WARNING: CPU: uaf_init\n"
+        "[ 1.1] old trace body\n"
+        "[ 1.2] ---[ end trace 111 ]---\n"
+    )
+    new = (
+        "[ 2.0] Kernel panic - not syncing: sysrq triggered crash\n"
+        "[ 2.1] ---[ end Kernel panic - not syncing: sysrq triggered crash ]---\n"
+    )
+    inst = replace(
+        _instance(tmp_path, harness=False),
+        guest_epoch_serial_offset=len(old.encode()),
+    )
+    Path(inst.serial_log).write_text(old + new)
+    clock = FakeClock()
+    qmp = FakeQMP(clock)
+    monkeypatch.setattr(lifecycle.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda selected: qmp)
+    monkeypatch.setattr(lifecycle, "instance_alive", lambda selected: False)
+
+    rc = cli.main(["wait", "--vm", "wait-vm", "--timeout", "1", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["stopped"] is True
+    assert "sysrq triggered crash" in payload["crash"]
+    assert "uaf_init" not in payload["crash"]

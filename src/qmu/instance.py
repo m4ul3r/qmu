@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import math
 import os
-import signal
+import stat
 import tempfile
-from dataclasses import asdict, dataclass, fields
+import time
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
-from .paths import instance_json_path, instances_dir, serial_log_path
+from .paths import instance_json_path, instances_dir, qemu_log_path, serial_log_path
+from .runtime import probe_unix_socket
+
+_KNOWN_INSTANCE_SUFFIXES = (".serial.log", ".qemu.log", ".qmp.sock", ".json")
 
 
 class QMUError(RuntimeError):
@@ -42,6 +47,9 @@ class VMInstance:
     # /proc/<pid>/stat field 22). Used to detect PID recycling across reboots.
     # Defaulted so instance JSON written before this field existed still loads.
     pid_start: str | None = None
+    # Byte offset at which the currently restored guest generation begins.
+    # Zero preserves old instance JSON and includes all bytes from a new launch.
+    guest_epoch_serial_offset: int = 0
 
 
 def _instance_from_dict(data: dict) -> VMInstance:
@@ -70,6 +78,16 @@ def save_instance(inst: VMInstance) -> Path:
             pass
         raise
     return path
+
+def save_guest_epoch_serial_offset(inst: VMInstance, offset: int) -> VMInstance:
+    """Atomically persist an explicitly captured guest-generation boundary."""
+    if type(offset) is not int:
+        raise TypeError("offset must be an integer")
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+    updated = replace(inst, guest_epoch_serial_offset=offset)
+    save_instance(updated)
+    return updated
 
 
 def load_instance(vm_id: str) -> VMInstance | None:
@@ -205,6 +223,196 @@ def _synthesize_orphan(vm_id: str, log_path: Path) -> VMInstance:
     )
 
 
+@dataclass(frozen=True, kw_only=True)
+class InstanceArtifacts:
+    vm_id: str
+    instance: VMInstance | None
+    invalid_json: bool
+    json_path: Path | None
+    qmp_socket: Path | None
+    serial_log: Path | None
+    qemu_log: Path | None
+
+
+def _match_known_suffix(name: str) -> tuple[str, str] | None:
+    """Return (vm_id, suffix) for the longest known exact suffix, else None."""
+    for suffix in _KNOWN_INSTANCE_SUFFIXES:
+        if name.endswith(suffix):
+            vm_id = name[: -len(suffix)]
+            if vm_id:
+                return vm_id, suffix
+    return None
+
+
+def _is_discoverable_instance_node(mode: int, suffix: str) -> bool:
+    """Accept regular files; also accept Unix sockets for the QMP suffix."""
+    if stat.S_ISLNK(mode) or stat.S_ISDIR(mode):
+        return False
+    if stat.S_ISREG(mode):
+        return True
+    return suffix == ".qmp.sock" and stat.S_ISSOCK(mode)
+
+
+def discover_instance_artifacts() -> list[InstanceArtifacts]:
+    """Group exact known instance suffixes under instances_dir() by VM id.
+
+    Scans only direct children. Directories, symlinks, nested files, and
+    unknown suffixes are ignored. JSON is parsed with the tolerant constructor;
+    ``invalid_json`` is True only when a ``.json`` path exists but cannot
+    produce a ``VMInstance``.
+    """
+    idir = instances_dir()
+    if not idir.exists():
+        return []
+
+    grouped: dict[str, dict[str, Path]] = {}
+    try:
+        children = sorted(idir.iterdir())
+    except OSError:
+        return []
+
+    for path in children:
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        matched = _match_known_suffix(path.name)
+        if matched is None:
+            continue
+        vm_id, suffix = matched
+        if not _is_discoverable_instance_node(st.st_mode, suffix):
+            continue
+        grouped.setdefault(vm_id, {})[suffix] = path
+
+    bundles: list[InstanceArtifacts] = []
+    for vm_id in sorted(grouped):
+        paths = grouped[vm_id]
+        json_path = paths.get(".json")
+        instance: VMInstance | None = None
+        invalid_json = False
+        if json_path is not None:
+            try:
+                data = json.loads(json_path.read_text())
+                instance = _instance_from_dict(data)
+            except (json.JSONDecodeError, TypeError, KeyError, OSError, UnicodeError):
+                invalid_json = True
+                instance = None
+        bundles.append(
+            InstanceArtifacts(
+                vm_id=vm_id,
+                instance=instance,
+                invalid_json=invalid_json,
+                json_path=json_path,
+                qmp_socket=paths.get(".qmp.sock"),
+                serial_log=paths.get(".serial.log"),
+                qemu_log=paths.get(".qemu.log"),
+            )
+        )
+    return bundles
+
+
+def _path_mtime(path: Path | None) -> float | None:
+    if path is None:
+        return None
+    try:
+        return path.lstat().st_mtime
+    except OSError:
+        return None
+
+
+def _bundle_is_age_eligible(
+    bundle: InstanceArtifacts, *, cutoff: float
+) -> bool:
+    """True when every present known artifact is at or older than cutoff."""
+    for path in (
+        bundle.json_path,
+        bundle.qmp_socket,
+        bundle.serial_log,
+        bundle.qemu_log,
+    ):
+        mtime = _path_mtime(path)
+        if mtime is None:
+            # Path listed but unstatable: treat as ineligible.
+            if path is not None:
+                return False
+            continue
+        if mtime > cutoff:
+            return False
+    return True
+
+
+def _qmp_safe_to_prune(qmp_socket: Path | None) -> bool:
+    if qmp_socket is None:
+        return True
+    try:
+        st = qmp_socket.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not stat.S_ISSOCK(st.st_mode):
+        # Non-socket leftover at the QMP path cannot be a live QMP channel.
+        return True
+    state = probe_unix_socket(qmp_socket)
+    return state in ("stale", "gone")
+
+
+def list_prunable_instance_ids(
+    *, older_than_seconds: float, now: float | None = None
+) -> list[str]:
+    """Return VM ids whose exact known artifacts are safe to prune.
+
+    Parseable stopped records and serial-only orphans remain immediately
+    eligible (no age gate). QEMU-log/QMP-only remnants require every present
+    known artifact to be at or older than the cutoff, and any QMP socket must
+    probe stale/gone. Live parseable instances and malformed JSON without a
+    serial-log recovery path are never returned.
+    """
+    if not math.isfinite(older_than_seconds) or older_than_seconds < 0:
+        raise ValueError("older_than_seconds must be finite and non-negative")
+    current_time = time.time() if now is None else now
+    if not math.isfinite(current_time):
+        raise ValueError("now must be finite")
+    cutoff = current_time - older_than_seconds
+
+    eligible: list[str] = []
+    for bundle in discover_instance_artifacts():
+        if bundle.instance is not None:
+            if instance_alive(bundle.instance):
+                continue
+            # Parseable stopped records prune immediately for compatibility.
+            if not _qmp_safe_to_prune(bundle.qmp_socket):
+                continue
+            eligible.append(bundle.vm_id)
+            continue
+
+        if bundle.invalid_json:
+            # Unknown identity: only serial-log recovery path is eligible.
+            if bundle.serial_log is None:
+                continue
+            if not _qmp_safe_to_prune(bundle.qmp_socket):
+                continue
+            eligible.append(bundle.vm_id)
+            continue
+
+        # Metadata-free remnant: serial-only stays immediate; qemu/QMP age-gated.
+        if (
+            bundle.serial_log is not None
+            and bundle.qmp_socket is None
+            and bundle.qemu_log is None
+        ):
+            eligible.append(bundle.vm_id)
+            continue
+
+        if not _bundle_is_age_eligible(bundle, cutoff=cutoff):
+            continue
+        if not _qmp_safe_to_prune(bundle.qmp_socket):
+            continue
+        eligible.append(bundle.vm_id)
+
+    return eligible
+
+
 def remove_instance(vm_id: str, *, keep_logs: bool = False) -> None:
     """Remove instance state files. With keep_logs=True, preserve the logs.
 
@@ -212,12 +420,11 @@ def remove_instance(vm_id: str, *, keep_logs: bool = False) -> None:
     (.qemu.log, written by launch_vm) are treated as logs: dropped by default,
     kept together under keep_logs so post-mortem forensics stay intact.
     """
-    idir = instances_dir()
-    suffixes = [".json", ".qmp.sock"]
+    instance_json_path(vm_id).unlink(missing_ok=True)
+    (instances_dir() / f"{vm_id}.qmp.sock").unlink(missing_ok=True)
     if not keep_logs:
-        suffixes.extend([".serial.log", ".qemu.log"])
-    for suffix in suffixes:
-        (idir / f"{vm_id}{suffix}").unlink(missing_ok=True)
+        serial_log_path(vm_id).unlink(missing_ok=True)
+        qemu_log_path(vm_id).unlink(missing_ok=True)
 
 
 def choose_instance(vm_id: str | None = None) -> VMInstance:
