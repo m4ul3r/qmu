@@ -107,14 +107,16 @@ def patch_exec(monkeypatch, tmp_path):
         initial_serial="boot ok\n",
         serial_during_run="",
         run_error=None,
+        stdout="",
+        stderr="",
     ):
         serial = tmp_path / "crash-vm.serial.log"
         serial.write_text(initial_serial)
         inst = _fake_instance(str(serial))
         fake = FakeSSH(
             rc=rc,
-            stdout="",
-            stderr="",
+            stdout=stdout,
+            stderr=stderr,
             ready=ready,
             serial_path=serial,
             serial_during_run=serial_during_run,
@@ -214,6 +216,8 @@ def test_rc255_ssh_up_is_normal_nonzero_exit1(patch_exec, capsys):
     assert payload["exit_code"] == 255
     assert payload["ssh_error"] is False
     assert payload["crash_detected"] is False
+    assert payload["kernel_warning_detected"] is False
+    assert payload["kernel_warning"] is None
 
 
 def test_rc255_ssh_down_text_mode_reports_crash(patch_exec, capsys):
@@ -231,6 +235,186 @@ def test_rc255_ssh_down_text_mode_reports_crash(patch_exec, capsys):
     out = capsys.readouterr().out
     assert "SSH connection lost" in out
     assert "panic" in out.lower()
+
+
+
+REPORT_KASAN = (
+    "[   10.000] BUG: KASAN: slab-out-of-bounds in report_bug+0x1/0x2\n"
+    "[   10.001] Call Trace:\n"
+    "[   10.002]  report_bug+0x1/0x2\n"
+    "[   10.003] ---[ end trace 2222222222222222 ]---\n"
+)
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_exec_report_mode_kasan_success_is_nonfatal_warning(patch_exec, capsys, fmt):
+    patch_exec(
+        0,
+        ready=True,
+        initial_serial="boot ok\n",
+        serial_during_run=REPORT_KASAN,
+        stdout="STILL_ALIVE\n",
+        stderr="",
+    )
+    rc = cli.main(["--format", fmt, "exec", "modprobe", "kasan_test"])
+    out = capsys.readouterr().out
+    if fmt == "ndjson":
+        assert len(out.splitlines()) == 1
+    payload = json.loads(out)
+    assert rc == 0
+    assert payload["ok"] is True
+    assert payload["exit_code"] == 0
+    assert payload["kernel_warning_detected"] is True
+    assert "BUG: KASAN" in payload["kernel_warning"]
+    assert payload["ssh_error"] is False
+    assert payload["crash_detected"] is False
+
+
+def test_exec_report_mode_kasan_text_warns_without_failing(patch_exec, capsys):
+    patch_exec(
+        0,
+        ready=True,
+        initial_serial="boot ok\n",
+        serial_during_run=REPORT_KASAN,
+        stdout="STILL_ALIVE\n",
+        stderr="",
+    )
+    rc = cli.main(["exec", "modprobe", "kasan_test"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "STILL_ALIVE" in out
+    assert "Kernel warning from command serial output:" in out
+    assert "BUG: KASAN" in out
+
+
+def test_exec_clean_success_has_stable_empty_warning_fields(patch_exec, capsys):
+    patch_exec(
+        0,
+        ready=True,
+        initial_serial="boot ok\n",
+        serial_during_run="ordinary serial chatter\n",
+        stdout="ok\n",
+        stderr="",
+    )
+    rc = cli.main(["--format", "json", "exec", "true"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["ok"] is True
+    assert payload["kernel_warning_detected"] is False
+    assert payload["kernel_warning"] is None
+
+
+def test_exec_success_ignores_stale_precommand_crash_in_warning(patch_exec, capsys):
+    """On the normal rc==0 path, kernel_warning is fresh-scoped: a crash that
+    was already in the serial log BEFORE the command must not surface as a
+    warning (start_offset is captured before ssh.run). Pins #12's fresh-scoping
+    for the success path, not just the transport-loss branch."""
+    patch_exec(
+        0,
+        ready=True,
+        initial_serial=PANIC_LOG,  # stale crash, present before the command
+        serial_during_run="clean run, no new warnings\n",
+        stdout="ok\n",
+        stderr="",
+    )
+    rc = cli.main(["--format", "json", "exec", "true"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["ok"] is True
+    assert payload["kernel_warning_detected"] is False
+    assert payload["kernel_warning"] is None
+    assert payload["crash_detected"] is False
+
+
+def test_exec_guest_nonzero_with_warning_preserves_remote_authority(patch_exec, capsys):
+    patch_exec(
+        7,
+        ready=True,
+        initial_serial="boot ok\n",
+        serial_during_run=REPORT_KASAN,
+        stdout="",
+        stderr="guest failed\n",
+    )
+    rc = cli.main(["--format", "json", "exec", "false"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["ok"] is False
+    assert payload["exit_code"] == 7
+    assert payload["kernel_warning_detected"] is True
+    assert "BUG: KASAN" in payload["kernel_warning"]
+    assert payload["ssh_error"] is False
+
+    # text path
+    patch_exec(
+        7,
+        ready=True,
+        initial_serial="boot ok\n",
+        serial_during_run=REPORT_KASAN,
+        stdout="",
+        stderr="guest failed\n",
+    )
+    rc = cli.main(["exec", "false"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[exit code: 7]" in out
+
+
+def test_exec_transport_loss_with_fresh_crash_is_exit3_json(patch_exec, capsys):
+    patch_exec(
+        255,
+        ready=False,
+        initial_serial="boot ok\n",
+        serial_during_run=PANIC_LOG,
+    )
+    rc = cli.main(["--format", "json", "exec", "trigger"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 3
+    assert payload["ok"] is False
+    assert payload["ssh_error"] is True
+    assert payload["crash_detected"] is True
+    assert "panic" in payload["crash"].lower()
+    assert "boot ok" not in (payload["crash"] or "")
+
+
+def test_exec_transport_loss_ignores_stale_precommand_crash(patch_exec, capsys):
+    patch_exec(255, ready=False, initial_serial=PANIC_LOG, serial_during_run="")
+    rc = cli.main(["--format", "json", "exec", "trigger"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 3
+    assert payload["ok"] is False
+    assert payload["ssh_error"] is True
+    assert payload["crash_detected"] is False
+    assert payload["crash"] is None
+
+
+def test_exec_json_ndjson_status_parity(patch_exec, capsys):
+    scenarios = [
+        ("clean", 0, True, "boot ok\n", "ordinary chatter\n", "ok\n", "", 0),
+        ("warning", 0, True, "boot ok\n", REPORT_KASAN, "STILL_ALIVE\n", "", 0),
+        ("guest_nonzero", 7, True, "boot ok\n", "", "", "guest failed\n", 1),
+        ("fatal", 255, False, "boot ok\n", PANIC_LOG, "", "", 3),
+    ]
+    for name, guest_rc, ready, initial, during, stdout, stderr, expected_qmu in scenarios:
+        payloads = {}
+        rcs = {}
+        for fmt in ("json", "ndjson"):
+            patch_exec(
+                guest_rc,
+                ready=ready,
+                initial_serial=initial,
+                serial_during_run=during,
+                stdout=stdout,
+                stderr=stderr,
+            )
+            rcs[fmt] = cli.main(["--format", fmt, "exec", "cmd"])
+            out = capsys.readouterr().out
+            if fmt == "ndjson":
+                assert len(out.splitlines()) == 1, name
+            payloads[fmt] = json.loads(out)
+            assert rcs[fmt] == expected_qmu, name
+            assert (rcs[fmt] == 0) is payloads[fmt]["ok"], name
+        assert payloads["json"] == payloads["ndjson"], name
+        assert rcs["json"] == rcs["ndjson"], name
 
 
 class FakeCompileSSH:

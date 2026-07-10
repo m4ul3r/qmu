@@ -151,5 +151,5 @@ def tail_log(log_path: str | Path, lines: int = 50) -> str | None:
         return ""
 
     all_lines = text.splitlines()
-    selected = all_lines[-lines:] if len(all_lines) > lines else all_lines
-    return "\n".join(selected) + "\n"
+    selected = all_lines[-lines:]
+    return "\n".join(selected) + ("\n" if selected else "")

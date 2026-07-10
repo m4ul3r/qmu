@@ -456,3 +456,52 @@ def test_ndjson_spill_uses_ndjson_suffix():
     assert res.spilled is True
     assert res.artifact["artifact_path"].endswith(".ndjson")
     assert res.artifact["summary"] == {"kind": "array", "count": 200}
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_forced_out_preserves_false_source_ok(tmp_path, fmt):
+    out = tmp_path / f"failed.{fmt}"
+    value = {"ok": False, "error": "guest command failed"}
+
+    result = write_output_result(value, fmt=fmt, out_path=out, stem="exec")
+
+    envelope = json.loads(result.rendered)
+    assert envelope["ok"] is False
+    assert json.loads(out.read_text()) == value
+    if fmt == "ndjson":
+        assert len(result.rendered.splitlines()) == 1
+
+
+def test_text_forced_out_uses_explicit_false_source_ok(tmp_path):
+    out = tmp_path / "failed.txt"
+
+    result = write_output_result(
+        "[exit code: 7]",
+        fmt="text",
+        out_path=out,
+        stem="exec",
+        source_ok=False,
+    )
+
+    assert json.loads(result.rendered)["ok"] is False
+    assert out.read_text() == "[exit code: 7]\n"
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_spill_preserves_false_source_ok(isolate_spill_runtime, fmt):
+    value = {"ok": False, "error": "x" * 512}
+
+    result = write_output_result(
+        value,
+        fmt=fmt,
+        out_path=None,
+        stem="error",
+        spill_token_limit=5,
+    )
+
+    envelope = json.loads(result.rendered)
+    assert result.spilled is True
+    assert envelope["ok"] is False
+    assert json.loads(Path(envelope["artifact_path"]).read_text()) == value
+    if fmt == "ndjson":
+        assert len(result.rendered.splitlines()) == 1
