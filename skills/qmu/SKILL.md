@@ -21,7 +21,7 @@ Project-local `./qmu.toml` is right for per-project rootfs/kernel paths; per-use
 
 ## Configuration
 
-TOML config holds machine settings (arch, rootfs, SSH key, profiles). Resolution order, later wins:
+Configuration combines built-in defaults with TOML sources and CLI flags. Resolution order, later wins:
 
 1. Built-in defaults — arch=x86_64, memory=4G, cpus=2
 2. Global config — `~/.config/qmu/config.toml`
@@ -33,6 +33,33 @@ qmu config show         # Resolved config and its sources
 qmu config init         # Write starter qmu.toml in CWD
 qmu config path         # Show config search paths
 ```
+
+TOML settings are table-scoped. The accepted schema is:
+
+- `[machine]`: `arch`, `memory`, `cpus`, `cpu`, `nic_model`, `net_backend`, `extra_args`
+- `[drive]`: `rootfs`, `format`
+- `[ssh]`: `key`, `user`, `port_start`
+- `[gdb]`: `port_start`
+- `[profiles.<name>]`: `cmdline`; `[profiles] name = "..."` is also accepted
+
+Every loaded global, project, or explicit `--config` file is validated before
+its values are applied. Malformed TOML, unknown keys, misplaced keys, wrong
+section shapes, and wrong value types fail with the source path and offending
+key. For example, use `[machine] arch`, `[drive] rootfs`, and `[ssh] key`; flat
+`arch`, `rootfs`, or `ssh_key` entries are invalid and the error names the
+canonical destination.
+
+Each layer may be empty or partial. `[drive]` and `[ssh]` are not universally
+required: another layer or CLI flags may provide their values, and harness mode
+intentionally runs without them. Later valid layers still win according to the
+precedence above.
+
+An invalid **global** config (`~/.config/qmu/config.toml`) is non-fatal: qmu
+prints a one-line `[qmu] Warning:` naming the file and continues from built-in
+defaults and any valid project/CLI layers, so a single stale global file never
+bricks every command (including `qmu doctor`, which diagnoses it). An invalid
+**project** (`qmu.toml`) or explicit `--config` file is fatal (exit 1) with the
+source path and offending key.
 
 `qmu config init` writes `[machine]` (arch/memory/cpus, with commented `cpu`/`nic_model`/`extra_args`), `[drive]`, `[ssh]`, `[gdb]`, three `[profiles.*]` blocks, and a commented harness-mode block. Notes:
 
