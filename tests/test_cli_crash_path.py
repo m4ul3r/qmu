@@ -304,6 +304,28 @@ def test_exec_clean_success_has_stable_empty_warning_fields(patch_exec, capsys):
     assert payload["kernel_warning"] is None
 
 
+def test_exec_success_ignores_stale_precommand_crash_in_warning(patch_exec, capsys):
+    """On the normal rc==0 path, kernel_warning is fresh-scoped: a crash that
+    was already in the serial log BEFORE the command must not surface as a
+    warning (start_offset is captured before ssh.run). Pins #12's fresh-scoping
+    for the success path, not just the transport-loss branch."""
+    patch_exec(
+        0,
+        ready=True,
+        initial_serial=PANIC_LOG,  # stale crash, present before the command
+        serial_during_run="clean run, no new warnings\n",
+        stdout="ok\n",
+        stderr="",
+    )
+    rc = cli.main(["--format", "json", "exec", "true"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["ok"] is True
+    assert payload["kernel_warning_detected"] is False
+    assert payload["kernel_warning"] is None
+    assert payload["crash_detected"] is False
+
+
 def test_exec_guest_nonzero_with_warning_preserves_remote_authority(patch_exec, capsys):
     patch_exec(
         7,

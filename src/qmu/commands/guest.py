@@ -48,6 +48,18 @@ def _emit_transfer_transport_lost(
     inst: VMInstance,
     start_offset: int,
 ) -> int:
+    """Emit the scp-transport-lost envelope; exit 3 only with a fresh crash.
+
+    This INTENTIONALLY differs from exec's :func:`_emit_ssh_lost`, which returns
+    exit 3 on any transport loss. An scp failure (rc=255 + transport marker) is a
+    weaker guest-death signal than an interactive exec session dropping: it can be
+    a host-side ssh control-master hiccup (issue #10's own repro is a mux "read
+    from master failed: Broken pipe"), so we do not claim a guest crash on the
+    transfer's word alone. A fresh command-scoped serial crash corroborates it →
+    exit 3 (CLAUDE.md "transport-loss"); otherwise it stays exit 4 (infra), per
+    the issue #10 spec. The fresh-crash presence is the discriminator between the
+    contract's transport-loss (3) and SSH-failure (4) buckets.
+    """
     crash = extract_crash(inst.serial_log, start_offset=start_offset)
     if crash is not None:
         hint = (
