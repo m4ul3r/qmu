@@ -42,7 +42,8 @@ qmu launch --harness \
 
 qmu wait --vm kctf-test --timeout 60
 qmu log  --vm kctf-test --tail 100
-qmu crash --vm kctf-test
+qmu crash --vm kctf-test                 # current guest epoch only
+qmu crash --vm kctf-test --full-history  # retained-log forensics
 ```
 
 `--harness` implies `--no-wait-ssh` and `--no-net`, and skips the rootfs/SSH
@@ -50,8 +51,30 @@ key requirements. SSH-using commands (`push`, `pull`, `exec`, `compile`,
 `dmesg`) error out with a clear message; serial-only commands (`log`, `crash`,
 `wait`, `qmp`, `monitor`, `kill`) work as usual.
 
-`qmu wait` blocks on QMP `STOP`/`SHUTDOWN`/`POWERDOWN` events, falling back to
-PID-liveness polling. Exit code `0` on clean stop, `124` on `--timeout`.
+`qmu wait` retains QMP `RESET`/`STOP`/`SHUTDOWN`/`POWERDOWN` events and
+non-running QEMU states as observations, but reports `stopped:true` and exits
+`0` only after the recorded QEMU process identity has exited. If `--timeout`
+elapses while that process is still alive, it exits `124` with
+`stopped:false` and preserves the latest QMP observation.
+
+`qmu crash` searches only the current guest epoch by default. A successful
+`snapshot load` or an observed guest reset advances that epoch, so an older
+panic retained in the serial log is not presented as current. Use
+`--full-history` only for forensics across previous epochs. JSON/NDJSON results
+identify the selected `scope` (`current` or `history`) and report detection in
+`crash_detected`.
+
+## Runtime cleanup
+
+```bash
+qmu prune --runtime --older-than 86400
+```
+
+Idempotent, age-gated cleanup of **qmu-owned** runtime artifacts only (marked
+automatic output spills and stale SSH ControlMaster sockets under the
+centralized runtime root). It never scans arbitrary `/tmp/qmu-*` names. See
+the qmu skill for ownership markers, root precedence (`QMU_TEMP_DIR` /
+`XDG_RUNTIME_DIR` / platform temp), and safety boundaries.
 
 ## Rootfs injection (no root needed)
 

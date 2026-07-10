@@ -110,6 +110,60 @@ def _emit(
         _output(data, args, stem=stem)
 
 
+_SSH_BLOCKED_QEMU_STATUSES = frozenset({"paused", "debug"})
+
+
+def _preflight_ssh_guest(
+    args: argparse.Namespace,
+    inst: VMInstance,
+    *,
+    stem: str,
+) -> int | None:
+    """Fail fast when QMP positively identifies a manual/debugger stop.
+
+    QMP introspection is best-effort. An unavailable QMP socket must not turn an
+    otherwise working guest command into a new outage, so transport failures
+    return None and preserve the existing SSH path.
+    """
+    try:
+        with _qmp_ctx(inst) as qmp:
+            status_result = qmp.execute("query-status")
+    except (QMPError, OSError):
+        return None
+
+    if not isinstance(status_result, dict):
+        return None
+    qemu_status = status_result.get("status")
+    if not isinstance(qemu_status, str):
+        return None
+    if qemu_status not in _SSH_BLOCKED_QEMU_STATUSES:
+        return None
+
+    hint = (
+        f"VM '{inst.vm_id}' is {qemu_status}. "
+        f"Resume with: qmu cont --vm {inst.vm_id}. "
+        "If a debugger halted the vCPU, use: pry continue."
+    )
+    _emit(
+        args,
+        data={
+            "ok": False,
+            "vm_id": inst.vm_id,
+            "qemu_status": qemu_status,
+            "ssh_error": False,
+            "crash_detected": False,
+            "hint": hint,
+        },
+        text=[
+            f"VM '{inst.vm_id}' is {qemu_status}; SSH operation was not started.",
+            f"Resume with: qmu cont --vm {inst.vm_id}",
+            "Debugger alternative: pry continue",
+        ],
+        stem=stem,
+    )
+    return 1
+
+
 def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) -> None:
     """Emit an error honoring --format (ERG-1).
 

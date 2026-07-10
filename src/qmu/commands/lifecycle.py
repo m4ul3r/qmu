@@ -3,12 +3,13 @@
 These manage the QEMU process and its instance metadata. Shared helpers come
 from :mod:`.._cliutil`.
 
-The patchable collaborators (``choose_instance``, ``_qmp_ctx``, ``is_pid_alive``,
-``extract_crash``) are imported directly into this module's namespace. The test
-suite drives the production seams via ``monkeypatch.setattr(lifecycle, ...)``
-(e.g. ``lifecycle.choose_instance`` / ``lifecycle._qmp_ctx`` /
-``lifecycle.is_pid_alive``); the patches take effect because the handlers read
-these names from this module at call time.
+The patchable collaborators (``choose_instance``, ``_qmp_ctx``,
+``instance_alive``, ``extract_crash``, ``serial_log_offset``, and
+``save_guest_epoch_serial_offset``) are imported directly into this module's
+namespace. The test suite drives the production seams via
+``monkeypatch.setattr(lifecycle, ...)`` (e.g. ``lifecycle.choose_instance`` /
+``lifecycle._qmp_ctx`` / ``lifecycle.instance_alive``); the patches take effect
+because the handlers read these names from this module at call time.
 """
 
 from __future__ import annotations
@@ -27,10 +28,13 @@ from ..instance import (
     instance_alive,
     is_pid_alive,
     list_instances,
+    list_prunable_instance_ids,
     list_stopped_instances,
     load_instance,
     remove_instance,
+    save_guest_epoch_serial_offset,
 )
+from ..runtime import prune_runtime_artifacts
 from ..paths import (
     all_skill_source_dirs,
     claude_skills_dir,
@@ -39,7 +43,7 @@ from ..paths import (
 )
 from ..qemu import native_passt_problem, probe_qemu_netdevs
 from ..qmp import QMPError
-from ..serial import extract_crash
+from ..serial import extract_crash, serial_log_offset
 from ..vm import launch_vm
 from .._cliutil import (
     _add_common_opts,
@@ -219,16 +223,44 @@ def _handle_kill(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _nonnegative_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from exc
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return seconds
+
+
 def _add_prune(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("prune", help="Remove state files for stopped VMs")
+    p = sub.add_parser(
+        "prune",
+        help="Remove stopped-instance state or aged qmu runtime artifacts",
+    )
     g = p.add_mutually_exclusive_group()
     # SUPPRESS (like _add_common_opts) so a top-level `--vm X` given before the
     # subcommand is not clobbered by this subparser's own default.
     g.add_argument("--vm", default=argparse.SUPPRESS, help="Prune a specific stopped VM")
     g.add_argument("--all", dest="prune_all", action="store_true",
                    help="Prune every stopped VM")
-    p.add_argument("--keep-logs", action="store_true",
-                   help="Drop .json + .qmp.sock but preserve .serial.log")
+    g.add_argument(
+        "--runtime",
+        dest="prune_runtime",
+        action="store_true",
+        help="Prune aged qmu-owned runtime artifacts (spills and SSH controls)",
+    )
+    p.add_argument(
+        "--older-than",
+        type=_nonnegative_seconds,
+        default=86400.0,
+        help="Age threshold in seconds for runtime and remnant pruning (default: 86400)",
+    )
+    p.add_argument(
+        "--keep-logs",
+        action="store_true",
+        help="preserve .serial.log and .qemu.log",
+    )
     # _add_common_opts adds --vm too; we declared --vm above so add the rest manually.
     p.add_argument("--format", choices=["text", "json", "ndjson"], default="text")
     p.add_argument("--out", default=None, help="Write output to file instead of stdout")
@@ -236,32 +268,66 @@ def _add_prune(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_prune(args: argparse.Namespace) -> int:
-    stopped = list_stopped_instances()
-    running = list_instances()
-    running_ids = {inst.vm_id for inst in running}
-
     # SUPPRESS default (fix #2) means the attribute may be absent when --vm is
     # not given after the subcommand; the top-level parser default of None
     # guarantees it otherwise exists.
     vm = getattr(args, "vm", None)
+    prune_runtime = getattr(args, "prune_runtime", False)
+    prune_all = getattr(args, "prune_all", False)
+
+    if prune_runtime:
+        if args.keep_logs:
+            raise QMUError("--keep-logs applies only to instance pruning.")
+        result = prune_runtime_artifacts(older_than_seconds=args.older_than)
+
+        def _art(item: Any) -> dict[str, str]:
+            return {"kind": item.kind, "path": str(item.path)}
+
+        data = {
+            "ok": True,
+            "runtime": {
+                "older_than_seconds": float(args.older_than),
+                "removed": [_art(item) for item in result.removed],
+                "skipped_live": [_art(item) for item in result.skipped_live],
+                "skipped_indeterminate": [
+                    _art(item) for item in result.skipped_indeterminate
+                ],
+            },
+        }
+        removed_n = len(result.removed)
+        live_n = len(result.skipped_live)
+        indet_n = len(result.skipped_indeterminate)
+        if removed_n == 0:
+            text = "No eligible qmu-owned runtime artifacts to prune."
+        else:
+            text = (
+                f"Pruned {removed_n} qmu-owned runtime artifact(s); "
+                f"skipped {live_n} live and {indet_n} indeterminate."
+            )
+        _emit(args, data=data, text=text, stem="prune")
+        return 0
+
+    running = list_instances()
+    running_ids = {inst.vm_id for inst in running}
+    prunable = list_prunable_instance_ids(older_than_seconds=args.older_than)
+
     if vm is not None:
         if vm in running_ids:
             raise QMUError(
                 f"VM '{vm}' is running. Use 'qmu kill --vm {vm}' first."
             )
-        target = next((inst for inst in stopped if inst.vm_id == vm), None)
-        if target is None:
+        if vm not in prunable:
             raise QMUError(f"No stopped VM named '{vm}'.")
-        targets = [target]
-    elif args.prune_all:
-        targets = stopped
+        targets = [vm]
+    elif prune_all:
+        targets = prunable
     else:
-        raise QMUError("Specify either --vm <name> or --all.")
+        raise QMUError("Specify either --vm <name>, --all, or --runtime.")
 
     pruned: list[str] = []
-    for inst in targets:
-        remove_instance(inst.vm_id, keep_logs=args.keep_logs)
-        pruned.append(inst.vm_id)
+    for vm_id in targets:
+        remove_instance(vm_id, keep_logs=args.keep_logs)
+        pruned.append(vm_id)
 
     if not pruned:
         text = "No stopped VMs to prune."
@@ -286,7 +352,8 @@ _STOP_EVENTS = {"STOP", "SHUTDOWN", "POWERDOWN", "RESET"}
 
 
 def _add_wait(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("wait", help="Block until a VM stops (harness/judge mode)")
+    description = "Block until the QEMU process exits (harness/judge mode)"
+    p = sub.add_parser("wait", help=description, description=description)
     p.add_argument("--timeout", type=float, default=None,
                    help="Max seconds to wait (default: no timeout)")
     p.add_argument("--no-clean", action="store_true",
@@ -299,29 +366,36 @@ def _handle_wait(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
 
     start = time.monotonic()
-    # `is not None` so --timeout 0 means "check once, then time out immediately"
-    # rather than being treated as "no timeout".
-    deadline: float | None = (start + args.timeout) if args.timeout is not None else None
+    deadline: float | None = (
+        start + args.timeout if args.timeout is not None else None
+    )
     reason = "unknown"
     qemu_status = "unknown"
+    last_event: str | None = None
     event_data: Any = None
     stopped = False
+    reset_persistence_in_progress = False
 
     try:
         with _qmp_ctx(inst) as qmp:
-            # Short-circuit: query current state first.
             try:
                 status = qmp.execute("query-status")
                 if isinstance(status, dict):
-                    qemu_status = status.get("status", "unknown")
-                    if qemu_status in ("paused", "shutdown", "postmigrate", "guest-panicked"):
-                        reason = qemu_status
-                        stopped = True
+                    observed_status = status.get("status")
+                    if isinstance(observed_status, str):
+                        qemu_status = observed_status
             except (QMPError, OSError):
                 pass
 
-            # Loop in 1s ticks: wait for an event OR notice the PID died.
-            while not stopped:
+            while True:
+                # The recorded process identity is the only terminal authority.
+                # Checking before the deadline also preserves --timeout 0 as
+                # “check once, then time out.”
+                if not instance_alive(inst):
+                    reason = "process_exited"
+                    stopped = True
+                    break
+
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -331,63 +405,79 @@ def _handle_wait(args: argparse.Namespace) -> int:
                 else:
                     tick = 1.0
 
-                ev = qmp.wait_event(_STOP_EVENTS, timeout=tick)
-                if ev is not None:
-                    reason = ev.get("event", "stopped")
-                    event_data = ev.get("data")
-                    stopped = True
-                    break
-
-                if not is_pid_alive(inst.pid):
-                    reason = "process_exited"
-                    stopped = True
-                    break
+                event = qmp.wait_event(_STOP_EVENTS, timeout=tick)
+                if event is not None:
+                    observed_event = event.get("event")
+                    last_event = (
+                        observed_event
+                        if isinstance(observed_event, str)
+                        else "unknown"
+                    )
+                    event_data = event.get("data")
+                    if last_event == "RESET":
+                        reset_persistence_in_progress = True
+                        reset_offset = serial_log_offset(inst.serial_log)
+                        inst = save_guest_epoch_serial_offset(inst, reset_offset)
+                        reset_persistence_in_progress = False
+                    # Continue immediately so identity is checked after every
+                    # observation; an event alone is never terminal.
+                    continue
     except (QMPError, OSError) as exc:
-        # If the QMP socket disappeared, the VM almost certainly stopped.
-        if not is_pid_alive(inst.pid):
+        if reset_persistence_in_progress:
+            raise
+        if not instance_alive(inst):
             stopped = True
             reason = "process_exited"
         else:
             raise QMUError(f"QMP error during wait: {exc}") from exc
 
     elapsed = time.monotonic() - start
-    crash = extract_crash(inst.serial_log) if stopped else None
+    crash = None
+    if stopped:
+        if inst.guest_epoch_serial_offset == 0:
+            crash = extract_crash(inst.serial_log)
+        else:
+            crash = extract_crash(
+                inst.serial_log,
+                start_offset=inst.guest_epoch_serial_offset,
+            )
 
     result = {
-        # ok mirrors success: True when the VM actually stopped, False on the
-        # timeout result object (exit 124).
         "ok": stopped,
         "vm_id": inst.vm_id,
         "stopped": stopped,
         "reason": reason,
         "elapsed": round(elapsed, 3),
+        "qemu_status": qemu_status,
+        "last_event": last_event,
         "event_data": event_data,
         "crash": crash,
     }
 
-    # Auto-clean harness VMs unless --no-clean.
     cleaned = False
     if stopped and inst.harness and not args.no_clean:
-        try:
-            _kill_vm(inst, force=False)
-            cleaned = True
-        except QMUError:
-            pass
+        # Identity death is already proven. Remove owned state directly; do not
+        # pass a potentially recycled PID to _kill_vm's pid-only signaling.
+        remove_instance(inst.vm_id)
+        cleaned = True
     result["cleaned"] = cleaned
 
     lines = [
         f"VM '{inst.vm_id}' {'stopped' if stopped else 'still running'} "
         f"({reason}, elapsed={elapsed:.2f}s)"
     ]
+    observation_suffix = "" if stopped else " (QEMU process still running)"
+    if last_event is not None:
+        lines.append(f"Observed QMP event {last_event}{observation_suffix}.")
+    if qemu_status not in {"unknown", "running"}:
+        lines.append(f"Observed QEMU status {qemu_status}{observation_suffix}.")
     if crash:
         lines.append("\nCrash from serial log:\n" + crash)
     if cleaned:
         lines.append("[qmu] Instance metadata cleaned up.")
     _emit(args, data=result, text=lines, stem="wait")
 
-    if not stopped:
-        return 124  # timeout
-    return 0
+    return 0 if stopped else 124
 
 
 # ---------------------------------------------------------------------------

@@ -145,7 +145,7 @@ docker run --rm --privileged tonistiigi/binfmt:latest --install all
 ```
 
 **ext4 image creation fails:**
-The script tries to create the ext4 image inside a helper Docker container (no sudo needed). If that fails, it falls back to `sudo mke2fs -d`. Ensure either Docker works or you have sudo access.
+The script tries to create the ext4 image inside a helper Docker container (no sudo needed). If that fails, it falls back to `sudo mke2fs -d`. Ensure either Docker works or you have sudo access. The temporary extracted root used by the sudo fallback is removed whether the fallback succeeds or fails.
 
 **SSH connection refused after boot:**
 - Wait for "QMU-NET-READY" in serial log (`qmu log --tail 20`)

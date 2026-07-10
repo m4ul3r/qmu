@@ -32,6 +32,7 @@ def test_old_schema_fills_defaults():
     assert inst.harness is False
     assert inst.nic_model is None
     assert inst.pid_start is None
+    assert inst.guest_epoch_serial_offset == 0
     assert inst.ssh_port == 10022
     assert inst.rootfs == "/var/rootfs.img"
 

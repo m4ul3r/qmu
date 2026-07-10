@@ -178,7 +178,28 @@ if [[ "$VERBOSE" == false ]]; then
 fi
 
 step "Building rootfs container image ($IMAGE_TAG, platform $PLATFORM)"
-local_ctx=$(mktemp -d) && trap "rm -rf '$local_ctx'" EXIT
+local_ctx=""
+CID=""
+ROOTDIR=""
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  set +e
+  if [[ -n "$ROOTDIR" ]]; then
+    sudo rm -rf -- "$ROOTDIR"
+  fi
+  if [[ -n "$CID" ]]; then
+    docker rm "$CID" >/dev/null 2>&1
+  fi
+  if [[ -n "$local_ctx" ]]; then
+    rm -rf -- "$local_ctx"
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+
+local_ctx="$(mktemp -d)"
 
 docker build $DOCKER_QUIET \
   --platform "$PLATFORM" \
@@ -234,28 +255,29 @@ DOCKERFILE
 # ---------------------------------------------------------------------------
 step "Exporting container filesystem"
 CID="$(docker create --platform "$PLATFORM" "$IMAGE_TAG")"
-trap "docker rm '$CID' >/dev/null 2>&1; rm -rf '$local_ctx'" EXIT
 
 step "Creating raw ext4 image ($SIZE)"
 # Use a helper container to run mke2fs as root — avoids requiring sudo on host.
-docker export "$CID" | docker run --rm -i \
+# The if/else form is required under `set -euo pipefail` so a failed helper
+# pipeline can fall back to host sudo mke2fs instead of aborting immediately.
+if docker export "$CID" | docker run --rm -i \
   -v "$OUTDIR:/output" \
   debian:bookworm-slim \
   bash -c "
     mkdir /rootfs && tar -x -C /rootfs &&
     apt-get update -qq && apt-get install -y -qq e2fsprogs >/dev/null 2>&1 &&
     mke2fs -F -q -t ext4 -d /rootfs -L qmu-root /output/rootfs.img $SIZE
-  "
-
-RC=$?
-if [[ $RC -ne 0 ]]; then
+  "; then
+  :
+else
+  RC=$?
   log "ext4 image creation failed (exit $RC)"
   log "fallback: trying sudo mke2fs..."
   ROOTDIR="$(mktemp -d)"
   docker export "$CID" | sudo tar -x -C "$ROOTDIR"
-  sudo mke2fs -F -q -t ext4 -d "$ROOTDIR" -L qmu-root "$OUTDIR/rootfs.img" "$SIZE"
+  sudo mke2fs -F -q -t ext4 -d "$ROOTDIR" -L qmu-root \
+    "$OUTDIR/rootfs.img" "$SIZE"
   sudo chown "$(id -u):$(id -g)" "$OUTDIR/rootfs.img"
-  sudo rm -rf "$ROOTDIR"
 fi
 
 # ---------------------------------------------------------------------------

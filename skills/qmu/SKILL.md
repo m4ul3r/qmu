@@ -110,8 +110,13 @@ qmu kill --force        # SIGKILL
 qmu kill --no-clean     # Stop but keep .serial.log + .json for forensics
 qmu prune --vm <name>             # Remove a stopped VM's state files
 qmu prune --all                   # Remove every stopped VM's state files
-qmu prune --vm <name> --keep-logs # Drop .json + .qmp.sock but PRESERVE .serial.log
+qmu prune --vm <name> --keep-logs # Drop .json + .qmp.sock but PRESERVE .serial.log and .qemu.log
+qmu prune --runtime --older-than 86400  # Age-gated prune of qmu-owned runtime artifacts
 ```
+
+`--keep-logs` preserves both `.serial.log` and `.qemu.log` (metadata and QMP sockets are still removed).
+
+`qmu prune --runtime` removes only aged **marked** automatic output spills and aged definitely stale direct `cm-*` Unix sockets under the runtime root. It skips live/uncertain SSH controls, explicit `--out` files, unmarked lookalikes, symlinks, and unrelated temp names (including arbitrary `/tmp/qmu-*`). Default age is 86400 seconds; use `--older-than SECONDS` (non-negative). The command is idempotent and never recursively deletes the runtime root.
 
 State files are **never silently removed** except by `qmu wait`'s harness auto-clean (below). After `kill --no-clean`, or a harness VM that powered off without `wait`, the `.serial.log` survives — read it with `qmu log`/`qmu crash`, then `qmu prune` when done. See [Files on disk](#files-on-disk).
 
@@ -124,18 +129,30 @@ qmu launch --harness --kernel ./bzImage --initrd ./ramdisk.img \
   --drive 'file=./rootfs.img,if=virtio,readonly,format=raw' \
   --cmdline 'console=ttyS0 root=/dev/vda1 ro init=/run.sh'
 
-qmu wait                  # block until the VM stops (no timeout by default)
+qmu wait                  # block until the recorded QEMU process exits (no timeout by default)
 qmu wait --timeout 120    # give up after 120s
-qmu wait --no-clean       # keep .serial.log after stop
+qmu wait --no-clean       # keep .serial.log after confirmed process exit
 ```
 
 `--harness` implies `--no-wait-ssh` and `--no-net` and skips the rootfs/SSH-key requirement.
 
 `qmu wait` is the harness/judge primitive:
-- **Exit 0** — VM stopped cleanly; the result **carries the crash** (JSON `crash` field, null if none; text prints `Crash from serial log:`).
-- **Exit 124** — `--timeout` elapsed, VM still running.
+- **Exit 0** — the recorded QEMU process identity exited; the result carries the
+  terminal crash (JSON `crash` field, null if none; text prints
+  `Crash from serial log:`).
+- **Exit 124** — `--timeout` elapsed while the QEMU process remained alive.
+  Structured output has `ok:false`, `stopped:false`, and retains `qemu_status`,
+  `last_event`, and `event_data`.
+- QMP `RESET`, `STOP`, `SHUTDOWN`, and `POWERDOWN`, plus non-running states such
+  as `paused`, `postmigrate`, and `guest-panicked`, are observations rather than
+  proof that QEMU exited.
 
-**`wait` auto-cleans harness VMs by default** (removes metadata + `.serial.log` on stop) unless you pass `--no-clean`. So **read the crash from `wait`'s own output** rather than a later `qmu crash` — the log may already be gone. Non-harness VMs are never auto-cleaned by `wait`.
+**`wait` auto-cleans harness VMs by default only after confirming that the
+recorded QEMU process identity exited** (removes metadata + `.serial.log`)
+unless you pass `--no-clean`. A live-PID timeout never auto-cleans. Read the
+terminal crash from `wait`'s own output rather than a later `qmu crash` — after
+a confirmed exit, the log may already be gone. Non-harness VMs are never
+auto-cleaned by `wait`.
 
 ## File Transfer
 
@@ -186,10 +203,19 @@ Default CFLAGS: `-static -lpthread`.
 The headline feature — works even when SSH is dead, and **after** a VM exits (state files survive until prune):
 
 ```bash
-qmu crash                   # extract last KASAN/BUG/Oops/panic from serial log
-qmu crash --vm run-3        # works on a stopped VM too
-qmu log --tail 100          # last 100 lines of serial console
+qmu crash                   # last crash in the current restored guest epoch
+qmu crash --vm run-3        # current epoch; works on a stopped VM too
+qmu crash --full-history    # retained-log forensics across snapshot/reset epochs
+qmu log --tail 100          # raw serial tail, without provenance filtering
 ```
+
+Command-attributed crashes from `exec` and `compile --run` are extracted only
+from serial bytes appended after that command began. A stale panic already in
+the log never sets `crash_detected` for the new command. Standalone `qmu crash`
+defaults to the persisted current guest epoch; use `--full-history` explicitly
+when older retained crashes are desired. In structured output, inspect
+`crash_detected` and `scope`; `ok: true`/exit 0 means the selected crash query
+found a report, not that the VM is healthy.
 
 Detects KASAN, BUG/Oops, kernel panic, general protection fault, UBSAN, slab-use-after-free, and more. If `qmu crash` reports nothing but you suspect a panic, fall back to `qmu log --tail 200`.
 
@@ -243,7 +269,13 @@ qmu launch --kernel /path/to/bzImage --gdb
 qmu gdb --symbols /path/to/vmlinux         # launches pry connected to the GDB stub
 ```
 
-**Gotcha — `qmu gdb` halts the vCPU.** Attaching to the QEMU GDB stub halts the guest CPU, so every `qmu exec`/`push`/`pull`/`compile`/`dmesg` fails with a banner/connect timeout (guest-side rc=255 — frozen guest, not a qmu exit code, not a crash). **Resume before SSH commands** with `qmu cont` (or `pry continue`, or `qmu monitor cont`). If `qmu exec` starts timing out right after `qmu gdb`, the guest is almost certainly paused.
+**Gotcha — `qmu gdb` halts the vCPU.** Attaching to the QEMU GDB stub halts
+the guest CPU. Before `qmu exec`/`push`/`pull`/`compile`/`dmesg` constructs an
+SSH client, qmu best-effort queries QMP; a positively observed `paused` or
+`debug` state fails immediately with operational exit `1`, not an SSH timeout
+or crash classification. **Resume before SSH commands** with
+`qmu cont --vm <id>` (or `pry continue`, or `qmu monitor cont`). If QMP
+introspection is unavailable, qmu preserves the existing SSH path.
 
 ```bash
 pry break set commit_creds
@@ -280,7 +312,7 @@ Use the exit code (not log scraping) to branch:
 
 Exit `3` is guest-side; an internal qmu/transport fault is `4`, so a tooling bug is never mistaken for a kernel panic. (Matches `qmu --help`.)
 
-**Output spilling.** Large outputs (>10k estimated tokens) auto-spill to a file under `$TMPDIR/qmu-spills/` (default `/tmp/qmu-spills/`). **Do not reconstruct the path** — read it from the result envelope's `artifact_path` field or the `[qmu] Output spilled to <path>` stderr line. The envelope's `{"token_estimate": <int>, "estimator": "chars/4"}` is a tokenizer-agnostic heuristic for sizing only.
+**Output spilling.** Large outputs (>10k estimated tokens) auto-spill to a file under the centralized spill root, in precedence order: `$QMU_TEMP_DIR/spills`, then `$XDG_RUNTIME_DIR/qmu/spills` when that XDG runtime directory is absolute/existing/writable/searchable, then `<platform temp>/qmu/spills`. Automatic spills are marked with an adjacent ownership sidecar; explicit `--out` paths are never marked as qmu-owned. **Callers must continue consuming `artifact_path`** — never reconstruct spill names or paths. Read the path from the result envelope's `artifact_path` field or the `[qmu] Output spilled to <path>` stderr line. The envelope's `{"token_estimate": <int>, "estimator": "chars/4"}` is a tokenizer-agnostic heuristic for sizing only.
 
 ## Health Check
 
@@ -299,7 +331,7 @@ Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
 | `<name>.json`       | VM metadata (pid, ports, kernel)     | `kill`, `prune`, `prune --keep-logs`, `wait` harness auto-clean |
 | `<name>.serial.log` | Serial console (read via `qmu log`)  | `kill`, `prune`, `wait` harness auto-clean — **kept** by `kill --no-clean`, `prune --keep-logs`, `wait --no-clean` |
 | `<name>.qmp.sock`   | QMP control socket                   | `kill`, `prune`, `prune --keep-logs`, `wait` harness auto-clean |
-| `<name>.qemu.log`   | QEMU stderr; rarely useful           | Never removed by qmu — delete by hand |
+| `<name>.qemu.log`   | QEMU stdout/stderr log               | `kill`, `prune`, `wait` harness auto-clean — **kept** by `kill --no-clean`, `prune --keep-logs`, `wait --no-clean` |
 
 `qmu list` shows running and stopped VMs with a status marker so you can see what's recoverable.
 
@@ -309,5 +341,12 @@ Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
 - **Durable internal snapshots need a direct writable qcow2 drive** — attach it explicitly without `snapshot=on`; changing `[drive] format` alone remains temporary.
 - **Network restore compatibility is QEMU/build/device dependent** — user/slirp often works; if `loadvm` names slirp/footer errors, use capability-advertised native passt or an operator-managed external passt + `stream` setup.
 - **`qmu gdb` halts the guest** — resume with `qmu cont` / `pry continue` / `qmu monitor cont` before SSH commands (see GDB Integration).
+  Before `exec`, `push`, `pull`, `compile`, or `dmesg` constructs an SSH client,
+  qmu best-effort queries QMP. A positively observed debugger/manual stop
+  (`paused` or `debug`) fails immediately with operational exit `1`, reports
+  `ssh_error:false` and `crash_detected:false`, and gives
+  `qmu cont --vm <id>` / `pry continue` recovery guidance. If QMP introspection is
+  unavailable, qmu preserves the existing SSH path rather than creating a new
+  command outage.
 - **Crash auto-extraction is best-effort** — confirm with `qmu crash` / `qmu log --tail 200` after any suspected panic (see Compile and Run).
 - **Serial log is write-only** — no interactive console; use SSH for interactive work.
