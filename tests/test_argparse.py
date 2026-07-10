@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from qmu import cli
-from qmu.commands import guest, lifecycle
+from qmu.commands import guest, lifecycle, qmp_cmds
 
 
 @pytest.fixture
@@ -242,6 +242,46 @@ class TestPruneVmPlacement:
             capsys.readouterr().out
             == "No eligible qmu-owned runtime artifacts to prune.\n"
         )
+
+
+@pytest.fixture
+def captured_kbase_args(monkeypatch):
+    captured = {}
+
+    def _stub(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(qmp_cmds, "_handle_kbase", _stub)
+    return captured
+
+
+def test_kbase_vm_flag_before_subcommand(captured_kbase_args):
+    rc = cli.main([
+        "--vm", "debug-vm", "kbase", "--symbols", "/tmp/vmlinux"
+    ])
+    assert rc == 0
+    assert captured_kbase_args["args"].vm == "debug-vm"
+    assert captured_kbase_args["args"].symbols == "/tmp/vmlinux"
+
+
+def test_kbase_vm_flag_after_subcommand(captured_kbase_args):
+    rc = cli.main([
+        "kbase", "--vm", "debug-vm", "--symbols", "/tmp/vmlinux"
+    ])
+    assert rc == 0
+    assert captured_kbase_args["args"].vm == "debug-vm"
+
+
+def test_kbase_requires_symbols(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["kbase", "--vm", "debug-vm"])
+
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "--symbols" in error
+    assert "required" in error
+    assert "invalid choice" not in error
 
 
 @pytest.fixture
