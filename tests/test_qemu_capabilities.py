@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from unittest.mock import Mock
 
@@ -133,3 +134,37 @@ def test_unsupported_message_is_capability_based_with_qemu_10_1_context():
     assert "10.1+" not in message
     assert ">=" not in message
     assert "version" not in message.lower()
+
+
+# --- real-binary cross-arch coverage -------------------------------------
+# The mocked tests above stub subprocess.run, so they cannot catch a probe
+# invocation that a real qemu binary rejects. The original bug was exactly
+# that: `-netdev help` with no `-machine` exits 1 on arches without a default
+# machine (aarch64, arm, riscv...), so the probe reported a false error on a
+# passt-capable QEMU. These tests run the ACTUAL binary when installed and
+# skip cleanly when it is not (e.g. CI without cross-arch qemu packages).
+
+_CROSS_ARCH_BINARIES = [
+    "qemu-system-x86_64",
+    "qemu-system-i386",
+    "qemu-system-aarch64",
+    "qemu-system-arm",
+    "qemu-system-riscv64",
+]
+
+
+@pytest.mark.parametrize("binary", _CROSS_ARCH_BINARIES)
+def test_real_probe_reaches_backend_enumeration_on_every_installed_arch(binary):
+    """Regression guard for the missing `-machine none`: on every installed
+    arch — not just x86_64 — the real probe must reach netdev enumeration
+    (no error) and report backends, including the always-present `user`."""
+    if shutil.which(binary) is None:
+        pytest.skip(f"{binary} not installed on this host")
+
+    caps = probe_qemu_netdevs(binary)
+
+    assert caps.error is None, (
+        f"{binary}: probe failed to reach netdev enumeration: {caps.error}"
+    )
+    assert caps.available is True
+    assert "user" in caps.backends, f"{binary}: backends={sorted(caps.backends)}"
