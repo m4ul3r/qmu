@@ -468,7 +468,16 @@ docker run --rm \
     rm -rf /output/scripts/gdb /output/vmlinux-gdb.py
     mkdir -p /output/scripts
     cp -a scripts/gdb /output/scripts/gdb
-    cp -a vmlinux-gdb.py /output/vmlinux-gdb.py
+    # The build tree's vmlinux-gdb.py is typically a symlink into scripts/gdb.
+    # Docker leaves that link as /src/scripts/gdb/... which is meaningless on
+    # the host, so dereference into a real file next to scripts/gdb/. With
+    # __file__ at the build-root path, the loader's sys.path insert of
+    # dirname(__file__)+"/scripts/gdb" resolves correctly on the host.
+    if [[ -e vmlinux-gdb.py || -L vmlinux-gdb.py ]]; then
+      cp -L vmlinux-gdb.py /output/vmlinux-gdb.py
+    else
+      cp scripts/gdb/vmlinux-gdb.py /output/vmlinux-gdb.py
+    fi
   "
 
 RC=$?
