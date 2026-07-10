@@ -64,3 +64,14 @@ def test_config_init_does_not_overwrite_existing(in_empty_dir, capsys):
 
     assert rc == 0
     assert target.read_text() == before  # untouched
+
+
+def test_config_init_writes_snapshot_mode_guidance(in_empty_dir, capsys):
+    assert cli.main(["config", "init"]) == 0
+    text = (in_empty_dir / "qmu.toml").read_text().lower()
+    assert "temporary snapshot=on overlay" in text
+    assert "raw or qcow2" in text
+    assert "durable" in text
+    assert "without snapshot=on" in text
+    assert "if loadvm reports slirp" in text
+    assert "advertises native passt" in text

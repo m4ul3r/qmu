@@ -276,11 +276,11 @@ Error: Section footer error, section_id: 1
 [exit=1]
 ```
 
-> FINDING (snapshot): `qmu snapshot load clean` printed `Missing section footer for slirp /
-> Error: Section footer error` and did NOT restore the VM (SSH stayed dead), yet exited 0.
-> Cause: savevm cannot serialize the `-net user` (slirp) state qmu configures. The documented
-> save->crash->load iteration loop is broken with qmu's default networking, and the failure is
-> reported as success (exit 0).
+> FINDING (snapshot, contextual): In this captured QEMU 11 run/build/device state,
+> `loadvm` named slirp section/footer errors and did not restore the VM; the old CLI
+> also misreported that failure as exit 0. Other QEMU builds can restore raw +
+> user/slirp in-session checkpoints, so this transcript supports conditional
+> compatibility guidance rather than a universal passt prerequisite.
 
 ## Output spilling (>10k tokens auto-spills to /tmp/qmu-spills)
 

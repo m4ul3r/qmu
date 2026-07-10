@@ -248,8 +248,6 @@ Detects KASAN, BUG/Oops, kernel panic, general protection fault, UBSAN, slab-use
 
 ## Snapshots
 
-Save/restore VM state within a session. Snapshots are ephemeral (a temporary COW overlay; lost when the VM exits — the base image stays clean):
-
 ```bash
 qmu snapshot save clean
 qmu snapshot list
@@ -257,13 +255,23 @@ qmu snapshot load clean
 qmu snapshot delete clean
 ```
 
-**Snapshots need a qcow2 rootfs disk.** `savevm` stores *internal* snapshots, which QEMU can only write into a **writable qcow2** disk. The default `[drive] format = "raw"` image (and the implicit `snapshot=on` overlay) cannot hold them, so `qmu snapshot save` fails out of the box. Convert the rootfs and switch formats: `qemu-img convert -O qcow2 rootfs.img rootfs.qcow2`, then set `[drive] format = "qcow2"`.
+**Ephemeral in-session rewind.** By default qmu attaches the configured rootfs through a temporary `snapshot=on` COW overlay. HMP `savevm`/`loadvm` checkpoints can therefore provide in-session rewind with a raw or qcow2 base. The base stays unchanged, and the checkpoints disappear when the QEMU process exits.
 
-**Snapshots also need the `passt` network backend.** The default `-net user` (slirp) backend can't be serialized by `savevm` (QEMU writes a corrupt section), so `loadvm` fails with `Section footer error` / `Missing section footer for slirp` and does **not** restore — `qmu snapshot load` returns a **non-zero exit code** in this case. Launch with **`--net-backend passt`** (or set `[machine] net_backend = "passt"`) to use [passt](https://passt.top/), a rootless, migration-capable slirp replacement: with it, `save`/`load` round-trip while SSH keeps working. Needs the `passt` binary on PATH (`qmu doctor` checks it; `apt install passt` / `pacman -S passt`).
+**Durable internal snapshots.** Attach a writable qcow2 drive without `snapshot=on`, for example:
 
-**Snapshot-rewind loop (with passt) — the fast way to run a crash-prone PoC repeatedly:**
 ```bash
-qmu launch --kernel ./bzImage --net-backend passt --name dev
+qemu-img convert -O qcow2 rootfs.img rootfs.qcow2
+qmu launch --kernel ./bzImage \
+  --drive 'file=./rootfs.qcow2,format=qcow2'
+```
+
+Changing `[drive] format` alone is not durable because qmu still places the configured rootfs behind its temporary overlay.
+
+**Migration/loadvm networking compatibility.** The default user/slirp backend often restores in-session checkpoints successfully. If `loadvm` reports slirp section/footer errors for a particular QEMU/build/device combination, use native passt only when the selected QEMU advertises it, or manually manage an external passt process with QEMU's `stream` backend. Native passt is documented since QEMU 10.1 but may be build-optional; qmu probes the capability instead of using the version as the decision. qmu does not manage an external passt process.
+
+**Snapshot-rewind loop — fast in-session iteration:**
+```bash
+qmu launch --kernel ./bzImage --name dev
 qmu push exploit /tmp/x
 qmu snapshot save clean              # clean pre-PoC state
 for i in 1 2 3 4 5; do
@@ -272,13 +280,7 @@ for i in 1 2 3 4 5; do
   qmu snapshot load clean            # rewind to clean — far faster than a full reboot
 done
 ```
-After `snapshot load`, the first SSH command may print a one-off `Broken pipe` on stderr (the pre-snapshot SSH control connection was rewound); the command itself still succeeds. Harness-mode VMs have no qcow2 drive, so `savevm` fails there unless you pass an explicit `--drive`.
-
-**Without passt, iterate by relaunching instead of snapshotting:**
-1. `qmu launch --kernel ...`
-2. `qmu compile exploit.c --run` (may crash)
-3. `qmu crash` (confirm — extraction is best-effort)
-4. `qmu kill` then `qmu launch ...` for a fresh known-good VM; edit and repeat from 2.
+After `snapshot load`, the first SSH command may print a one-off `Broken pipe` on stderr (the pre-snapshot SSH control connection was rewound); the command itself still succeeds. `savevm` needs an attached snapshot-capable writable layer; harness configurations with only readonly drives may not provide one.
 
 ## Kernel Logs
 
@@ -362,8 +364,9 @@ Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
 
 ## Known Limitations
 
-- **Snapshots require a qcow2 rootfs AND `--net-backend passt`** — `savevm` needs a writable qcow2 disk (the default `format = "raw"` image cannot store internal snapshots, so `snapshot save` fails), and the default slirp backend can't be serialized (so `loadvm` fails and `snapshot load` returns non-zero). Convert to qcow2 and use passt for a working `save`/`load` loop, or relaunch instead (see Snapshots).
-- **Snapshots are ephemeral** — a temporary COW overlay, gone when the VM exits (by design; base image stays clean).
+- **Implicit snapshots are ephemeral** — the configured raw or qcow2 base is behind a temporary `snapshot=on` overlay, and in-session checkpoints disappear with the QEMU process.
+- **Durable internal snapshots need a direct writable qcow2 drive** — attach it explicitly without `snapshot=on`; changing `[drive] format` alone remains temporary.
+- **Network restore compatibility is QEMU/build/device dependent** — user/slirp often works; if `loadvm` names slirp/footer errors, use capability-advertised native passt or an operator-managed external passt + `stream` setup.
 - **`qmu gdb` halts the guest** — resume with `qmu cont` / `pry continue` / `qmu monitor cont` before SSH commands (see GDB Integration).
   Before `exec`, `push`, `pull`, `compile`, or `dmesg` constructs an SSH client,
   qmu best-effort queries QMP. A positively observed debugger/manual stop

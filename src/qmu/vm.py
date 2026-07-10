@@ -13,6 +13,7 @@ from pathlib import Path
 from .config import QMUConfig
 from .instance import QMUError, VMInstance, proc_pid_start, save_instance
 from .paths import instances_dir, qmp_socket_path, qemu_log_path, serial_log_path
+from .qemu import native_passt_problem, probe_qemu_netdevs
 from .qmp import QMPClient
 
 
@@ -108,6 +109,33 @@ def find_free_port(start: int, max_tries: int = 100) -> int:
     raise QMUError(f"No free port found in range {start}-{start + max_tries - 1}")
 
 
+def _preflight_native_passt(
+    *,
+    config: QMUConfig,
+    net_backend: str | None,
+    no_net: bool,
+    harness: bool,
+) -> str | None:
+    effective_backend = net_backend or config.net_backend
+    if no_net or harness or effective_backend != "passt":
+        return None
+
+    caps = probe_qemu_netdevs(config.qemu_binary())
+    problem = native_passt_problem(caps)
+    if problem is not None:
+        raise QMUError(problem)
+
+    if shutil.which("passt") is None:
+        raise QMUError(
+            "net_backend=passt requires the 'passt' binary on PATH "
+            "(e.g. 'apt install passt' / 'pacman -S passt'). "
+            "Use the default 'user' backend, or --no-net, if passt is unavailable."
+        )
+
+    assert caps.path is not None
+    return caps.path
+
+
 def build_qemu_command(
     *,
     config: QMUConfig,
@@ -123,6 +151,7 @@ def build_qemu_command(
     no_net: bool = False,
     nic_model: str | None = None,
     net_backend: str | None = None,
+    qemu_binary: str | None = None,
     extra_args: list[str] | None = None,
 ) -> list[str]:
     """Build the qemu-system command line from config."""
@@ -130,7 +159,7 @@ def build_qemu_command(
     backend = net_backend or config.net_backend
 
     cmd = [
-        config.qemu_binary(),
+        qemu_binary or config.qemu_binary(),
         "-m", config.memory,
         "-smp", str(config.cpus),
         "-kernel", kernel,
@@ -148,6 +177,9 @@ def build_qemu_command(
         for spec in drives:
             cmd.extend(["-drive", spec])
     elif rootfs is not None:
+        # Configured raw or qcow2 rootfs images sit behind this temporary overlay:
+        # in-session checkpoints disappear with QEMU. A durable internal snapshot
+        # needs an explicit writable qcow2 drive above, without snapshot=on.
         cmd.extend(["-drive", f"file={rootfs},format={config.drive_format},snapshot=on"])
 
     # Networking
@@ -157,19 +189,10 @@ def build_qemu_command(
         # No SSH hostfwd, but still provide a NIC (rare: --no-wait-ssh without --no-net).
         cmd.extend(["-nic", f"user,model={nic}"])
     elif backend == "passt":
-        # passt is a migration-capable, rootless slirp replacement. Unlike the
-        # default `user` (slirp) backend — whose vmstate is broken in QEMU 11 and
-        # makes savevm/loadvm fail with "Section footer error" — passt serializes
-        # cleanly, so snapshots round-trip while keeping SSH (verified live).
-        # address/gateway mirror slirp's well-known 10.0.2.x convention that qmu
-        # rootfs images already use; tcp-ports forwards the host SSH port to
-        # guest :22 (slirp's hostfwd equivalent).
-        if shutil.which("passt") is None:
-            raise QMUError(
-                "net_backend=passt requires the 'passt' binary on PATH "
-                "(e.g. 'apt install passt' / 'pacman -S passt'). "
-                "Use the default 'user' backend, or --no-net, if passt is unavailable."
-            )
+        # Native passt is migration-compatible when the selected QEMU advertises it.
+        # Some user/slirp QEMU/build/device combinations restore successfully; others
+        # report slirp section/footer errors on loadvm. Capability and external-binary
+        # validation happens once in launch_vm before artifacts or process creation.
         cmd.extend([
             "-netdev",
             f"passt,id=net0,address=10.0.2.15,gateway=10.0.2.2,"
@@ -271,6 +294,12 @@ def launch_vm(
     # Resolve command line
     if cmdline is None:
         cmdline = config.profiles[profile]
+    resolved_qemu = _preflight_native_passt(
+        config=config,
+        net_backend=net_backend,
+        no_net=no_net,
+        harness=harness,
+    )
 
     idir = instances_dir()
     idir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +354,7 @@ def launch_vm(
             no_net=no_net,
             nic_model=nic_model,
             net_backend=net_backend,
+            qemu_binary=resolved_qemu,
             extra_args=extra_args,
         )
 
