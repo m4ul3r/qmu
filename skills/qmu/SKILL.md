@@ -378,9 +378,10 @@ qmu compile hello.c --run --vm arm70    # machine=aarch64, sizeof(void*)=8
 ```
 
 The arm64 `virt` machine exposes virtio over PCI, so the rootfs reaches `/dev/vda` through
-a plain virtio drive. The implicit rootfs drive is being made arch-aware in linked PR #26 —
-with that fix a default launch already lands on `/dev/vda`. **Fallback if your qmu predates
-the fix** (implicit drive has no `if=virtio` and fails VFS mount): pass the drive explicitly.
+a plain virtio drive. The implicit rootfs drive is made arch-aware by the arch-aware-drive
+fix in PR #31 (issues #26/#28) — with that fix a default launch already lands on `/dev/vda`.
+**Fallback if your qmu predates the fix** (implicit drive has no `if=virtio` and fails VFS
+mount): pass the drive explicitly.
 
 ```bash
 qmu launch --kernel "$KERNEL" --arch aarch64 --gdb --name arm70 \
@@ -398,7 +399,6 @@ symbol `0x10000` low and breakpoints miss. Rebase on the runtime `_stext` until 
 eval "$(qmu kbase --vm arm70 --symbols "$VMLINUX")"      # records _text-based KBASE/SLIDE
 STEXT=$(qmu exec --vm arm70 \
   'echo 0 >/proc/sys/kernel/kptr_restrict; awk "/T _stext\$/{print \$1}" /proc/kallsyms')
-qmu cont --vm arm70                                       # --gdb attach halts the vCPU; resume it
 pry launch --connect localhost:1234
 pry load "$VMLINUX" --base "0x$STEXT" --src "$KERNEL_SRC"
 pry break set __arm64_sys_newuname                        # arm64 syscall wrapper prefix
@@ -414,19 +414,20 @@ or kallsyms.
 
 ### arm32 (armv7l)
 
-The arm32 `virt` machine uses virtio over **MMIO**, so a plain `if=virtio` drive is *not*
-enough (it boots to `VFS: unable to mount root … unknown-block(0,0)`). Attach the rootfs and
-NIC as MMIO devices with `if=none` + `-device virtio-blk-device` / `virtio-net-device`:
+The arm32 `virt` machine uses virtio over **MMIO**, so the rootfs reaches `/dev/vda` through
+an MMIO `virtio-blk-device` rather than a PCI virtio drive. The arch-aware-drive fix in
+PR #31 (issues #26/#28) attaches that MMIO block device by default, so a default launch
+already lands on `/dev/vda`. Networking still needs manual MMIO flags — PR #31 does not wire
+up the NIC — so keep the `-netdev`/`virtio-net-device` pair below:
 
 ```bash
 eval "$(tools/kbuild.sh --version 7.0 --arch arm32)"     # KERNEL=zImage (multi_v7)
-eval "$(tools/mkrootfs.sh --arch arm32)"
+eval "$(tools/mkrootfs.sh --arch arm32)"                 # ROOTFS, SSH_KEY
 
-qmu launch --kernel "$KERNEL" --arch arm --gdb --name arm32-70 --no-net \
-  --drive "file=${ROOTFS},if=none,format=raw,id=hd0,snapshot=on" \
+qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY" \
+  --arch arm --gdb --name arm32-70 --no-net \
   --cmdline "console=ttyAMA0 root=/dev/vda rw net.ifnames=0" \
   -- -M virt -cpu cortex-a15 \
-  -device virtio-blk-device,drive=hd0 \
   -netdev user,id=net0,hostfwd=tcp:127.0.0.1:10021-:22 \
   -device virtio-net-device,netdev=net0
 
@@ -435,9 +436,25 @@ qmu compile hello.c --run --vm arm32-70    # sizeof(void*)=4
 ```
 
 `--no-net` disables qmu's own NIC so the MMIO `virtio-net-device` (with the `hostfwd` that
-maps guest `:22`) is the only interface. When linked PR #28 makes the implicit drive
-arch-aware for arm, a default launch attaches the MMIO block device for you and the explicit
-`--drive`/`-device` pair above becomes the fallback.
+maps guest `:22`) is the only interface. **Match the SSH port:** with `--no-net` qmu still
+auto-allocates an SSH port starting at `10021` but emits no forward of its own, so the manual
+`hostfwd=…:10021-:22` must match that recorded port. If `10021` is already taken (e.g. a
+concurrent VM) qmu records a different port than the `hostfwd`, so `qmu exec`/`qmu kbase`
+connect to the wrong port and fail.
+
+**Fallback if your qmu predates the PR #31 fix** (the implicit drive is not MMIO and boots to
+`VFS: unable to mount root … unknown-block(0,0)`): attach the rootfs explicitly as an MMIO
+device with `if=none` + `-device virtio-blk-device`:
+
+```bash
+qmu launch --kernel "$KERNEL" --arch arm --gdb --name arm32-70 --no-net \
+  --drive "file=${ROOTFS},if=none,format=raw,id=hd0,snapshot=on" \
+  --cmdline "console=ttyAMA0 root=/dev/vda rw net.ifnames=0" \
+  -- -M virt -cpu cortex-a15 \
+  -device virtio-blk-device,drive=hd0 \
+  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:10021-:22 \
+  -device virtio-net-device,netdev=net0
+```
 
 **Debug — `--slide 0`, not `--base`.** The `multi_v7` build typically loads with no KASLR
 slide (`qmu kbase` shows link == runtime). `pry load --base` fails on this ELF
@@ -446,7 +463,6 @@ syscall symbol is `sys_newuname` (also `__se_sys_newuname`), **not** the `__arm_
 `__arm64_sys_*` wrappers:
 
 ```bash
-qmu cont --vm arm32-70
 pry launch --connect localhost:1234
 pry load "$VMLINUX" --slide 0 --src "$KERNEL_SRC"
 pry break set sys_newuname

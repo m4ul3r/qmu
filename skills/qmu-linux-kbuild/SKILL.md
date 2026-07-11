@@ -188,6 +188,7 @@ extra_args = ["-M", "virt", "-cpu", "cortex-a57"]
 
 ```bash
 eval $(tools/kbuild.sh --version 6.1.120 --arch arm32hf)
+eval $(tools/mkrootfs.sh --arch arm32)
 qmu launch --kernel "$KERNEL" --arch arm --name arm32 --no-net \
   --drive "file=${ROOTFS},if=none,format=raw,id=hd0,snapshot=on" \
   --cmdline "console=ttyAMA0 root=/dev/vda rw" \
