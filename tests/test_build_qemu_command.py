@@ -190,6 +190,73 @@ def test_cpu_model_from_config_emits_flag():
     assert cmd[cmd.index("-cpu") + 1] == "host"
 
 
+# --- arch-aware implicit rootfs drive topology (issues #26, #28) --------------
+
+def _drive_args(cmd):
+    return [cmd[i + 1] for i, a in enumerate(cmd) if a == "-drive"]
+
+
+def test_x86_implicit_drive_unchanged():
+    """x86 argv must stay byte-for-byte as before: plain -drive, no virtio topology."""
+    for arch in ("x86_64", "i386"):
+        cfg = _base_config()
+        cfg.arch = arch
+        cfg.drive_format = "raw"
+        cmd = build_qemu_command(**_kwargs(config=cfg))
+        assert _drive_args(cmd) == ["file=/r/rootfs.img,format=raw,snapshot=on"]
+        # No virtio-blk device is synthesized for x86.
+        assert not any("virtio-blk-device" in a for a in cmd)
+        assert not any("if=virtio" in a for a in cmd if a.startswith("file="))
+
+
+def test_aarch64_implicit_drive_is_virtio():
+    """aarch64 virt: implicit rootfs drive gets if=virtio so guest sees /dev/vda."""
+    cfg = _base_config()
+    cfg.arch = "aarch64"
+    cfg.drive_format = "raw"
+    cmd = build_qemu_command(**_kwargs(config=cfg))
+    assert _drive_args(cmd) == ["file=/r/rootfs.img,if=virtio,format=raw,snapshot=on"]
+    # aarch64 uses if=virtio alone; no separate -device needed.
+    assert not any("virtio-blk-device" in a for a in cmd)
+
+
+def test_arm32_implicit_drive_splits_into_backend_plus_device():
+    """arm32 virt: if=virtio alone fails; need if=none backend + virtio-blk-device."""
+    cfg = _base_config()
+    cfg.arch = "arm"
+    cfg.drive_format = "raw"
+    cmd = build_qemu_command(**_kwargs(config=cfg))
+    assert _drive_args(cmd) == [
+        "file=/r/rootfs.img,if=none,format=raw,id=rootfs,snapshot=on"
+    ]
+    # Explicit virtio-blk device wired to the backend by drive id.
+    i = cmd.index("-device")
+    assert "virtio-blk-device,drive=rootfs" in cmd
+    assert cmd[cmd.index("virtio-blk-device,drive=rootfs") - 1] == "-device"
+    # id on the drive matches the device's drive= reference.
+    assert "id=rootfs" in _drive_args(cmd)[0]
+
+
+def test_aarch64_qcow2_format_preserved_in_virtio_drive():
+    cfg = _base_config()
+    cfg.arch = "aarch64"
+    cfg.drive_format = "qcow2"
+    cmd = build_qemu_command(**_kwargs(config=cfg))
+    assert _drive_args(cmd) == ["file=/r/rootfs.img,if=virtio,format=qcow2,snapshot=on"]
+
+
+def test_arm32_explicit_drive_still_suppresses_implicit():
+    """An explicit --drive fully suppresses the arch-aware implicit drive/device."""
+    spec = "file=/a.img,if=none,format=raw,id=hd0,snapshot=on"
+    cfg = _base_config()
+    cfg.arch = "arm"
+    cmd = build_qemu_command(**_kwargs(config=cfg, drives=[spec]))
+    assert _drive_args(cmd) == [spec]
+    # No implicit rootfs or synthesized virtio-blk device leaks through.
+    assert not any("/r/rootfs.img" in a for a in cmd)
+    assert not any(a == "virtio-blk-device,drive=rootfs" for a in cmd)
+
+
 def test_ssh_port_none_without_no_net_uses_nic_user():
     """Edge case: --no-wait-ssh without --no-net (harness=False, ssh_port=None)."""
     cmd = build_qemu_command(**_kwargs(ssh_port=None, no_net=False))

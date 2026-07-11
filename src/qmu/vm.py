@@ -136,6 +136,38 @@ def _preflight_native_passt(
     return caps.path
 
 
+# Stable id linking the implicit rootfs -drive to its -device on machines
+# (arm 'virt') where a bare if=virtio does not auto-instantiate a blk device.
+_IMPLICIT_ROOTFS_DRIVE_ID = "rootfs"
+
+
+def _implicit_rootfs_drive_args(rootfs: str, config: QMUConfig) -> list[str]:
+    """QEMU args for the synthesized rootfs drive, made arch-aware.
+
+    On QEMU 'virt' machines the guest only sees /dev/vda through a virtio-blk
+    topology; a plain -drive yields no block device and boot panics with
+    "VFS: Unable to mount root fs on unknown-block(0,0)".
+
+    - x86 (x86_64/i386): unchanged plain drive — the suite pins this argv.
+    - aarch64: if=virtio is enough on qemu-system-aarch64 (per issue #26).
+    - arm (arm32 virt): if=virtio alone does NOT create the disk on
+      qemu-system-arm; split into an if=none backend drive plus an explicit
+      virtio-blk-device (per issue #28).
+    """
+    fmt = config.drive_format
+    if config.arch == "aarch64":
+        return ["-drive", f"file={rootfs},if=virtio,format={fmt},snapshot=on"]
+    if config.arch == "arm":
+        return [
+            "-drive",
+            f"file={rootfs},if=none,format={fmt},"
+            f"id={_IMPLICIT_ROOTFS_DRIVE_ID},snapshot=on",
+            "-device",
+            f"virtio-blk-device,drive={_IMPLICIT_ROOTFS_DRIVE_ID}",
+        ]
+    return ["-drive", f"file={rootfs},format={fmt},snapshot=on"]
+
+
 def build_qemu_command(
     *,
     config: QMUConfig,
@@ -179,8 +211,9 @@ def build_qemu_command(
     elif rootfs is not None:
         # Configured raw or qcow2 rootfs images sit behind this temporary overlay:
         # in-session checkpoints disappear with QEMU. A durable internal snapshot
-        # needs an explicit writable qcow2 drive above, without snapshot=on.
-        cmd.extend(["-drive", f"file={rootfs},format={config.drive_format},snapshot=on"])
+        # needs an explicit writable qcow2 drive above, without snapshot=on. The
+        # topology is arch-aware so 'virt' machines boot to /dev/vda unassisted.
+        cmd.extend(_implicit_rootfs_drive_args(rootfs, config))
 
     # Networking
     if no_net:
