@@ -343,6 +343,141 @@ pry continue                # REQUIRED to resume before the parallel exec
 pry backtrace
 ```
 
+## Cross-arch quickstarts (aarch64 / arm32)
+
+Booting a non-x86 guest needs three things the x86 defaults don't provide: the right
+`qemu-system-*` binary (`--arch`), a `virt` machine + CPU model (`-- -M virt -cpu …`),
+and an ARM console/root cmdline (`console=ttyAMA0 root=/dev/vda`). The built-in profiles
+hard-code `console=ttyS0 root=/dev/sda` for x86, so cross-arch launches **must** either
+override `--cmdline` or use an arch-aware `qmu.toml` (see below). Build the kernel and
+rootfs with the `qmu-linux-kbuild` and `qmu-linux-rootfs` skills (`--arch arm64` / `--arch arm32`).
+
+**Multiarch GDB (required on x86 hosts).** Ubuntu's stock `gdb` is x86-only and pry always
+invokes `gdb`; an ARM target makes it fail with a truncated `g` packet. Put `gdb-multiarch`
+on `PATH` as `gdb` before any pry command:
+
+```bash
+mkdir -p /tmp/gdb-multiarch-bin
+ln -sfn /usr/bin/gdb-multiarch /tmp/gdb-multiarch-bin/gdb
+export PATH=/tmp/gdb-multiarch-bin:$PATH
+```
+
+### aarch64 (arm64)
+
+```bash
+eval "$(tools/kbuild.sh --version 7.0 --arch arm64)"     # KERNEL=Image, VMLINUX, KERNEL_SRC
+eval "$(tools/mkrootfs.sh --arch arm64)"                 # ROOTFS, SSH_KEY
+
+qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY" \
+  --arch aarch64 --gdb --name arm70 \
+  --cmdline "console=ttyAMA0 root=/dev/vda rw earlyprintk=serial net.ifnames=0" \
+  -- -M virt -cpu cortex-a57
+
+qmu exec --vm arm70 "uname -a"          # … 7.0.0 … aarch64
+qmu compile hello.c --run --vm arm70    # machine=aarch64, sizeof(void*)=8
+```
+
+The arm64 `virt` machine exposes virtio over PCI, so the rootfs reaches `/dev/vda` through
+a plain virtio drive. The implicit rootfs drive is being made arch-aware in linked PR #26 —
+with that fix a default launch already lands on `/dev/vda`. **Fallback if your qmu predates
+the fix** (implicit drive has no `if=virtio` and fails VFS mount): pass the drive explicitly.
+
+```bash
+qmu launch --kernel "$KERNEL" --arch aarch64 --gdb --name arm70 \
+  --drive "file=${ROOTFS},if=virtio,format=raw,snapshot=on" \
+  --cmdline "console=ttyAMA0 root=/dev/vda rw earlyprintk=serial net.ifnames=0" \
+  -- -M virt -cpu cortex-a57
+```
+
+**KASLR rebase — use `_stext`, not `_text`, on arm64.** `qmu kbase` and `/proc/kallsyms`
+report `_text`, but `pry load --base` slides from the ELF executable-section base, which on
+arm64 is `_stext` — `0x10000` above `_text` (the `.head.text` gap). Passing `_text` puts every
+symbol `0x10000` low and breakpoints miss. Rebase on the runtime `_stext` until pry is fixed:
+
+```bash
+eval "$(qmu kbase --vm arm70 --symbols "$VMLINUX")"      # records _text-based KBASE/SLIDE
+STEXT=$(qmu exec --vm arm70 \
+  'echo 0 >/proc/sys/kernel/kptr_restrict; awk "/T _stext\$/{print \$1}" /proc/kallsyms')
+qmu cont --vm arm70                                       # --gdb attach halts the vCPU; resume it
+pry launch --connect localhost:1234
+pry load "$VMLINUX" --base "0x$STEXT" --src "$KERNEL_SRC"
+pry break set __arm64_sys_newuname                        # arm64 syscall wrapper prefix
+pry continue --background
+qmu exec --vm arm70 "uname -r"                            # hits the breakpoint
+```
+
+For `lx-*` scripts and `$lx_current()`, the arm64 kernel must be built with **full**
+`DEBUG_INFO` (not `DEBUG_INFO_REDUCED`, the arm64 defconfig default, which makes lx scripts
+refuse to load). Current `qmu-linux-kbuild` disables the reduced variant; rebuild if your
+kernel predates that. `pry kbase`'s VBAR fallback is unreliable here — prefer `qmu kbase`
+or kallsyms.
+
+### arm32 (armv7l)
+
+The arm32 `virt` machine uses virtio over **MMIO**, so a plain `if=virtio` drive is *not*
+enough (it boots to `VFS: unable to mount root … unknown-block(0,0)`). Attach the rootfs and
+NIC as MMIO devices with `if=none` + `-device virtio-blk-device` / `virtio-net-device`:
+
+```bash
+eval "$(tools/kbuild.sh --version 7.0 --arch arm32)"     # KERNEL=zImage (multi_v7)
+eval "$(tools/mkrootfs.sh --arch arm32)"
+
+qmu launch --kernel "$KERNEL" --arch arm --gdb --name arm32-70 --no-net \
+  --drive "file=${ROOTFS},if=none,format=raw,id=hd0,snapshot=on" \
+  --cmdline "console=ttyAMA0 root=/dev/vda rw net.ifnames=0" \
+  -- -M virt -cpu cortex-a15 \
+  -device virtio-blk-device,drive=hd0 \
+  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:10021-:22 \
+  -device virtio-net-device,netdev=net0
+
+qmu exec --vm arm32-70 "uname -a"          # … 7.0.0 … armv7l
+qmu compile hello.c --run --vm arm32-70    # sizeof(void*)=4
+```
+
+`--no-net` disables qmu's own NIC so the MMIO `virtio-net-device` (with the `hostfwd` that
+maps guest `:22`) is the only interface. When linked PR #28 makes the implicit drive
+arch-aware for arm, a default launch attaches the MMIO block device for you and the explicit
+`--drive`/`-device` pair above becomes the fallback.
+
+**Debug — `--slide 0`, not `--base`.** The `multi_v7` build typically loads with no KASLR
+slide (`qmu kbase` shows link == runtime). `pry load --base` fails on this ELF
+(`could not read the .text address … pass --slide`); use `--slide 0` instead. The uname
+syscall symbol is `sys_newuname` (also `__se_sys_newuname`), **not** the `__arm_sys_*` /
+`__arm64_sys_*` wrappers:
+
+```bash
+qmu cont --vm arm32-70
+pry launch --connect localhost:1234
+pry load "$VMLINUX" --slide 0 --src "$KERNEL_SRC"
+pry break set sys_newuname
+pry continue --background
+qmu exec --vm arm32-70 "uname -r"          # hits the breakpoint
+```
+
+KASAN is **unsupported on arm32** upstream (no `HAVE_ARCH_KASAN`); use x86_64 or arm64 if you
+need it.
+
+### Arch-aware qmu.toml (skip the per-launch flags)
+
+Baking the machine args, arch, and ARM cmdline into `qmu.toml` lets you launch with just
+`qmu launch --kernel "$KERNEL"`. Example for aarch64 (swap `cortex-a15`/`arm` for arm32):
+
+```toml
+[machine]
+arch = "aarch64"
+extra_args = ["-M", "virt", "-cpu", "cortex-a57"]
+
+[drive]
+rootfs = "/…/rootfs/bookworm/arm64/rootfs.img"
+format = "raw"
+
+[ssh]
+key = "/…/rootfs/bookworm/arm64/id_ed25519"
+
+[profiles.exploit-dev]
+cmdline = "console=ttyAMA0 root=/dev/vda rw earlyprintk=serial net.ifnames=0 selinux=0 apparmor=0 kasan.fault=panic"
+```
+
 ## Raw QEMU Access
 
 ```bash
