@@ -155,11 +155,18 @@ qmu launch --kernel "$KERNEL" --arch i386
 - KASAN: supported since 4.15
 - Needs `-M virt -cpu cortex-a57` QEMU args
 
+Extra QEMU args are positional after `--` (there is no `--extra-args` flag), and the
+default profiles use an x86 cmdline, so override the console/root for arm64:
+
 ```bash
 eval $(tools/kbuild.sh --version 5.15.170 --arch arm64)
 qmu launch --kernel "$KERNEL" --arch aarch64 \
-  --extra-args "-M virt -cpu cortex-a57"
+  --cmdline "console=ttyAMA0 root=/dev/vda rw" \
+  -- -M virt -cpu cortex-a57
 ```
+
+See the qmu skill's **Cross-arch quickstarts** section for the full boot + virtio-drive +
+pry rebase recipe.
 
 Or in qmu.toml:
 ```toml
@@ -174,15 +181,18 @@ extra_args = ["-M", "virt", "-cpu", "cortex-a57"]
 - Kernel image: `zImage`
 - Docker toolchain: `gcc-arm-linux-gnueabi` (arm32) or `gcc-arm-linux-gnueabihf` (arm32hf)
 - KASAN: **not supported** on arm32 upstream
-- Needs `-M vexpress-a15` QEMU args
+- Machine: prefer `-M virt -cpu cortex-a15` (works for `multi_v7`; `vexpress-a15` also works but is narrower)
 - Kernels < 5.0 use `vexpress_defconfig`; >= 5.0 use `multi_v7_defconfig`
+- On `-M virt`, virtio is MMIO — attach the rootfs as `if=none` + `-device virtio-blk-device` (see the qmu skill's Cross-arch quickstarts), which lands on `/dev/vda`
 - arm32 vs arm32hf: kernel itself is identical (kernel does not use FP); the difference is the cross-compiler ABI, which affects vermagic and any userspace built alongside
 
 ```bash
 eval $(tools/kbuild.sh --version 6.1.120 --arch arm32hf)
-qmu launch --kernel "$KERNEL" --arch arm \
-  --extra-args "-M vexpress-a15 -cpu cortex-a15" \
-  --cmdline "console=ttyAMA0 root=/dev/mmcblk0 rw"
+eval $(tools/mkrootfs.sh --arch arm32)
+qmu launch --kernel "$KERNEL" --arch arm --name arm32 --no-net \
+  --drive "file=${ROOTFS},if=none,format=raw,id=hd0,snapshot=on" \
+  --cmdline "console=ttyAMA0 root=/dev/vda rw" \
+  -- -M virt -cpu cortex-a15 -device virtio-blk-device,drive=hd0
 ```
 
 ## Kernel config overlays

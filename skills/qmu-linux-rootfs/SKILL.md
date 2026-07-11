@@ -64,7 +64,7 @@ Image is raw ext4, 2G by default (configurable with `--size`).
 | `x86_64` | `linux/amd64` | `/dev/sda` | default (PC/q35) |
 | `i386` | `linux/386` | `/dev/sda` | default (PC) |
 | `arm64` | `linux/arm64` | `/dev/vda` | virt (`-M virt -cpu cortex-a57`) |
-| `arm32` | `linux/arm/v7` | `/dev/vda` | vexpress-a15 (`-M vexpress-a15`) |
+| `arm32` | `linux/arm/v7` | `/dev/vda` | virt (`-M virt -cpu cortex-a15`) |
 
 The fstab inside the rootfs is automatically set to the correct root device for the target arch.
 
@@ -100,13 +100,18 @@ qmu exec "uname -r"
 qmu compile exploit.c --run
 ```
 
-For arm64:
+For arm64 (extra QEMU args go after `--`; there is no `--extra-args` flag, and the ARM
+console/root cmdline must be set since the default profile is x86-only):
 ```bash
 eval $(tools/kbuild.sh --version 6.6.75 --arch arm64)
 eval $(tools/mkrootfs.sh --arch arm64)
 qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY" \
-  --arch aarch64 --extra-args "-M virt -cpu cortex-a57"
+  --arch aarch64 --cmdline "console=ttyAMA0 root=/dev/vda rw" \
+  -- -M virt -cpu cortex-a57
 ```
+
+See the qmu skill's **Cross-arch quickstarts (aarch64 / arm32)** section for the complete
+recipe, including the arm32 virtio-MMIO drive form and pry rebasing.
 
 ## Cache layout
 
