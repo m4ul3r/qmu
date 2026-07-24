@@ -306,7 +306,11 @@ build_docker_image() {
     extra_run="RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${extra_pkgs} && rm -rf /var/lib/apt/lists/*"
   fi
 
-  docker build $DOCKER_QUIET -t "$KBUILD_IMAGE" -f - "$_ctx" <<DOCKERFILE
+  # Send build output to stderr: with -q docker prints the image sha256 to
+  # stdout, and a verbose build streams the whole log there — either one
+  # corrupts the eval-able KERNEL=/VMLINUX= assignments this script emits on
+  # stdout. Only a cache hit (image already present) skips this and stays clean.
+  docker build $DOCKER_QUIET -t "$KBUILD_IMAGE" -f - "$_ctx" >&2 <<DOCKERFILE
 FROM ubuntu:${ubuntu_tag}
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       build-essential bc bison flex libelf-dev libssl-dev cpio kmod xz-utils \
@@ -488,7 +492,7 @@ docker run --rm \
     else
       cp scripts/gdb/vmlinux-gdb.py /output/vmlinux-gdb.py
     fi
-  "
+  " >&2
 
 RC=$?
 if [[ $RC -ne 0 ]]; then
