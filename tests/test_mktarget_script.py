@@ -84,13 +84,26 @@ import sys
 from pathlib import Path
 
 FIX = Path({str(fixtures)!r})
-url = [a for a in sys.argv[1:] if a.startswith("http")]
+args = sys.argv[1:]
+url = [a for a in args if a.startswith("http")]
 if not url:
     raise SystemExit(2)
 url = url[-1]
 
+# honour -o, as the real curl does: the ddebs pocket probe uses -o /dev/null
+# and a fake that ignored it would invent a stdout leak the script does not have
+out = None
+if "-o" in args:
+    out = args[args.index("-o") + 1]
+
+def emit(data: bytes):
+    if out is not None:
+        Path(out).write_bytes(data)
+    else:
+        sys.stdout.buffer.write(data)
+
 if url.endswith("/Release"):
-    sys.stdout.write("Origin: Ubuntu\\nDate: Thu, 25 Apr 2024 15:10:33 UTC\\n")
+    emit(b"Origin: Ubuntu\\nDate: Thu, 25 Apr 2024 15:10:33 UTC\\n")
     raise SystemExit(0)
 
 if "ddebs" in url:
@@ -103,7 +116,7 @@ elif "-updates/" in url or "-security/" in url:
 else:
     raise SystemExit(22)
 
-sys.stdout.buffer.write(body.read_bytes())
+emit(body.read_bytes())
 '''
     )
     curl.chmod(0o755)
@@ -515,6 +528,54 @@ def test_symbols_request_makes_vmlinux_part_of_the_cache_contract(mktarget_env):
     assert withsym.returncode == 0, withsym.stderr
     assert any(c[0] == "build" for c in mktarget_env.docker_calls())
     assert "VMLINUX=" in withsym.stdout
+
+
+def test_vmlinux_is_not_emitted_without_symbols_even_if_cached(mktarget_env):
+    """A vmlinux left by an earlier --symbols run must not be advertised by a
+    plain run, or `$VMLINUX` cannot answer "did I get symbols THIS run"."""
+    withsym = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert withsym.returncode == 0, withsym.stderr
+    vmlinux = Path(_assignments(withsym.stdout)["VMLINUX"])
+    assert vmlinux.exists()
+
+    # cache hit: the file is still on disk, deliberately, but is not claimed
+    plain = mktarget_env.run("--kernel-abi", "ga")
+    assert plain.returncode == 0, plain.stderr
+    assert vmlinux.exists()
+    assert "VMLINUX=" not in plain.stdout
+
+    # A cache hit does not rewrite target.json, and the manifest legitimately
+    # describes what is in the directory -- which still includes that vmlinux.
+    # A FRESH build without --symbols is where the manifest must not claim it.
+    Path(_assignments(plain.stdout)["ROOTFS"]).unlink()
+    fresh = mktarget_env.run("--kernel-abi", "ga")
+    assert fresh.returncode == 0, fresh.stderr
+    assert "VMLINUX=" not in fresh.stdout
+    manifest = json.loads(Path(_assignments(fresh.stdout)["TARGET_MANIFEST"]).read_text())
+    assert manifest["dbgsym_version"] is None
+    assert manifest["dwarf_comp_dir"] == ""
+
+
+def test_relax_hardening_covers_userfaultfd(mktarget_env):
+    """vm.unprivileged_userfaultfd is gated by the upstream kernel default, not
+    an Ubuntu sysctl file, so it is easy to leave out of the relax set -- and
+    uffd is what most heap PoCs need for grooming. Leaving it restricted on the
+    *debugging* image is a trap."""
+    r = mktarget_env.run("--kernel-abi", "ga", "--relax-hardening")
+    assert r.returncode == 0, r.stderr
+    build = next(c for c in mktarget_env.docker_calls() if c[0] == "build")
+    # RELAX is what switches the sysctl-writing layer on
+    assert "RELAX=1" in build
+    dockerfile = ROOT.joinpath("tools/mktarget.sh").read_text()
+    relax_block = dockerfile.split("99-qmu-relax.conf")[0].rsplit("if [ \"$RELAX\"", 1)[-1]
+    for knob in (
+        "kernel.kptr_restrict = 0",
+        "kernel.dmesg_restrict = 0",
+        "kernel.unprivileged_bpf_disabled = 0",
+        "kernel.apparmor_restrict_unprivileged_userns = 0",
+        "vm.unprivileged_userfaultfd = 1",
+    ):
+        assert knob in relax_block, knob
 
 
 def test_generated_toml_carries_fidelity_profiles(mktarget_env):

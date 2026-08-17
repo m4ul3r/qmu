@@ -49,8 +49,18 @@ VMLINUX   (only with --symbols)
 INITRD    (only with --initramfs)
 ```
 
+`VMLINUX` is emitted only when `--symbols` was passed on *this* run, even if an
+earlier run left a cached `vmlinux` in the output directory — so testing for
+`$VMLINUX` is a reliable answer to "did I get symbols this run".
+
 Cache: `~/.cache/qmu/targets/ubuntu/<suite>/<arch>/<abi>-<flavour>[-relaxed]/`.
 All logs go to stderr; stdout is only the assignments, so `eval $(...)` is safe.
+
+Cost: a cache hit is under a second. A fresh x86_64 target is a couple of
+minutes; a cross-arch (arm64) one runs `apt` under `qemu-user` and takes ~15 min
+the first time, then caches. `--relax-hardening` is a separate image and so a
+separate build. The `Creating raw ext4 image` step is silent for 1-2 minutes
+while it exports ~1 GB — that is normal, not a hang.
 
 ## Pinning an ABI — the part that makes a result citable
 
@@ -107,19 +117,76 @@ kernel.dmesg_restrict = 1                                 (CONFIG_SECURITY_DMESG
 kernel.perf_event_paranoid = 4                            (CONFIG_SECURITY_PERF_EVENTS_RESTRICT=y)
 kernel.unprivileged_bpf_disabled = 2                      (CONFIG_BPF_UNPRIV_DEFAULT_OFF=y)
 kernel.apparmor_restrict_unprivileged_userns = 1           (apparmor package)
-vm.unprivileged_userfaultfd = 0
+vm.unprivileged_userfaultfd = 0                           (upstream default, not a distro file)
+kernel.unprivileged_userns_clone = 1                      (a DECOY -- see below)
 /sys/kernel/security/lsm -> lockdown,capability,landlock,yama,apparmor
 101 AppArmor profiles loaded, 7 in enforce mode
 ```
 
-`--relax-hardening` turns the sysctls off. It is recorded **four** ways so a
-relaxed run can never be mistaken for a fidelity one: `hardening: "relaxed"` in
-`/etc/qmu-target.json`, an `/etc/motd` banner, `QMU-TARGET-RELAXED` echoed to the
-serial log, and a `-relaxed` cache directory so the two variants never share a
-build. The guest hostname also becomes `qmu-ubuntu-relaxed`.
+### How the userns restriction actually fails — check the right thing
 
-Do not reach for it to make a PoC work. A PoC that fails because of one of these
-has told you something true about Ubuntu.
+This is the trap most likely to produce a confidently wrong answer, because the
+obvious probe reports the opposite of the truth.
+
+`unshare(CLONE_NEWUSER)` **succeeds** on a fidelity target. AppArmor allows the
+namespace to be created, transitions the task into the `unprivileged_userns`
+profile, and then denies `CAP_SYS_ADMIN` — which `map_write()` needs. So the
+namespace exists but is unusable, and the `EPERM` lands on the **`uid_map`
+write**, not on `unshare()`:
+
+```
+[1] unshare(CLONE_NEWUSER)          OK          <-- checking only this misleads
+[2] write "0 1000 1" > uid_map      EPERM       <-- the actual denial
+[2] euid after mapping              65534       (never becomes 0)
+[3] unshare(CLONE_NEWNET)           EPERM       (no CAP_SYS_ADMIN in the ns)
+```
+
+Guest audit log for the same event:
+
+```
+apparmor="AUDIT"  operation="userns_create" profile="unconfined"
+                  target="unprivileged_userns"
+apparmor="DENIED" operation="capable" profile="unprivileged_userns"
+                  capability=21 capname="sys_admin"
+```
+
+So: **test the `uid_map` write, or just use `unshare -U -r`** (util-linux does
+both steps and reports `write failed /proc/self/uid_map`). A PoC whose first line
+is `unshare(CLONE_NEWUSER)` does not die on line 1 — it dies on line 2.
+
+Two more decoys in the same area:
+
+- **`kernel.unprivileged_userns_clone` reads `1`** on an Ubuntu target. It is a
+  Debian-ism the Ubuntu kernel still exposes and it does **not** reflect the
+  AppArmor restriction. Reading it gives the opposite of the truth;
+  `kernel.apparmor_restrict_unprivileged_userns` is the one that matters.
+- **Build the map string before you unshare.** After `unshare(CLONE_NEWUSER)`
+  `getuid()` returns `65534`, so a probe that calls it afterwards writes
+  `"0 65534 1"` and gets `EPERM` *even as root* — which looks exactly like the
+  distro restriction.
+
+### Relaxing it
+
+`--relax-hardening` turns those sysctls off (and additionally sets
+`vm.unprivileged_userfaultfd = 1`, since uffd is gated separately — see below).
+It is recorded **four** ways so a relaxed run can never be mistaken for a
+fidelity one: `hardening: "relaxed"` in `/etc/qmu-target.json`, an `/etc/motd`
+banner, `QMU-TARGET-RELAXED` echoed to the serial log, and a `-relaxed` cache
+directory so the two variants never share a build. The guest hostname also
+becomes `qmu-ubuntu-relaxed`.
+
+It builds a **separate image**, so it is a full build (a few minutes), not a
+cache hit off the fidelity one.
+
+`vm.unprivileged_userfaultfd = 0` is the *upstream kernel* default rather than an
+Ubuntu sysctl file, so it blocks `userfaultfd()` independently of everything
+above — for the unprivileged user *and* for root. If your PoC needs uffd for
+heap grooming, that is a second, separate gate.
+
+Do not reach for `--relax-hardening` to make a PoC work. A PoC that fails
+because of one of these has told you something true about Ubuntu, and "works on
+the relaxed image" means only "works once you have also defeated the AppArmor
+userns restriction" — a separate proof obligation, same class as a KASLR bypass.
 
 ## Running a PoC as an unprivileged user
 

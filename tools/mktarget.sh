@@ -77,9 +77,11 @@ Optional:
   --headers                Install linux-headers (default: no)
   --initramfs              Generate an initrd and emit INITRD= (default: no;
                            all boot-critical drivers are built in)
-  --relax-hardening        Disable Ubuntu's kptr/dmesg/bpf/userns/perf
-                           restrictions. Results are then NOT statements about
-                           the real target.
+  --relax-hardening        Disable the guest's kptr/dmesg/bpf/userns/perf/
+                           ptrace_scope restrictions and enable unprivileged
+                           userfaultfd. Results are then NOT statements about
+                           the real target. Builds a SEPARATE image (-relaxed
+                           cache dir), so expect a full build, not a cache hit.
   --unpriv-user NAME       Unprivileged PoC user (default: ubuntu)
   --size SIZE              Image size (default: 4G)
   --packages PKGS          Comma-separated extra apt packages
@@ -484,7 +486,11 @@ emit_outputs() {
   printf 'PROFILE=%q\n'            "ubuntu-target"
   printf 'QMU_TOML=%q\n'           "$TOML_OUT"
   printf 'TARGET_MANIFEST=%q\n'    "$MANIFEST_OUT"
-  [[ -f "$VMLINUX_OUT" ]] && printf 'VMLINUX=%q\n' "$VMLINUX_OUT"
+  # Gated on the flag, not just the file. A vmlinux cached by an earlier
+  # --symbols run would otherwise be emitted by a plain run, so the presence of
+  # $VMLINUX could not answer "did I get symbols THIS run" -- which is exactly
+  # what the documented contract invites callers to assume.
+  [[ "$SYMBOLS" != "none" && -f "$VMLINUX_OUT" ]] && printf 'VMLINUX=%q\n' "$VMLINUX_OUT"
   [[ -f "$INITRD_OUT" ]]  && printf 'INITRD=%q\n'  "$INITRD_OUT"
   return 0
 }
@@ -801,6 +807,7 @@ RUN if [ "$RELAX" = "1" ]; then \
         'kernel.unprivileged_bpf_disabled = 0' \
         'kernel.apparmor_restrict_unprivileged_userns = 0' \
         'kernel.yama.ptrace_scope = 0' \
+        'vm.unprivileged_userfaultfd = 1' \
         > /etc/sysctl.d/99-qmu-relax.conf; \
       printf '%s\n' \
         '*** qmu target built with --relax-hardening ***' \
@@ -974,7 +981,7 @@ if [[ "$SYMBOLS" != "none" && "$DBGSYM_AVAILABLE" == true ]]; then
 fi
 
 DWARF_COMP_DIR=""
-if [[ -f "$VMLINUX_OUT" ]] && command -v objdump >/dev/null 2>&1; then
+if [[ "$SYMBOLS" != "none" && -f "$VMLINUX_OUT" ]] && command -v objdump >/dev/null 2>&1; then
   DWARF_COMP_DIR="$( { objdump --dwarf=info --dwarf-depth=1 "$VMLINUX_OUT" 2>/dev/null || true; } \
     | awk '/DW_AT_comp_dir/ { if (d == "") { sub(/.*:[[:space:]]*/, ""); d = $0 } } END { print d }')"
   [[ -n "$DWARF_COMP_DIR" ]] && log "DWARF comp_dir: $DWARF_COMP_DIR"
@@ -983,7 +990,7 @@ fi
 # ---------------------------------------------------------------------------
 # export container filesystem -> raw ext4 image
 # ---------------------------------------------------------------------------
-step "Creating raw ext4 image ($SIZE)"
+step "Creating raw ext4 image ($SIZE) -- exports ~1 GB and runs mke2fs, expect 1-2 min"
 # The if/else form is required under `set -euo pipefail` so a failed helper
 # pipeline can fall back to host sudo mke2fs instead of aborting immediately.
 if docker export "$CID" | docker run --rm -i \
@@ -1019,7 +1026,7 @@ step "Writing manifest and qmu.toml"
 KERNEL_SHA="$(sha256sum "$KERNEL_OUT" | awk '{print $1}')"
 ROOTFS_SHA="$(sha256sum "$ROOTFS_OUT" | awk '{print $1}')"
 DBGVER="null"
-[[ -f "$VMLINUX_OUT" ]] && DBGVER="\"$KDEBVER\""
+[[ "$SYMBOLS" != "none" && -f "$VMLINUX_OUT" ]] && DBGVER="\"$KDEBVER\""
 
 cat > "$MANIFEST_OUT" <<JSON
 {
