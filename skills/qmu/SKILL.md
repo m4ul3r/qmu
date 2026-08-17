@@ -108,14 +108,23 @@ It takes every boot flag `launch` does, with three differences:
 - **QEMU passthrough is `--qemu-arg`**, repeatable — the positional is spent on
   the guest command. Use the `=` form for values starting with a dash:
   `--qemu-arg=-M --qemu-arg=virt`. Cross-arch guests need this.
-- **No `--harness` / `--no-wait-ssh`.** `run` executes a guest command over SSH,
-  so a mode that guarantees no SSH cannot run one (argparse rejects them, exit 2).
-  For boot-and-die kernels use `launch --harness` + `wait` + `crash`.
+- **No `--harness` / `--no-wait-ssh` / `--no-net`.** `run` executes a guest
+  command over SSH, so a mode that guarantees no SSH cannot run one (argparse
+  rejects all three, exit 2). For boot-and-die kernels use `launch --harness` +
+  `wait` + `crash`.
 - **Reaping is conditional.** On a clean run the VM is fully removed and stdout
   is byte-identical to what `qmu exec` would have printed (so `qmu run ... | grep`
-  works). If the run crashed the kernel, never reached a guest, or died on boot,
-  the VM is stopped but the instance metadata and `.serial.log` are **preserved**,
-  and the output names the follow-up: `qmu crash --vm ID`, `qmu prune --vm ID`.
+  works). The VM is stopped but the instance metadata and `.serial.log` are
+  **preserved** whenever anything is left to inspect — a crash, a *survived*
+  kernel report (a KASAN splat that let the command still exit 0), a guest that
+  never answered, or a VM that died on boot — and the output names the follow-up:
+  `qmu crash --vm ID`, `qmu prune --vm ID`.
+
+Exit `3` requires a **terminal panic** (`Kernel panic - not syncing`). A boot
+that only logged a WARNING or KASAN splat and then failed to start sshd is still
+`124`, with the report shown under `kernel_warning` — a survived splat is not
+evidence the kernel died, and reporting it as one would send you chasing a panic
+that never happened.
 
 ```bash
 $ qmu run --kernel ./bzImage -- 'echo c > /proc/sysrq-trigger'
@@ -310,6 +319,14 @@ Selection order per arch:
 If nothing is found, the error names what was tried, the package to install, and
 `--cc`. `--cc` is honored verbatim and is deliberately **not** checked against the
 guest arch, so an unmodelled toolchain (musl cross, clang, a wrapper script) works.
+
+A VM whose instance record has **no** recorded arch (written before qmu recorded
+it) is refused rather than guessed — relaunch it, or pass `--cc`. Falling back to
+the host compiler there would hand a cross-arch guest a host-arch binary that
+fails to exec, reported as a success.
+
+`--cflags` is parsed with `shlex`, exactly like the guest shell would, so a
+quoted flag survives: `--cflags '-static -DMSG="hello world"'`.
 
 Keep `-static` in `--cflags` (it is the default): a host-built dynamic binary
 must match the guest's libc, and a static one sidesteps that entirely. The pushed

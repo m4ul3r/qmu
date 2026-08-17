@@ -31,8 +31,16 @@ strictly worse than the three-command sequence it replaces.
 from __future__ import annotations
 
 import argparse
+import re
 import time
 from typing import Any
+
+# `extract_crash` deliberately also matches SURVIVED reports (a WARNING, a KASAN
+# splat), because those are worth showing. They are not evidence that the boot
+# failed, so the boot-failure classifier needs the stricter, terminal marker.
+# (The qmu-agent-ergonomics branch grows a shared `serial.has_terminal_panic()`;
+# consolidate onto it when that lands rather than keeping two spellings.)
+_TERMINAL_PANIC = re.compile(r"Kernel panic - not syncing", re.IGNORECASE)
 
 from ..instance import VMInstance, instance_alive
 from ..serial import extract_crash
@@ -109,13 +117,19 @@ def _boot_failure_payload(
 ) -> tuple[int, dict[str, Any], list[str]]:
     """Classify a VM that never reached a usable guest.
 
-    A fresh crash report in the serial log is the discriminator: a kernel that
-    panicked on boot is a crash (3) and the agent wants the report, while a guest
-    that merely never started sshd is an operational failure (124/1) and must not
-    be dressed up as a panic. ``start_offset=0`` is the whole log because the VM
-    was launched by this command — every byte belongs to this boot.
+    A **terminal panic** in the serial log is the discriminator, not merely the
+    presence of a report: a kernel that panicked on boot is a crash (3) and the
+    agent wants the report, while a guest that merely never started sshd is an
+    operational failure (124/1) and must not be dressed up as a panic. A
+    survived WARNING or KASAN splat sits between the two — it is reported in the
+    envelope and preserved on disk, but it does not by itself promote a boot
+    timeout to a crash, because the guest that emitted it is still alive.
+
+    ``start_offset=0`` is the whole log because the VM was launched by this
+    command — every byte belongs to this boot.
     """
-    crash = extract_crash(inst.serial_log, start_offset=0)
+    report = extract_crash(inst.serial_log, start_offset=0)
+    crash = report if report and _TERMINAL_PANIC.search(report) else None
     if crash is not None:
         return (
             3,
@@ -132,6 +146,16 @@ def _boot_failure_payload(
                 f"\nCrash from serial log:\n{crash}",
             ],
         )
+    # A non-terminal report (survived WARNING / KASAN splat) is still shown and
+    # still preserved on disk — it is usually the reason the boot went wrong —
+    # but it does not change the exit code, because the guest that printed it
+    # did not die of it.
+    warned = report is not None
+    warning_line = (
+        f"\nNon-fatal kernel report from serial log:\n{report}"
+        if warned
+        else "No crash report in the serial log"
+    )
     if outcome == "died":
         return (
             1,
@@ -140,13 +164,15 @@ def _boot_failure_payload(
                 "ssh_error": True,
                 "crash_detected": False,
                 "crash": None,
-                "hint": "QEMU exited before the guest was reachable, with no "
-                        f"crash report. Check: qmu log --vm {inst.vm_id} --tail 200",
+                "kernel_warning_detected": warned,
+                "kernel_warning": report,
+                "hint": "QEMU exited before the guest was reachable. Check: "
+                        f"qmu log --vm {inst.vm_id} --tail 200",
             },
             [
                 f"VM '{inst.vm_id}' exited before the guest became reachable.",
-                "No crash report in the serial log — the kernel may have failed "
-                "to boot, or the command line may be wrong.",
+                f"{warning_line} — the kernel may have failed to boot, or the "
+                "command line may be wrong.",
             ],
         )
     return (
@@ -156,14 +182,15 @@ def _boot_failure_payload(
             "ssh_error": True,
             "crash_detected": False,
             "crash": None,
-            "hint": f"Guest did not answer SSH within {timeout:g}s and no crash "
-                    "was reported. Raise --ssh-timeout, or check that the rootfs "
+            "kernel_warning_detected": warned,
+            "kernel_warning": report,
+            "hint": f"Guest did not answer SSH within {timeout:g}s and did not "
+                    "panic. Raise --ssh-timeout, or check that the rootfs "
                     f"starts sshd: qmu log --vm {inst.vm_id} --tail 200",
         },
         [
             f"VM '{inst.vm_id}' did not become reachable within {timeout:g}s.",
-            "No crash report in the serial log; the guest may still be booting "
-            "or may not start sshd.",
+            f"{warning_line}; the guest may still be booting or may not start sshd.",
         ],
     )
 
@@ -185,7 +212,8 @@ def _handle_run(args: argparse.Namespace) -> int:
         ssh_timeout=args.ssh_timeout,
         initrd=args.initrd,
         drives=args.drives,
-        no_net=args.no_net,
+        # `run` needs the forwarded SSH port; --no-net is not on its parser.
+        no_net=False,
         nic_model=args.nic_model,
         net_backend=args.net_backend,
         harness=False,
@@ -217,13 +245,20 @@ def _handle_run(args: argparse.Namespace) -> int:
     # guest command (1) is NOT that: the guest already reported it in stdout/
     # stderr, and keeping a VM per failed run would leak instances across a
     # normal edit-run loop.
+    # A survived kernel report counts: under the default exploit-dev profile an
+    # Oops kills only the faulting task, so a command can trigger a KASAN splat
+    # and still exit 0. Reaping there would delete the splat the run just
+    # produced, which is the whole reason the caller ran it.
     preserve = (
         outcome != "ready"
         or status not in (0, 1)
         or data.get("crash_detected") is True
+        or data.get("kernel_warning_detected") is True
     )
     if args.keep:
-        vm_state = "running"
+        # --keep means "do not kill it", which is not the same as "it is up":
+        # a VM that died on boot is kept in the sense that qmu did not stop it.
+        vm_state = "running" if instance_alive(inst) else "exited on its own"
     else:
         _kill_vm(inst, clean=not preserve)
         vm_state = "stopped (state preserved)" if preserve else "reaped"

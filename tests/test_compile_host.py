@@ -24,9 +24,10 @@ import pytest
 from qmu import cli
 from qmu.commands import guest
 from qmu.instance import QMUError, VMInstance
+from qmu.ssh import SSHError
 
 
-def _fake_instance(serial_log: str, arch: str | None = None) -> VMInstance:
+def _fake_instance(serial_log: str, arch: str | None = "x86_64") -> VMInstance:
     return VMInstance(
         vm_id="hostcc-vm",
         pid=5150,
@@ -50,16 +51,40 @@ def _fake_instance(serial_log: str, arch: str | None = None) -> VMInstance:
 class FakeSSH:
     """Records guest-side traffic. `run_results` is consumed per run() call."""
 
-    def __init__(self, run_results=None):
+    def __init__(
+        self,
+        run_results=None,
+        *,
+        ready=True,
+        serial_path=None,
+        append_on_run="",
+        push_raises=None,
+    ):
         self.pushes: list[tuple[str, str]] = []
         self.runs: list[str] = []
         self._run_results = list(run_results or [])
+        self.ready = ready
+        self.serial_path = serial_path
+        self.append_on_run = append_on_run
+        self.push_raises = push_raises
+
+    def _panic(self):
+        if self.append_on_run and self.serial_path is not None:
+            with open(self.serial_path, "a", encoding="utf-8") as stream:
+                stream.write(self.append_on_run)
+
+    def is_ready(self, timeout=2):
+        return self.ready
 
     def push(self, local, remote):
         self.pushes.append((local, remote))
+        if self.push_raises is not None:
+            self._panic()
+            raise self.push_raises
 
     def run(self, command, timeout=None):
         self.runs.append(command)
+        self._panic()
         if self._run_results:
             return self._run_results.pop(0)
         return 0, "", ""
@@ -72,9 +97,9 @@ def wired(monkeypatch, tmp_path):
     serial.write_text("[    0.000] Linux version 6.9.0\n")
     state: dict = {"serial": serial}
 
-    def _install(*, arch=None, run_results=None):
+    def _install(*, arch="x86_64", run_results=None, **ssh_kw):
         inst = _fake_instance(str(serial), arch=arch)
-        ssh = FakeSSH(run_results=run_results)
+        ssh = FakeSSH(run_results=run_results, serial_path=serial, **ssh_kw)
         monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
         monkeypatch.setattr(guest, "_make_ssh", lambda instance: ssh)
         monkeypatch.setattr(
@@ -253,6 +278,100 @@ def test_chmod_failure_is_reported_as_a_compile_failure(
     assert payload["ok"] is False
     assert payload["compile_exit"] == 1
     assert "could not make it executable" in payload["compile_stderr"]
+
+
+PANIC = (
+    "[    4.100] BUG: unable to handle page fault for address: ffffffff81000000\n"
+    "[    4.101] Kernel panic - not syncing: Fatal exception\n"
+)
+
+
+def test_panic_during_delivery_chmod_is_a_crash_not_a_compile_failure(
+    wired, source, capsys
+):
+    """rc=255 from chmod is both a legal exit code and what ssh returns when a
+    panic drops the transport. Reporting the panic as 'compilation failed' with
+    ssh_error:false would bury the very thing the caller is looking for."""
+    install, _state = wired
+    install(
+        run_results=[(255, "", "")],
+        ready=False,              # liveness probe confirms the guest is gone
+        append_on_run=PANIC,
+    )
+
+    rc = cli.main(["compile", "--host", "--format", "json", str(source)])
+
+    assert rc == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["ssh_error"] is True
+    assert payload["crash_detected"] is True
+    assert "Kernel panic" in payload["crash"]
+
+
+def test_transport_loss_delivering_the_binary_without_a_crash_is_exit_4(
+    wired, source, capsys
+):
+    """Same discrimination push/pull use: no fresh crash report means the guest
+    is merely unreachable (4), never the kernel-crash class (3)."""
+    install, _state = wired
+    install(run_results=[(255, "", "")], ready=False)
+
+    rc = cli.main(["compile", "--host", "--format", "json", str(source)])
+
+    assert rc == 4
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["crash_detected"] is False
+
+
+def test_scp_transport_failure_during_delivery_is_classified(wired, source, capsys):
+    install, _state = wired
+    install(
+        push_raises=SSHError(
+            "SCP push failed: Connection reset by peer",
+            returncode=255,
+            stderr="Connection reset by peer",
+        ),
+        append_on_run=PANIC,
+    )
+
+    rc = cli.main(["compile", "--host", "--format", "json", str(source)])
+
+    assert rc == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["crash_detected"] is True
+
+
+def test_non_transport_scp_failure_still_surfaces_as_infra(wired, source):
+    """A plain scp error (not a transport marker) must not be dressed up as a
+    guest crash — it stays the infrastructure class."""
+    install, _state = wired
+    install(
+        push_raises=SSHError(
+            "SCP push failed: No such file or directory",
+            returncode=1,
+            stderr="No such file or directory",
+        )
+    )
+
+    assert cli.main(["compile", "--host", str(source)]) == 4
+
+
+def test_quoted_cflags_survive_on_the_host_path(wired, source, capsys):
+    """The in-guest path interpolates --cflags into a guest shell, so a quoted
+    flag works there; splitting on bare whitespace would break it on --host only."""
+    install, _state = wired
+    install()
+
+    rc = cli.main([
+        "compile", "--host", "--format", "json",
+        "--cflags", "-O0 -DMSG='hello world'", str(source),
+    ])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    # One argv entry, not two: the shell's quoting work done by shlex.
+    assert "-DMSG=hello world" in payload["compile_cmd"]
 
 
 # --- --run composition -----------------------------------------------------

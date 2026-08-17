@@ -24,6 +24,7 @@ the CLI, so the selection table is unit-testable without a VM.
 from __future__ import annotations
 
 import platform
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -125,11 +126,20 @@ def resolve_host_cc(arch: str | None, override: str | None = None) -> list[str]:
     `override` (from ``--cc``) is honored verbatim and is *not* checked against
     the target arch: it exists precisely so an unusual toolchain (a musl cross,
     a clang with an explicit --target, a wrapper script) can be used without qmu
-    having to model it. It is split with shlex-free whitespace splitting so
-    ``--cc 'clang --target=aarch64-linux-gnu'`` works.
+    having to model it. It is split with :func:`shlex.split`, so a quoted
+    argument survives: ``--cc "/opt/my toolchain/gcc"``.
+
+    An instance with no recorded arch is refused rather than guessed. Falling
+    back to the host compiler there would hand a cross-arch guest a host-arch
+    binary that fails to exec as "cannot execute binary file" — the exact
+    silent-wrong-answer this module exists to prevent — and the two ways out
+    (relaunch so the arch is recorded, or name the compiler) are both cheap.
     """
     if override:
-        parts = override.split()
+        try:
+            parts = shlex.split(override)
+        except ValueError as exc:
+            raise QMUError(f"--cc is not a parseable command: {exc}") from exc
         if not parts:
             raise QMUError("--cc was given an empty compiler command")
         if shutil.which(parts[0]) is None:
@@ -138,6 +148,14 @@ def resolve_host_cc(arch: str | None, override: str | None = None) -> list[str]:
                 "Give an absolute path or install it."
             )
         return parts
+
+    if arch is None:
+        raise QMUError(
+            "Cannot pick a host compiler: this VM's instance record has no "
+            "architecture (it predates the recorded arch field). Relaunch it so "
+            "the arch is recorded, or name the compiler: "
+            "qmu compile --host --cc <compiler>"
+        )
 
     candidates = candidate_compilers(arch)
     for cand in candidates:
@@ -163,15 +181,20 @@ def host_compile(
 ) -> tuple[int, str, str, list[str]]:
     """Compile `source` to `output` on the host. Returns (rc, stdout, stderr, argv).
 
-    `cflags` is split on whitespace and passed through as separate argv entries —
-    the in-guest path interpolates it into a shell command, but there is no shell
-    here, so a quoted flag with a space is not supported (and never was, since the
-    guest path leaves --cflags deliberately unquoted for the same reason).
+    `cflags` is split with :func:`shlex.split`, not on bare whitespace: the
+    in-guest path interpolates the flags into a guest shell, so a quoted flag
+    like ``-DMSG='"hello world"'`` works there, and splitting on whitespace here
+    would silently break it on --host only. There is no shell in this path, so
+    the split has to do the quoting work the shell would have done.
 
     A compile failure is returned as a non-zero rc, not raised: the caller renders
     it as the same "Compilation failed" envelope the in-guest path produces.
     """
-    argv = [*cc, *cflags.split(), "-o", str(output), str(source)]
+    try:
+        flags = shlex.split(cflags)
+    except ValueError as exc:
+        raise QMUError(f"--cflags is not parseable: {exc}") from exc
+    argv = [*cc, *flags, "-o", str(output), str(source)]
     try:
         proc = subprocess.run(
             argv,

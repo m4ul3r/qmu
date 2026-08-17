@@ -341,8 +341,12 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
                         help="QEMU -drive spec, repeatable (suppresses implicit rootfs drive)")
     parser.add_argument("--nic-model", default=None, dest="nic_model",
                         help="NIC model (default: virtio-net-pci)")
-    parser.add_argument("--no-net", action="store_true",
-                        help="Disable networking entirely (-nic none)")
+    if not run_mode:
+        # Same reasoning as --harness/--no-wait-ssh: `run` reaches the guest over
+        # a forwarded SSH port, so -nic none guarantees a 124 and a preserved VM
+        # instead of the argparse error the caller deserves.
+        parser.add_argument("--no-net", action="store_true",
+                            help="Disable networking entirely (-nic none)")
     parser.add_argument("--net-backend", default=None, dest="net_backend",
                         choices=["user", "passt"],
                         help="Network backend: 'user' (slirp, default) or 'passt' "

@@ -216,6 +216,74 @@ def test_unreachable_guest_exits_124(harness, capsys):
     assert "did not become reachable" in out
 
 
+WARNING = (
+    "[    1.500] ------------[ cut here ]------------\n"
+    "[    1.501] WARNING: CPU: 0 PID: 1 at drivers/thing.c:42 thing_init+0x10/0x20\n"
+    "[    1.502] ---[ end trace 0000000000000000 ]---\n"
+)
+
+
+def test_boot_warning_without_a_panic_is_not_promoted_to_a_crash(harness, capsys):
+    """extract_crash also matches SURVIVED reports (WARNING/KASAN). A guest that
+    merely never started sshd must stay 124 — claiming exit 3 would tell the
+    caller a healthy kernel died."""
+    install, state = harness
+    install(serial_text=WARNING, ready=False, alive=True)
+
+    rc = cli.main(_argv("--ssh-timeout", "0", "./exploit"))
+
+    assert rc == 124
+    out = capsys.readouterr().out
+    # The warning is still SHOWN and the state preserved — it is usually the
+    # reason the boot went wrong — it just does not change the exit code.
+    assert "Non-fatal kernel report" in out
+    assert "WARNING: CPU: 0" in out
+    assert state["kills"] == [False]
+
+
+def test_boot_warning_is_reported_in_json_without_crash_detected(harness, capsys):
+    install, state = harness
+    install(serial_text=WARNING, ready=False, alive=True)
+
+    rc = cli.main(_argv("--format", "json", "--ssh-timeout", "0", "./exploit"))
+
+    assert rc == 124
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["crash_detected"] is False
+    assert payload["crash"] is None
+    assert payload["kernel_warning_detected"] is True
+    assert "WARNING: CPU: 0" in payload["kernel_warning"]
+
+
+def test_survived_kernel_warning_during_a_clean_run_is_not_reaped(harness, capsys):
+    """Under the default exploit-dev profile an Oops kills only the faulting
+    task, so a command can trigger a splat and still exit 0. Reaping there would
+    delete the splat the run just produced."""
+    install, state = harness
+    install(run_result=(0, "done\n", ""), append_on_run=WARNING)
+
+    rc = cli.main(_argv("--format", "json", "./exploit"))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kernel_warning_detected"] is True
+    assert payload["state_preserved"] is True
+    assert state["kills"] == [False]          # clean=False -> serial log kept
+
+
+def test_keep_does_not_claim_a_dead_vm_is_running(harness, capsys):
+    install, state = harness
+    install(ready=False, alive=False, serial_text="early boot noise\n")
+
+    rc = cli.main(_argv("--format", "json", "--keep", "./exploit"))
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert state["kills"] == []               # --keep still means "do not kill"
+    assert payload["vm_state"] != "running"
+    assert "exited" in payload["vm_state"]
+
+
 def test_ssh_timeout_zero_still_probes_once(harness):
     """--ssh-timeout 0 means 'probe once', not 'never try'."""
     install, state = harness
@@ -337,7 +405,7 @@ def test_no_qemu_args_passes_none(harness):
     assert state["launch_kwargs"]["extra_args"] is None
 
 
-@pytest.mark.parametrize("flag", ["--harness", "--no-wait-ssh"])
+@pytest.mark.parametrize("flag", ["--harness", "--no-wait-ssh", "--no-net"])
 def test_ssh_less_modes_are_a_usage_error(harness, flag):
     """`run` executes a guest command over SSH, so a mode that guarantees no SSH
     cannot run one. Rejected by argparse (exit 2) rather than booting a VM that

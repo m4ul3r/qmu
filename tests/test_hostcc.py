@@ -78,10 +78,22 @@ def test_same_arch_uses_plain_host_compiler(monkeypatch, x86_host):
     assert hostcc.resolve_host_cc("x86_64") == ["cc"]
 
 
-def test_unknown_instance_arch_falls_back_to_host_compiler(monkeypatch, x86_host):
-    """arch=None (instance JSON written before the field existed) still builds."""
+def test_unknown_instance_arch_is_refused_not_guessed(monkeypatch, x86_host):
+    """arch=None (instance JSON predating the field) must NOT fall back to the
+    host compiler: an older cross-arch VM would silently receive a host-arch
+    binary and fail to exec it. Both escapes are named in the message."""
+    monkeypatch.setattr(hostcc.shutil, "which", _fake_which({"cc", "gcc"}))
+    with pytest.raises(QMUError) as exc:
+        hostcc.resolve_host_cc(None)
+    message = str(exc.value)
+    assert "no architecture" in message
+    assert "--cc" in message
+
+
+def test_unknown_instance_arch_still_builds_with_an_explicit_cc(monkeypatch, x86_host):
+    """--cc is the documented escape and bypasses arch selection entirely."""
     monkeypatch.setattr(hostcc.shutil, "which", _fake_which({"cc"}))
-    assert hostcc.resolve_host_cc(None) == ["cc"]
+    assert hostcc.resolve_host_cc(None, "cc") == ["cc"]
 
 
 def test_arm_guest_prefers_hardfloat_then_softfloat(monkeypatch, x86_host):

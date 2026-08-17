@@ -39,13 +39,15 @@ qmu run --kernel ./bzImage --keep -- 'id'     # leave the VM up afterwards
 SSH came up) · `3` kernel crash · `124` guest never became reachable.
 
 On a clean run the VM is reaped and stdout matches what `qmu exec` would have
-printed. If the run crashed the kernel, timed out, or died on boot, the VM is
-stopped but its `.serial.log` and metadata are **preserved**, and the output
-names the follow-up (`qmu crash --vm ID`, `qmu prune --vm ID`).
+printed. Whenever anything is left to inspect — a crash, a survived kernel
+report, a guest that never answered, a VM that died on boot — the VM is stopped
+but its `.serial.log` and metadata are **preserved**, and the output names the
+follow-up (`qmu crash --vm ID`, `qmu prune --vm ID`). Exit `3` requires a
+terminal panic; a boot that only logged a WARNING is still `124`.
 
-`run` takes launch's boot flags, minus `--harness`/`--no-wait-ssh` (it needs
-SSH), and carries QEMU passthrough as a repeatable `--qemu-arg` because the
-positional is the guest command: `--qemu-arg=-M --qemu-arg=virt`.
+`run` takes launch's boot flags, minus `--harness`/`--no-wait-ssh`/`--no-net`
+(it needs SSH), and carries QEMU passthrough as a repeatable `--qemu-arg`
+because the positional is the guest command: `--qemu-arg=-M --qemu-arg=virt`.
 
 ## Building on the host
 

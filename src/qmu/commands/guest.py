@@ -431,6 +431,15 @@ def _compile_on_host(
     # "Permission denied" that reads like a guest problem. chmod is part of
     # delivering a *runnable* artifact, so its failure is a compile failure.
     chmod_rc, _, chmod_err = ssh.run(f"chmod +x {shlex.quote(remote_bin)}", timeout=15)
+    # ...unless the guest vanished under it. rc=255 is both a legal exit code and
+    # what ssh returns when a panic drops the transport, so confirm with the same
+    # liveness probe exec uses and hand the caller the transport-loss path:
+    # reporting a kernel panic as "compilation failed" would bury it.
+    if chmod_rc == 255 and _transport_lost(ssh):
+        raise SSHError(
+            "SSH transport lost (rc=255) while delivering the host-built "
+            "binary — guest likely crashed"
+        )
     if chmod_rc != 0:
         result["compile_exit"] = chmod_rc
         result["compile_stderr"] = (
@@ -456,7 +465,27 @@ def _handle_compile(args: argparse.Namespace) -> int:
     remote_bin = f"/root/{name}"
 
     if args.host_build:
-        rc, result = _compile_on_host(args, inst, ssh, source, remote_bin)
+        delivery_offset = serial_log_offset(inst.serial_log)
+        try:
+            rc, result = _compile_on_host(args, inst, ssh, source, remote_bin)
+        except SSHError as exc:
+            # Delivering the host-built binary lost the transport. Classify it
+            # exactly as push/pull do — a fresh crash report is the only thing
+            # that justifies the kernel-crash class (3); otherwise the guest is
+            # merely unreachable (4). Without this the panic would surface as
+            # either a bare infra error or a bogus "compilation failed".
+            if exc.returncode is not None and not is_transport_failure(
+                exc.returncode, exc.stderr
+            ):
+                raise
+            return _emit_transfer_transport_lost(
+                args,
+                operation="push",
+                local=str(source),
+                remote=remote_bin,
+                inst=inst,
+                start_offset=delivery_offset,
+            )
     else:
         # Push source
         ssh.push(str(source), remote_src)
