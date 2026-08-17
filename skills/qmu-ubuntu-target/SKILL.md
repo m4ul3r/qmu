@@ -345,7 +345,12 @@ qmu exec --vm ubu 'cat /sys/kernel/security/lsm; aa-status | head -3'
 qmu exec --vm ubu 'sysctl kernel.kptr_restrict kernel.dmesg_restrict \
     kernel.unprivileged_bpf_disabled kernel.perf_event_paranoid \
     kernel.apparmor_restrict_unprivileged_userns'
-qmu exec --vm ubu 'modprobe nf_tables ksmbd hfsplus n_gsm && lsmod | head'
+# One modprobe per module: `modprobe a b c` treats b and c as PARAMETERS of a,
+# so the single-command form verified nothing but nf_tables. Fails closed -- a
+# missing module has to make the exec itself fail, or the check is decorative.
+qmu exec --vm ubu 'for m in nf_tables ksmbd hfsplus n_gsm; do
+    modprobe "$m" || { echo "MISSING $m" >&2; exit 1; }; echo "ok $m"
+  done; lsmod | head'
 qmu exec --vm ubu 'grep " _text$" /proc/kallsyms'   # differs across boots => KASLR live
 qmu exec --vm ubu 'echo c > /proc/sysrq-trigger'; qmu crash --vm ubu
 ```

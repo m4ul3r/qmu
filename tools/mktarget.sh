@@ -483,10 +483,16 @@ assert_no_index_fault
 KREL="$KABI-$FLAVOUR"
 log "resolved: ABI=$KABI deb=$KDEBVER pkg=$KPKG pocket=$KPOCKET"
 
-# dbgsym availability -- checked BEFORE building, so --symbols never discovers
-# a missing ddeb after a 10-minute build.
+# dbgsym availability -- resolved lazily, by assert_dbgsym_available below.
+#
+# It is checked before any building, so --symbols never discovers a missing ddeb
+# after a 10-minute build, but NOT before the cache gate: a run whose symbols are
+# already cached needs nothing from ddebs, and probing anyway cost a pointless
+# round-trip and could fail outright on a target whose dbgsym has since been
+# pruned -- refusing to repair a manifest over symbols that are already on disk.
 DBGSYM_AVAILABLE=false
-if [[ "$SYMBOLS" != "none" ]]; then
+
+assert_dbgsym_available() {
   DBG_ALL="$(collect_all_dbgsym || true)"
   assert_no_index_fault
   if grep -qx -- "$KABI" <<<"$DBG_ALL"; then
@@ -502,7 +508,32 @@ if [[ "$SYMBOLS" != "none" ]]; then
     } >&2
     exit 2
   fi
-fi
+}
+
+# none < vmlinux < full
+symbols_rank() {
+  case "$1" in
+    full)    printf '2' ;;
+    vmlinux) printf '1' ;;
+    *)       printf '0' ;;
+  esac
+}
+
+# What the directory ACTUALLY holds, which is not the same as what this run
+# asked for. A metadata-only repair invoked without --symbols must not erase the
+# record of symbols still sitting there, or the next --symbols run redownloads
+# 1.9 GB to recover what it never lost. Claims are backed by the files: a level
+# is only recorded if the artifacts for it are present.
+effective_symbols() {
+  local want="$1"
+  if [[ "$(symbols_rank "$want")" -ge 2 && -f "$VMLINUX_OUT" && -d "$MODDBG_OUT" ]]; then
+    printf 'full'
+  elif [[ "$(symbols_rank "$want")" -ge 1 && -f "$VMLINUX_OUT" ]]; then
+    printf 'vmlinux'
+  else
+    printf 'none'
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # SSH key (validated here, before the build key, which hashes the public half)
@@ -644,7 +675,13 @@ stamp_get() {
 #
 # Split from the symbol check below because the two have different remedies: a
 # stale or damaged IMAGE has to be rebuilt, whereas missing SYMBOLS can be
-# fetched onto the image already sitting there.
+# fetched onto the image already sitting there. The stamp keeps them in
+# different row types for the same reason -- `artifact` rows describe the image
+# and are walked here, `symbol` rows describe the debug files and are walked by
+# cache_symbols_ok. Recording vmlinux as an `artifact` put it in this loop, so
+# deleting or truncating just the symbols failed the IMAGE check and triggered a
+# full rebuild -- replacing the very rootfs a result had been measured on, to
+# repair a file that sits beside it.
 cache_image_ok() {
   local stamp_ver stamp_key path want have
 
@@ -662,6 +699,22 @@ cache_image_ok() {
     return 1
   }
 
+  # Only files that cannot be produced without the container are checked here,
+  # because failing this function costs a rootfs rebuild. Three classes exist:
+  #
+  #   image     kernel, rootfs, config, System.map, initrd, packages.tsv
+  #             -- derived from the container, unrecoverable without one
+  #   symbol    vmlinux, the module debug tree -- refetchable from ddebs
+  #   meta      target.json, qmu.toml -- regenerable on the host from what is
+  #             already on disk, so a damaged one is a rewrite, never a rebuild
+  #
+  # Symbol and meta paths are excluded BY PATH rather than by row label, because
+  # stamps written by earlier versions filed all of them as `artifact` and an
+  # intact stamp is never rewritten while it keeps hitting. A label-only rule
+  # would leave every already-built target still rebuilding its measured rootfs
+  # to repair a file sitting beside it -- exactly what this split prevents --
+  # and bumping the stamp version to dodge that would discard those images
+  # outright, which is worse.
   while IFS=$'\t' read -r _ path want; do
     [[ -n "$path" ]] || continue
     have="$(stat -c %s -- "$path" 2>/dev/null || echo missing)"
@@ -669,8 +722,33 @@ cache_image_ok() {
       log "cache rejected: $path is $have bytes, stamp recorded $want"
       return 1
     }
-  done < <(awk -F'\t' '$1 == "artifact"' "$STAMP_OUT")
+  done < <(awk -F'\t' -v vm="$VMLINUX_OUT" -v tm="$TOML_OUT" -v mf="$MANIFEST_OUT" \
+             '$1 == "artifact" && $2 != vm && $2 != tm && $2 != mf' "$STAMP_OUT")
 
+  return 0
+}
+
+# target.json and qmu.toml are rewritten on every reuse pass, so any mismatch
+# here is repaired rather than rebuilt.
+#
+# This is what makes an interrupted symbols upgrade survivable. That path keeps
+# the old stamp on purpose, but it rewrites target.json first -- and the file
+# grows when dbgsym_version and the DWARF fields appear. A kill between those
+# two writes therefore left a manifest the old stamp disagreed with, and while
+# the manifest was an image-class artifact that disagreement condemned the
+# rootfs. Writing them atomically only narrows that window; taking them out of
+# the image class removes it.
+cache_meta_ok() {
+  local path want have
+  while IFS=$'\t' read -r _ path want; do
+    [[ -n "$path" ]] || continue
+    have="$(stat -c %s -- "$path" 2>/dev/null || echo missing)"
+    [[ "$have" == "$want" ]] || {
+      log "metadata stale: $path is $have bytes, stamp recorded $want"
+      return 1
+    }
+  done < <(awk -F'\t' -v tm="$TOML_OUT" -v mf="$MANIFEST_OUT" \
+             '$1 == "meta" || ($1 == "artifact" && ($2 == tm || $2 == mf))' "$STAMP_OUT")
   return 0
 }
 
@@ -678,15 +756,19 @@ cache_image_ok() {
 # cannot describe it. Its shape is recorded separately -- object count and total
 # bytes -- because a bare `-d` test passes on a tree whose every .ko has been
 # deleted, and --symbols=full would then be a cache hit with no module symbols.
+# One colon-joined field, not two tab-separated ones: stamp_get returns a single
+# column, so a two-field value came back truncated and never matched what was
+# recomputed -- which quietly meant --symbols=full could not hit its own cache
+# and refetched 1.9 GB on every invocation.
 moddbg_shape() {
   local n b
   n="$(find "$MODDBG_OUT" -name '*.ko*' -type f 2>/dev/null | wc -l)"
   b="$(du -sb "$MODDBG_OUT" 2>/dev/null | awk '{print $1}')"
-  printf '%s\t%s' "$n" "${b:-0}"
+  printf '%s:%s' "$n" "${b:-0}"
 }
 
 cache_symbols_ok() {
-  local stamp_symbols want_shape
+  local stamp_symbols want_shape path want have
 
   stamp_symbols="$(stamp_get symbols)"
   # Asking for fewer symbols than are cached is satisfied; asking for more is
@@ -697,32 +779,118 @@ cache_symbols_ok() {
        return 1 ;;
   esac
 
+  # A run that did not ask for symbols has no opinion about them: a damaged
+  # vmlinux beside the image is irrelevant to it and must not cost it a rebuild.
+  [[ "$SYMBOLS" != none ]] || return 0
+
+  # The mirror image of the exclusion in cache_image_ok: a legacy stamp files
+  # vmlinux under `artifact`, and it still has to be validated here -- otherwise
+  # cache_image_ok skips it and nothing checks it at all, and a damaged legacy
+  # vmlinux would be handed back as if it were intact. A stamp rewritten by this
+  # version uses `symbol`; both are accepted, and the first upgrade a legacy
+  # target takes rewrites it into the new form.
+  while IFS=$'\t' read -r _ path want; do
+    [[ -n "$path" ]] || continue
+    have="$(stat -c %s -- "$path" 2>/dev/null || echo missing)"
+    [[ "$have" == "$want" ]] || {
+      log "symbols rejected: $path is $have bytes, stamp recorded $want"
+      return 1
+    }
+  done < <(awk -F'\t' -v vm="$VMLINUX_OUT" \
+             '$1 == "symbol" || ($1 == "artifact" && $2 == vm)' "$STAMP_OUT")
+
   if [[ "$SYMBOLS" == full ]]; then
-    [[ -d "$MODDBG_OUT" ]] || { log "cache rejected: $MODDBG_OUT is missing"; return 1; }
+    [[ -d "$MODDBG_OUT" ]] || { log "symbols rejected: $MODDBG_OUT is missing"; return 1; }
     want_shape="$(stamp_get moddbg)"
     [[ "$want_shape" == "$(moddbg_shape)" ]] || {
-      log "cache rejected: module debug tree is $(moddbg_shape), stamp recorded $want_shape"
+      log "symbols rejected: module debug tree is $(moddbg_shape), stamp recorded $want_shape"
       return 1
     }
   fi
   return 0
 }
 
-# Fetching symbols must not rebuild the image. Rebuilding would re-run apt, and
-# only the KERNEL debs are version-pinned -- the userland moves with the
-# archive, so `--symbols` on an already-validated target could hand back a
-# different rootfs, with a different apparmor or procps, than the one the PoC
-# result was measured against. When the image checks out and only the symbols
-# are short, fetch just those and leave every other artifact untouched.
-SYMBOLS_UPGRADE=false
-if [[ "$NO_CACHE" == false ]] && cache_image_ok && [[ -f "$PRIVKEY" ]]; then
-  if cache_symbols_ok; then
+# A cached image is only usable if its key still is. The gate tested `-f`, so a
+# zero-byte or truncated private key was a cache HIT: the run exited 0 and
+# emitted SSH_KEY pointing at a file no ssh will ever load, and the failure
+# surfaced later as an unexplained connection refusal against a guest that had
+# booted perfectly.
+#
+# Scope: only the key this script generated, which lives inside the output
+# directory and is by construction the one baked into that directory's image.
+# An externally supplied --ssh-key belongs to the caller and is never inspected,
+# rewritten or regenerated here.
+privkey_usable() {
+  [[ -f "$PRIVKEY" ]] || return 1
+  [[ -z "$SSH_KEY_ARG" ]] || return 0
+  ssh-keygen -y -P '' -f "$PRIVKEY" >/dev/null 2>&1
+}
+
+# The public half is derivable from the private half, so a missing or mismatched
+# .pub is repairable in place rather than a reason to discard a working target.
+ensure_pubkey() {
+  local derived
+  [[ -z "$SSH_KEY_ARG" ]] || return 0
+  derived="$(ssh-keygen -y -P '' -f "$PRIVKEY" 2>/dev/null)" || return 1
+  if [[ ! -f "${PRIVKEY}.pub" ]] || ! grep -qF -- "$derived" "${PRIVKEY}.pub"; then
+    warn "recovering ${PRIVKEY}.pub from the private key"
+    printf '%s qmu-target-%s-%s-%s\n' "$derived" "$SUITE" "$KREL" "$ARCH" > "${PRIVKEY}.pub"
+  fi
+  return 0
+}
+
+# Repairing what sits AROUND the image must never rebuild the image. Rebuilding
+# re-runs apt, and only the KERNEL debs are version-pinned -- the userland moves
+# with the archive, so a rebuild triggered by a missing vmlinux or a half-written
+# manifest could hand back a different rootfs, with a different apparmor or
+# procps, than the one the PoC result was measured against. Whenever the image
+# itself checks out, everything else is refetched or regenerated in place.
+# The two repair reasons are tracked separately. Collapsing them into one flag
+# meant a stale manifest on a target whose symbols were perfectly intact still
+# re-downloaded the 1.9 GB ddeb, because the extraction step keyed off "are we
+# reusing" rather than "are the symbols short".
+#
+# CACHED_SYMBOLS is captured here, before anything in the directory is
+# rewritten: it is what the stamp claimed on entry, and it is how a repair pass
+# knows which symbols it must not forget.
+REUSE_IMAGE=false
+REFRESH_SYMBOLS=true
+CACHED_SYMBOLS=""
+PRIOR_SYMBOL_ROWS=""
+PRIOR_MODDBG=""
+if [[ "$NO_CACHE" == false ]] && cache_image_ok && privkey_usable; then
+  CACHED_SYMBOLS="$(stamp_get symbols)"
+  # The prior symbol expectations, kept so a pass that does NOT validate them
+  # can carry them forward untouched. Legacy `artifact` rows for vmlinux are
+  # normalised to `symbol` on the way through.
+  PRIOR_SYMBOL_ROWS="$(awk -F'\t' -v vm="$VMLINUX_OUT" -v OFS='\t' \
+    '$1 == "symbol" || ($1 == "artifact" && $2 == vm) { print "symbol", $2, $3 }' \
+    "$STAMP_OUT")"
+  PRIOR_MODDBG="$(stamp_get moddbg)"
+  symbols_state_ok=false
+  meta_state_ok=false
+  cache_symbols_ok && symbols_state_ok=true
+  cache_meta_ok    && meta_state_ok=true
+
+  if [[ "$symbols_state_ok" == true && "$meta_state_ok" == true ]]; then
+    ensure_pubkey || die "cannot derive a public key from $PRIVKEY"
     log "cached target found at $OUTDIR"
     emit_outputs
     exit 0
   fi
-  SYMBOLS_UPGRADE=true
-  log "image is cached and intact; fetching symbols only, leaving the rootfs as built"
+
+  REUSE_IMAGE=true
+  REFRESH_SYMBOLS="$([[ "$symbols_state_ok" == true ]] && printf 'false' || printf 'true')"
+  if [[ "$REFRESH_SYMBOLS" == true ]]; then
+    log "image is cached and intact; refetching symbols, leaving the rootfs as built"
+  else
+    log "image and symbols are cached and intact; regenerating metadata only"
+  fi
+fi
+
+# Only now, and only if something actually has to come from ddebs.
+if [[ "$SYMBOLS" != none && "$REFRESH_SYMBOLS" == true ]]; then
+  assert_dbgsym_available
 fi
 
 mkdir -p "$OUTDIR"
@@ -730,16 +898,29 @@ mkdir -p "$OUTDIR"
 # From here on the directory is mid-build and must never satisfy a cache hit,
 # even if this process is killed between two docker cp calls.
 #
-# Not on the symbols path: nothing there invalidates the image, so a failed
-# symbol fetch must not condemn a good target to a full rebuild. The stamp is
-# replaced atomically at the end either way.
-[[ "$SYMBOLS_UPGRADE" == true ]] || rm -f -- "$STAMP_OUT"
+# Not on the reuse path: nothing there invalidates the image, so a failed symbol
+# fetch or metadata rewrite must not condemn a good target to a full rebuild.
+# Keeping the old stamp is safe precisely because symbols and metadata are no
+# longer image-class -- a stamp that disagrees with them asks for a repair, not
+# a rootfs. The stamp is replaced atomically at the end either way.
+[[ "$REUSE_IMAGE" == true ]] || rm -f -- "$STAMP_OUT"
 
-if [[ -z "$SSH_KEY_ARG" && ! -f "$PRIVKEY" ]]; then
-  step "Generating SSH keypair"
-  ssh-keygen -t ed25519 -N '' -f "$PRIVKEY" -C "qmu-target-$SUITE-$KREL-$ARCH" >/dev/null
+if [[ -z "$SSH_KEY_ARG" ]]; then
+  # An unusable leftover has to be cleared, not built around: `! -f` alone left
+  # a zero-byte or truncated key in place, and the image was then baked with
+  # whatever stale .pub happened to sit next to it.
+  if [[ -f "$PRIVKEY" ]] && ! privkey_usable; then
+    warn "generated key $PRIVKEY is unusable; regenerating the pair"
+    rm -f -- "$PRIVKEY" "${PRIVKEY}.pub"
+  fi
+  if [[ ! -f "$PRIVKEY" ]]; then
+    step "Generating SSH keypair"
+    ssh-keygen -t ed25519 -N '' -f "$PRIVKEY" -C "qmu-target-$SUITE-$KREL-$ARCH" >/dev/null
+  fi
 fi
 chmod 600 "$PRIVKEY"
+ensure_pubkey || die "cannot derive a public key from $PRIVKEY"
+[[ -f "${PRIVKEY}.pub" ]] || die "SSH public key not found: ${PRIVKEY}.pub"
 PUBKEY_CONTENT="$(cat "${PRIVKEY}.pub")"
 
 # ---------------------------------------------------------------------------
@@ -871,7 +1052,7 @@ pkgver() { awk -F'\t' -v p="$1" '$1 == p { print $2; exit }' "$PACKAGES_OUT"; }
 # injects the leading whitespace into the file it writes. The matching
 # "END image build" marker closes this guard.
 # ===========================================================================
-if [[ "$SYMBOLS_UPGRADE" == false ]]; then
+if [[ "$REUSE_IMAGE" == false ]]; then
 
 local_ctx="$(mktemp -d)"
 
@@ -1223,7 +1404,9 @@ fi
 # Stream-extracted: the ddeb is ~1.9 GB unpacked and we want exactly one file
 # out of it, so it must never land in a container layer or on disk whole.
 # ---------------------------------------------------------------------------
-if [[ "$SYMBOLS" != "none" && "$DBGSYM_AVAILABLE" == true ]]; then
+# REFRESH_SYMBOLS, not REUSE_IMAGE: a metadata-only repair leaves symbols that
+# are already present and validated exactly where they are.
+if [[ "$SYMBOLS" != "none" && "$REFRESH_SYMBOLS" == true && "$DBGSYM_AVAILABLE" == true ]]; then
   step "Fetching debug symbols from $DDEBS_MIRROR (mode: $SYMBOLS)"
   KEEP_MODULES=0
   [[ "$SYMBOLS" == "full" ]] && KEEP_MODULES=1
@@ -1265,24 +1448,46 @@ if [[ "$SYMBOLS" != "none" && "$DBGSYM_AVAILABLE" == true ]]; then
               | awk "{gsub(/^.|.\$/, \"\", \$1); print \$1}" | head -1)
         [ -n "$URI" ] || { echo "could not resolve ddeb URI for $PKG" >&2; exit 1; }
         echo "ddeb: $URI" >&2
+
+        # Everything lands in staging first and is published only once BOTH
+        # halves have succeeded. Writing vmlinux straight to its final name made
+        # a failed vmlinux->full upgrade destructive: the partial write clobbered
+        # a perfectly good cached vmlinux, and the next run then had to rebuild
+        # the rootfs to recover a file the rootfs has nothing to do with.
+        # The container owns the cleanup because it created these paths as root,
+        # and the host cannot recurse into a root-owned staging tree.
+        STAGE=/output/.symstage
+        VMPART="/output/vmlinux-${KREL}.part"
+        rm -rf "$STAGE"; mkdir -p "$STAGE"
+        trap "rm -rf $STAGE $VMPART" EXIT
+
         curl -sSfL "$URI" \
           | bsdtar -xOf - "data.tar*" \
           | bsdtar -xOf - "./usr/lib/debug/boot/vmlinux-${KREL}" \
-          > "/output/vmlinux-${KREL}"
-        [ -s "/output/vmlinux-${KREL}" ] || { echo "vmlinux extraction produced an empty file" >&2; exit 1; }
+          > "$VMPART"
+        [ -s "$VMPART" ] || { echo "vmlinux extraction produced an empty file" >&2; exit 1; }
+
         if [ "$KEEP_MODULES" = "1" ]; then
           # No `|| true` here. --symbols=full promises module debug info, and a
           # swallowed download or extraction failure handed back a target whose
           # module symbols silently did not exist -- discovered only once a GDB
           # session failed to resolve a symbol inside a module.
-          rm -rf "/output/usr/lib/debug/lib/modules/${KREL}"
           curl -sSfL "$URI" | bsdtar -xOf - "data.tar*" \
-            | bsdtar -xf - -C /output "./usr/lib/debug/lib/modules/${KREL}"
-          find "/output/usr/lib/debug/lib/modules/${KREL}" -name "*.ko" -print -quit 2>/dev/null \
+            | bsdtar -xf - -C "$STAGE" "./usr/lib/debug/lib/modules/${KREL}"
+          find "$STAGE/usr/lib/debug/lib/modules/${KREL}" -name "*.ko" -print -quit 2>/dev/null \
             | grep -q . || {
               echo "--symbols=full requested but the ddeb yielded no module debug objects" >&2
               exit 1
             }
+        fi
+
+        # publish
+        mv -f "$VMPART" "/output/vmlinux-${KREL}"
+        if [ "$KEEP_MODULES" = "1" ]; then
+          mkdir -p /output/usr/lib/debug/lib/modules
+          rm -rf "/output/usr/lib/debug/lib/modules/${KREL}"
+          mv "$STAGE/usr/lib/debug/lib/modules/${KREL}" \
+             "/output/usr/lib/debug/lib/modules/${KREL}"
         fi
       ' >&2; then
     log "vmlinux extracted: $VMLINUX_OUT"
@@ -1291,15 +1496,50 @@ if [[ "$SYMBOLS" != "none" && "$DBGSYM_AVAILABLE" == true ]]; then
     # failure here is an infrastructure fault, and --symbols is a flag that
     # promises an artifact -- quietly emitting a target without it would let a
     # GDB session start against symbols the caller believes they asked for.
-    rm -f "$VMLINUX_OUT"
+    #
+    # Any previously cached vmlinux is deliberately left alone: this run
+    # published nothing, so the target is exactly as it was before, and the
+    # stamp still describes it. Deleting it here is what used to force the next
+    # run to rebuild the rootfs.
     die "debug-symbol extraction failed for $KREL (dbgsym $KDEBVER exists in the index).
   Re-run with --verbose for the container output, or drop --symbols to build
   the target without them."
   fi
 fi
 
+# The symbol level this directory ends up holding, which the manifest and stamp
+# must record -- as opposed to $SYMBOLS, which is only what this invocation
+# asked for. A metadata repair run without --symbols records the cached level it
+# found, so the symbols are not forgotten and re-downloaded next time; a run
+# that fetched records whichever level is higher. Backed by the files either
+# way, so a cached claim whose artifacts have since gone is not carried forward.
+#
+# $VMLINUX on stdout stays gated on $SYMBOLS in emit_outputs: what this run
+# ASKED for and what the directory HOLDS are different questions, and callers
+# rely on the first.
+if [[ "$REUSE_IMAGE" == true && "$REFRESH_SYMBOLS" == false ]]; then
+  # Nothing about the symbols was validated or refetched on this pass, so
+  # nothing about them is re-measured. Recomputing here would ratify whatever
+  # state the files happen to be in: a plain metadata repair over a truncated
+  # vmlinux (or a module tree emptied of .ko files) would record the damaged
+  # sizes as if they were correct, and the next --symbols request would then
+  # accept the damage as a cache hit. Carrying the prior expectations forward
+  # keeps that request able to detect the damage and refetch.
+  STAMP_SYMBOLS="$CACHED_SYMBOLS"
+else
+  STAMP_SYMBOLS_WANT="$CACHED_SYMBOLS"
+  if [[ "$(symbols_rank "$SYMBOLS")" -gt "$(symbols_rank "$STAMP_SYMBOLS_WANT")" ]]; then
+    STAMP_SYMBOLS_WANT="$SYMBOLS"
+  fi
+  # A fresh build starts from nothing: a stale vmlinux left in the directory is
+  # not evidence that this rebuild produced one.
+  [[ "$REUSE_IMAGE" == true ]] || STAMP_SYMBOLS_WANT="$SYMBOLS"
+  STAMP_SYMBOLS="$(effective_symbols "$STAMP_SYMBOLS_WANT")"
+fi
+[[ "$STAMP_SYMBOLS" == "$SYMBOLS" ]] || log "recording symbols=${STAMP_SYMBOLS:-none} (what the target holds)"
+
 DWARF_COMP_DIR=""
-if [[ "$SYMBOLS" != "none" && -f "$VMLINUX_OUT" ]] && command -v objdump >/dev/null 2>&1; then
+if [[ "$STAMP_SYMBOLS" != "none" && -f "$VMLINUX_OUT" ]] && command -v objdump >/dev/null 2>&1; then
   DWARF_COMP_DIR="$( { objdump --dwarf=info --dwarf-depth=1 "$VMLINUX_OUT" 2>/dev/null || true; } \
     | awk '/DW_AT_comp_dir/ { if (d == "") { sub(/.*:[[:space:]]*/, ""); d = $0 } } END { print d }')"
   [[ -n "$DWARF_COMP_DIR" ]] && log "DWARF comp_dir: $DWARF_COMP_DIR"
@@ -1308,8 +1548,8 @@ fi
 # ---------------------------------------------------------------------------
 # export container filesystem -> raw ext4 image
 # ---------------------------------------------------------------------------
-if [[ "$SYMBOLS_UPGRADE" == true ]]; then
-  log "rootfs left untouched (symbols-only upgrade)"
+if [[ "$REUSE_IMAGE" == true ]]; then
+  log "rootfs left untouched (symbols/metadata refresh only)"
 else
 step "Creating raw ext4 image ($SIZE) -- exports ~1 GB and runs mke2fs, expect 1-2 min"
 # The if/else form is required under `set -euo pipefail` so a failed helper
@@ -1345,20 +1585,40 @@ fi
 # ---------------------------------------------------------------------------
 step "Writing manifest and qmu.toml"
 
-# A symbols upgrade does not rebuild the image, so `built_at` must keep naming
-# when that image was built. Overwriting it with "now" would misdate the very
-# artifact the manifest exists to attribute.
-if [[ "$SYMBOLS_UPGRADE" == true && -f "$MANIFEST_OUT" ]]; then
-  PRIOR_BUILT_AT="$(awk -F'"' '/"built_at"/ { print $4; exit }' "$MANIFEST_OUT")"
+# Reusing an image does not rebuild it, so every field describing WHEN that
+# image was made must keep its old value. Both are resolved fresh on each run
+# and would otherwise be silently re-dated: `built_at` to now, and
+# `archive_release_date` to whatever the pocket's Release file says today. The
+# image was built against the archive as it stood at the earlier date, and that
+# is the provenance a cited result depends on.
+#
+# The stamp is consulted first and the manifest only as a fallback, because the
+# manifest is the file a repair pass exists to rewrite -- it may be the very
+# thing that was truncated. Stamps written before these rows existed have
+# neither, so the manifest still has to be tried.
+if [[ "$REUSE_IMAGE" == true ]]; then
+  PRIOR_BUILT_AT="$(stamp_get built_at)"
+  PRIOR_ARCHIVE_DATE="$(stamp_get archive_release_date)"
+  if [[ -z "$PRIOR_BUILT_AT" && -f "$MANIFEST_OUT" ]]; then
+    PRIOR_BUILT_AT="$(awk -F'"' '/"built_at"/ { print $4; exit }' "$MANIFEST_OUT")"
+  fi
+  if [[ -z "$PRIOR_ARCHIVE_DATE" && -f "$MANIFEST_OUT" ]]; then
+    PRIOR_ARCHIVE_DATE="$(awk -F'"' '/"archive_release_date"/ { print $4; exit }' "$MANIFEST_OUT")"
+  fi
   [[ -n "$PRIOR_BUILT_AT" ]] && BUILT_AT="$PRIOR_BUILT_AT"
+  [[ -n "$PRIOR_ARCHIVE_DATE" ]] && ARCHIVE_DATE="$PRIOR_ARCHIVE_DATE"
 fi
 
 KERNEL_SHA="$(sha256sum "$KERNEL_OUT" | awk '{print $1}')"
 ROOTFS_SHA="$(sha256sum "$ROOTFS_OUT" | awk '{print $1}')"
 DBGVER="null"
-[[ "$SYMBOLS" != "none" && -f "$VMLINUX_OUT" ]] && DBGVER="\"$KDEBVER\""
+[[ "$STAMP_SYMBOLS" != "none" && -f "$VMLINUX_OUT" ]] && DBGVER="\"$KDEBVER\""
 
-cat > "$MANIFEST_OUT" <<JSON
+# Written via .part + rename. This does not carry the correctness argument --
+# that rests on metadata being repairable rather than image-class -- but it does
+# mean a kill mid-write leaves the previous manifest whole instead of a truncated
+# one, which is worth the two extra lines.
+cat > "$MANIFEST_OUT.part" <<JSON
 {
   "mktarget_version": "$MKTARGET_VERSION",
   "built_at": "$BUILT_AT",
@@ -1397,6 +1657,7 @@ cat > "$MANIFEST_OUT" <<JSON
   }
 }
 JSON
+mv -f "$MANIFEST_OUT.part" "$MANIFEST_OUT"
 
 # ---------------------------------------------------------------------------
 # generated qmu.toml
@@ -1409,7 +1670,7 @@ JSON
 # ---------------------------------------------------------------------------
 CMDLINE_BASE="console=$CONSOLE_TTY root=$ROOT_DEV rw earlyprintk=serial net.ifnames=0"
 
-cat > "$TOML_OUT" <<TOML
+cat > "$TOML_OUT.part" <<TOML
 # Generated by tools/mktarget.sh -- Ubuntu $SUITE $KREL ($ARCH)
 #
 # Fidelity contract:
@@ -1448,6 +1709,7 @@ cmdline = "$CMDLINE_BASE nokaslr"
 [profiles.ubuntu-trigger]
 cmdline = "$CMDLINE_BASE panic_on_oops=1 panic_on_warn=1"
 TOML
+mv -f "$TOML_OUT.part" "$TOML_OUT"
 
 # ---------------------------------------------------------------------------
 # output
@@ -1463,30 +1725,54 @@ TOML
 {
   printf 'version\t%s\n'            "$MKTARGET_VERSION"
   printf 'build_key\t%s\n'          "$BUILD_KEY"
-  printf 'symbols\t%s\n'            "$SYMBOLS"
+  printf 'symbols\t%s\n'            "$STAMP_SYMBOLS"
   printf 'kernel_deb_version\t%s\n' "$KDEBVER"
-  for f in "$KERNEL_OUT" "$ROOTFS_OUT" "$CONFIG_OUT" "$SYSMAP_OUT" \
-           "$TOML_OUT" "$MANIFEST_OUT" "$PACKAGES_OUT"; do
+  # Recorded here as well as in the manifest, so a repair pass can restore the
+  # image's provenance even when the manifest is the file that was damaged.
+  printf 'built_at\t%s\n'             "$BUILT_AT"
+  printf 'archive_release_date\t%s\n' "${ARCHIVE_DATE:-unknown}"
+  # Image class: not reproducible without the container, so a mismatch here
+  # really does mean rebuild. packages.tsv belongs with them -- it is read out
+  # of the container's dpkg database and cannot be regenerated on the host.
+  for f in "$KERNEL_OUT" "$ROOTFS_OUT" "$CONFIG_OUT" "$SYSMAP_OUT" "$PACKAGES_OUT"; do
     printf 'artifact\t%s\t%s\n' "$f" "$(stat -c %s -- "$f")"
+  done
+  # `meta`, not `artifact`: both are regenerated from what is already on disk on
+  # every reuse pass, so a mismatch is a rewrite. Filing them as image artifacts
+  # is what let an interrupted upgrade -- manifest rewritten, stamp not yet
+  # renamed -- condemn the measured rootfs on the following run.
+  for f in "$TOML_OUT" "$MANIFEST_OUT"; do
+    printf 'meta\t%s\t%s\n' "$f" "$(stat -c %s -- "$f")"
   done
   # Recorded only when actually produced: --initramfs can legitimately yield no
   # initrd, and demanding one back would make that target rebuild forever.
   if [[ "$INITRAMFS" == true && -f "$INITRD_OUT" ]]; then
     printf 'artifact\t%s\t%s\n' "$INITRD_OUT" "$(stat -c %s -- "$INITRD_OUT")"
   fi
-  if [[ "$SYMBOLS" != none && -f "$VMLINUX_OUT" ]]; then
-    printf 'artifact\t%s\t%s\n' "$VMLINUX_OUT" "$(stat -c %s -- "$VMLINUX_OUT")"
+  # `symbol`, not `artifact`: these are checked by cache_symbols_ok, whose
+  # remedy is a refetch, rather than by cache_image_ok, whose remedy is a
+  # rootfs-replacing rebuild.
+  # Only measurements this run actually took get recorded; anything it did not
+  # validate or refetch is carried forward verbatim. Re-measuring an unchecked
+  # file would bless whatever damage it has and make the next symbol request
+  # accept it.
+  if [[ "$SYMBOLS" != none && "$REFRESH_SYMBOLS" == true && -f "$VMLINUX_OUT" ]]; then
+    printf 'symbol\t%s\t%s\n' "$VMLINUX_OUT" "$(stat -c %s -- "$VMLINUX_OUT")"
+  elif [[ "$STAMP_SYMBOLS" != none && -n "$PRIOR_SYMBOL_ROWS" ]]; then
+    printf '%s\n' "$PRIOR_SYMBOL_ROWS"
   fi
   # A directory cannot be described by the artifact-size list, and `-d` alone
   # passes on a tree whose every .ko has been deleted.
-  if [[ "$SYMBOLS" == full && -d "$MODDBG_OUT" ]]; then
+  if [[ "$SYMBOLS" == full && "$REFRESH_SYMBOLS" == true && -d "$MODDBG_OUT" ]]; then
     printf 'moddbg\t%s\n' "$(moddbg_shape)"
+  elif [[ "$STAMP_SYMBOLS" == full && -n "$PRIOR_MODDBG" ]]; then
+    printf 'moddbg\t%s\n' "$PRIOR_MODDBG"
   fi
 } > "$STAMP_OUT.part"
 mv -f "$STAMP_OUT.part" "$STAMP_OUT"
 
-if [[ "$SYMBOLS_UPGRADE" == true ]]; then
-  step "Symbols added to cached target: $OUTDIR"
+if [[ "$REUSE_IMAGE" == true ]]; then
+  step "Cached target refreshed in place: $OUTDIR"
 else
   step "Target ready: $OUTDIR"
 fi

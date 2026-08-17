@@ -127,7 +127,9 @@ if gone and gone in url:
     finish(404)
 
 if url.endswith("/Release"):
-    finish(200, b"Origin: Ubuntu\\nDate: Thu, 25 Apr 2024 15:10:33 UTC\\n")
+    # settable, so a test can move the archive on between two runs
+    date = os.environ.get("MKTARGET_FAKE_RELEASE_DATE", "Thu, 25 Apr 2024 15:10:33 UTC")
+    finish(200, ("Origin: Ubuntu\\nDate: " + date + "\\n").encode())
 
 if "ddebs" in url:
     # only the release pocket carries dbgsym in this fixture, and ddebs has no
@@ -247,7 +249,12 @@ if verb == "run":
     if out is not None and "mke2fs" in inner:
         (out / "rootfs.img").write_bytes(b"\\0" * 4096)
     elif out is not None and "dbgsym" in inner:
-        if os.environ.get("MKTARGET_FAKE_DBGSYM_FAIL") == "1":
+        full = "KEEP_MODULES=1" in args
+        if os.environ.get("MKTARGET_FAKE_DBGSYM_FAIL") == "1" or (
+            full and os.environ.get("MKTARGET_FAKE_DBGSYM_FAIL_FULL") == "1"
+        ):
+            # the real helper stages and publishes only on success, so a failed
+            # run must leave any previously cached vmlinux exactly as it was
             print("ddeb extraction blew up", file=sys.stderr)
             raise SystemExit(1)
         krel = next(a.split("=", 1)[1] for a in args if a.startswith("KREL="))
@@ -721,6 +728,417 @@ def test_symbols_are_added_without_rebuilding_the_measured_rootfs(mktarget_env):
     assert again.stdout == withsym.stdout
 
 
+@pytest.mark.parametrize("damage", ["delete", "truncate"])
+def test_damaged_vmlinux_is_refetched_without_rebuilding_the_image(mktarget_env, damage):
+    """vmlinux was recorded as a generic `artifact`, so the IMAGE completeness
+    loop walked it: losing only the symbols failed the image check and rebuilt
+    the rootfs -- replacing the thing a result was measured on in order to
+    repair a file sitting beside it."""
+    first = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert first.returncode == 0, first.stderr
+    a = _assignments(first.stdout)
+    vmlinux, rootfs = Path(a["VMLINUX"]), Path(a["ROOTFS"])
+    before = (rootfs.read_bytes(), rootfs.stat().st_mtime_ns)
+
+    if damage == "delete":
+        vmlinux.unlink()
+    else:
+        vmlinux.write_bytes(b"EL")          # truncated, still present
+    mktarget_env.clear_docker_log()
+
+    second = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert second.returncode == 0, second.stderr
+
+    verbs = [c[0] for c in mktarget_env.docker_calls()]
+    assert "build" not in verbs, "the image was rebuilt to repair symbols"
+    assert "export" not in verbs, "the rootfs was regenerated to repair symbols"
+    assert any(
+        c[0] == "run" and "dbgsym" in c[-1] for c in mktarget_env.docker_calls()
+    ), "symbols were never refetched"
+
+    assert vmlinux.exists() and vmlinux.stat().st_size > 2
+    assert (rootfs.read_bytes(), rootfs.stat().st_mtime_ns) == before
+
+
+def _make_stamp_legacy(outdir: Path) -> Path:
+    """Rewrite a stamp into the pre-split form, where vmlinux was filed as a
+    generic `artifact` row.
+
+    Targets built by earlier versions carry exactly this, and an intact stamp is
+    never rewritten while it keeps hitting -- so the split only protects real
+    users if it reads those rows too. Bumping the stamp version instead would
+    discard the very measured images this is supposed to preserve.
+    """
+    stamp = outdir / ".mktarget-stamp"
+    rows = stamp.read_text().splitlines()
+    assert any(r.startswith("symbol\t") for r in rows), rows
+    stamp.write_text(
+        "\n".join(
+            "artifact\t" + r.split("\t", 1)[1] if r.startswith("symbol\t") else r
+            for r in rows
+        )
+        + "\n"
+    )
+    assert not any(r.startswith("symbol\t") for r in stamp.read_text().splitlines())
+    return stamp
+
+
+@pytest.mark.parametrize("damage", ["delete", "truncate"])
+def test_legacy_stamp_vmlinux_is_refetched_without_rebuilding(mktarget_env, damage):
+    """A legacy stamp labels vmlinux `artifact`, so the image loop walked it and
+    a damaged vmlinux rebuilt the rootfs -- meaning the split protected only
+    freshly built targets, not the existing measured ones it was written for."""
+    first = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert first.returncode == 0, first.stderr
+    a = _assignments(first.stdout)
+    vmlinux, rootfs = Path(a["VMLINUX"]), Path(a["ROOTFS"])
+    _make_stamp_legacy(rootfs.parent)
+    before = (rootfs.read_bytes(), rootfs.stat().st_mtime_ns)
+
+    if damage == "delete":
+        vmlinux.unlink()
+    else:
+        vmlinux.write_bytes(b"EL")
+    mktarget_env.clear_docker_log()
+
+    second = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert second.returncode == 0, second.stderr
+
+    verbs = [c[0] for c in mktarget_env.docker_calls()]
+    assert "build" not in verbs, "a legacy stamp rebuilt the image to repair symbols"
+    assert "export" not in verbs, "a legacy stamp regenerated the rootfs"
+    assert any(
+        c[0] == "run" and "dbgsym" in c[-1] for c in mktarget_env.docker_calls()
+    ), "symbols were never refetched"
+
+    assert vmlinux.exists() and vmlinux.stat().st_size > 2
+    assert (rootfs.read_bytes(), rootfs.stat().st_mtime_ns) == before
+    # the repair also migrates the stamp forward
+    assert any(
+        r.startswith("symbol\t")
+        for r in (rootfs.parent / ".mktarget-stamp").read_text().splitlines()
+    )
+
+
+def test_legacy_stamp_damaged_vmlinux_is_ignored_by_a_plain_run(mktarget_env):
+    """A run that wants no symbols must not pay for a broken vmlinux beside the
+    image, whichever row type an older stamp filed it under."""
+    withsym = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert withsym.returncode == 0, withsym.stderr
+    a = _assignments(withsym.stdout)
+    rootfs = Path(a["ROOTFS"])
+    _make_stamp_legacy(rootfs.parent)
+    Path(a["VMLINUX"]).write_bytes(b"")
+    mktarget_env.clear_docker_log()
+
+    plain = mktarget_env.run("--kernel-abi", "ga", fail_if_docker_runs=True)
+    assert plain.returncode == 0, plain.stderr
+    assert not mktarget_env.docker_calls()
+    assert "VMLINUX=" not in plain.stdout
+
+
+def test_an_intact_legacy_stamp_is_still_a_plain_cache_hit(mktarget_env):
+    """Migration must not cost a rebuild on its own: an undamaged legacy target
+    keeps hitting exactly as before."""
+    first = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert first.returncode == 0, first.stderr
+    _make_stamp_legacy(Path(_assignments(first.stdout)["ROOTFS"]).parent)
+    mktarget_env.clear_docker_log()
+
+    again = mktarget_env.run("--kernel-abi", "ga", "--symbols", fail_if_docker_runs=True)
+    assert again.returncode == 0, again.stderr
+    assert again.stdout == first.stdout
+
+
+def test_a_damaged_vmlinux_does_not_disturb_a_run_that_wants_no_symbols(mktarget_env):
+    """A plain run has no opinion about symbols, so a broken vmlinux beside the
+    image must not cost it a rebuild either."""
+    withsym = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert withsym.returncode == 0, withsym.stderr
+    Path(_assignments(withsym.stdout)["VMLINUX"]).write_bytes(b"")
+    mktarget_env.clear_docker_log()
+
+    plain = mktarget_env.run("--kernel-abi", "ga", fail_if_docker_runs=True)
+    assert plain.returncode == 0, plain.stderr
+    assert "VMLINUX=" not in plain.stdout
+
+
+def test_a_failed_full_upgrade_preserves_the_existing_vmlinux(mktarget_env):
+    """Extraction wrote vmlinux straight to its final name and the failure path
+    rm -f'd it, so a failed vmlinux->full repair destroyed a perfectly good
+    cached vmlinux and forced the next run to rebuild the rootfs."""
+    vm = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert vm.returncode == 0, vm.stderr
+    a = _assignments(vm.stdout)
+    vmlinux, rootfs = Path(a["VMLINUX"]), Path(a["ROOTFS"])
+    keep = vmlinux.read_bytes()
+    rootfs_before = (rootfs.read_bytes(), rootfs.stat().st_mtime_ns)
+
+    broken = mktarget_env.run(
+        "--kernel-abi", "ga", "--symbols=full", MKTARGET_FAKE_DBGSYM_FAIL_FULL="1"
+    )
+    assert broken.returncode == 2
+    assert vmlinux.read_bytes() == keep, "the prior vmlinux was destroyed"
+    assert (rootfs.read_bytes(), rootfs.stat().st_mtime_ns) == rootfs_before
+
+    # and the target is still a plain cache hit at its old symbol level
+    mktarget_env.clear_docker_log()
+    after = mktarget_env.run("--kernel-abi", "ga", "--symbols", fail_if_docker_runs=True)
+    assert after.returncode == 0, after.stderr
+    assert after.stdout == vm.stdout
+
+
+def test_symbol_upgrade_preserves_the_image_provenance(mktarget_env):
+    """built_at and archive_release_date both describe WHEN THE IMAGE was made.
+    Both are resolved fresh every run, so a symbols upgrade silently re-dated the
+    image to today's archive -- exactly the provenance a cited result rests on."""
+    first = mktarget_env.run("--kernel-abi", "ga")
+    assert first.returncode == 0, first.stderr
+    before = json.loads(Path(_assignments(first.stdout)["TARGET_MANIFEST"]).read_text())
+    assert before["archive_release_date"] == "Thu, 25 Apr 2024 15:10:33 UTC"
+
+    # the archive moves on between the image build and the symbol fetch
+    second = mktarget_env.run(
+        "--kernel-abi", "ga", "--symbols",
+        MKTARGET_FAKE_RELEASE_DATE="Fri, 06 Jun 2025 09:00:00 UTC",
+    )
+    assert second.returncode == 0, second.stderr
+    after = json.loads(Path(_assignments(second.stdout)["TARGET_MANIFEST"]).read_text())
+
+    assert after["built_at"] == before["built_at"]
+    assert after["archive_release_date"] == before["archive_release_date"]
+    # the symbols themselves are newly recorded, so this really was an upgrade
+    assert after["dbgsym_version"] == "6.8.0-31.31"
+    assert before["dbgsym_version"] is None
+
+
+def test_an_upgrade_interrupted_before_the_stamp_rename_does_not_rebuild(mktarget_env):
+    """The reuse path keeps the old stamp on purpose, but it rewrites
+    target.json first -- and the manifest grows once dbgsym_version and the DWARF
+    fields appear. A kill between those two writes left a manifest the old stamp
+    disagreed with, and while the manifest counted as an image artifact that
+    disagreement condemned the measured rootfs on the next run.
+
+    Restoring only the old stamp after a successful upgrade reproduces exactly
+    that interruption.
+    """
+    plain = mktarget_env.run("--kernel-abi", "ga")
+    assert plain.returncode == 0, plain.stderr
+    a = _assignments(plain.stdout)
+    rootfs, outdir = Path(a["ROOTFS"]), Path(a["ROOTFS"]).parent
+    stamp = outdir / ".mktarget-stamp"
+    old_stamp = stamp.read_bytes()
+    built_at = json.loads(Path(a["TARGET_MANIFEST"]).read_text())["built_at"]
+    before = (rootfs.read_bytes(), rootfs.stat().st_mtime_ns)
+
+    upgraded = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert upgraded.returncode == 0, upgraded.stderr
+
+    # the interruption: metadata is the post-upgrade version, the stamp is not
+    stamp.write_bytes(old_stamp)
+    mktarget_env.clear_docker_log()
+
+    after = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert after.returncode == 0, after.stderr
+
+    verbs = [c[0] for c in mktarget_env.docker_calls()]
+    assert "build" not in verbs, "an interrupted upgrade rebuilt the image"
+    assert "export" not in verbs, "an interrupted upgrade regenerated the rootfs"
+    assert (rootfs.read_bytes(), rootfs.stat().st_mtime_ns) == before
+
+    manifest = json.loads(Path(_assignments(after.stdout)["TARGET_MANIFEST"]).read_text())
+    assert manifest["dbgsym_version"] == "6.8.0-31.31"
+    assert manifest["built_at"] == built_at
+    # and the repaired directory is a clean hit from here on
+    mktarget_env.clear_docker_log()
+    again = mktarget_env.run("--kernel-abi", "ga", "--symbols", fail_if_docker_runs=True)
+    assert again.returncode == 0, again.stderr
+
+
+def test_stale_metadata_on_a_symbol_target_does_not_refetch_symbols(mktarget_env):
+    """Repairing metadata is not a reason to re-download 1.9 GB. Extraction used
+    to key off "are we reusing the image" rather than "are the symbols short",
+    so a stale manifest on a target whose symbols were perfectly intact pulled
+    the whole ddeb again."""
+    first = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert first.returncode == 0, first.stderr
+    a = _assignments(first.stdout)
+    manifest = Path(a["TARGET_MANIFEST"])
+    vmlinux = Path(a["VMLINUX"])
+    vm_before = (vmlinux.read_bytes(), vmlinux.stat().st_mtime_ns)
+    manifest.write_text("{ truncated")
+    mktarget_env.clear_docker_log()
+
+    # no docker at all: not a build, not an export, and not the ddeb helper
+    second = mktarget_env.run("--kernel-abi", "ga", "--symbols", fail_if_docker_runs=True)
+    assert second.returncode == 0, second.stderr
+    assert not mktarget_env.docker_calls()
+
+    assert (vmlinux.read_bytes(), vmlinux.stat().st_mtime_ns) == vm_before
+    assert "VMLINUX=" in second.stdout
+    assert json.loads(manifest.read_text())["dbgsym_version"] == "6.8.0-31.31"
+
+
+@pytest.mark.parametrize("level", ["--symbols", "--symbols=full"])
+def test_a_plain_metadata_repair_does_not_forget_cached_symbols(mktarget_env, level):
+    """A repair run without --symbols rewrote the stamp as symbols=none with no
+    symbol rows, silently discarding the record of symbols still sitting in the
+    directory -- so the next --symbols run downloaded them all over again."""
+    first = mktarget_env.run("--kernel-abi", "ga", level)
+    assert first.returncode == 0, first.stderr
+    a = _assignments(first.stdout)
+    outdir = Path(a["ROOTFS"]).parent
+    vmlinux = Path(a["VMLINUX"])
+    vm_before = (vmlinux.read_bytes(), vmlinux.stat().st_mtime_ns)
+    Path(a["TARGET_MANIFEST"]).write_text("{ truncated")
+    mktarget_env.clear_docker_log()
+
+    # plain repair: no symbols asked for, and none needed from the network
+    plain = mktarget_env.run("--kernel-abi", "ga", fail_if_docker_runs=True)
+    assert plain.returncode == 0, plain.stderr
+    assert not mktarget_env.docker_calls()
+    # stdout still reflects what THIS run asked for
+    assert "VMLINUX=" not in plain.stdout
+
+    # but the record kept what the directory actually holds
+    expected = "full" if level == "--symbols=full" else "vmlinux"
+    stamp = dict(
+        (r.split("\t")[0], r.split("\t", 1)[1])
+        for r in (outdir / ".mktarget-stamp").read_text().splitlines()
+    )
+    assert stamp["symbols"] == expected
+    assert any(
+        r.startswith("symbol\t")
+        for r in (outdir / ".mktarget-stamp").read_text().splitlines()
+    )
+    if expected == "full":
+        assert "moddbg" in stamp
+    manifest = json.loads(Path(a["TARGET_MANIFEST"]).read_text())
+    assert manifest["dbgsym_version"] == "6.8.0-31.31"
+
+    # so asking again is a plain hit, with nothing re-downloaded
+    mktarget_env.clear_docker_log()
+    again = mktarget_env.run("--kernel-abi", "ga", level, fail_if_docker_runs=True)
+    assert again.returncode == 0, again.stderr
+    assert not mktarget_env.docker_calls()
+    assert "VMLINUX=" in again.stdout
+    assert (vmlinux.read_bytes(), vmlinux.stat().st_mtime_ns) == vm_before
+
+
+@pytest.mark.parametrize(
+    "level,damage",
+    [
+        ("--symbols", "truncate-vmlinux"),
+        ("--symbols=full", "truncate-vmlinux"),
+        ("--symbols=full", "empty-module-tree"),
+    ],
+)
+def test_a_plain_repair_does_not_ratify_damaged_symbols(mktarget_env, level, damage):
+    """A metadata-only repair does not validate the symbols, so it must not
+    re-measure them either.
+
+    Recomputing sizes and tree shapes from files nobody checked writes the
+    DAMAGE into the stamp as though it were correct -- after which the later
+    --symbols request compares the damaged files against a record of themselves,
+    matches, and hands back a truncated vmlinux (or a module tree with no .ko in
+    it) as a cache hit.
+    """
+    first = mktarget_env.run("--kernel-abi", "ga", level)
+    assert first.returncode == 0, first.stderr
+    a = _assignments(first.stdout)
+    rootfs, vmlinux = Path(a["ROOTFS"]), Path(a["VMLINUX"])
+    outdir = rootfs.parent
+    mods = outdir / "usr/lib/debug/lib/modules" / a["KERNEL_RELEASE"]
+    rootfs_before = (rootfs.read_bytes(), rootfs.stat().st_mtime_ns)
+
+    if damage == "truncate-vmlinux":
+        vmlinux.write_bytes(b"EL")
+    else:
+        for ko in mods.rglob("*.ko"):
+            ko.unlink()
+        assert mods.is_dir() and not list(mods.rglob("*.ko"))
+    Path(a["TARGET_MANIFEST"]).write_text("{ truncated")
+    mktarget_env.clear_docker_log()
+
+    # plain repair: touches metadata only, and must not bless the damage
+    plain = mktarget_env.run("--kernel-abi", "ga", fail_if_docker_runs=True)
+    assert plain.returncode == 0, plain.stderr
+    assert not mktarget_env.docker_calls()
+
+    # the damage is still detectable, so the later request refetches
+    mktarget_env.clear_docker_log()
+    again = mktarget_env.run("--kernel-abi", "ga", level)
+    assert again.returncode == 0, again.stderr
+
+    verbs = [c[0] for c in mktarget_env.docker_calls()]
+    assert "build" not in verbs, "repairing symbols rebuilt the image"
+    assert "export" not in verbs, "repairing symbols regenerated the rootfs"
+    assert any(
+        c[0] == "run" and "dbgsym" in c[-1] for c in mktarget_env.docker_calls()
+    ), "the damaged symbols were accepted as a cache hit"
+
+    assert (rootfs.read_bytes(), rootfs.stat().st_mtime_ns) == rootfs_before
+    assert vmlinux.stat().st_size > 2
+    if level == "--symbols=full":
+        assert list(mods.rglob("*.ko"))
+
+
+def test_a_plain_repair_keeps_the_symbol_expectation_when_vmlinux_is_gone(mktarget_env):
+    """Same rule with the file removed outright: the expectation is preserved,
+    so the next symbol request notices it is missing and refetches."""
+    first = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert first.returncode == 0, first.stderr
+    a = _assignments(first.stdout)
+    outdir = Path(a["ROOTFS"]).parent
+    Path(a["VMLINUX"]).unlink()
+    Path(a["TARGET_MANIFEST"]).write_text("{ truncated")
+    mktarget_env.clear_docker_log()
+
+    plain = mktarget_env.run("--kernel-abi", "ga", fail_if_docker_runs=True)
+    assert plain.returncode == 0, plain.stderr
+    assert "VMLINUX=" not in plain.stdout
+
+    stamp_text = (outdir / ".mktarget-stamp").read_text()
+    assert "symbols\tvmlinux" in stamp_text
+    assert any(r.startswith("symbol\t") for r in stamp_text.splitlines())
+
+    mktarget_env.clear_docker_log()
+    again = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert again.returncode == 0, again.stderr
+    assert "build" not in [c[0] for c in mktarget_env.docker_calls()]
+    assert Path(a["VMLINUX"]).exists()
+
+
+def test_stale_metadata_is_regenerated_rather_than_rebuilt(mktarget_env):
+    """target.json and qmu.toml are regenerable on the host from what is already
+    on disk, so damaging one must cost a rewrite, never a rootfs."""
+    first = mktarget_env.run("--kernel-abi", "ga")
+    assert first.returncode == 0, first.stderr
+    a = _assignments(first.stdout)
+    rootfs = Path(a["ROOTFS"])
+    manifest, toml = Path(a["TARGET_MANIFEST"]), Path(a["QMU_TOML"])
+    before = (rootfs.read_bytes(), rootfs.stat().st_mtime_ns)
+    built_at = json.loads(manifest.read_text())["built_at"]
+
+    manifest.write_text("{ truncated")
+    toml.write_text("")
+    mktarget_env.clear_docker_log()
+
+    second = mktarget_env.run("--kernel-abi", "ga")
+    assert second.returncode == 0, second.stderr
+    verbs = [c[0] for c in mktarget_env.docker_calls()]
+    assert "build" not in verbs, "stale metadata rebuilt the image"
+    assert "export" not in verbs, "stale metadata regenerated the rootfs"
+    assert (rootfs.read_bytes(), rootfs.stat().st_mtime_ns) == before
+
+    # regenerated, valid, and still dating the image it describes -- recovered
+    # from the stamp, since the manifest itself was the damaged file
+    repaired = json.loads(manifest.read_text())
+    assert repaired["built_at"] == built_at
+    assert repaired["archive_release_date"] == "Thu, 25 Apr 2024 15:10:33 UTC"
+    assert "[profiles.ubuntu-target]" in toml.read_text()
+
+
 def test_a_failed_symbols_upgrade_leaves_the_cached_target_usable(mktarget_env):
     """The image was never touched, so a failed symbol fetch must not condemn a
     good target to a full rebuild."""
@@ -1146,6 +1564,76 @@ def test_initrd_is_not_emitted_without_initramfs_even_if_cached(mktarget_env):
     assert "INITRD=" not in plain.stdout
 
 
+# --- generated SSH key --------------------------------------------------------
+
+
+def _key_loads(path: Path) -> bool:
+    return subprocess.run(
+        ["ssh-keygen", "-y", "-P", "", "-f", str(path)],
+        capture_output=True, check=False,
+    ).returncode == 0
+
+
+@pytest.mark.parametrize("damage", [b"", b"not a key at all\n"])
+def test_an_unusable_generated_private_key_is_not_a_cache_hit(mktarget_env, damage):
+    """The gate tested -f, so a zero-byte or corrupt key was a HIT: rc 0, and
+    SSH_KEY on stdout pointing at a file no ssh will ever load. The failure then
+    surfaced as an unexplained connection refusal against a guest that had
+    booted perfectly."""
+    first = mktarget_env.run("--kernel-abi", "ga")
+    assert first.returncode == 0, first.stderr
+    key = Path(_assignments(first.stdout)["SSH_KEY"])
+    assert _key_loads(key)
+
+    key.write_bytes(damage)
+    assert not _key_loads(key)
+    mktarget_env.clear_docker_log()
+
+    second = mktarget_env.run("--kernel-abi", "ga")
+    assert second.returncode == 0, second.stderr
+    # the cached image trusts a key that no longer exists, so it must rebuild
+    assert any(c[0] == "build" for c in mktarget_env.docker_calls())
+    emitted = Path(_assignments(second.stdout)["SSH_KEY"])
+    assert _key_loads(emitted), "an unusable key was emitted as SSH_KEY"
+
+
+def test_a_missing_public_half_is_recovered_without_rebuilding(mktarget_env):
+    """The public half is derivable from the private half, so losing it is
+    repairable in place rather than a reason to discard a working target."""
+    first = mktarget_env.run("--kernel-abi", "ga")
+    assert first.returncode == 0, first.stderr
+    key = Path(_assignments(first.stdout)["SSH_KEY"])
+    pub = Path(str(key) + ".pub")
+    original = pub.read_text()
+    pub.unlink()
+    mktarget_env.clear_docker_log()
+
+    second = mktarget_env.run("--kernel-abi", "ga", fail_if_docker_runs=True)
+    assert second.returncode == 0, second.stderr
+    assert pub.exists()
+    # same key material, even if the trailing comment differs
+    assert pub.read_text().split()[:2] == original.split()[:2]
+
+
+def test_an_externally_supplied_key_is_never_rewritten(mktarget_env, tmp_path):
+    """--ssh-key belongs to the caller: it is not inspected, regenerated or
+    rewritten, however odd it looks."""
+    key = tmp_path / "mine"
+    subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key), "-C", "mine"],
+        check=True, capture_output=True,
+    )
+    pub = Path(str(key) + ".pub")
+    pub_before = pub.read_text()
+    priv_before = key.read_bytes()
+
+    r = mktarget_env.run("--kernel-abi", "ga", "--ssh-key", str(key))
+    assert r.returncode == 0, r.stderr
+    assert _assignments(r.stdout)["SSH_KEY"] == str(key)
+    assert key.read_bytes() == priv_before
+    assert pub.read_text() == pub_before
+
+
 # --- attribution --------------------------------------------------------------
 
 
@@ -1167,3 +1655,28 @@ def test_userland_package_versions_are_recorded(mktarget_env):
     assert rows["procps"] == "2:4.0.4-4ubuntu3.2"
     # a package whose files were removed is not installed and must not be listed
     assert "removed-but-configured" not in rows
+
+
+# --- documented recipes -------------------------------------------------------
+
+
+def test_the_modules_extra_check_loads_every_module_and_fails_closed():
+    """`modprobe a b c` treats b and c as PARAMETERS of a, so the documented
+    one-liner loaded nf_tables and verified nothing else -- while still exiting
+    0, which is what made it look like a passing check."""
+    skill = ROOT.joinpath("skills/qmu-ubuntu-target/SKILL.md").read_text()
+    assert "modprobe nf_tables ksmbd hfsplus n_gsm" not in skill
+    # the exec that actually runs modprobe, not the comment above it
+    recipe = next(
+        block for block in skill.split("qmu exec") if 'modprobe "$m"' in block
+    )
+    # one invocation per module...
+    assert "for m in nf_tables ksmbd hfsplus n_gsm" in recipe
+    # ...and a missing one has to fail the exec, not just print
+    assert "exit 1" in recipe
+
+    # the snippet the docs hand the user must actually be valid sh
+    snippet = recipe.split("'")[1]
+    assert (
+        subprocess.run(["sh", "-n", "-c", snippet], capture_output=True).returncode == 0
+    ), snippet
