@@ -14,6 +14,11 @@ Use it when the answer has to be about **Ubuntu**. Use `qmu-linux-kbuild` +
 `qmu-linux-rootfs` instead when you want to control the kernel source and config
 (bug triage, KASAN, syzkaller repros).
 
+The script ships in the qmu project's `tools/` directory and is not on `PATH`;
+resolve it relative to the install location — from this skill's directory that is
+`../../tools/mktarget.sh`, or from a checkout of the qmu repo just
+`tools/mktarget.sh` (the form used below).
+
 | | `kbuild.sh` + `mkrootfs.sh` | `mktarget.sh` |
 |---|---|---|
 | kernel | upstream kernel.org, your config | Ubuntu's `-generic`, Ubuntu's config |

@@ -387,6 +387,62 @@ def test_container_marker_is_stripped_after_export(mktarget_env):
     assert inner.index("dockerenv") < inner.index("mke2fs")
 
 
+def test_guest_stamp_is_deterministic_across_rebuilds(mktarget_env):
+    """GUEST_STAMP is a build-arg, so any value that changes between runs
+    invalidates BuildKit's cache from the ARG declaration onward and re-runs the
+    whole apt install -- ~12 minutes under qemu-user for a cross-arch target."""
+    first = mktarget_env.run("--kernel-abi", "ga")
+    assert first.returncode == 0, first.stderr
+    stamp1 = next(
+        a for c in mktarget_env.docker_calls() if c[0] == "build"
+        for a in c if a.startswith("GUEST_STAMP=")
+    )
+    mktarget_env.clear_docker_log()
+
+    # force a real rebuild rather than a cache hit
+    Path(_assignments(first.stdout)["ROOTFS"]).unlink()
+    second = mktarget_env.run("--kernel-abi", "ga")
+    assert second.returncode == 0, second.stderr
+    stamp2 = next(
+        a for c in mktarget_env.docker_calls() if c[0] == "build"
+        for a in c if a.startswith("GUEST_STAMP=")
+    )
+
+    assert stamp1 == stamp2
+    # the volatile fields belong to the host manifest only
+    assert "built_at" not in stamp1
+    assert "archive_release_date" not in stamp1
+    manifest = json.loads(Path(_assignments(second.stdout)["TARGET_MANIFEST"]).read_text())
+    assert manifest["built_at"]
+    assert manifest["archive_release_date"]
+
+
+def test_mke2fs_helper_runs_on_the_host_platform(mktarget_env):
+    """Untarring an export and writing ext4 is arch-independent, but after a
+    cross-arch build the local ubuntu:<suite> tag points at the target-arch
+    image -- so an unpinned helper would run under qemu-user and emulate tar
+    and mke2fs for minutes."""
+    r = mktarget_env.run("--arch", "arm64", "--kernel-abi", "ga")
+    assert r.returncode == 0, r.stderr
+    mke2fs = next(
+        c for c in mktarget_env.docker_calls()
+        if c[0] == "run" and "mke2fs" in c[-1]
+    )
+    platform = mke2fs[mke2fs.index("--platform") + 1]
+    assert platform != "linux/arm64", "helper was pinned to the TARGET platform"
+    assert platform in ("linux/amd64", "linux/arm64")
+
+    # the symbols helper, by contrast, MUST be the target platform: it runs
+    # `apt-get download` and would otherwise resolve the wrong arch's ddeb
+    r2 = mktarget_env.run("--arch", "arm64", "--kernel-abi", "ga", "--symbols")
+    assert r2.returncode == 0, r2.stderr
+    sym = next(
+        c for c in mktarget_env.docker_calls()
+        if c[0] == "run" and "dbgsym" in c[-1]
+    )
+    assert sym[sym.index("--platform") + 1] == "linux/arm64"
+
+
 def test_fidelity_is_the_default_and_is_recorded(mktarget_env):
     r = mktarget_env.run("--kernel-abi", "ga")
     assert r.returncode == 0, r.stderr

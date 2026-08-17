@@ -197,27 +197,40 @@ IDXDIR="$(mktemp -d)"
 cleanup_idx() { [[ -n "${IDXDIR:-}" ]] && rm -rf -- "$IDXDIR"; }
 trap cleanup_idx EXIT
 
+# _fetch_gz <url> <outfile> -> 0 on success. Retried: a single transient
+# archive hiccup should not abort a build that is otherwise minutes long, and
+# one was observed in practice while the network was busy.
+_fetch_gz() {
+  local url="$1" out="$2" attempt
+  for attempt in 1 2 3; do
+    if curl -sSfL --max-time 180 "$url" 2>/dev/null | gunzip > "$out" 2>/dev/null; then
+      [[ -s "$out" ]] && return 0
+    fi
+    rm -f -- "$out"
+    [[ "$attempt" -lt 3 ]] && sleep $((attempt * 2))
+  done
+  return 1
+}
+
 # fetch_index <pocket> -> path to decompressed Packages, or empty on failure
 fetch_index() {
   local pocket="$1" out="$IDXDIR/pkg-$1"
   if [[ -f "$out" ]]; then printf '%s' "$out"; return 0; fi
-  local url="$MIRROR/dists/$pocket/main/binary-$DEBARCH/Packages.gz"
-  if curl -sSfL --max-time 180 "$url" 2>/dev/null | gunzip > "$out" 2>/dev/null; then
+  if _fetch_gz "$MIRROR/dists/$pocket/main/binary-$DEBARCH/Packages.gz" "$out"; then
     printf '%s' "$out"
   else
-    rm -f -- "$out"
     printf ''
   fi
 }
 
+# Absence is normal here, not an error: ddebs carries <suite> and
+# <suite>-updates but no <suite>-security.
 fetch_ddebs_index() {
   local pocket="$1" out="$IDXDIR/ddeb-$1"
   if [[ -f "$out" ]]; then printf '%s' "$out"; return 0; fi
-  local url="$DDEBS_MIRROR/dists/$pocket/main/binary-$DEBARCH/Packages.gz"
-  if curl -sSfL --max-time 180 "$url" 2>/dev/null | gunzip > "$out" 2>/dev/null; then
+  if _fetch_gz "$DDEBS_MIRROR/dists/$pocket/main/binary-$DEBARCH/Packages.gz" "$out"; then
     printf '%s' "$out"
   else
-    rm -f -- "$out"
     printf ''
   fi
 }
@@ -522,6 +535,20 @@ PUBKEY_CONTENT="$(cat "${PRIVKEY}.pub")"
 command -v docker >/dev/null 2>&1 || die "docker not found in PATH"
 
 HOST_ARCH="$(uname -m)"
+
+# The mke2fs helper must run on the HOST platform, not the target's. It only
+# untars an exported filesystem and writes an ext4 image, which is entirely
+# arch-independent -- but after a cross-arch target build the local
+# `ubuntu:<suite>` tag points at the target-arch image, so an unqualified
+# `docker run` would execute the helper under qemu-user and spend minutes
+# emulating `tar` and `mke2fs` for no reason. (mkrootfs.sh avoids this only by
+# accident, by hardcoding debian:bookworm-slim.)
+HELPER_PLATFORM=()
+case "$HOST_ARCH" in
+  x86_64)  HELPER_PLATFORM=(--platform linux/amd64) ;;
+  aarch64) HELPER_PLATFORM=(--platform linux/arm64) ;;
+esac
+
 NEED_BINFMT=false
 case "$ARCH" in
   x86_64) [[ "$HOST_ARCH" != "x86_64"  ]] && NEED_BINFMT=true ;;
@@ -575,10 +602,16 @@ ARCHIVE_DATE="$( { curl -sSfL --max-time 60 "$MIRROR/dists/$KPOCKET/Release" 2>/
 # kernels), and a stamp that silently fails to appear is worse than none. The
 # host-side target.json is the authoritative copy and additionally carries the
 # artifact hashes, which cannot be known before the image exists.
+#
+# Every field here MUST be deterministic given the cache key. It is passed as a
+# build-arg, so a value that changes between runs invalidates BuildKit's cache
+# from the ARG declaration onward and re-runs the whole apt install -- which
+# under qemu-user emulation for a cross-arch target costs ~12 minutes on every
+# rebuild. `built_at` and the pocket's mutable `archive_release_date` therefore
+# live only in the host-side target.json.
 GUEST_STAMP="$(cat <<JSON
 {
   "mktarget_version": "$MKTARGET_VERSION",
-  "built_at": "$BUILT_AT",
   "distro": "ubuntu",
   "suite": "$SUITE",
   "pocket": "$KPOCKET",
@@ -588,11 +621,10 @@ GUEST_STAMP="$(cat <<JSON
   "kernel_release": "$KREL",
   "kernel_deb_version": "$KDEBVER",
   "kernel_image_package": "$KPKG",
-  "archive_release_date": "${ARCHIVE_DATE:-unknown}",
   "hardening": "$HARDENING",
   "modules_extra": $MODULES_EXTRA,
   "unpriv_user": "$UNPRIV_USER",
-  "note": "authoritative copy with artifact hashes is target.json in the build outdir"
+  "note": "authoritative copy, with build time and artifact hashes, is target.json in the build outdir"
 }
 JSON
 )"
@@ -955,6 +987,7 @@ step "Creating raw ext4 image ($SIZE)"
 # The if/else form is required under `set -euo pipefail` so a failed helper
 # pipeline can fall back to host sudo mke2fs instead of aborting immediately.
 if docker export "$CID" | docker run --rm -i \
+  "${HELPER_PLATFORM[@]}" \
   -v "$OUTDIR:/output" \
   "ubuntu:$SUITE" \
   bash -c "
