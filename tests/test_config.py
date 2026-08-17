@@ -114,6 +114,34 @@ def test_defaults_only(isolate_config):
     assert cfg._sources == ["built-in defaults"]
 
 
+def test_distro_target_profiles_do_not_disable_the_lsm_stack():
+    """The whole point of a distro target is that its hardening is real.
+
+    On Ubuntu, AppArmor *is* the LSM (CONFIG_LSM ends in "apparmor") and the
+    shipped `unprivileged_userns` profile decides whether an unprivileged user
+    namespace can be created at all -- the primitive most modern LPEs open with.
+    `apparmor=0` silently flips that, turning a PoC result into a statement
+    about nothing. `kasan.fault=` is likewise inert on a distro kernel (no
+    KASAN) and only misleads.
+    """
+    for name in ("ubuntu-target", "ubuntu-debug", "ubuntu-trigger"):
+        cmdline = DEFAULT_PROFILES[name]
+        assert "apparmor=0" not in cmdline, name
+        assert "selinux=0" not in cmdline, name
+        assert "kasan.fault" not in cmdline, name
+        # Ubuntu's kernel mounts / from a plain virtio/ATA drive and needs it rw
+        assert "rw" in cmdline.split(), name
+
+    # Only the debug profile may disable KASLR, and it must be explicit about
+    # it: a silent nokaslr would make every measured address meaningless.
+    assert "nokaslr" in DEFAULT_PROFILES["ubuntu-debug"]
+    assert "nokaslr" not in DEFAULT_PROFILES["ubuntu-target"]
+    assert "nokaslr" not in DEFAULT_PROFILES["ubuntu-trigger"]
+
+    # And the exploit-dev family keeps its existing behaviour untouched.
+    assert "apparmor=0" in DEFAULT_PROFILES["exploit-dev"]
+
+
 def test_global_overrides_defaults(isolate_config):
     _global_config(isolate_config, '[machine]\nmemory = "8G"\n')
     cfg = resolve_config()
