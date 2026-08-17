@@ -18,7 +18,7 @@
 #              --profile "$PROFILE"
 set -euo pipefail
 
-MKTARGET_VERSION="1"
+MKTARGET_VERSION="2"
 
 # ---------------------------------------------------------------------------
 # defaults
@@ -199,42 +199,90 @@ IDXDIR="$(mktemp -d)"
 cleanup_idx() { [[ -n "${IDXDIR:-}" ]] && rm -rf -- "$IDXDIR"; }
 trap cleanup_idx EXIT
 
-# _fetch_gz <url> <outfile> -> 0 on success. Retried: a single transient
-# archive hiccup should not abort a build that is otherwise minutes long, and
-# one was observed in practice while the network was busy.
+INDEX_FAULT_FILE="$IDXDIR/index-fault"
+
+# A fetch fault is RECORDED rather than raised on the spot. fetch_index runs
+# inside command substitutions, several of them under `|| true`, where a `die`
+# would only kill the subshell and be swallowed -- so the main shell checks this
+# marker after every collection instead.
+note_index_fault() { printf '%s\n' "$1" >> "$INDEX_FAULT_FILE"; }
+
+assert_no_index_fault() {
+  [[ -f "$INDEX_FAULT_FILE" ]] || return 0
+  {
+    echo "mktarget: error: could not read the archive index:"
+    sed 's/^/    /' "$INDEX_FAULT_FILE"
+    echo "  This is a fetch fault, not an empty pocket. Resolving an ABI from a"
+    echo "  partial view of the archive would silently break the pin -- e.g."
+    echo "  --kernel-abi latest returning the GA kernel because -updates timed"
+    echo "  out -- so the build stops here rather than producing a result that"
+    echo "  cannot be attributed. Retry when the mirror is reachable."
+  } >&2
+  exit 2
+}
+
+# _fetch_gz <url> <outfile>
+#   0 -> fetched and decompressed
+#   2 -> the server answered 404: this index legitimately does not exist
+#   1 -> anything else (timeout, DNS, 5xx, truncated body)
+#
+# The 1/2 split is the point. Both used to collapse into "empty", so a
+# -updates pocket that merely timed out looked identical to one with no
+# kernels in it, and `--kernel-abi latest` would happily return the GA kernel
+# as "latest". Retried on faults only; a 404 is definitive and returns at once.
 _fetch_gz() {
-  local url="$1" out="$2" attempt
+  local url="$1" out="$2" attempt code
+  # Separate `local`: all words of a `local` are expanded before the builtin
+  # assigns any of them, so "$out.gz.part" on the line above would have expanded
+  # $out from the enclosing scope (empty) and written ./.gz.part instead.
+  local tmp="$out.gz.part"
   for attempt in 1 2 3; do
-    if curl -sSfL --max-time 180 "$url" 2>/dev/null | gunzip > "$out" 2>/dev/null; then
-      [[ -s "$out" ]] && return 0
+    code="$(curl -sSL --max-time 180 -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null || true)"
+    if [[ "$code" == "200" ]] && gunzip -c "$tmp" > "$out" 2>/dev/null && [[ -s "$out" ]]; then
+      rm -f -- "$tmp"
+      return 0
     fi
-    rm -f -- "$out"
+    rm -f -- "$out" "$tmp"
+    [[ "$code" == "404" ]] && return 2
     [[ "$attempt" -lt 3 ]] && sleep $((attempt * 2))
   done
   return 1
 }
 
-# fetch_index <pocket> -> path to decompressed Packages, or empty on failure
+# fetch_index <pocket> -> path to decompressed Packages, or "" if the pocket
+# genuinely has no index. A fetch fault records a fault marker and yields "",
+# which assert_no_index_fault then turns into a hard failure in the main shell.
 fetch_index() {
-  local pocket="$1" out="$IDXDIR/pkg-$1"
+  local pocket="$1" out="$IDXDIR/pkg-$1" url rc=0
   if [[ -f "$out" ]]; then printf '%s' "$out"; return 0; fi
-  if _fetch_gz "$MIRROR/dists/$pocket/main/binary-$DEBARCH/Packages.gz" "$out"; then
-    printf '%s' "$out"
-  else
-    printf ''
-  fi
+  if [[ -f "$IDXDIR/absent-pkg-$pocket" ]]; then printf ''; return 0; fi
+  url="$MIRROR/dists/$pocket/main/binary-$DEBARCH/Packages.gz"
+  _fetch_gz "$url" "$out" || rc=$?
+  case "$rc" in
+    0) printf '%s' "$out" ;;
+    2) : > "$IDXDIR/absent-pkg-$pocket"
+       warn "no binary-$DEBARCH index for pocket '$pocket' (404); treating it as empty"
+       printf '' ;;
+    *) note_index_fault "$url"
+       printf '' ;;
+  esac
 }
 
 # Absence is normal here, not an error: ddebs carries <suite> and
-# <suite>-updates but no <suite>-security.
+# <suite>-updates but no <suite>-security. A fault is still a fault.
 fetch_ddebs_index() {
-  local pocket="$1" out="$IDXDIR/ddeb-$1"
+  local pocket="$1" out="$IDXDIR/ddeb-$1" url rc=0
   if [[ -f "$out" ]]; then printf '%s' "$out"; return 0; fi
-  if _fetch_gz "$DDEBS_MIRROR/dists/$pocket/main/binary-$DEBARCH/Packages.gz" "$out"; then
-    printf '%s' "$out"
-  else
-    printf ''
-  fi
+  if [[ -f "$IDXDIR/absent-ddeb-$pocket" ]]; then printf ''; return 0; fi
+  url="$DDEBS_MIRROR/dists/$pocket/main/binary-$DEBARCH/Packages.gz"
+  _fetch_gz "$url" "$out" || rc=$?
+  case "$rc" in
+    0) printf '%s' "$out" ;;
+    2) : > "$IDXDIR/absent-ddeb-$pocket"
+       printf '' ;;
+    *) note_index_fault "$url"
+       printf '' ;;
+  esac
 }
 
 # kernel_rows <packages-file> -> "<abi> <debversion> <pkgname>" per line
@@ -339,8 +387,10 @@ collect_all_dbgsym() {
 if [[ "$LIST_ABIS" == true ]]; then
   step "Querying $MIRROR for $SUITE/$DEBARCH $FLAVOUR kernels"
   ROWS="$(collect_all_rows || true)"
+  assert_no_index_fault
   [[ -n "$ROWS" ]] || die "no $FLAVOUR kernels found for $SUITE/$DEBARCH at $MIRROR"
   DBG="$(collect_all_dbgsym || true)"
+  assert_no_index_fault
   {
     printf '%-14s %-18s %-18s %s\n' "ABI" "DEB VERSION" "POCKET" "DBGSYM"
     while IFS=$'\t' read -r abi ver pkg pocket; do
@@ -426,6 +476,9 @@ resolve_abi() {
 
 step "Resolving kernel ABI ($SUITE/$DEBARCH, flavour $FLAVOUR, spec '$KERNEL_ABI_SPEC')"
 IFS=$'\t' read -r KABI KDEBVER KPKG KPOCKET <<<"$(resolve_abi)"
+# Before trusting the answer: a pocket that faulted rather than being empty
+# makes every resolution above unsound, most of all `latest`.
+assert_no_index_fault
 [[ -n "$KABI" && -n "$KDEBVER" ]] || die "ABI resolution failed"
 KREL="$KABI-$FLAVOUR"
 log "resolved: ABI=$KABI deb=$KDEBVER pkg=$KPKG pocket=$KPOCKET"
@@ -435,6 +488,7 @@ log "resolved: ABI=$KABI deb=$KDEBVER pkg=$KPKG pocket=$KPOCKET"
 DBGSYM_AVAILABLE=false
 if [[ "$SYMBOLS" != "none" ]]; then
   DBG_ALL="$(collect_all_dbgsym || true)"
+  assert_no_index_fault
   if grep -qx -- "$KABI" <<<"$DBG_ALL"; then
     DBGSYM_AVAILABLE=true
     log "dbgsym available for $KABI (~1.9 GB unpacked; only vmlinux is extracted)"
@@ -451,13 +505,78 @@ if [[ "$SYMBOLS" != "none" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# output directory + cache completeness
+# SSH key (validated here, before the build key, which hashes the public half)
+# ---------------------------------------------------------------------------
+if [[ -n "$SSH_KEY_ARG" ]]; then
+  [[ -f "$SSH_KEY_ARG" ]] || die "SSH private key not found: $SSH_KEY_ARG"
+  [[ -f "${SSH_KEY_ARG}.pub" ]] || die "SSH public key not found: ${SSH_KEY_ARG}.pub"
+fi
+
+# ---------------------------------------------------------------------------
+# build key -- a digest of everything that changes the image produced
+#
+# The cache directory is named for the ABI, flavour and hardening only, because
+# that is the part a human wants to find on disk. Every OTHER build-affecting
+# input goes into this digest, which the completion stamp records and every
+# cache hit re-checks. Without it the directory alone decided identity, so a run
+# differing only in --headers / --packages / --size / --unpriv-user / --ssh-key,
+# or one whose ABI now resolves to a NEWER deb version, was handed the old image
+# while stdout advertised the newly requested parameters.
+#
+# --symbols is deliberately NOT in the digest: symbols are a side artifact next
+# to the image rather than part of it, so adding them to an existing target must
+# not force the rootfs to be rebuilt. The stamp tracks symbol completeness.
+# ---------------------------------------------------------------------------
+build_key_material() {
+  printf 'mktarget\t%s\n'  "$MKTARGET_VERSION"
+  printf 'suite\t%s\n'     "$SUITE"
+  printf 'arch\t%s\n'      "$ARCH"
+  printf 'flavour\t%s\n'   "$FLAVOUR"
+  printf 'abi\t%s\n'       "$KABI"
+  printf 'debver\t%s\n'    "$KDEBVER"
+  printf 'imagepkg\t%s\n'  "$KPKG"
+  printf 'relax\t%s\n'     "$RELAX"
+  printf 'modext\t%s\n'    "$MODULES_EXTRA"
+  printf 'headers\t%s\n'   "$HEADERS"
+  printf 'initramfs\t%s\n' "$INITRAMFS"
+  printf 'size\t%s\n'      "$SIZE"
+  printf 'unpriv\t%s\n'    "$UNPRIV_USER"
+  # order-insensitive: --packages a,b and --packages b,a build the same image
+  printf 'packages\t%s\n' \
+    "$(printf '%s' "${PACKAGES//,/ }" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd, -)"
+  # Only an EXTERNALLY supplied key can disagree with what is baked into a
+  # cached image; the generated key lives inside the output directory and is by
+  # construction the one that directory's image already trusts.
+  if [[ -n "$SSH_KEY_ARG" ]]; then
+    printf 'sshpub\t%s\n' "$(awk '{print $1, $2}' "${SSH_KEY_ARG}.pub")"
+  else
+    printf 'sshpub\tgenerated\n'
+  fi
+}
+BUILD_KEY="$(build_key_material | sha256sum | awk '{print $1}')"
+
+# ---------------------------------------------------------------------------
+# output directory
 #
 # The -relaxed suffix keeps a hardening-relaxed image from ever being served
-# from cache to a fidelity request (or vice versa).
+# from cache to a fidelity request (or vice versa). A build that differs from
+# the defaults in any other way gets its own directory keyed by the build
+# digest, so alternating (say) --headers with a plain build caches both instead
+# of rebuilding each time. Correctness does not rest on this -- the stamp check
+# does -- it only stops two legitimate variants from evicting each other.
 # ---------------------------------------------------------------------------
 VARIANT="$KABI-$FLAVOUR"
 [[ "$RELAX" == true ]] && VARIANT="$VARIANT-relaxed"
+
+DEFAULT_SHAPE=true
+[[ "$MODULES_EXTRA"  == true   ]] || DEFAULT_SHAPE=false
+[[ "$HEADERS"        == false  ]] || DEFAULT_SHAPE=false
+[[ "$INITRAMFS"      == false  ]] || DEFAULT_SHAPE=false
+[[ "$SIZE"           == "4G"   ]] || DEFAULT_SHAPE=false
+[[ "$UNPRIV_USER"    == ubuntu ]] || DEFAULT_SHAPE=false
+[[ -z "$PACKAGES"    ]]           || DEFAULT_SHAPE=false
+[[ -z "$SSH_KEY_ARG" ]]           || DEFAULT_SHAPE=false
+[[ "$DEFAULT_SHAPE"  == true   ]] || VARIANT="$VARIANT-${BUILD_KEY:0:8}"
 
 if [[ -n "$OUTDIR_OVERRIDE" ]]; then
   OUTDIR="$OUTDIR_OVERRIDE"
@@ -469,10 +588,19 @@ KERNEL_OUT="$OUTDIR/vmlinuz-$KREL"
 CONFIG_OUT="$OUTDIR/config-$KREL"
 SYSMAP_OUT="$OUTDIR/System.map-$KREL"
 VMLINUX_OUT="$OUTDIR/vmlinux-$KREL"
+MODDBG_OUT="$OUTDIR/usr/lib/debug/lib/modules/$KREL"
 INITRD_OUT="$OUTDIR/initrd.img-$KREL"
 ROOTFS_OUT="$OUTDIR/rootfs.img"
 TOML_OUT="$OUTDIR/qmu.toml"
 MANIFEST_OUT="$OUTDIR/target.json"
+PACKAGES_OUT="$OUTDIR/packages.tsv"
+STAMP_OUT="$OUTDIR/.mktarget-stamp"
+
+if [[ -n "$SSH_KEY_ARG" ]]; then
+  PRIVKEY="$SSH_KEY_ARG"
+else
+  PRIVKEY="$OUTDIR/id_ed25519"
+fi
 
 emit_outputs() {
   printf 'KERNEL=%q\n'             "$KERNEL_OUT"
@@ -486,39 +614,74 @@ emit_outputs() {
   printf 'PROFILE=%q\n'            "ubuntu-target"
   printf 'QMU_TOML=%q\n'           "$TOML_OUT"
   printf 'TARGET_MANIFEST=%q\n'    "$MANIFEST_OUT"
-  # Gated on the flag, not just the file. A vmlinux cached by an earlier
-  # --symbols run would otherwise be emitted by a plain run, so the presence of
-  # $VMLINUX could not answer "did I get symbols THIS run" -- which is exactly
-  # what the documented contract invites callers to assume.
-  [[ "$SYMBOLS" != "none" && -f "$VMLINUX_OUT" ]] && printf 'VMLINUX=%q\n' "$VMLINUX_OUT"
-  [[ -f "$INITRD_OUT" ]]  && printf 'INITRD=%q\n'  "$INITRD_OUT"
+  # Both of these are gated on the FLAG, not merely on the file existing. An
+  # artifact cached by an earlier run that asked for it would otherwise be
+  # emitted by a run that did not, so the presence of $VMLINUX / $INITRD could
+  # not answer "did I get this THIS run" -- which is exactly what the documented
+  # contract invites callers to assume.
+  [[ "$SYMBOLS"   != none && -f "$VMLINUX_OUT" ]] && printf 'VMLINUX=%q\n' "$VMLINUX_OUT"
+  [[ "$INITRAMFS" == true && -f "$INITRD_OUT"  ]] && printf 'INITRD=%q\n'  "$INITRD_OUT"
   return 0
 }
 
-# Every emitted product must exist -- mkrootfs.sh's single-file `-f rootfs.img`
-# check (mkrootfs.sh:116) reports a half-built target as cached, which is a bug
-# pattern, not a shortcut.
-cache_complete() {
-  [[ -f "$KERNEL_OUT"   ]] &&
-  [[ -f "$ROOTFS_OUT"   ]] &&
-  [[ -f "$CONFIG_OUT"   ]] &&
-  [[ -f "$SYSMAP_OUT"   ]] &&
-  [[ -f "$TOML_OUT"     ]] &&
-  [[ -f "$MANIFEST_OUT" ]] &&
-  { [[ "$SYMBOLS" == "none" ]] || [[ -f "$VMLINUX_OUT" ]]; } &&
-  { [[ "$INITRAMFS" == false ]] || [[ -f "$INITRD_OUT" ]]; }
+# stamp_get <field> -> value, or "" when the stamp has no such field
+stamp_get() {
+  [[ -f "$STAMP_OUT" ]] || return 0
+  awk -F'\t' -v k="$1" '$1 == k { print $2; exit }' "$STAMP_OUT"
 }
 
-# ---------------------------------------------------------------------------
-# SSH key
-# ---------------------------------------------------------------------------
-if [[ -n "$SSH_KEY_ARG" ]]; then
-  PRIVKEY="$SSH_KEY_ARG"
-  [[ -f "$PRIVKEY" ]] || die "SSH private key not found: $PRIVKEY"
-  [[ -f "${PRIVKEY}.pub" ]] || die "SSH public key not found: ${PRIVKEY}.pub"
-else
-  PRIVKEY="$OUTDIR/id_ed25519"
-fi
+# A cache hit must prove three things, each of which has produced a wrong answer
+# in practice:
+#
+#   1. the build FINISHED.  The stamp is removed before a build starts and
+#      written last, so an interrupted build can never look complete. The old
+#      check tested `-f` on each product, which an aborted rebuild satisfies
+#      with a mix of truncated new files and stale old ones.
+#   2. it is the SAME build. The recorded build key must equal this run's.
+#   3. the files are INTACT. Recorded byte sizes must still match -- that is
+#      what catches a truncated artifact, which `-f` happily accepts and which
+#      then boots into an unexplained kernel panic.
+cache_complete() {
+  local stamp_ver stamp_key stamp_symbols path want have
+
+  [[ -f "$STAMP_OUT" ]] || return 1
+
+  stamp_ver="$(stamp_get version)"
+  [[ "$stamp_ver" == "$MKTARGET_VERSION" ]] || {
+    log "cache rejected: stamp is from mktarget v${stamp_ver:-0}, this is v$MKTARGET_VERSION"
+    return 1
+  }
+
+  stamp_key="$(stamp_get build_key)"
+  [[ "$stamp_key" == "$BUILD_KEY" ]] || {
+    log "cache rejected: cached target was built with different options"
+    return 1
+  }
+
+  # Asking for fewer symbols than are cached is satisfied; asking for more is
+  # not. `full` needs the module debug tree that a `vmlinux` run never fetched.
+  stamp_symbols="$(stamp_get symbols)"
+  case "$SYMBOLS:$stamp_symbols" in
+    none:*|vmlinux:vmlinux|vmlinux:full|full:full) ;;
+    *) log "cache rejected: --symbols=$SYMBOLS but cached target has symbols=${stamp_symbols:-none}"
+       return 1 ;;
+  esac
+  [[ "$SYMBOLS" != full ]] || [[ -d "$MODDBG_OUT" ]] || {
+    log "cache rejected: --symbols=full but $MODDBG_OUT is missing"
+    return 1
+  }
+
+  while IFS=$'\t' read -r _ path want; do
+    [[ -n "$path" ]] || continue
+    have="$(stat -c %s -- "$path" 2>/dev/null || echo missing)"
+    [[ "$have" == "$want" ]] || {
+      log "cache rejected: $path is $have bytes, stamp recorded $want"
+      return 1
+    }
+  done < <(awk -F'\t' '$1 == "artifact"' "$STAMP_OUT")
+
+  return 0
+}
 
 if [[ "$NO_CACHE" == false ]] && cache_complete && [[ -f "$PRIVKEY" ]]; then
   log "cached target found at $OUTDIR"
@@ -527,6 +690,10 @@ if [[ "$NO_CACHE" == false ]] && cache_complete && [[ -f "$PRIVKEY" ]]; then
 fi
 
 mkdir -p "$OUTDIR"
+
+# From here on the directory is mid-build and must never satisfy a cache hit,
+# even if this process is killed between two docker cp calls.
+rm -f -- "$STAMP_OUT"
 
 if [[ -z "$SSH_KEY_ARG" && ! -f "$PRIVKEY" ]]; then
   step "Generating SSH keypair"
@@ -721,26 +888,78 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN depmod -a "${KREL}" || true
 
-RUN mkdir -p /root/.ssh \
- && printf '%s\n' "$PUBKEY" > /root/.ssh/authorized_keys \
- && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys \
- && passwd -d root \
- && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
- && sed -i 's/^#\?PermitEmptyPasswords.*/PermitEmptyPasswords yes/' /etc/ssh/sshd_config \
- && printf '%s / ext4 defaults 0 1\n' "$ROOT_DEV" > /etc/fstab \
- && systemd-machine-id-setup || true
+# Root SSH is key-only.
+#
+# This used to run `passwd -d root` (delete root's password) together with
+# PermitRootLogin yes and PermitEmptyPasswords yes, which authenticated ANY
+# local process as root in the guest with no credential at all -- the listener
+# is loopback-only, so the blast radius was the host, but a target whose root
+# account is open to every process on the box is not a controlled measurement.
+# The keypair this script generates is the only way in.
+#
+# The settings go in sshd_config.d rather than through sed on sshd_config:
+# sshd takes the FIRST value it sees for a keyword and noble's sshd_config
+# Includes that directory from its first line, so these win outright, and a
+# keyword that is absent from the main file (rather than merely commented) is
+# still set -- which sed cannot promise.
+RUN set -e; \
+    mkdir -p /root/.ssh /etc/ssh/sshd_config.d; \
+    printf '%s\n' "$PUBKEY" > /root/.ssh/authorized_keys; \
+    chmod 700 /root/.ssh; \
+    chmod 600 /root/.ssh/authorized_keys; \
+    passwd -l root; \
+    printf '%s\n' \
+      'PermitRootLogin prohibit-password' \
+      'PubkeyAuthentication yes' \
+      'PasswordAuthentication no' \
+      'KbdInteractiveAuthentication no' \
+      'PermitEmptyPasswords no' \
+      > /etc/ssh/sshd_config.d/60-qmu.conf; \
+    if ! grep -q '^Include /etc/ssh/sshd_config.d/' /etc/ssh/sshd_config; then \
+      sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config; \
+    fi; \
+    printf '%s / ext4 defaults 0 1\n' "$ROOT_DEV" > /etc/fstab; \
+    systemd-machine-id-setup || true
 
 # An unprivileged user is mandatory: without it every PoC runs as root and LPE
-# results are meaningless. uid 1000 'ubuntu' already exists in the base image.
-RUN if ! id -u "$UNPRIV_USER" >/dev/null 2>&1; then \
-      useradd -m -s /bin/bash -u 1000 "$UNPRIV_USER"; \
-    fi \
- && mkdir -p "/home/$UNPRIV_USER/.ssh" \
- && printf '%s\n' "$PUBKEY" > "/home/$UNPRIV_USER/.ssh/authorized_keys" \
- && chmod 700 "/home/$UNPRIV_USER/.ssh" \
- && chmod 600 "/home/$UNPRIV_USER/.ssh/authorized_keys" \
- && chown -R "$UNPRIV_USER:$UNPRIV_USER" "/home/$UNPRIV_USER" \
- && echo "$UNPRIV_USER:$UNPRIV_USER" | chpasswd
+# results are meaningless.
+#
+# The base image already owns uid 1000 as 'ubuntu', so `useradd -u 1000` for any
+# other --unpriv-user died with "UID 1000 is not unique" and took the build with
+# it; the existing account is renamed instead, which keeps "the unprivileged
+# user is uid 1000" true whatever it is called. A system account is refused
+# rather than silently relabelled "unprivileged", which would have made every
+# LPE result meaningless in the opposite direction.
+RUN set -e; \
+    case "$UNPRIV_USER" in \
+      ''|root) echo "mktarget: --unpriv-user must name a non-root user" >&2; exit 1 ;; \
+    esac; \
+    if id -u "$UNPRIV_USER" >/dev/null 2>&1; then \
+      uid="$(id -u "$UNPRIV_USER")"; \
+      if [ "$uid" -lt 1000 ]; then \
+        echo "mktarget: --unpriv-user '$UNPRIV_USER' is system account uid $uid;" >&2; \
+        echo "  refusing to present it as the unprivileged PoC user." >&2; \
+        exit 1; \
+      fi; \
+    else \
+      existing="$(getent passwd 1000 | cut -d: -f1)"; \
+      if [ -n "$existing" ]; then \
+        oldhome="$(getent passwd "$existing" | cut -d: -f6)"; \
+        [ -n "$oldhome" ] && mkdir -p "$oldhome"; \
+        usermod -l "$UNPRIV_USER" -d "/home/$UNPRIV_USER" -m "$existing"; \
+        groupmod -n "$UNPRIV_USER" "$existing" 2>/dev/null || true; \
+        usermod -s /bin/bash "$UNPRIV_USER"; \
+      else \
+        useradd -m -s /bin/bash -u 1000 "$UNPRIV_USER"; \
+      fi; \
+    fi; \
+    mkdir -p "/home/$UNPRIV_USER/.ssh"; \
+    printf '%s\n' "$PUBKEY" > "/home/$UNPRIV_USER/.ssh/authorized_keys"; \
+    chmod 700 "/home/$UNPRIV_USER/.ssh"; \
+    chmod 600 "/home/$UNPRIV_USER/.ssh/authorized_keys"; \
+    chown -R "$UNPRIV_USER:" "/home/$UNPRIV_USER"; \
+    echo "$UNPRIV_USER:$UNPRIV_USER" | chpasswd; \
+    id "$UNPRIV_USER" >&2
 
 # Network, hostname and resolv.conf are all configured at BOOT, not here:
 # docker bind-mounts /etc/resolv.conf and /etc/hostname during RUN, so anything
@@ -887,6 +1106,37 @@ docker cp "$CID:/boot/vmlinuz-$KREL"    "$OUTDIR/vmlinuz-$KREL.raw" >/dev/null
 docker cp "$CID:/boot/config-$KREL"     "$CONFIG_OUT" >/dev/null
 docker cp "$CID:/boot/System.map-$KREL" "$SYSMAP_OUT" >/dev/null
 
+# ---------------------------------------------------------------------------
+# userland package inventory
+#
+# The kernel version alone does not describe the target. Whether an
+# unprivileged-userns PoC is blocked depends on the apparmor package (it ships
+# the only sysctl that sets it), kptr_restrict on procps, and whether sysctl.d
+# is applied at all on systemd -- so a manifest that records only the kernel
+# cannot attribute the hardening behaviour it is being cited for.
+#
+# Read from the container's dpkg database host-side rather than by running
+# dpkg-query in the image: for a cross-arch target that would be another
+# qemu-user process, and this needs to be free.
+# ---------------------------------------------------------------------------
+step "Recording userland package inventory"
+docker cp "$CID:/var/lib/dpkg/status" "$OUTDIR/.dpkg-status" >/dev/null
+awk -F': ' '
+  function flush() {
+    if (pkg != "" && ver != "" && status ~ /(^| )installed$/) print pkg "\t" ver
+    pkg = ""; ver = ""; status = ""
+  }
+  /^Package: /{ pkg    = $2; next }
+  /^Version: /{ ver    = $2; next }
+  /^Status: / { status = $2; next }
+  /^[[:space:]]*$/ { flush(); next }
+  END { flush() }
+' "$OUTDIR/.dpkg-status" | sort -u > "$PACKAGES_OUT"
+rm -f "$OUTDIR/.dpkg-status"
+log "userland inventory: $(wc -l < "$PACKAGES_OUT") packages -> $PACKAGES_OUT"
+
+pkgver() { awk -F'\t' -v p="$1" '$1 == p { print $2; exit }' "$PACKAGES_OUT"; }
+
 if [[ "$INITRAMFS" == true ]]; then
   if docker cp "$CID:/boot/initrd.img-$KREL" "$INITRD_OUT" >/dev/null 2>&1; then
     log "initrd extracted: $INITRD_OUT"
@@ -963,8 +1213,18 @@ if [[ "$SYMBOLS" != "none" && "$DBGSYM_AVAILABLE" == true ]]; then
           > "/output/vmlinux-${KREL}"
         [ -s "/output/vmlinux-${KREL}" ] || { echo "vmlinux extraction produced an empty file" >&2; exit 1; }
         if [ "$KEEP_MODULES" = "1" ]; then
+          # No `|| true` here. --symbols=full promises module debug info, and a
+          # swallowed download or extraction failure handed back a target whose
+          # module symbols silently did not exist -- discovered only once a GDB
+          # session failed to resolve a symbol inside a module.
+          rm -rf "/output/usr/lib/debug/lib/modules/${KREL}"
           curl -sSfL "$URI" | bsdtar -xOf - "data.tar*" \
-            | bsdtar -xf - -C /output "./usr/lib/debug/lib/modules/${KREL}" || true
+            | bsdtar -xf - -C /output "./usr/lib/debug/lib/modules/${KREL}"
+          find "/output/usr/lib/debug/lib/modules/${KREL}" -name "*.ko" -print -quit 2>/dev/null \
+            | grep -q . || {
+              echo "--symbols=full requested but the ddeb yielded no module debug objects" >&2
+              exit 1
+            }
         fi
       ' >&2; then
     log "vmlinux extracted: $VMLINUX_OUT"
@@ -1054,7 +1314,17 @@ cat > "$MANIFEST_OUT" <<JSON
   "root_dev": "$ROOT_DEV",
   "console": "$CONSOLE_TTY",
   "kernel_sha256": "$KERNEL_SHA",
-  "rootfs_sha256": "$ROOTFS_SHA"
+  "rootfs_sha256": "$ROOTFS_SHA",
+  "build_key": "$BUILD_KEY",
+  "packages_manifest": "$PACKAGES_OUT",
+  "userland": {
+    "apparmor": "$(pkgver apparmor)",
+    "procps": "$(pkgver procps)",
+    "systemd": "$(pkgver systemd)",
+    "libc6": "$(pkgver libc6)",
+    "gcc": "$(pkgver gcc)",
+    "openssh-server": "$(pkgver openssh-server)"
+  }
 }
 JSON
 
@@ -1112,6 +1382,34 @@ TOML
 # ---------------------------------------------------------------------------
 # output
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# completion stamp -- written LAST, and only here
+#
+# Its existence is what makes a directory a cache hit, so everything above must
+# have succeeded for one to appear. It is assembled beside the final name and
+# renamed into place, so even a kill during this write cannot leave a partial
+# stamp that parses.
+# ---------------------------------------------------------------------------
+{
+  printf 'version\t%s\n'            "$MKTARGET_VERSION"
+  printf 'build_key\t%s\n'          "$BUILD_KEY"
+  printf 'symbols\t%s\n'            "$SYMBOLS"
+  printf 'kernel_deb_version\t%s\n' "$KDEBVER"
+  for f in "$KERNEL_OUT" "$ROOTFS_OUT" "$CONFIG_OUT" "$SYSMAP_OUT" \
+           "$TOML_OUT" "$MANIFEST_OUT" "$PACKAGES_OUT"; do
+    printf 'artifact\t%s\t%s\n' "$f" "$(stat -c %s -- "$f")"
+  done
+  # Recorded only when actually produced: --initramfs can legitimately yield no
+  # initrd, and demanding one back would make that target rebuild forever.
+  if [[ "$INITRAMFS" == true && -f "$INITRD_OUT" ]]; then
+    printf 'artifact\t%s\t%s\n' "$INITRD_OUT" "$(stat -c %s -- "$INITRD_OUT")"
+  fi
+  if [[ "$SYMBOLS" != none && -f "$VMLINUX_OUT" ]]; then
+    printf 'artifact\t%s\t%s\n' "$VMLINUX_OUT" "$(stat -c %s -- "$VMLINUX_OUT")"
+  fi
+} > "$STAMP_OUT.part"
+mv -f "$STAMP_OUT.part" "$STAMP_OUT"
+
 step "Target ready: $OUTDIR"
 log "Ubuntu $SUITE $KREL ($KDEBVER, pocket $KPOCKET, hardening=$HARDENING)"
 if [[ "$RELAX" == true ]]; then

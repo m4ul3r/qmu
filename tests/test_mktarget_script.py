@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -80,6 +81,7 @@ def mktarget_env(tmp_path, monkeypatch):
     curl = fake_bin / "curl"
     curl.write_text(
         f'''#!/usr/bin/env python3
+import os
 import sys
 from pathlib import Path
 
@@ -96,32 +98,57 @@ out = None
 if "-o" in args:
     out = args[args.index("-o") + 1]
 
-def emit(data: bytes):
-    if out is not None:
-        Path(out).write_bytes(data)
-    else:
-        sys.stdout.buffer.write(data)
+# The script distinguishes "this pocket 404s" from "this fetch faulted", and it
+# can only do that by reading -w %{{http_code}}. A fake that ignored -w would
+# make every fetch look like a fault, so the contract is modelled here.
+want_code = "-w" in args and "%{{http_code}}" in args[args.index("-w") + 1]
+fail_hard = "-f" in args or "-sSfL" in args
 
-if url.endswith("/Release"):
-    emit(b"Origin: Ubuntu\\nDate: Thu, 25 Apr 2024 15:10:33 UTC\\n")
+def finish(code: int, data: bytes = b""):
+    if code == 200 and data:
+        if out is not None:
+            Path(out).write_bytes(data)
+        else:
+            sys.stdout.buffer.write(data)
+    if want_code:
+        sys.stdout.write(str(code).zfill(3))
+    if code == 0:
+        raise SystemExit(7)          # transport failure, as curl reports it
+    if code >= 400 and fail_hard:
+        raise SystemExit(22)         # curl -f on an HTTP error
     raise SystemExit(0)
 
+# fault injection: substring match on the URL
+fault = os.environ.get("MKTARGET_FAKE_CURL_FAULT")
+if fault and fault in url:
+    finish(0)
+gone = os.environ.get("MKTARGET_FAKE_CURL_404")
+if gone and gone in url:
+    finish(404)
+
+if url.endswith("/Release"):
+    finish(200, b"Origin: Ubuntu\\nDate: Thu, 25 Apr 2024 15:10:33 UTC\\n")
+
 if "ddebs" in url:
-    # only the release pocket carries dbgsym in this fixture
+    # only the release pocket carries dbgsym in this fixture, and ddebs has no
+    # -security pocket at all -- that is a 404, not an empty index
+    if "/dists/noble-security/" in url:
+        finish(404)
     body = FIX / ("ddebs.gz" if "/dists/noble/" in url else "empty.gz")
 elif "/dists/noble/" in url:
     body = FIX / "release.gz"
 elif "-updates/" in url or "-security/" in url:
     body = FIX / "updates.gz"
 else:
-    raise SystemExit(22)
+    finish(404)
 
-emit(body.read_bytes())
+finish(200, body.read_bytes())
 '''
     )
     curl.chmod(0o755)
 
     docker = fake_bin / "docker"
+    dockerfile_log = tmp_path / "Dockerfile.sent"
     docker.write_text(
         f'''#!/usr/bin/env python3
 import json
@@ -133,6 +160,7 @@ from pathlib import Path
 
 args = sys.argv[1:]
 LOG = Path({str(docker_log)!r})
+DOCKERFILE = Path({str(dockerfile_log)!r})
 with LOG.open("a") as fh:
     fh.write(json.dumps(args) + "\\n")
 
@@ -143,8 +171,10 @@ if os.environ.get("MKTARGET_FAIL_IF_DOCKER_RUNS") == "1":
 verb = args[0] if args else ""
 
 if verb == "build":
-    # consume the Dockerfile on stdin so the writer never sees EPIPE
-    sys.stdin.read()
+    # consume the Dockerfile on stdin so the writer never sees EPIPE, and keep
+    # it: what the guest ends up with is decided here, so assertions about the
+    # guest should read this rather than grepping the script's own source
+    DOCKERFILE.write_text(sys.stdin.read())
     raise SystemExit(0)
 
 if verb == "create":
@@ -163,6 +193,27 @@ if verb == "cp":
         dest.write_bytes(b"MZ\\x00\\x00bzImage-ish\\n")
     elif "config" in name:
         dest.write_text("CONFIG_EXT4_FS=y\\nCONFIG_RANDOM_KMALLOC_CACHES=y\\n")
+    elif "dpkg/status" in name:
+        # dpkg's real paragraph shape: Status precedes Version, not-installed
+        # entries linger in the database, and the file ends without a blank line
+        dest.write_text(
+            "Package: apparmor\\n"
+            "Status: install ok installed\\n"
+            "Architecture: amd64\\n"
+            "Version: 4.0.1really4.0.0-beta3-0ubuntu0.24.04.4\\n"
+            "\\n"
+            "Package: procps\\n"
+            "Status: install ok installed\\n"
+            "Version: 2:4.0.4-4ubuntu3.2\\n"
+            "\\n"
+            "Package: removed-but-configured\\n"
+            "Status: deinstall ok config-files\\n"
+            "Version: 1.0\\n"
+            "\\n"
+            "Package: systemd\\n"
+            "Status: install ok installed\\n"
+            "Version: 255.4-1ubuntu8.6\\n"
+        )
     else:
         dest.write_text("ffffffff81000000 T _text\\n")
     raise SystemExit(0)
@@ -196,9 +247,17 @@ if verb == "run":
     if out is not None and "mke2fs" in inner:
         (out / "rootfs.img").write_bytes(b"\\0" * 4096)
     elif out is not None and "dbgsym" in inner:
-        for a in args:
-            if a.startswith("KREL="):
-                (out / ("vmlinux-" + a.split("=", 1)[1])).write_text("ELF\\n")
+        if os.environ.get("MKTARGET_FAKE_DBGSYM_FAIL") == "1":
+            print("ddeb extraction blew up", file=sys.stderr)
+            raise SystemExit(1)
+        krel = next(a.split("=", 1)[1] for a in args if a.startswith("KREL="))
+        (out / ("vmlinux-" + krel)).write_text("ELF\\n")
+        # --symbols=full additionally unpacks the module debug tree; a helper
+        # that produced only vmlinux would let a full request look satisfied
+        if "KEEP_MODULES=1" in args:
+            mods = out / "usr/lib/debug/lib/modules" / krel / "kernel/fs/overlayfs"
+            mods.mkdir(parents=True, exist_ok=True)
+            (mods / "overlay.ko").write_text("ELF\\n")
     raise SystemExit(0)
 
 raise SystemExit(0)
@@ -219,10 +278,11 @@ raise SystemExit(0)
             self.env = env
             self.tmp_path = tmp_path
 
-        def run(self, *extra, fail_if_docker_runs=False):
+        def run(self, *extra, fail_if_docker_runs=False, **envvars):
             e = dict(env)
             if fail_if_docker_runs:
                 e["MKTARGET_FAIL_IF_DOCKER_RUNS"] = "1"
+            e.update(envvars)
             return subprocess.run(
                 [str(MKTARGET), *extra],
                 text=True,
@@ -236,10 +296,115 @@ raise SystemExit(0)
                 return []
             return [json.loads(l) for l in docker_log.read_text().splitlines() if l]
 
+        def dockerfile(self):
+            return dockerfile_log.read_text()
+
         def clear_docker_log(self):
             docker_log.unlink(missing_ok=True)
 
+        def fixture(self, name):
+            return fixtures / name
+
+        def set_release_pocket(self, entries):
+            """Rewrite the release-pocket index, as the archive itself would."""
+            (fixtures / "release.gz").write_bytes(
+                gzip.compress(_packages_body(entries).encode())
+            )
+
     return Env()
+
+
+def _run_block(dockerfile: str, marker: str) -> str:
+    """The text of the single RUN instruction containing `marker`.
+
+    Reads the Dockerfile that was actually sent to `docker build`, so a layer
+    that exists in mktarget.sh but never reaches the build cannot pass.
+    """
+    blocks, cur = [], []
+    for line in dockerfile.splitlines():
+        cur.append(line)
+        if not line.rstrip().endswith("\\"):
+            blocks.append("\n".join(cur))
+            cur = []
+    if cur:
+        blocks.append("\n".join(cur))
+    hits = [b for b in blocks if b.lstrip().startswith("RUN") and marker in b]
+    assert len(hits) == 1, f"want 1 RUN block containing {marker!r}, found {len(hits)}"
+    return hits[0]
+
+
+def _user_stub_bin(tmp_path, passwd_lines):
+    """A PATH shim for the account tools, backed by a fake /etc/passwd.
+
+    Lets the guest's user-setup logic actually RUN. Without this the suite could
+    only assert on the text of the Dockerfile, which is how `useradd -u 1000`
+    against an already-occupied uid 1000 shipped: every test passed and every
+    real build with --unpriv-user died.
+    """
+    binp = tmp_path / "userbin"
+    binp.mkdir()
+    pw = tmp_path / "passwd.fixture"
+    pw.write_text("".join(l + "\n" for l in passwd_lines))
+    log = tmp_path / "usercalls.log"
+
+    preamble = f'''#!/usr/bin/env python3
+import sys
+from pathlib import Path
+PW = Path({str(pw)!r})
+LOG = Path({str(log)!r})
+ARGS = sys.argv[1:]
+with LOG.open("a") as fh:
+    fh.write(" ".join([Path(sys.argv[0]).name] + ARGS) + "\\n")
+ROWS = [l.split(":") for l in PW.read_text().splitlines() if l.strip()]
+'''
+    bodies = {
+        "id": '''
+name = ARGS[-1]
+for r in ROWS:
+    if r[0] == name:
+        print(r[2]); raise SystemExit(0)
+print("id: no such user", file=sys.stderr); raise SystemExit(1)
+''',
+        "getent": '''
+key = ARGS[-1]
+for r in ROWS:
+    if r[0] == key or r[2] == key:
+        print(":".join(r)); raise SystemExit(0)
+raise SystemExit(2)
+''',
+    }
+    for name in ("useradd", "usermod", "groupmod", "chpasswd"):
+        bodies[name] = "\nraise SystemExit(0)\n"
+
+    for name, body in bodies.items():
+        p = binp / name
+        p.write_text(preamble + body)
+        p.chmod(0o755)
+    return binp, log
+
+
+def _exec_user_setup(mktarget_env, tmp_path, unpriv_user, passwd_lines):
+    """Run the guest's account-resolution logic against the fake passwd db."""
+    block = _run_block(mktarget_env.dockerfile(), "must name a non-root user")
+    script = re.sub(r"^RUN\s+", "", block)
+    # stop before the parts that would write to the real /home; the account
+    # resolution above it is what this exercises
+    cut = script.index('mkdir -p "/home/')
+    script = script[:cut].rstrip().rstrip("\\").rstrip().rstrip(";")
+
+    binp, log = _user_stub_bin(tmp_path, passwd_lines)
+    proc = subprocess.run(
+        ["sh", "-c", script],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            "PATH": f"{binp}:/usr/bin:/bin",
+            "UNPRIV_USER": unpriv_user,
+        },
+    )
+    calls = log.read_text().splitlines() if log.exists() else []
+    return proc, calls
 
 
 def _assignments(stdout: str) -> dict[str, str]:
@@ -566,8 +731,10 @@ def test_relax_hardening_covers_userfaultfd(mktarget_env):
     build = next(c for c in mktarget_env.docker_calls() if c[0] == "build")
     # RELAX is what switches the sysctl-writing layer on
     assert "RELAX=1" in build
-    dockerfile = ROOT.joinpath("tools/mktarget.sh").read_text()
-    relax_block = dockerfile.split("99-qmu-relax.conf")[0].rsplit("if [ \"$RELAX\"", 1)[-1]
+    # read the Dockerfile actually handed to docker, not the script's source:
+    # a knob present in the file but never reaching the build is still absent
+    # from the guest, and grepping mktarget.sh cannot tell the difference
+    relax_block = _run_block(mktarget_env.dockerfile(), "99-qmu-relax.conf")
     for knob in (
         "kernel.kptr_restrict = 0",
         "kernel.dmesg_restrict = 0",
@@ -605,3 +772,327 @@ def test_arm64_toml_uses_virt_machine_and_vda(mktarget_env):
     assert '"-M", "virt"' in toml
     assert "root=/dev/vda" in toml
     assert "console=ttyAMA0" in toml
+
+
+# --- cache identity ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ("--headers",),
+        ("--packages", "strace"),
+        ("--size", "8G"),
+        ("--unpriv-user", "researcher"),
+        ("--no-modules-extra",),
+        ("--initramfs",),
+    ],
+)
+def test_build_affecting_options_are_not_served_from_a_default_cache(mktarget_env, flag):
+    """The cache directory used to be keyed by ABI and flavour alone, so these
+    all returned the default image while stdout advertised the option: headers
+    absent, user still `ubuntu`, package missing, filesystem still 4 GiB."""
+    base = mktarget_env.run("--kernel-abi", "ga")
+    assert base.returncode == 0, base.stderr
+    mktarget_env.clear_docker_log()
+
+    variant = mktarget_env.run("--kernel-abi", "ga", *flag)
+    assert variant.returncode == 0, variant.stderr
+    assert any(c[0] == "build" for c in mktarget_env.docker_calls()), (
+        f"{flag} was served from the default cache"
+    )
+    # and it lands somewhere else, so the two do not evict each other
+    assert _assignments(variant.stdout)["ROOTFS"] != _assignments(base.stdout)["ROOTFS"]
+
+    # the variant is itself cacheable -- the key must be stable across runs
+    mktarget_env.clear_docker_log()
+    again = mktarget_env.run("--kernel-abi", "ga", *flag, fail_if_docker_runs=True)
+    assert again.returncode == 0, again.stderr
+    assert again.stdout == variant.stdout
+
+
+def test_package_order_does_not_change_cache_identity(mktarget_env):
+    first = mktarget_env.run("--packages", "strace,ltrace")
+    assert first.returncode == 0, first.stderr
+    mktarget_env.clear_docker_log()
+    second = mktarget_env.run("--packages", "ltrace,strace", fail_if_docker_runs=True)
+    assert second.returncode == 0, second.stderr
+    assert second.stdout == first.stdout
+
+
+def test_same_abi_at_a_newer_deb_version_rebuilds(mktarget_env):
+    """`6.17.0-42` ships as both `.42` and `.42+1`. The ABI names the cache
+    directory, so a bumped deb version used to return the OLD kernel while
+    KERNEL_DEB_VERSION on stdout claimed the new one."""
+    first = mktarget_env.run("--kernel-abi", "ga")
+    assert first.returncode == 0, first.stderr
+    assert _assignments(first.stdout)["KERNEL_DEB_VERSION"] == "6.8.0-31.31"
+    mktarget_env.clear_docker_log()
+
+    mktarget_env.set_release_pocket([("6.8.0-31", "6.8.0-31.32")])
+    second = mktarget_env.run("--kernel-abi", "ga")
+    assert second.returncode == 0, second.stderr
+    assert any(c[0] == "build" for c in mktarget_env.docker_calls())
+    a = _assignments(second.stdout)
+    assert a["KERNEL_DEB_VERSION"] == "6.8.0-31.32"
+    # the emitted version and the version actually installed must agree
+    build = next(c for c in mktarget_env.docker_calls() if c[0] == "build")
+    kpkgs = next(x.split("=", 1)[1] for x in build if x.startswith("KPKGS="))
+    assert "6.8.0-31.32" in kpkgs
+    assert json.loads(Path(a["TARGET_MANIFEST"]).read_text())[
+        "kernel_deb_version"
+    ] == "6.8.0-31.32"
+
+
+def test_interrupted_build_is_not_a_cache_hit(mktarget_env):
+    """An aborted rebuild leaves a truncated rootfs among stale siblings. Every
+    file exists, so the old `-f` test called it complete and the target booted
+    into an unexplained panic."""
+    first = mktarget_env.run("--kernel-abi", "ga")
+    assert first.returncode == 0, first.stderr
+    rootfs = Path(_assignments(first.stdout)["ROOTFS"])
+    rootfs.write_bytes(b"\0" * 512)          # truncated, still present
+    mktarget_env.clear_docker_log()
+
+    second = mktarget_env.run("--kernel-abi", "ga")
+    assert second.returncode == 0, second.stderr
+    assert any(c[0] == "build" for c in mktarget_env.docker_calls())
+
+
+def test_a_directory_without_a_completion_stamp_is_never_cached(mktarget_env):
+    first = mktarget_env.run("--kernel-abi", "ga")
+    assert first.returncode == 0, first.stderr
+    outdir = Path(_assignments(first.stdout)["ROOTFS"]).parent
+    stamp = outdir / ".mktarget-stamp"
+    assert stamp.exists(), "a completed build must leave a stamp"
+    stamp.unlink()
+    mktarget_env.clear_docker_log()
+
+    second = mktarget_env.run("--kernel-abi", "ga")
+    assert second.returncode == 0, second.stderr
+    assert any(c[0] == "build" for c in mktarget_env.docker_calls())
+
+
+def test_stamp_is_removed_before_a_rebuild_starts(mktarget_env):
+    """Proves the ordering the atomicity argument rests on: if the stamp
+    outlived the start of a rebuild, a kill mid-build would leave one."""
+    first = mktarget_env.run("--kernel-abi", "ga")
+    assert first.returncode == 0, first.stderr
+    outdir = Path(_assignments(first.stdout)["ROOTFS"]).parent
+    stamp = outdir / ".mktarget-stamp"
+
+    probe = mktarget_env.tmp_path / "stamp-at-build-time"
+    docker = Path(mktarget_env.env["PATH"].split(":")[0]) / "docker"
+    original = docker.read_text()
+    docker.write_text(
+        original.replace(
+            'verb = args[0] if args else ""',
+            'verb = args[0] if args else ""\n'
+            f'if verb == "build":\n'
+            f'    Path({str(probe)!r}).write_text(str(Path({str(stamp)!r}).exists()))\n',
+        )
+    )
+    r = mktarget_env.run("--kernel-abi", "ga", "--no-cache")
+    assert r.returncode == 0, r.stderr
+    assert probe.read_text() == "False"
+    assert stamp.exists(), "and it must be back once the build completes"
+
+
+# --- archive faults vs genuinely absent pockets -------------------------------
+
+
+def test_a_faulting_pocket_fails_instead_of_silently_narrowing_latest(mktarget_env):
+    """If -updates merely times out it must not look like a -updates with no
+    kernels in it: that turned `--kernel-abi latest` into `ga` and destroyed the
+    pin the whole tool exists to provide."""
+    r = mktarget_env.run(
+        "--kernel-abi", "latest", MKTARGET_FAKE_CURL_FAULT="dists/noble-"
+    )
+    assert r.returncode == 2
+    assert "fetch fault" in r.stderr
+    assert "6.8.0-31" not in r.stdout      # must not fall back to the GA kernel
+    assert r.stdout == ""
+    assert not any(c[0] == "build" for c in mktarget_env.docker_calls())
+
+
+def test_a_404_pocket_is_treated_as_empty_and_still_resolves(mktarget_env):
+    """The other half of the distinction: a pocket that genuinely has no index
+    is normal (ddebs has no -security) and must not stop a build."""
+    r = mktarget_env.run(
+        "--kernel-abi", "latest", MKTARGET_FAKE_CURL_404="dists/noble-security/"
+    )
+    assert r.returncode == 0, r.stderr
+    assert _assignments(r.stdout)["KERNEL_ABI"] == "6.8.0-137"
+    assert "404" in r.stderr
+
+
+# --- guest hardening ----------------------------------------------------------
+
+
+def test_root_ssh_is_key_only(mktarget_env):
+    """The image used to delete root's password and enable empty-password
+    logins, so any local process could enter the guest as root with no
+    credential and perturb the measurement."""
+    r = mktarget_env.run("--kernel-abi", "ga")
+    assert r.returncode == 0, r.stderr
+    # "authorized_keys" alone also matches the unprivileged-user layer
+    block = _run_block(mktarget_env.dockerfile(), "sshd_config.d/60-qmu.conf")
+
+    assert "passwd -d root" not in block
+    assert "PermitEmptyPasswords yes" not in block
+    assert "PermitRootLogin yes" not in block
+
+    assert "PermitRootLogin prohibit-password" in block
+    assert "PasswordAuthentication no" in block
+    assert "KbdInteractiveAuthentication no" in block
+    assert "PermitEmptyPasswords no" in block
+    # and the drop-in has to be reachable, or none of the above applies
+    assert "sshd_config.d/60-qmu.conf" in block
+    assert "Include /etc/ssh/sshd_config.d/" in block
+
+
+def test_unpriv_user_defaults_to_the_existing_uid_1000_account(mktarget_env, tmp_path):
+    r = mktarget_env.run("--kernel-abi", "ga")
+    assert r.returncode == 0, r.stderr
+    proc, calls = _exec_user_setup(
+        mktarget_env, tmp_path, "ubuntu",
+        [f"ubuntu:x:1000:1000::{tmp_path}/home/ubuntu:/bin/bash"],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not any(c.startswith(("useradd", "usermod -l")) for c in calls), calls
+
+
+def test_unpriv_user_renames_the_uid_1000_account(mktarget_env, tmp_path):
+    """`useradd -m -s /bin/bash -u 1000 researcher` against an image that
+    already has `ubuntu` at 1000 fails with "UID 1000 is not unique" and takes
+    the whole build with it."""
+    r = mktarget_env.run("--kernel-abi", "ga")
+    assert r.returncode == 0, r.stderr
+    proc, calls = _exec_user_setup(
+        mktarget_env, tmp_path, "researcher",
+        [f"ubuntu:x:1000:1000::{tmp_path}/home/ubuntu:/bin/bash"],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not any("useradd" in c for c in calls), calls
+    rename = next(c for c in calls if c.startswith("usermod -l"))
+    assert "researcher" in rename and rename.endswith("ubuntu")
+    assert any(c.startswith("groupmod -n researcher") for c in calls), calls
+
+
+def test_unpriv_user_creates_the_account_when_uid_1000_is_free(mktarget_env, tmp_path):
+    r = mktarget_env.run("--kernel-abi", "ga")
+    assert r.returncode == 0, r.stderr
+    proc, calls = _exec_user_setup(
+        mktarget_env, tmp_path, "researcher", ["root:x:0:0::/root:/bin/bash"],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert any(c == "useradd -m -s /bin/bash -u 1000 researcher" for c in calls), calls
+
+
+@pytest.mark.parametrize("name", ["root", "daemon"])
+def test_privileged_unpriv_user_is_refused(mktarget_env, tmp_path, name):
+    """Accepting a system account would label it "the unprivileged user" and
+    make every LPE result meaningless in the opposite direction."""
+    r = mktarget_env.run("--kernel-abi", "ga")
+    assert r.returncode == 0, r.stderr
+    proc, calls = _exec_user_setup(
+        mktarget_env, tmp_path, name,
+        ["root:x:0:0::/root:/bin/bash", "daemon:x:1:1::/usr/sbin:/usr/sbin/nologin"],
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "unpriv-user" in proc.stderr
+    assert not any("useradd" in c or "usermod" in c for c in calls), calls
+
+
+# --- symbols ------------------------------------------------------------------
+
+
+def test_symbols_full_is_not_satisfied_by_a_vmlinux_only_cache(mktarget_env):
+    """`--symbols` fetches vmlinux; `--symbols=full` also needs the module debug
+    tree. Completeness checked only vmlinux, so the second returned exit 0 with
+    no module symbols at all -- found only when GDB failed to resolve one."""
+    vm = mktarget_env.run("--kernel-abi", "ga", "--symbols")
+    assert vm.returncode == 0, vm.stderr
+    outdir = Path(_assignments(vm.stdout)["ROOTFS"]).parent
+    assert not (outdir / "usr/lib/debug/lib/modules").exists()
+    mktarget_env.clear_docker_log()
+
+    full = mktarget_env.run("--kernel-abi", "ga", "--symbols=full")
+    assert full.returncode == 0, full.stderr
+    assert any(
+        c[0] == "run" and "KEEP_MODULES=1" in c for c in mktarget_env.docker_calls()
+    ), "the full-symbol helper never ran"
+    mods = outdir / "usr/lib/debug/lib/modules" / _assignments(full.stdout)["KERNEL_RELEASE"]
+    assert list(mods.rglob("*.ko")), "module debug objects were not extracted"
+
+
+def test_a_failed_symbol_extraction_leaves_no_target(mktarget_env):
+    """--symbols promises an artifact, so a failure has to be fatal rather than
+    a warning: a target quietly built without it lets a GDB session start
+    against symbols the caller believes they asked for."""
+    r = mktarget_env.run("--kernel-abi", "ga", "--symbols", MKTARGET_FAKE_DBGSYM_FAIL="1")
+    assert r.returncode == 2
+    assert r.stdout == ""
+    assert "debug-symbol extraction failed" in r.stderr
+    # and the half-built directory must not be usable next time
+    mktarget_env.clear_docker_log()
+    after = mktarget_env.run("--kernel-abi", "ga")
+    assert after.returncode == 0, after.stderr
+    assert any(c[0] == "build" for c in mktarget_env.docker_calls())
+
+
+def test_symbols_full_module_extraction_is_not_swallowed(mktarget_env):
+    """The module half of --symbols=full used to end in `|| true`, so a failed
+    download produced a target claiming full symbols with none in it. The
+    container script has to treat that as fatal.
+
+    This reads the helper text because the fake docker does not execute the
+    inner shell; the surrounding contract is covered behaviourally above.
+    """
+    r = mktarget_env.run("--kernel-abi", "ga", "--symbols=full")
+    assert r.returncode == 0, r.stderr
+    helper = next(
+        c[-1] for c in mktarget_env.docker_calls()
+        if c[0] == "run" and "dbgsym" in c[-1]
+    )
+    keep = helper.split('if [ "$KEEP_MODULES" = "1" ]')[1]
+    # comments stripped: the block explains the `|| true` it no longer has
+    keep = "\n".join(l for l in keep.splitlines() if not l.lstrip().startswith("#"))
+    assert "|| true" not in keep
+    assert "exit 1" in keep
+
+
+def test_initrd_is_not_emitted_without_initramfs_even_if_cached(mktarget_env):
+    """Same contract as VMLINUX: gated on the flag, not on the file, so
+    `[ -n "$INITRD" ]` answers "did I ask for one THIS run"."""
+    withinit = mktarget_env.run("--kernel-abi", "ga", "--initramfs")
+    assert withinit.returncode == 0, withinit.stderr
+    initrd = Path(_assignments(withinit.stdout)["INITRD"])
+    assert initrd.exists()
+
+    plain = mktarget_env.run("--kernel-abi", "ga")
+    assert plain.returncode == 0, plain.stderr
+    assert "INITRD=" not in plain.stdout
+
+
+# --- attribution --------------------------------------------------------------
+
+
+def test_userland_package_versions_are_recorded(mktarget_env):
+    """The kernel version alone cannot attribute a hardening result: whether an
+    unprivileged-userns PoC is blocked is decided by the apparmor package, which
+    ships the only file that sets that sysctl."""
+    r = mktarget_env.run("--kernel-abi", "ga")
+    assert r.returncode == 0, r.stderr
+    a = _assignments(r.stdout)
+    manifest = json.loads(Path(a["TARGET_MANIFEST"]).read_text())
+
+    assert manifest["userland"]["apparmor"].startswith("4.0.1really")
+    assert manifest["userland"]["procps"] == "2:4.0.4-4ubuntu3.2"
+    assert manifest["userland"]["systemd"] == "255.4-1ubuntu8.6"
+
+    packages = Path(manifest["packages_manifest"])
+    rows = dict(l.split("\t") for l in packages.read_text().splitlines())
+    assert rows["procps"] == "2:4.0.4-4ubuntu3.2"
+    # a package whose files were removed is not installed and must not be listed
+    assert "removed-but-configured" not in rows

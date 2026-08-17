@@ -49,18 +49,40 @@ VMLINUX   (only with --symbols)
 INITRD    (only with --initramfs)
 ```
 
-`VMLINUX` is emitted only when `--symbols` was passed on *this* run, even if an
-earlier run left a cached `vmlinux` in the output directory — so testing for
-`$VMLINUX` is a reliable answer to "did I get symbols this run".
+`VMLINUX` and `INITRD` are emitted only when `--symbols` / `--initramfs` was
+passed on *this* run, even if an earlier run left the file in the output
+directory — so testing for `$VMLINUX` is a reliable answer to "did I get symbols
+this run", and the same holds for `$INITRD`.
 
-Cache: `~/.cache/qmu/targets/ubuntu/<suite>/<arch>/<abi>-<flavour>[-relaxed]/`.
 All logs go to stderr; stdout is only the assignments, so `eval $(...)` is safe.
 
-Cost: a cache hit is under a second. A fresh x86_64 target is a couple of
-minutes; a cross-arch (arm64) one runs `apt` under `qemu-user` and takes ~15 min
-the first time, then caches. `--relax-hardening` is a separate image and so a
-separate build. The `Creating raw ext4 image` step is silent for 1-2 minutes
-while it exports ~1 GB — that is normal, not a hang.
+### Cache
+
+`~/.cache/qmu/targets/ubuntu/<suite>/<arch>/<abi>-<flavour>[-relaxed][-<key>]/`
+
+The `<key>` suffix appears only when a build-affecting option departs from the
+defaults (`--headers`, `--packages`, `--size`, `--unpriv-user`, `--initramfs`,
+`--no-modules-extra`, `--ssh-key`), so a default build keeps the predictable
+short name and two legitimate variants stop evicting each other.
+
+A directory counts as a cache hit only if it holds a completion stamp whose
+build key matches this run and whose recorded artifact sizes still match. That
+means an interrupted build is never served as a cached one, and a run whose
+options — or whose resolved deb version — differ from the cached target rebuilds
+instead of handing back an image that disagrees with the variables on stdout.
+
+Cost: a cache hit is 1–8 s. It is not free and it is not offline: the ABI is
+resolved against the archive *before* the cache is consulted, since for `ga` and
+`latest` the resolved ABI is what names the directory. A fresh x86_64 target is a
+couple of minutes; a cross-arch (arm64) one runs `apt` under `qemu-user` and
+takes ~15 min the first time, then caches. `--relax-hardening` is a separate
+image and so a separate build. The `Creating raw ext4 image` step is silent for
+1–2 minutes while it exports ~1 GB — that is normal, not a hang.
+
+If the archive cannot be read, the script **fails** rather than resolving from
+whatever pockets did answer. A `-updates` fetch that times out used to look
+identical to a `-updates` with no kernels in it, which quietly turned
+`--kernel-abi latest` into `ga`.
 
 ## Pinning an ABI — the part that makes a result citable
 
@@ -191,8 +213,10 @@ userns restriction" — a separate proof obligation, same class as a KASLR bypas
 ## Running a PoC as an unprivileged user
 
 An LPE result measured as root is meaningless. The image has an unprivileged
-`ubuntu` user (uid 1000, `--unpriv-user` to rename). `/root` is `0700`, so the
-binary has to be copied out:
+`ubuntu` user at uid 1000. `--unpriv-user NAME` renames that account rather than
+adding a second one, so the PoC user is uid 1000 whatever it is called; naming
+root or any uid < 1000 is refused rather than quietly relabelled. `/root` is
+`0700`, so the binary has to be copied out:
 
 ```bash
 qmu compile ./poc.c --vm ubu
@@ -289,12 +313,22 @@ reason:
 
 `target.json` (host, authoritative, includes `kernel_sha256`/`rootfs_sha256`) and
 `/etc/qmu-target.json` (baked into the guest at build time) record suite, pocket,
-arch, flavour, ABI, every deb version, dbgsym version, archive release date,
+arch, flavour, ABI, the kernel and dbgsym deb versions, archive release date,
 hardening mode, and the unprivileged user. Quote the ABI and deb version when
 reporting a result:
 
 ```bash
 qmu exec --vm ubu 'cat /etc/qmu-target.json'
+```
+
+The kernel version alone does not attribute a *hardening* result. Whether an
+unprivileged-userns PoC is blocked depends on the `apparmor` package — it ships
+the only file that sets that sysctl — and `kptr_restrict` comes from `procps`,
+so `target.json` also carries a `userland` object with those versions, and
+`packages.tsv` beside it lists every installed package and version in the guest:
+
+```bash
+grep -E '^(apparmor|procps|systemd)\b' "$(dirname "$TARGET_MANIFEST")/packages.tsv"
 ```
 
 ## Verifying a fresh target
