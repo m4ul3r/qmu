@@ -641,8 +641,12 @@ stamp_get() {
 #   3. the files are INTACT. Recorded byte sizes must still match -- that is
 #      what catches a truncated artifact, which `-f` happily accepts and which
 #      then boots into an unexplained kernel panic.
-cache_complete() {
-  local stamp_ver stamp_key stamp_symbols path want have
+#
+# Split from the symbol check below because the two have different remedies: a
+# stale or damaged IMAGE has to be rebuilt, whereas missing SYMBOLS can be
+# fetched onto the image already sitting there.
+cache_image_ok() {
+  local stamp_ver stamp_key path want have
 
   [[ -f "$STAMP_OUT" ]] || return 1
 
@@ -658,19 +662,6 @@ cache_complete() {
     return 1
   }
 
-  # Asking for fewer symbols than are cached is satisfied; asking for more is
-  # not. `full` needs the module debug tree that a `vmlinux` run never fetched.
-  stamp_symbols="$(stamp_get symbols)"
-  case "$SYMBOLS:$stamp_symbols" in
-    none:*|vmlinux:vmlinux|vmlinux:full|full:full) ;;
-    *) log "cache rejected: --symbols=$SYMBOLS but cached target has symbols=${stamp_symbols:-none}"
-       return 1 ;;
-  esac
-  [[ "$SYMBOLS" != full ]] || [[ -d "$MODDBG_OUT" ]] || {
-    log "cache rejected: --symbols=full but $MODDBG_OUT is missing"
-    return 1
-  }
-
   while IFS=$'\t' read -r _ path want; do
     [[ -n "$path" ]] || continue
     have="$(stat -c %s -- "$path" 2>/dev/null || echo missing)"
@@ -683,17 +674,66 @@ cache_complete() {
   return 0
 }
 
-if [[ "$NO_CACHE" == false ]] && cache_complete && [[ -f "$PRIVKEY" ]]; then
-  log "cached target found at $OUTDIR"
-  emit_outputs
-  exit 0
+# The module debug tree is a directory, not a file, so the artifact-size list
+# cannot describe it. Its shape is recorded separately -- object count and total
+# bytes -- because a bare `-d` test passes on a tree whose every .ko has been
+# deleted, and --symbols=full would then be a cache hit with no module symbols.
+moddbg_shape() {
+  local n b
+  n="$(find "$MODDBG_OUT" -name '*.ko*' -type f 2>/dev/null | wc -l)"
+  b="$(du -sb "$MODDBG_OUT" 2>/dev/null | awk '{print $1}')"
+  printf '%s\t%s' "$n" "${b:-0}"
+}
+
+cache_symbols_ok() {
+  local stamp_symbols want_shape
+
+  stamp_symbols="$(stamp_get symbols)"
+  # Asking for fewer symbols than are cached is satisfied; asking for more is
+  # not. `full` needs the module debug tree that a `vmlinux` run never fetched.
+  case "$SYMBOLS:$stamp_symbols" in
+    none:*|vmlinux:vmlinux|vmlinux:full|full:full) ;;
+    *) log "cached target has symbols=${stamp_symbols:-none}, --symbols=$SYMBOLS was asked for"
+       return 1 ;;
+  esac
+
+  if [[ "$SYMBOLS" == full ]]; then
+    [[ -d "$MODDBG_OUT" ]] || { log "cache rejected: $MODDBG_OUT is missing"; return 1; }
+    want_shape="$(stamp_get moddbg)"
+    [[ "$want_shape" == "$(moddbg_shape)" ]] || {
+      log "cache rejected: module debug tree is $(moddbg_shape), stamp recorded $want_shape"
+      return 1
+    }
+  fi
+  return 0
+}
+
+# Fetching symbols must not rebuild the image. Rebuilding would re-run apt, and
+# only the KERNEL debs are version-pinned -- the userland moves with the
+# archive, so `--symbols` on an already-validated target could hand back a
+# different rootfs, with a different apparmor or procps, than the one the PoC
+# result was measured against. When the image checks out and only the symbols
+# are short, fetch just those and leave every other artifact untouched.
+SYMBOLS_UPGRADE=false
+if [[ "$NO_CACHE" == false ]] && cache_image_ok && [[ -f "$PRIVKEY" ]]; then
+  if cache_symbols_ok; then
+    log "cached target found at $OUTDIR"
+    emit_outputs
+    exit 0
+  fi
+  SYMBOLS_UPGRADE=true
+  log "image is cached and intact; fetching symbols only, leaving the rootfs as built"
 fi
 
 mkdir -p "$OUTDIR"
 
 # From here on the directory is mid-build and must never satisfy a cache hit,
 # even if this process is killed between two docker cp calls.
-rm -f -- "$STAMP_OUT"
+#
+# Not on the symbols path: nothing there invalidates the image, so a failed
+# symbol fetch must not condemn a good target to a full rebuild. The stamp is
+# replaced atomically at the end either way.
+[[ "$SYMBOLS_UPGRADE" == true ]] || rm -f -- "$STAMP_OUT"
 
 if [[ -z "$SSH_KEY_ARG" && ! -f "$PRIVKEY" ]]; then
   step "Generating SSH keypair"
@@ -821,6 +861,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+pkgver() { awk -F'\t' -v p="$1" '$1 == p { print $2; exit }' "$PACKAGES_OUT"; }
+
+# ===========================================================================
+# BEGIN image build -- skipped entirely by a symbols-only upgrade
+#
+# The body below is left at its original indentation on purpose: it contains
+# `<<'DOCKERFILE'`, JSON and TOML heredocs, and indenting a non-`<<-` heredoc
+# injects the leading whitespace into the file it writes. The matching
+# "END image build" marker closes this guard.
+# ===========================================================================
+if [[ "$SYMBOLS_UPGRADE" == false ]]; then
+
 local_ctx="$(mktemp -d)"
 
 step "Building target container image ($IMAGE_TAG, platform $PLATFORM)"
@@ -936,9 +988,12 @@ RUN set -e; \
     esac; \
     if id -u "$UNPRIV_USER" >/dev/null 2>&1; then \
       uid="$(id -u "$UNPRIV_USER")"; \
-      if [ "$uid" -lt 1000 ]; then \
-        echo "mktarget: --unpriv-user '$UNPRIV_USER' is system account uid $uid;" >&2; \
-        echo "  refusing to present it as the unprivileged PoC user." >&2; \
+      if [ "$uid" -ne 1000 ]; then \
+        echo "mktarget: --unpriv-user '$UNPRIV_USER' already exists at uid $uid, not 1000." >&2; \
+        echo "  The PoC user is documented as uid 1000. Accepting anything else" >&2; \
+        echo "  would label an arbitrary account 'the unprivileged user' -- noble's" >&2; \
+        echo "  nobody (65534, /usr/sbin/nologin) is the case that motivates this." >&2; \
+        echo "  Pick a name that does not exist and it will be created at 1000." >&2; \
         exit 1; \
       fi; \
     else \
@@ -1135,8 +1190,6 @@ awk -F': ' '
 rm -f "$OUTDIR/.dpkg-status"
 log "userland inventory: $(wc -l < "$PACKAGES_OUT") packages -> $PACKAGES_OUT"
 
-pkgver() { awk -F'\t' -v p="$1" '$1 == p { print $2; exit }' "$PACKAGES_OUT"; }
-
 if [[ "$INITRAMFS" == true ]]; then
   if docker cp "$CID:/boot/initrd.img-$KREL" "$INITRD_OUT" >/dev/null 2>&1; then
     log "initrd extracted: $INITRD_OUT"
@@ -1158,6 +1211,11 @@ if [[ "$MAGIC" == "1f8b" ]]; then
 else
   mv "$OUTDIR/vmlinuz-$KREL.raw" "$KERNEL_OUT"
 fi
+
+fi
+# ===========================================================================
+# END image build
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
 # debug symbols from ddebs
@@ -1250,6 +1308,9 @@ fi
 # ---------------------------------------------------------------------------
 # export container filesystem -> raw ext4 image
 # ---------------------------------------------------------------------------
+if [[ "$SYMBOLS_UPGRADE" == true ]]; then
+  log "rootfs left untouched (symbols-only upgrade)"
+else
 step "Creating raw ext4 image ($SIZE) -- exports ~1 GB and runs mke2fs, expect 1-2 min"
 # The if/else form is required under `set -euo pipefail` so a failed helper
 # pipeline can fall back to host sudo mke2fs instead of aborting immediately.
@@ -1274,6 +1335,7 @@ else
   sudo mke2fs -F -q -t ext4 -d "$ROOTDIR" -L qmu-ubuntu "$ROOTFS_OUT" "$SIZE" >&2
   sudo chown "$(id -u):$(id -g)" "$ROOTFS_OUT" >&2
 fi
+fi
 
 [[ -f "$ROOTFS_OUT" ]] || die "build appeared to succeed but $ROOTFS_OUT not found"
 
@@ -1282,6 +1344,14 @@ fi
 # so `qmu exec 'cat /etc/qmu-target.json'` attributes a LIVE result.
 # ---------------------------------------------------------------------------
 step "Writing manifest and qmu.toml"
+
+# A symbols upgrade does not rebuild the image, so `built_at` must keep naming
+# when that image was built. Overwriting it with "now" would misdate the very
+# artifact the manifest exists to attribute.
+if [[ "$SYMBOLS_UPGRADE" == true && -f "$MANIFEST_OUT" ]]; then
+  PRIOR_BUILT_AT="$(awk -F'"' '/"built_at"/ { print $4; exit }' "$MANIFEST_OUT")"
+  [[ -n "$PRIOR_BUILT_AT" ]] && BUILT_AT="$PRIOR_BUILT_AT"
+fi
 
 KERNEL_SHA="$(sha256sum "$KERNEL_OUT" | awk '{print $1}')"
 ROOTFS_SHA="$(sha256sum "$ROOTFS_OUT" | awk '{print $1}')"
@@ -1407,10 +1477,19 @@ TOML
   if [[ "$SYMBOLS" != none && -f "$VMLINUX_OUT" ]]; then
     printf 'artifact\t%s\t%s\n' "$VMLINUX_OUT" "$(stat -c %s -- "$VMLINUX_OUT")"
   fi
+  # A directory cannot be described by the artifact-size list, and `-d` alone
+  # passes on a tree whose every .ko has been deleted.
+  if [[ "$SYMBOLS" == full && -d "$MODDBG_OUT" ]]; then
+    printf 'moddbg\t%s\n' "$(moddbg_shape)"
+  fi
 } > "$STAMP_OUT.part"
 mv -f "$STAMP_OUT.part" "$STAMP_OUT"
 
-step "Target ready: $OUTDIR"
+if [[ "$SYMBOLS_UPGRADE" == true ]]; then
+  step "Symbols added to cached target: $OUTDIR"
+else
+  step "Target ready: $OUTDIR"
+fi
 log "Ubuntu $SUITE $KREL ($KDEBVER, pocket $KPOCKET, hardening=$HARDENING)"
 if [[ "$RELAX" == true ]]; then
   warn "=============================================================="

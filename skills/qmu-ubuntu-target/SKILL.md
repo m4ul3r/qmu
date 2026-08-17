@@ -71,6 +71,11 @@ means an interrupted build is never served as a cached one, and a run whose
 options — or whose resolved deb version — differ from the cached target rebuilds
 instead of handing back an image that disagrees with the variables on stdout.
 
+Adding `--symbols` to an already-built target fetches **only** the symbols and
+leaves the rootfs exactly as it was. Only the kernel debs are version-pinned, so
+a rebuild could pull a different `apparmor` or `procps` — asking for symbols
+must not change the image a result was already measured on.
+
 Cost: a cache hit is 1–8 s. It is not free and it is not offline: the ABI is
 resolved against the archive *before* the cache is consulted, since for `ga` and
 `latest` the resolved ABI is what names the directory. A fresh x86_64 target is a
@@ -214,9 +219,10 @@ userns restriction" — a separate proof obligation, same class as a KASLR bypas
 
 An LPE result measured as root is meaningless. The image has an unprivileged
 `ubuntu` user at uid 1000. `--unpriv-user NAME` renames that account rather than
-adding a second one, so the PoC user is uid 1000 whatever it is called; naming
-root or any uid < 1000 is refused rather than quietly relabelled. `/root` is
-`0700`, so the binary has to be copied out:
+adding a second one, so the PoC user is uid 1000 whatever it is called. A name
+that already exists at any other uid is refused rather than quietly relabelled —
+including `nobody`, which noble ships at 65534 with `/usr/sbin/nologin`. `/root`
+is `0700`, so the binary has to be copied out:
 
 ```bash
 qmu compile ./poc.c --vm ubu

@@ -682,17 +682,60 @@ def test_cache_is_incomplete_without_every_emitted_product(mktarget_env):
     assert any(c[0] == "build" for c in mktarget_env.docker_calls())
 
 
-def test_symbols_request_makes_vmlinux_part_of_the_cache_contract(mktarget_env):
-    """A target built without symbols must not satisfy a later --symbols run."""
+def test_symbols_are_added_without_rebuilding_the_measured_rootfs(mktarget_env):
+    """A target built without symbols must not satisfy a later --symbols run --
+    but satisfying it must not rebuild the image either. Only the kernel debs
+    are version-pinned, so re-running apt can change apparmor or procps out from
+    under a result already measured on that rootfs."""
     plain = mktarget_env.run("--kernel-abi", "ga")
     assert plain.returncode == 0, plain.stderr
     assert "VMLINUX=" not in plain.stdout
+    rootfs = Path(_assignments(plain.stdout)["ROOTFS"])
+    before = (rootfs.read_bytes(), rootfs.stat().st_mtime_ns)
+    built_at = json.loads(
+        Path(_assignments(plain.stdout)["TARGET_MANIFEST"]).read_text()
+    )["built_at"]
     mktarget_env.clear_docker_log()
 
     withsym = mktarget_env.run("--kernel-abi", "ga", "--symbols")
     assert withsym.returncode == 0, withsym.stderr
-    assert any(c[0] == "build" for c in mktarget_env.docker_calls())
     assert "VMLINUX=" in withsym.stdout
+
+    verbs = [c[0] for c in mktarget_env.docker_calls()]
+    assert "build" not in verbs, "the image was rebuilt to add symbols"
+    assert "export" not in verbs, "the rootfs was regenerated to add symbols"
+    assert any(
+        c[0] == "run" and "dbgsym" in c[-1] for c in mktarget_env.docker_calls()
+    ), "symbols were never fetched"
+
+    assert (rootfs.read_bytes(), rootfs.stat().st_mtime_ns) == before
+    manifest = json.loads(Path(_assignments(withsym.stdout)["TARGET_MANIFEST"]).read_text())
+    # the manifest now records symbols, but still dates the image it describes
+    assert manifest["dbgsym_version"] == "6.8.0-31.31"
+    assert manifest["built_at"] == built_at
+
+    # and the upgraded target is a plain cache hit from here on
+    mktarget_env.clear_docker_log()
+    again = mktarget_env.run("--kernel-abi", "ga", "--symbols", fail_if_docker_runs=True)
+    assert again.returncode == 0, again.stderr
+    assert again.stdout == withsym.stdout
+
+
+def test_a_failed_symbols_upgrade_leaves_the_cached_target_usable(mktarget_env):
+    """The image was never touched, so a failed symbol fetch must not condemn a
+    good target to a full rebuild."""
+    plain = mktarget_env.run("--kernel-abi", "ga")
+    assert plain.returncode == 0, plain.stderr
+
+    broken = mktarget_env.run(
+        "--kernel-abi", "ga", "--symbols", MKTARGET_FAKE_DBGSYM_FAIL="1"
+    )
+    assert broken.returncode == 2
+    mktarget_env.clear_docker_log()
+
+    after = mktarget_env.run("--kernel-abi", "ga", fail_if_docker_runs=True)
+    assert after.returncode == 0, after.stderr
+    assert after.stdout == plain.stdout
 
 
 def test_vmlinux_is_not_emitted_without_symbols_even_if_cached(mktarget_env):
@@ -989,15 +1032,22 @@ def test_unpriv_user_creates_the_account_when_uid_1000_is_free(mktarget_env, tmp
     assert any(c == "useradd -m -s /bin/bash -u 1000 researcher" for c in calls), calls
 
 
-@pytest.mark.parametrize("name", ["root", "daemon"])
-def test_privileged_unpriv_user_is_refused(mktarget_env, tmp_path, name):
-    """Accepting a system account would label it "the unprivileged user" and
-    make every LPE result meaningless in the opposite direction."""
+@pytest.mark.parametrize("name", ["root", "daemon", "nobody"])
+def test_an_existing_account_that_is_not_uid_1000_is_refused(mktarget_env, tmp_path, name):
+    """Accepting an existing account at any other uid would label it "the
+    unprivileged user" while the skill promises uid 1000. `nobody` is the case
+    that matters: noble ships it at 65534 with /usr/sbin/nologin, so a uid<1000
+    guard waves it through and the PoC user cannot even get a shell."""
     r = mktarget_env.run("--kernel-abi", "ga")
     assert r.returncode == 0, r.stderr
     proc, calls = _exec_user_setup(
         mktarget_env, tmp_path, name,
-        ["root:x:0:0::/root:/bin/bash", "daemon:x:1:1::/usr/sbin:/usr/sbin/nologin"],
+        [
+            "root:x:0:0::/root:/bin/bash",
+            "daemon:x:1:1::/usr/sbin:/usr/sbin/nologin",
+            "ubuntu:x:1000:1000::/home/ubuntu:/bin/bash",
+            "nobody:x:65534:65534::/nonexistent:/usr/sbin/nologin",
+        ],
     )
     assert proc.returncode == 1, proc.stdout
     assert "unpriv-user" in proc.stderr
@@ -1024,6 +1074,27 @@ def test_symbols_full_is_not_satisfied_by_a_vmlinux_only_cache(mktarget_env):
     ), "the full-symbol helper never ran"
     mods = outdir / "usr/lib/debug/lib/modules" / _assignments(full.stdout)["KERNEL_RELEASE"]
     assert list(mods.rglob("*.ko")), "module debug objects were not extracted"
+
+
+def test_an_emptied_module_debug_tree_is_not_a_cache_hit(mktarget_env):
+    """Completeness checked only that the directory existed, so deleting every
+    .ko while leaving the tree in place made the next --symbols=full request a
+    hit with no module symbols in it."""
+    full = mktarget_env.run("--kernel-abi", "ga", "--symbols=full")
+    assert full.returncode == 0, full.stderr
+    outdir = Path(_assignments(full.stdout)["ROOTFS"]).parent
+    mods = outdir / "usr/lib/debug/lib/modules" / _assignments(full.stdout)["KERNEL_RELEASE"]
+    for ko in mods.rglob("*.ko"):
+        ko.unlink()
+    assert mods.is_dir()
+    mktarget_env.clear_docker_log()
+
+    again = mktarget_env.run("--kernel-abi", "ga", "--symbols=full")
+    assert again.returncode == 0, again.stderr
+    assert any(
+        c[0] == "run" and "KEEP_MODULES=1" in c for c in mktarget_env.docker_calls()
+    ), "the emptied tree was accepted as cached"
+    assert list(mods.rglob("*.ko"))
 
 
 def test_a_failed_symbol_extraction_leaves_no_target(mktarget_env):
