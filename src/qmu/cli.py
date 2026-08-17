@@ -24,7 +24,7 @@ from .qmp import QMPError
 from .ssh import SSHError
 
 from ._cliutil import _add_top_level_common_opts, _emit_error
-from .commands import guest, lifecycle, meta, qmp_cmds
+from .commands import guest, lifecycle, meta, qmp_cmds, run
 
 # Re-exported solely so test_snapshot_exit can reach it as ``cli._snapshot_failed``.
 from .commands.qmp_cmds import _snapshot_failed  # noqa: F401
@@ -51,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
             "  4    infrastructure / internal error (QMP or SSH layer failures,\n"
             "       unexpected qmu errors, infra-subprocess failures such as a\n"
             "       pry/gdb hang)\n"
-            "  124  wait timeout\n"
+            "  124  wait timeout (also: 'run' gave up waiting for the guest)\n"
             "\n"
             "json contract:\n"
             "  With --format json|ndjson every result is a JSON object carrying\n"
@@ -67,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="subcommand")
 
     lifecycle._add_launch(sub)
+    run._add_run(sub)
     lifecycle._add_kill(sub)
     lifecycle._add_prune(sub)
     lifecycle._add_wait(sub)

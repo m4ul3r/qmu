@@ -47,6 +47,7 @@ from ..serial import extract_crash, serial_log_offset
 from ..vm import launch_vm
 from .._cliutil import (
     _add_common_opts,
+    _add_launch_opts,
     _emit,
     _kill_vm,
     _make_ssh,
@@ -63,43 +64,29 @@ from .._cliutil import (
 
 def _add_launch(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("launch", help="Start a QEMU VM")
-    p.add_argument("--kernel", required=True, help="Path to bzImage")
-    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
-    p.add_argument("--rootfs", default=None, help="Path to rootfs image (overrides config)")
-    p.add_argument("--ssh-key", default=None, dest="ssh_key", help="SSH private key (overrides config)")
-    p.add_argument("--arch", default=None, help="Architecture (overrides config, e.g. x86_64, aarch64)")
-    p.add_argument("--memory", default=None, help="VM memory (overrides config)")
-    p.add_argument("--cpus", type=int, default=None, help="VM CPU count (overrides config)")
-    p.add_argument("--cpu", default=None, dest="cpu_model",
-                   help="QEMU -cpu model, e.g. 'host', 'max', 'qemu64' (overrides config)")
-    p.add_argument("--profile", default="exploit-dev", help="Boot profile (default: exploit-dev)")
-    p.add_argument("--cmdline", default=None, help="Override kernel command line")
-    p.add_argument("--gdb", action="store_true", help="Enable GDB stub")
-    p.add_argument("--name", default=None, help="VM instance name")
-    p.add_argument("--no-replace", action="store_true",
-                   help="Don't kill existing VM with same name (default: replace)")
-    p.add_argument("--ssh-port", type=int, default=None, help="SSH port (auto-allocated)")
-    p.add_argument("--gdb-port", type=int, default=None, help="GDB port (auto-allocated)")
-    p.add_argument("--ssh-timeout", type=int, default=60, help="SSH wait timeout in seconds")
-    p.add_argument("--no-wait-ssh", action="store_true", help="Don't wait for SSH to be ready")
-    p.add_argument("--initrd", default=None, help="Path to initramfs/initrd image")
-    p.add_argument("--drive", action="append", dest="drives", default=None,
-                   help="QEMU -drive spec, repeatable (suppresses implicit rootfs drive)")
-    p.add_argument("--nic-model", default=None, dest="nic_model",
-                   help="NIC model (default: virtio-net-pci)")
-    p.add_argument("--no-net", action="store_true",
-                   help="Disable networking entirely (-nic none)")
-    p.add_argument("--net-backend", default=None, dest="net_backend",
-                   choices=["user", "passt"],
-                   help="Network backend: 'user' (slirp, default) or 'passt' "
-                        "(migration-compatible when the selected QEMU advertises native passt). "
-                        "Overrides config.")
-    p.add_argument("--harness", action="store_true",
-                   help="Harness/judge VM mode: implies --no-wait-ssh + --no-net; "
-                        "skips rootfs/ssh-key requirement")
-    p.add_argument("extra", nargs="*", help="Extra QEMU arguments")
+    _add_launch_opts(p)
     _add_common_opts(p)
     p.set_defaults(handler=_handle_launch)
+
+
+def _replace_existing_named_vm(name: str | None, no_replace: bool) -> None:
+    """Clear the way for a named launch: kill a live namesake, reap a stale one.
+
+    Shared with ``qmu run`` (``commands.run``) so both boot paths treat a
+    same-named VM identically; a second copy would let one of them orphan a QEMU
+    process still holding the rootfs. The collaborators are read from this
+    module's namespace, so ``monkeypatch.setattr(lifecycle, "load_instance", ...)``
+    keeps working for both callers.
+    """
+    if not name or no_replace:
+        return
+    existing = load_instance(name)
+    if existing is not None and instance_alive(existing):
+        sys.stderr.write(f"[qmu] Replacing existing VM '{name}' (pid={existing.pid})\n")
+        _kill_vm(existing)
+    elif existing is not None:
+        # Stale metadata from dead process — just clean up
+        remove_instance(existing.vm_id)
 
 
 def _handle_launch(args: argparse.Namespace) -> int:
@@ -111,14 +98,7 @@ def _handle_launch(args: argparse.Namespace) -> int:
         args.no_net = True
 
     # Replace existing VM with the same name (default behavior)
-    if args.name and not args.no_replace:
-        existing = load_instance(args.name)
-        if existing is not None and instance_alive(existing):
-            sys.stderr.write(f"[qmu] Replacing existing VM '{args.name}' (pid={existing.pid})\n")
-            _kill_vm(existing)
-        elif existing is not None:
-            # Stale metadata from dead process — just clean up
-            remove_instance(existing.vm_id)
+    _replace_existing_named_vm(args.name, args.no_replace)
 
     inst = launch_vm(
         config=config,

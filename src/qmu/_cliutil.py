@@ -295,6 +295,78 @@ def _add_format_opts(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False) -> None:
+    """Register the boot-describing flags shared by ``launch`` and ``run``.
+
+    ``run`` boots a VM with exactly the same knobs ``launch`` does, so the two
+    parsers are built from one registrar: a flag added to only one of them is the
+    "subcommand vs subcommand" divergence the state-agreement matrix exists to
+    catch, and it would surface as a boot that silently differs from the launch
+    the agent verified by hand.
+
+    ``run_mode`` drops the three flags whose meaning does not survive the
+    boot-run-reap composition:
+
+    - ``--harness`` / ``--no-wait-ssh`` — ``run`` executes a guest command over
+      SSH, so a mode that guarantees no SSH cannot run one. Left unregistered so
+      the attempt is an argparse usage error (exit 2), not a boot that comes up
+      and then reports a confusing SSH failure.
+    - ``extra`` (trailing QEMU passthrough) — ``run`` spends its positional on
+      the guest command instead; two greedy positionals cannot be disambiguated.
+      The passthrough returns as the repeatable ``--qemu-arg`` flag, because an
+      aarch64/arm guest does not boot without ``-M virt``.
+    """
+    parser.add_argument("--kernel", required=True, help="Path to bzImage")
+    parser.add_argument("--config", default=None, help="Path to qmu.toml config file")
+    parser.add_argument("--rootfs", default=None, help="Path to rootfs image (overrides config)")
+    parser.add_argument("--ssh-key", default=None, dest="ssh_key", help="SSH private key (overrides config)")
+    parser.add_argument("--arch", default=None, help="Architecture (overrides config, e.g. x86_64, aarch64)")
+    parser.add_argument("--memory", default=None, help="VM memory (overrides config)")
+    parser.add_argument("--cpus", type=int, default=None, help="VM CPU count (overrides config)")
+    parser.add_argument("--cpu", default=None, dest="cpu_model",
+                        help="QEMU -cpu model, e.g. 'host', 'max', 'qemu64' (overrides config)")
+    parser.add_argument("--profile", default="exploit-dev", help="Boot profile (default: exploit-dev)")
+    parser.add_argument("--cmdline", default=None, help="Override kernel command line")
+    parser.add_argument("--gdb", action="store_true", help="Enable GDB stub")
+    parser.add_argument("--name", default=None, help="VM instance name")
+    parser.add_argument("--no-replace", action="store_true",
+                        help="Don't kill existing VM with same name (default: replace)")
+    parser.add_argument("--ssh-port", type=int, default=None, help="SSH port (auto-allocated)")
+    parser.add_argument("--gdb-port", type=int, default=None, help="GDB port (auto-allocated)")
+    parser.add_argument("--ssh-timeout", type=int, default=60, help="SSH wait timeout in seconds")
+    if not run_mode:
+        parser.add_argument("--no-wait-ssh", action="store_true", help="Don't wait for SSH to be ready")
+    parser.add_argument("--initrd", default=None, help="Path to initramfs/initrd image")
+    parser.add_argument("--drive", action="append", dest="drives", default=None,
+                        help="QEMU -drive spec, repeatable (suppresses implicit rootfs drive)")
+    parser.add_argument("--nic-model", default=None, dest="nic_model",
+                        help="NIC model (default: virtio-net-pci)")
+    parser.add_argument("--no-net", action="store_true",
+                        help="Disable networking entirely (-nic none)")
+    parser.add_argument("--net-backend", default=None, dest="net_backend",
+                        choices=["user", "passt"],
+                        help="Network backend: 'user' (slirp, default) or 'passt' "
+                             "(migration-compatible when the selected QEMU advertises native passt). "
+                             "Overrides config.")
+    if run_mode:
+        # `run` spends its positional on the guest command, so QEMU passthrough
+        # has to be flag-carried. It is not optional decoration: an aarch64 or
+        # arm guest does not boot without `-M virt`, so without this `run` would
+        # be unusable for exactly the cross-arch case it is most useful for.
+        # Use the `=` form for values that start with a dash (argparse would
+        # otherwise read them as options): --qemu-arg=-M --qemu-arg=virt
+        parser.add_argument(
+            "--qemu-arg", action="append", dest="extra", default=None, metavar="ARG",
+            help="Extra QEMU argument, repeatable. Use the '=' form for values "
+                 "starting with a dash: --qemu-arg=-M --qemu-arg=virt",
+        )
+    else:
+        parser.add_argument("--harness", action="store_true",
+                            help="Harness/judge VM mode: implies --no-wait-ssh + --no-net; "
+                                 "skips rootfs/ssh-key requirement")
+        parser.add_argument("extra", nargs="*", help="Extra QEMU arguments")
+
+
 def _add_common_opts(parser: argparse.ArgumentParser) -> None:
     """Register --vm/--format/--out on a SUBPARSER so the flags also work AFTER
     the subcommand (e.g. ``qmu exec --vm X``).

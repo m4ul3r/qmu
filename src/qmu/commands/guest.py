@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
+from ..hostcc import host_compile, resolve_host_cc
 from ..instance import QMUError, VMInstance, choose_instance, find_instance
 from ..serial import extract_crash, serial_log_offset, tail_log
 from ..ssh import SSHClient, SSHError, is_transport_failure
@@ -210,19 +212,23 @@ def _transport_lost(ssh: SSHClient) -> bool:
     return True
 
 
-def _emit_ssh_lost(
-    args: argparse.Namespace,
+def _ssh_lost_payload(
     command: str,
     inst: VMInstance,
     *,
     start_offset: int,
-) -> int:
-    """Emit the SSH-lost / probable-crash envelope and return exit 3.
+) -> tuple[int, dict[str, Any], list[str]]:
+    """Build the SSH-lost / probable-crash (status, data, text) triple.
 
     Used for both an SSH timeout (TimeoutExpired -> SSHError) and a transport
     disconnect (rc=255 + ssh transport marker), which both mean the guest very
     likely panicked and dropped the connection. Exit 3 distinguishes a
     crash/transport-loss from an ordinary non-zero guest command (exit 1).
+
+    Split out from :func:`_emit_ssh_lost` so ``qmu run`` reaches the identical
+    classification without re-deriving it: a second copy of this decision is
+    exactly how ``exec`` and ``push``/``pull`` came to disagree about what a
+    dropped connection means.
     """
     crash = extract_crash(inst.serial_log, start_offset=start_offset)
     # CORR-5: only assert a kernel crash when a crash report was actually
@@ -240,7 +246,7 @@ def _emit_ssh_lost(
             "No fresh crash report in serial log. Check: qmu log --tail 100"
         )
         text_msg = "\nNo fresh crash detected in serial log. Check: qmu log --tail 100"
-    result = {
+    result: dict[str, Any] = {
         "ok": False,
         "ssh_error": True,
         "crash_detected": crash is not None,
@@ -248,13 +254,20 @@ def _emit_ssh_lost(
         "crash": crash,
         "hint": hint,
     }
-    _emit(
-        args,
-        data=result,
-        text=[f"SSH connection lost while running: {command}", text_msg],
-        stem="exec",
-    )
-    return 3
+    return 3, result, [f"SSH connection lost while running: {command}", text_msg]
+
+
+def _emit_ssh_lost(
+    args: argparse.Namespace,
+    command: str,
+    inst: VMInstance,
+    *,
+    start_offset: int,
+) -> int:
+    """Emit the SSH-lost / probable-crash envelope and return exit 3."""
+    status, data, text = _ssh_lost_payload(command, inst, start_offset=start_offset)
+    _emit(args, data=data, text=text, stem="exec")
+    return status
 
 
 def _join_exec_command(command: list[str]) -> str:
@@ -269,21 +282,27 @@ def _join_exec_command(command: list[str]) -> str:
     return command[0] if len(command) == 1 else shlex.join(command)
 
 
-def _handle_exec(args: argparse.Namespace) -> int:
-    inst = choose_instance(args.vm)
-    _require_ssh(inst)
-    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="exec")) is not None:
-        return preflight_rc
-    ssh = _make_ssh(inst)
-    command = _join_exec_command(args.command)
+def _run_guest_command(
+    ssh: SSHClient,
+    command: str,
+    inst: VMInstance,
+    *,
+    timeout: float,
+) -> tuple[int, dict[str, Any], str | list[str]]:
+    """Run `command` in the guest and classify the outcome.
 
+    Returns the (exit status, JSON data, text payload) triple rather than
+    emitting, so ``qmu exec`` and ``qmu run`` render the same classification
+    under their own ``stem`` instead of maintaining two copies of the
+    crash-vs-transport-loss discrimination.
+    """
     command_start_offset = serial_log_offset(inst.serial_log)
     try:
-        rc, stdout, stderr = ssh.run(command, timeout=args.timeout)
+        rc, stdout, stderr = ssh.run(command, timeout=timeout)
     except SSHError:
         # SSH command exceeded qmu's own timeout — likely a hung/crashed guest.
-        return _emit_ssh_lost(
-            args, command, inst, start_offset=command_start_offset
+        return _ssh_lost_payload(
+            command, inst, start_offset=command_start_offset
         )
 
     # A kernel panic during the command drops the connection and ssh exits 255 —
@@ -294,8 +313,8 @@ def _handle_exec(args: argparse.Namespace) -> int:
     # the guest vanished (crash); if it answers, the guest genuinely returned 255
     # and we take the normal path.
     if rc == 255 and _transport_lost(ssh):
-        return _emit_ssh_lost(
-            args, command, inst, start_offset=command_start_offset
+        return _ssh_lost_payload(
+            command, inst, start_offset=command_start_offset
         )
 
     kernel_warning = extract_crash(
@@ -316,22 +335,31 @@ def _handle_exec(args: argparse.Namespace) -> int:
     text = "\n".join(output_parts) if output_parts else f"[exit code: {rc}]"
     # L1: always include ssh_error/crash_detected so consumers have a stable,
     # explicit contract (not an implicit "key omitted on success").
-    _emit(
-        args,
-        data={
-            "ok": rc == 0,
-            "exit_code": rc,
-            "stdout": stdout,
-            "stderr": stderr,
-            "ssh_error": False,
-            "crash_detected": False,
-            "kernel_warning_detected": kernel_warning is not None,
-            "kernel_warning": kernel_warning,
-        },
-        text=text,
-        stem="exec",
+    data: dict[str, Any] = {
+        "ok": rc == 0,
+        "exit_code": rc,
+        "stdout": stdout,
+        "stderr": stderr,
+        "ssh_error": False,
+        "crash_detected": False,
+        "kernel_warning_detected": kernel_warning is not None,
+        "kernel_warning": kernel_warning,
+    }
+    return (0 if rc == 0 else 1), data, text
+
+
+def _handle_exec(args: argparse.Namespace) -> int:
+    inst = choose_instance(args.vm)
+    _require_ssh(inst)
+    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="exec")) is not None:
+        return preflight_rc
+    ssh = _make_ssh(inst)
+    command = _join_exec_command(args.command)
+    status, data, text = _run_guest_command(
+        ssh, command, inst, timeout=args.timeout
     )
-    return 0 if rc == 0 else 1
+    _emit(args, data=data, text=text, stem="exec")
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -340,13 +368,76 @@ def _handle_exec(args: argparse.Namespace) -> int:
 
 
 def _add_compile(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("compile", help="Compile C file in guest")
+    p = sub.add_parser("compile", help="Compile C file in guest (or on the host with --host)")
     p.add_argument("source", help="Local C source file")
     p.add_argument("--run", action="store_true", help="Run after compiling")
     p.add_argument("--cflags", default="-static -lpthread", help="Compiler flags")
     p.add_argument("--timeout", type=float, default=60.0, help="Execution timeout")
+    p.add_argument(
+        "--host",
+        action="store_true",
+        dest="host_build",
+        help="Compile on the HOST with a toolchain for the guest arch, then push "
+             "the binary (guest needs no gcc; much faster for emulated guests)",
+    )
+    p.add_argument(
+        "--cc",
+        default=None,
+        help="With --host: compiler to use, overriding arch-based selection "
+             "(e.g. 'clang --target=aarch64-linux-gnu')",
+    )
     _add_common_opts(p)
     p.set_defaults(handler=_handle_compile)
+
+
+def _compile_on_host(
+    args: argparse.Namespace,
+    inst: VMInstance,
+    ssh: SSHClient,
+    source: Path,
+    remote_bin: str,
+) -> tuple[int, dict[str, Any]]:
+    """Build `source` on the host for the guest arch and push it to `remote_bin`.
+
+    Returns (compile rc, partial result dict) using the SAME key names as the
+    in-guest path, so a JSON consumer does not have to branch on where the build
+    happened; ``compiled_on`` records which path ran.
+    """
+    cc = resolve_host_cc(inst.arch, args.cc)
+    with tempfile.TemporaryDirectory(prefix="qmu-compile-") as tmpdir:
+        local_bin = Path(tmpdir) / source.stem
+        rc, stdout, stderr, argv = host_compile(
+            source, local_bin, args.cflags, cc
+        )
+        result: dict[str, Any] = {
+            "source": str(source),
+            "compile_cmd": " ".join(argv),
+            "compile_exit": rc,
+            "compile_stdout": stdout,
+            "compile_stderr": stderr,
+            "compiled_on": "host",
+            "compiler": " ".join(cc),
+            "guest_arch": inst.arch,
+            "ssh_error": False,
+            "crash_detected": False,
+        }
+        if rc != 0:
+            return rc, result
+
+        ssh.push(str(local_bin), remote_bin)
+
+    # scp does not preserve the mode (no -p in SSHClient._scp_base), so the
+    # pushed binary lands non-executable and --run would fail with a bare
+    # "Permission denied" that reads like a guest problem. chmod is part of
+    # delivering a *runnable* artifact, so its failure is a compile failure.
+    chmod_rc, _, chmod_err = ssh.run(f"chmod +x {shlex.quote(remote_bin)}", timeout=15)
+    if chmod_rc != 0:
+        result["compile_exit"] = chmod_rc
+        result["compile_stderr"] = (
+            f"pushed {remote_bin} but could not make it executable: {chmod_err.strip()}"
+        )
+        return chmod_rc, result
+    return 0, result
 
 
 def _handle_compile(args: argparse.Namespace) -> int:
@@ -364,35 +455,40 @@ def _handle_compile(args: argparse.Namespace) -> int:
     remote_src = f"/root/{source.name}"
     remote_bin = f"/root/{name}"
 
-    # Push source
-    ssh.push(str(source), remote_src)
+    if args.host_build:
+        rc, result = _compile_on_host(args, inst, ssh, source, remote_bin)
+    else:
+        # Push source
+        ssh.push(str(source), remote_src)
 
-    # Compile. The remote paths are quoted (a source name with a space or shell
-    # metacharacter must not detonate the root shell); --cflags is intentionally
-    # left unquoted — it is a list of shell flags.
-    compile_cmd = (
-        f"gcc {args.cflags} -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)}"
-    )
-    rc, stdout, stderr = ssh.run(compile_cmd, timeout=30)
+        # Compile. The remote paths are quoted (a source name with a space or shell
+        # metacharacter must not detonate the root shell); --cflags is intentionally
+        # left unquoted — it is a list of shell flags.
+        compile_cmd = (
+            f"gcc {args.cflags} -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)}"
+        )
+        rc, stdout, stderr = ssh.run(compile_cmd, timeout=30)
 
-    result: dict[str, Any] = {
-        "source": str(source),
-        "compile_cmd": compile_cmd,
-        "compile_exit": rc,
-        "compile_stdout": stdout,
-        "compile_stderr": stderr,
-        # L1: always-present booleans for a stable JSON contract. Updated below
-        # if the run path detects a crash/transport loss.
-        "ssh_error": False,
-        "crash_detected": False,
-    }
+        result = {
+            "source": str(source),
+            "compile_cmd": compile_cmd,
+            "compile_exit": rc,
+            "compile_stdout": stdout,
+            "compile_stderr": stderr,
+            "compiled_on": "guest",
+            # L1: always-present booleans for a stable JSON contract. Updated below
+            # if the run path detects a crash/transport loss.
+            "ssh_error": False,
+            "crash_detected": False,
+        }
 
     if rc != 0:
         result["ok"] = False
+        where = "on the host" if args.host_build else "in the guest"
         _emit(
             args,
             data=result,
-            text=f"Compilation failed:\n{stderr.strip()}",
+            text=f"Compilation failed {where}:\n{str(result['compile_stderr']).strip()}",
             stem="compile",
         )
         return 1
@@ -401,10 +497,13 @@ def _handle_compile(args: argparse.Namespace) -> int:
 
     if not args.run:
         result["ok"] = True
+        built_by = (
+            f" (host {result['compiler']})" if args.host_build else ""
+        )
         _emit(
             args,
             data=result,
-            text=f"Compiled {source.name} -> {remote_bin}",
+            text=f"Compiled {source.name} -> {remote_bin}{built_by}",
             stem="compile",
         )
         return 0

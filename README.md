@@ -25,6 +25,44 @@ qmu kill
 
 Run `qmu --help` for full usage.
 
+## One-shot runs
+
+`qmu run` collapses `launch` → `exec` → `kill` into one command whose exit code
+is the *guest command's*:
+
+```bash
+qmu run --kernel ./bzImage -- './exploit'
+qmu run --kernel ./bzImage --keep -- 'id'     # leave the VM up afterwards
+```
+
+`0` guest command succeeded · `1` guest command failed (or the VM died before
+SSH came up) · `3` kernel crash · `124` guest never became reachable.
+
+On a clean run the VM is reaped and stdout matches what `qmu exec` would have
+printed. If the run crashed the kernel, timed out, or died on boot, the VM is
+stopped but its `.serial.log` and metadata are **preserved**, and the output
+names the follow-up (`qmu crash --vm ID`, `qmu prune --vm ID`).
+
+`run` takes launch's boot flags, minus `--harness`/`--no-wait-ssh` (it needs
+SSH), and carries QEMU passthrough as a repeatable `--qemu-arg` because the
+positional is the guest command: `--qemu-arg=-M --qemu-arg=virt`.
+
+## Building on the host
+
+`qmu compile --host` builds with a host toolchain for the *guest* arch and
+pushes the binary, so the guest needs no gcc:
+
+```bash
+qmu compile exploit.c --host --run
+qmu compile exploit.c --host --cc 'clang --target=aarch64-linux-gnu'
+```
+
+Worth it whenever the rootfs ships no compiler (kernelCTF, vendor firmware,
+minimal Debian) or the guest is emulated — measured on the bundled sample
+against an emulated aarch64 guest: 1.2s on the host vs 6.3s in the guest.
+The compiler is chosen from the instance's recorded arch (`aarch64` →
+`aarch64-linux-gnu-gcc`), never the host's.
+
 ## Harness mode (boot-and-die VMs)
 
 For kernelCTF judge envs, syzkaller reproducers, and other VMs that boot from

@@ -78,6 +78,59 @@ qmu crash                                   # Extract crash report (works even w
 qmu kill                                    # Stop the VM
 ```
 
+One-shot, for a disposable VM — boot, run, reap in a single command:
+
+```bash
+qmu run --kernel /path/to/bzImage -- './exploit'
+```
+
+## One-shot runs (`qmu run`)
+
+`qmu run` collapses `launch` → `exec` → `kill` into one call. **The exit code is
+the guest command's**, mapped onto the same contract every other command uses:
+
+| Exit | Meaning |
+|------|---------|
+| `0`  | guest command exited 0 |
+| `1`  | guest command exited non-zero, or the VM died before SSH came up |
+| `3`  | kernel crash / SSH transport loss (same discrimination as `exec`) |
+| `124`| the guest never became reachable within `--ssh-timeout` |
+
+```bash
+qmu run --kernel ./bzImage -- './exploit'
+qmu run --kernel ./bzImage --timeout 120 -- './exploit --spray'
+qmu run --kernel ./bzImage --keep -- 'id'          # leave the VM up for follow-up
+qmu run --kernel ./bzImage --profile exploit-test -- './exploit'
+```
+
+It takes every boot flag `launch` does, with three differences:
+
+- **QEMU passthrough is `--qemu-arg`**, repeatable — the positional is spent on
+  the guest command. Use the `=` form for values starting with a dash:
+  `--qemu-arg=-M --qemu-arg=virt`. Cross-arch guests need this.
+- **No `--harness` / `--no-wait-ssh`.** `run` executes a guest command over SSH,
+  so a mode that guarantees no SSH cannot run one (argparse rejects them, exit 2).
+  For boot-and-die kernels use `launch --harness` + `wait` + `crash`.
+- **Reaping is conditional.** On a clean run the VM is fully removed and stdout
+  is byte-identical to what `qmu exec` would have printed (so `qmu run ... | grep`
+  works). If the run crashed the kernel, never reached a guest, or died on boot,
+  the VM is stopped but the instance metadata and `.serial.log` are **preserved**,
+  and the output names the follow-up: `qmu crash --vm ID`, `qmu prune --vm ID`.
+
+```bash
+$ qmu run --kernel ./bzImage -- 'echo c > /proc/sysrq-trigger'
+SSH connection lost while running: echo c > /proc/sysrq-trigger
+
+Crash from serial log:
+[    5.952246] Kernel panic - not syncing: sysrq triggered crash
+...
+VM 'vm-10022' stopped (state preserved). Serial log: ~/.cache/qmu/instances/vm-10022.serial.log
+Inspect: qmu log --vm vm-10022 --tail 200 | qmu crash --vm vm-10022
+Clean up:  qmu prune --vm vm-10022
+$ echo $?
+3
+```
+
 ## VM Lifecycle
 
 ### Launching
@@ -222,6 +275,48 @@ qmu compile exploit.c --cflags "-static -lpthread -DDEBUG"
 ```
 
 Default CFLAGS: `-static -lpthread`.
+
+### Building on the host (`--host`)
+
+`--host` compiles on the **host** with a toolchain for the guest arch, then
+pushes the binary. Reach for it when either of these is true:
+
+- **The guest has no gcc.** kernelCTF images, most vendor firmware rootfs, and
+  minimal Debian images ship no toolchain, so the default path cannot work at all.
+- **The guest is emulated.** Compiling inside a TCG aarch64/arm guest is far
+  slower than the host cross-compiler — measured on the bundled sample against an
+  emulated aarch64 bookworm guest: **1.2s host vs 6.3s in-guest**, and the gap
+  grows with the size of the source.
+
+```bash
+qmu compile exploit.c --host --run
+qmu compile exploit.c --host --cc 'clang --target=aarch64-linux-gnu'
+```
+
+The compiler is chosen from the **guest** arch recorded on the instance, not the
+host's — an aarch64 VM gets `aarch64-linux-gnu-gcc` even though `gcc` is right
+there. (A host-arch binary would fail in the guest as a bare "cannot execute
+binary file", which reads like a guest problem rather than a missing toolchain.)
+Selection order per arch:
+
+| Guest arch | Tried, in order |
+|------------|-----------------|
+| host arch  | `cc`, `gcc` |
+| `aarch64`  | `aarch64-linux-gnu-gcc` |
+| `arm`      | `arm-linux-gnueabihf-gcc`, `arm-linux-gnueabi-gcc` |
+| `i386`     | `i686-linux-gnu-gcc`, `i586-linux-gnu-gcc`, then `gcc -m32` |
+| `x86_64`   | `x86_64-linux-gnu-gcc` |
+
+If nothing is found, the error names what was tried, the package to install, and
+`--cc`. `--cc` is honored verbatim and is deliberately **not** checked against the
+guest arch, so an unmodelled toolchain (musl cross, clang, a wrapper script) works.
+
+Keep `-static` in `--cflags` (it is the default): a host-built dynamic binary
+must match the guest's libc, and a static one sidesteps that entirely. The pushed
+binary is `chmod +x`'d — `scp` does not preserve the mode.
+
+JSON results use the **same keys** on both paths, with `compiled_on`
+(`"host"`/`"guest"`) recording which ran, so a consumer never has to branch.
 
 > **Crash detection is best-effort.** When a guest command crashes the kernel, qmu attempts to pull the crash report from the serial log — both when the command exceeds `--timeout` and when SSH is torn down (rc=255) by a panic. This is best-effort: after **any** suspected panic, including a bare `[exit code: 255]`, always confirm with `qmu crash` (and `qmu log --tail 200`). Never rely on the exit code alone to detect a crash.
 
@@ -518,7 +613,7 @@ Use the exit code (not log scraping) to branch:
 | `2`  | Usage / argument-parse error (argparse) |
 | `3`  | Guest kernel crash, or SSH transport loss under a panic |
 | `4`  | QMP or SSH transport-layer failure (`QMPError`/`SSHError`), or an internal/unexpected qmu error (the `main()` catch-all, a hung helper subprocess) |
-| `124`| `qmu wait` timed out |
+| `124`| `qmu wait` timed out, or `qmu run` gave up waiting for the guest to answer SSH |
 
 Exit `3` is guest-side; an internal qmu/transport fault is `4`, so a tooling bug is never mistaken for a kernel panic. (Matches `qmu --help`.)
 

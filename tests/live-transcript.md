@@ -429,3 +429,190 @@ qmu: error: argument subcommand: invalid choice: 'live' (choose from 'launch', '
 492:[    6.664354] Kernel panic - not syncing: sysrq triggered crash
 527:[    6.673365] ---[ end Kernel panic - not syncing: sysrq triggered crash ]---
 ```
+
+---
+
+# `qmu run` / `qmu compile --host` — live verification
+
+Added with the one-shot `run` command and host-side compilation. Unit doubles
+cannot see either of the two classes that matter here (a real panicking guest,
+and a real cross toolchain producing a binary the guest can actually exec), so
+both were driven against real VMs. Kernel: linux-6.6.75 (x86_64 + arm64 builds
+from `~/.cache/qmu/kernels`), Debian bookworm rootfs.
+
+## `qmu run` — clean path (boot + command + reap in 10.3s)
+
+### $ qmu run --kernel .../6.6.75/x86_64/bzImage --rootfs ... --ssh-key ... --name run-smoke --ssh-timeout 90 -- 'uname -r; id'
+```
+6.6.75
+uid=0(root) gid=0(root) groups=0(root)
+[exit=0]   (10.354s wall)
+```
+
+### $ qmu list        # run-smoke was fully reaped, not left behind
+```
+VMs:
+  vm-10021  pid=2147730  ssh=10021(down)  profile=exploit-dev  kernel=bzImage  [running]
+[exit=0]
+```
+
+Note the clean-path stdout carries no VM chatter — byte-comparable with what
+`qmu exec` prints, so `qmu run ... | grep` behaves the same.
+
+## `qmu run` — guest command failure is exit 1, VM still reaped
+
+### $ qmu run ... --name run-fail -- 'exit 42'
+```
+[exit code: 42]
+[exit=1]
+```
+
+## `qmu run` — real kernel panic is exit 3 with the report, state preserved
+
+### $ qmu run ... --name run-panic -- 'echo 1 > /proc/sys/kernel/sysrq; echo c > /proc/sysrq-trigger'
+```
+SSH connection lost while running: echo 1 > /proc/sys/kernel/sysrq; echo c > /proc/sysrq-trigger
+
+Crash from serial log:
+[    5.952246] Kernel panic - not syncing: sysrq triggered crash
+[    5.953231] CPU: 0 PID: 133 Comm: bash Not tainted 6.6.75 #1
+[    5.953231] Call Trace:
+[    5.953231]  sysrq_handle_crash+0x1a/0x20
+[    5.953231]  __handle_sysrq+0xff/0x250
+[    5.953231]  write_sysrq_trigger+0x23/0x40
+[    5.953231]  vfs_write+0x1c1/0x6c0
+[    5.953231]  ksys_write+0xb8/0x150
+[    5.953231]  do_syscall_64+0x39/0x90
+[    5.953231] Kernel Offset: 0x1e600000 from 0xffffffff81000000
+[    5.953231] ---[ end Kernel panic - not syncing: sysrq triggered crash ]---
+
+VM 'run-panic' stopped (state preserved). Serial log: ~/.cache/qmu/instances/run-panic.serial.log
+Inspect: qmu log --vm run-panic --tail 200 | qmu crash --vm run-panic
+Clean up:  qmu prune --vm run-panic
+[exit=3]
+```
+
+The preserved state is genuinely usable afterwards — the whole point of not
+reaping the evidence of the crash the caller just triggered:
+
+### $ qmu list
+```
+VMs:
+  vm-10021  pid=2147730  ssh=10021(down)  profile=exploit-dev  kernel=bzImage  [running]
+  run-panic  profile=exploit-dev  kernel=bzImage  [stopped]
+[exit=0]
+```
+
+### $ qmu crash --vm run-panic
+```
+Crash detected in current guest epoch:
+[    5.952246] Kernel panic - not syncing: sysrq triggered crash
+[    5.953231] CPU: 0 PID: 133 Comm: bash Not tainted 6.6.75 #1
+[exit=0]
+```
+
+### $ qmu prune --vm run-panic
+```
+Pruned 1 VM(s) (removed): run-panic
+[exit=0]
+```
+
+## `qmu run` — unreachable guest is exit 124 (found a real gap)
+
+First cross-arch attempt, WITHOUT `--qemu-arg`, failed at launch:
+
+### $ qmu run --arch aarch64 --kernel .../arm64/Image ... -- 'uname -m'
+```
+[qmu] Error: QEMU exited immediately (code 1).
+qemu-system-aarch64: No machine specified, and there is no default
+[exit=1]
+```
+
+That is what added `--qemu-arg`: `run` spends its positional on the guest
+command, so without a flag-carried passthrough an aarch64/arm guest (which needs
+`-M virt`) could not be booted at all. Second attempt, with `-M virt` but the
+x86 default `console=ttyS0`, exercised the timeout path — serial stayed empty
+because an aarch64 `virt` console is `ttyAMA0`:
+
+### $ qmu run --arch aarch64 ... --qemu-arg=-M --qemu-arg=virt --cpu cortex-a57 --ssh-timeout 240 -- 'uname -m'
+```
+VM 'arm-smoke' did not become reachable within 240s.
+No crash report in the serial log; the guest may still be booting or may not start sshd.
+
+VM 'arm-smoke' stopped (state preserved). Serial log: ~/.cache/qmu/instances/arm-smoke.serial.log
+Inspect: qmu log --vm arm-smoke --tail 200 | qmu crash --vm arm-smoke
+Clean up:  qmu prune --vm arm-smoke
+[exit=124]
+```
+
+With the right console/root, the same command boots an emulated aarch64 guest
+in 27s:
+
+### $ qmu run --keep --arch aarch64 ... --cmdline 'console=ttyAMA0 root=/dev/vda earlyprintk=serial net.ifnames=0' -- 'uname -m'
+```
+aarch64
+
+VM 'arm-smoke' running. Serial log: ~/.cache/qmu/instances/arm-smoke.serial.log
+Inspect: qmu log --vm arm-smoke --tail 200 | qmu crash --vm arm-smoke
+[exit=0]   (27.134s wall)
+```
+
+## `qmu compile --host` — x86_64 guest
+
+### $ qmu compile --host --run --vm hostcc-smoke tests/exploit-samples/hello.c
+```
+Compiled and ran hello.c:
+qmu-compile-ok uid=0
+[exit code: 0]
+[exit=0]
+```
+
+### $ qmu compile --host --vm hostcc-smoke --format json tests/exploit-samples/hello.c
+```
+{
+  "compile_cmd": "cc -static -lpthread -o /tmp/qmu-compile-7kyvaj_h/hello tests/exploit-samples/hello.c",
+  "compile_exit": 0,
+  "compiled": true,
+  "compiled_on": "host",
+  "compiler": "cc",
+  "crash_detected": false,
+  "guest_arch": "x86_64",
+  "ok": true,
+  "source": "tests/exploit-samples/hello.c",
+  "ssh_error": false
+}
+[exit=0]
+```
+
+## `qmu compile --host` — cross-arch, against the emulated aarch64 guest
+
+The toolchain is picked from the INSTANCE's arch, with a host `gcc` sitting
+right there unused:
+
+### $ qmu compile --host --run --vm arm-smoke --format json tests/exploit-samples/hello.c
+```
+{
+  "compile_cmd": "aarch64-linux-gnu-gcc -static -lpthread -o /tmp/qmu-compile-au96y3pv/hello tests/exploit-samples/hello.c",
+  "compile_exit": 0,
+  "compiled_on": "host",
+  "compiler": "aarch64-linux-gnu-gcc",
+  "guest_arch": "aarch64",
+  "ok": true,
+  "run_exit": 0,
+  "run_stdout": "qmu-compile-ok uid=0\n",
+  "ssh_error": false
+}
+[exit=0]   (1.244s wall)
+```
+
+### $ qmu compile --run --vm arm-smoke tests/exploit-samples/hello.c   # same file, in-guest
+```
+Compiled and ran hello.c:
+qmu-compile-ok uid=0
+[exit code: 0]
+[exit=0]   (6.287s wall)
+```
+
+**1.24s host vs 6.29s in-guest** for an 8-line source on an emulated aarch64
+guest — and that ratio is the floor, since the in-guest cost scales with the
+size of the translation unit while the host cost barely moves.
