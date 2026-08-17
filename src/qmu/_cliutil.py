@@ -52,8 +52,14 @@ def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
     """Build a QMUConfig from CLI args, layered over config files."""
     cli_overrides: dict[str, Any] = {}
 
-    # Map CLI flag names to QMUConfig field names
+    # Map CLI flag names to QMUConfig field names. The [boot] fields are here
+    # so a flag and a config key resolve through the same layering — a launch
+    # flag beats qmu.toml, and qmu.toml beats the built-in default.
     flag_map = {
+        "kernel": "kernel",
+        "initrd": "initrd",
+        "cmdline": "cmdline",
+        "profile": "profile",
         "rootfs": "rootfs",
         "ssh_key": "ssh_key",
         "memory": "memory",

@@ -160,7 +160,7 @@ def test_rc255_ssh_down_ignores_precommand_crash(patch_exec, capsys):
     patch_exec(255, ready=False, initial_serial=PANIC_LOG, serial_during_run="")
     rc = cli.main(["--format", "json", "exec", "trigger"])
     payload = json.loads(capsys.readouterr().out)
-    assert rc == 3
+    assert rc == 4
     assert payload["ok"] is False
     assert payload["ssh_error"] is True
     assert payload["crash_detected"] is False
@@ -177,21 +177,26 @@ def test_exec_timeout_ignores_precommand_crash(patch_exec, capsys):
     )
     rc = cli.main(["--format", "json", "exec", "trigger"])
     payload = json.loads(capsys.readouterr().out)
-    assert rc == 3
+    assert rc == 4
     assert payload["ok"] is False
     assert payload["ssh_error"] is True
     assert payload["crash_detected"] is False
     assert payload["crash"] is None
 
 
-def test_rc255_ssh_down_no_crash_in_log_still_exit3(patch_exec, capsys):
-    """SSH lost but no panic markers in the log: still the crash/SSH-lost path
-    (exit 3), but crash_detected=False so the agent knows to look elsewhere."""
+def test_rc255_ssh_down_no_crash_in_log_is_transport_not_crash(patch_exec, capsys):
+    """SSH lost with no panic markers is exit 4 (transport), never 3.
+
+    Returning 3 here reported a merely-unreachable guest — a VM running no
+    sshd produces this on every exec — in the kernel-crash class, which is the
+    signal callers branch on to mean "the exploit crashed the kernel". scp
+    already discriminated this way; exec now matches it.
+    """
     fake = patch_exec(255, ready=False, initial_serial="ordinary boot log\n")
 
     rc = cli.main(["--format", "json", "exec", "trigger"])
 
-    assert rc == 3
+    assert rc == 4
     assert fake.is_ready_calls >= 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["ssh_error"] is True
@@ -380,7 +385,7 @@ def test_exec_transport_loss_ignores_stale_precommand_crash(patch_exec, capsys):
     patch_exec(255, ready=False, initial_serial=PANIC_LOG, serial_during_run="")
     rc = cli.main(["--format", "json", "exec", "trigger"])
     payload = json.loads(capsys.readouterr().out)
-    assert rc == 3
+    assert rc == 4
     assert payload["ok"] is False
     assert payload["ssh_error"] is True
     assert payload["crash_detected"] is False
