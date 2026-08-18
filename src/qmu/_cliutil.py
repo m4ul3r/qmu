@@ -52,8 +52,14 @@ def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
     """Build a QMUConfig from CLI args, layered over config files."""
     cli_overrides: dict[str, Any] = {}
 
-    # Map CLI flag names to QMUConfig field names
+    # Map CLI flag names to QMUConfig field names. The [boot] fields are here
+    # so a flag and a config key resolve through the same layering — a launch
+    # flag beats qmu.toml, and qmu.toml beats the built-in default.
     flag_map = {
+        "kernel": "kernel",
+        "initrd": "initrd",
+        "cmdline": "cmdline",
+        "profile": "profile",
         "rootfs": "rootfs",
         "ssh_key": "ssh_key",
         "memory": "memory",
@@ -316,7 +322,8 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
       The passthrough returns as the repeatable ``--qemu-arg`` flag, because an
       aarch64/arm guest does not boot without ``-M virt``.
     """
-    parser.add_argument("--kernel", required=True, help="Path to bzImage")
+    parser.add_argument("--kernel", default=None,
+                        help="Path to bzImage (overrides [boot] kernel in qmu.toml)")
     parser.add_argument("--config", default=None, help="Path to qmu.toml config file")
     parser.add_argument("--rootfs", default=None, help="Path to rootfs image (overrides config)")
     parser.add_argument("--ssh-key", default=None, dest="ssh_key", help="SSH private key (overrides config)")
@@ -325,10 +332,25 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
     parser.add_argument("--cpus", type=int, default=None, help="VM CPU count (overrides config)")
     parser.add_argument("--cpu", default=None, dest="cpu_model",
                         help="QEMU -cpu model, e.g. 'host', 'max', 'qemu64' (overrides config)")
-    parser.add_argument("--profile", default="exploit-dev", help="Boot profile (default: exploit-dev)")
-    parser.add_argument("--cmdline", default=None, help="Override kernel command line")
+    parser.add_argument("--profile", default=None,
+                        help="Boot profile (default: exploit-dev, or [boot] profile in qmu.toml)")
+    parser.add_argument("--cmdline", default=None,
+                        help="REPLACE the profile's kernel command line (see --append to extend it)")
+    parser.add_argument("--append", default=None,
+                        help="Append params to the resolved cmdline instead of replacing it, "
+                             "e.g. --append 'slub_debug=- nokaslr'")
     parser.add_argument("--gdb", action="store_true", help="Enable GDB stub")
     parser.add_argument("--name", default=None, help="VM instance name")
+    parser.add_argument("--inject", action="append", dest="injects", default=None,
+                        help="Copy LOCAL:/guest/dir into the rootfs image before boot "
+                             "(repeatable; needs libguestfs)")
+    parser.add_argument("--partition", type=int, default=1,
+                        help="With --inject: rootfs partition (default 1; use 0 for a "
+                             "whole-disk/partitionless image)")
+    parser.add_argument("--mkdir", action="store_true",
+                        help="With --inject: create the guest directory if missing "
+                             "(default: a missing directory is an error, so a typo'd "
+                             "path cannot report success)")
     parser.add_argument("--no-replace", action="store_true",
                         help="Don't kill existing VM with same name (default: replace)")
     parser.add_argument("--ssh-port", type=int, default=None, help="SSH port (auto-allocated)")

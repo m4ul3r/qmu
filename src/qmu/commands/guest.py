@@ -17,6 +17,7 @@ call time.
 from __future__ import annotations
 
 import argparse
+import re
 import shlex
 import tempfile
 import time
@@ -25,7 +26,7 @@ from typing import Any
 
 from ..hostcc import host_compile, resolve_host_cc
 from ..instance import QMUError, VMInstance, choose_instance, find_instance
-from ..serial import extract_crash, serial_log_offset, tail_log
+from ..serial import extract_crash, read_log, serial_log_offset, tail_log
 from ..ssh import SSHClient, SSHError, is_transport_failure
 from .._cliutil import (
     _add_common_opts,
@@ -34,6 +35,23 @@ from .._cliutil import (
     _preflight_ssh_guest,
     _require_ssh,
 )
+
+
+def _require_running_vm(vm_id: str | None, command: str) -> None:
+    """Reject a non-running VM with a description, never with "not found".
+
+    Imported lazily: lifecycle sits beside this module in the command layer, so
+    a module-level import would make the two mutually dependent. The shared
+    describer is what keeps `exec` from contradicting `list` about whether a VM
+    exists — the invariant that six rounds of dogfooding kept catching.
+    """
+    if not vm_id:
+        return
+    from .lifecycle import describe_non_running
+
+    explanation = describe_non_running(vm_id, command=command)
+    if explanation is not None:
+        raise QMUError(explanation)
 
 
 # ---------------------------------------------------------------------------
@@ -230,12 +248,17 @@ def _ssh_lost_payload(
     *,
     start_offset: int,
 ) -> tuple[int, dict[str, Any], list[str]]:
-    """Build the SSH-lost / probable-crash (status, data, text) triple.
+    """Build the SSH-lost (status, data, text) triple; status 3 only on a crash.
 
     Used for both an SSH timeout (TimeoutExpired -> SSHError) and a transport
-    disconnect (rc=255 + ssh transport marker), which both mean the guest very
-    likely panicked and dropped the connection. Exit 3 distinguishes a
-    crash/transport-loss from an ordinary non-zero guest command (exit 1).
+    disconnect (rc=255 + ssh transport marker). A dropped connection alone does
+    NOT prove a panic: a guest with no sshd produces one on every exec, and
+    returning 3 there reports a missing daemon in the kernel-crash class —
+    against the contract that a tooling fault is never mistaken for a panic.
+    Status 3 requires a corroborating fresh serial crash; otherwise the guest is
+    merely unreachable and this is transport-layer (4). This matches the
+    discrimination `_emit_transfer_transport_lost` already applied to scp, so
+    the two siblings no longer disagree about the same condition.
 
     Split out from :func:`_emit_ssh_lost` so ``qmu run`` reaches the identical
     classification without re-deriving it: a second copy of this decision is
@@ -266,7 +289,10 @@ def _ssh_lost_payload(
         "crash": crash,
         "hint": hint,
     }
-    return 3, result, [f"SSH connection lost while running: {command}", text_msg]
+    # 3 only with a corroborating fresh crash; a bare dropped connection
+    # (no sshd, guest wedged) is transport-layer, i.e. 4.
+    status = 3 if crash is not None else 4
+    return status, result, [f"SSH connection lost while running: {command}", text_msg]
 
 
 def _emit_ssh_lost(
@@ -399,6 +425,7 @@ def _run_guest_command(
 
 
 def _handle_exec(args: argparse.Namespace) -> int:
+    _require_running_vm(args.vm, "exec")
     inst = choose_instance(args.vm)
     _require_ssh(inst)
     if (preflight_rc := _preflight_ssh_guest(args, inst, stem="exec")) is not None:
@@ -763,25 +790,91 @@ def _handle_crash(args: argparse.Namespace) -> int:
 
 def _add_log(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("log", help="View serial console log")
-    p.add_argument("--tail", type=int, default=50, help="Last N lines (default: 50)")
+    p.add_argument("--tail", type=int, default=None,
+                   help="Last N lines (default: 50, or the whole log when --grep is used)")
+    p.add_argument("--full", action="store_true",
+                   help="Emit the whole serial log (ignores --tail); pair with --out to "
+                        "save it as evidence")
+    p.add_argument("--grep", default=None,
+                   help="Keep only lines matching this regex. Searches the WHOLE log "
+                        "unless you also pass an explicit --tail")
+    p.add_argument("--context", "-C", type=int, default=0, dest="context",
+                   help="With --grep: also keep N lines around each match")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_log)
 
 
+def _grep_lines(text: str, pattern: str, context: int) -> tuple[str, int]:
+    """Return (rendered, match_count) for lines matching `pattern`.
+
+    Non-adjacent hit windows are separated by a `--` marker, matching grep's
+    convention so the output stays readable when context is requested.
+    """
+    try:
+        matcher = re.compile(pattern)
+    except re.error as exc:
+        raise QMUError(f"Invalid --grep regex {pattern!r}: {exc}") from exc
+
+    lines = text.splitlines()
+    hits = [i for i, line in enumerate(lines) if matcher.search(line)]
+    if not hits:
+        return "", 0
+
+    keep: set[int] = set()
+    for i in hits:
+        keep.update(range(max(0, i - context), min(len(lines), i + context + 1)))
+
+    rendered: list[str] = []
+    previous: int | None = None
+    for i in sorted(keep):
+        if previous is not None and i > previous + 1:
+            rendered.append("--")
+        rendered.append(lines[i])
+        previous = i
+    return "\n".join(rendered) + "\n", len(hits)
+
+
 def _handle_log(args: argparse.Namespace) -> int:
     inst = find_instance(args.vm)
-    log = tail_log(inst.serial_log, lines=args.tail)
+
+    # A filtered read defaults to the WHOLE log. Applying the 50-line tail
+    # first would silently scope the search to the end of the boot and report
+    # "no lines matched" for a pattern that is present — a confident false
+    # negative, and exactly wrong for crash triage. An explicit --tail still
+    # wins, so the window is narrowable on purpose but never by accident.
+    # `--full` is unbounded: the spill path in _emit turns an oversized log
+    # into an artifact pointer, so this stays agent-safe.
+    whole_log = args.full or (args.grep is not None and args.tail is None)
+    tail_lines = 50 if args.tail is None else args.tail
+
+    log = read_log(inst.serial_log) if whole_log else tail_log(inst.serial_log, lines=tail_lines)
     value = log or ""
+
+    matches: int | None = None
+    if args.grep is not None and value:
+        value, matches = _grep_lines(value, args.grep, max(0, args.context))
+
     available = bool(value)
-    _emit(
-        args,
-        data={
-            "ok": True,
-            "log": value,
-            "available": available,
-            "empty": not available,
-        },
-        text=value if value else "Serial log is empty or missing.",
-        stem="log",
-    )
+    data = {
+        "ok": True,
+        "log": value,
+        "available": available,
+        "empty": not available,
+    }
+    if args.grep is not None:
+        data["grep"] = args.grep
+        data["matches"] = matches or 0
+        # State the scope that was actually searched, so a zero-match result is
+        # never mistaken for a statement about the whole log.
+        data["scope"] = "full" if whole_log else f"last {tail_lines} lines"
+
+    if value:
+        text = value
+    elif args.grep is not None:
+        scope = "the serial log" if whole_log else f"the last {tail_lines} lines"
+        text = f"No lines in {scope} matched /{args.grep}/."
+    else:
+        text = "Serial log is empty or missing."
+
+    _emit(args, data=data, text=text, stem="log")
     return 0

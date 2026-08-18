@@ -3,7 +3,9 @@ from __future__ import annotations
 import platform
 import sys
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from difflib import get_close_matches
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +40,12 @@ class ConfigError(QMUError):
 
 
 _FIXED_SCHEMA: dict[str, dict[str, str]] = {
+    "boot": {
+        "kernel": "string",
+        "initrd": "string",
+        "cmdline": "string",
+        "profile": "string",
+    },
     "machine": {
         "arch": "string",
         "memory": "string",
@@ -62,6 +70,15 @@ _FIXED_SCHEMA: dict[str, dict[str, str]] = {
 }
 
 _MIGRATION_DESTINATIONS: dict[str, tuple[str, ...]] = {
+    # A `[vm]` table is the most common wrong guess: it reads like the obvious
+    # name for "the machine I am booting", but qmu splits those keys across
+    # three tables. Name all three so the fix needs no second lookup.
+    "vm": ("[boot]", "[machine]", "[drive]"),
+    "kernel": ("[boot] kernel",),
+    "initrd": ("[boot] initrd",),
+    "cmdline": ("[boot] cmdline",),
+    "append": ("[boot] cmdline",),
+    "profile": ("[boot] profile",),
     "arch": ("[machine] arch",),
     "memory": ("[machine] memory",),
     "cpus": ("[machine] cpus",),
@@ -99,7 +116,13 @@ def _value_type_name(value: Any) -> str:
     return type(value).__name__
 
 
-def _migration_hint(key: str) -> str | None:
+def _did_you_mean(key: str, candidates: Iterable[str]) -> str | None:
+    """Suggest the closest schema key for a probable typo."""
+    matches = get_close_matches(key, list(candidates), n=1, cutoff=0.7)
+    return matches[0] if matches else None
+
+
+def _migration_hint(key: str, *, is_table: bool = False) -> str | None:
     destinations = _MIGRATION_DESTINATIONS.get(key)
     if destinations is None:
         return None
@@ -108,6 +131,10 @@ def _migration_hint(key: str) -> str | None:
         target = quoted[0]
     else:
         target = " or ".join(quoted)
+    if is_table:
+        # A misplaced *table* has no single home — its keys scatter across the
+        # named tables — so "move 'vm' to '[boot]'" would misdescribe the fix.
+        return f"the keys of '[{key}]' belong in {target}"
     return f"move '{key}' to {target}"
 def _validate_value(value: Any, kind: str, source: Path, key_path: str) -> None:
     if kind == "string":
@@ -177,11 +204,16 @@ def _validate_profiles(profiles: dict[str, Any], source: Path) -> None:
 def _validate_toml(raw: dict[str, Any], source: Path) -> None:
     for section, section_value in raw.items():
         if section not in (*_FIXED_SCHEMA, "profiles"):
+            hint = _migration_hint(section, is_table=True)
+            if hint is None:
+                near = _did_you_mean(section, (*_FIXED_SCHEMA, "profiles"))
+                if near is not None:
+                    hint = f"did you mean '[{near}]'?"
             raise ConfigError(
                 source,
                 "unknown top-level key",
                 key_path=section,
-                hint=_migration_hint(section),
+                hint=hint,
             )
         if not isinstance(section_value, dict):
             raise ConfigError(
@@ -198,11 +230,19 @@ def _validate_toml(raw: dict[str, Any], source: Path) -> None:
             key_path = f"{section}.{key}"
             kind = section_schema.get(key)
             if kind is None:
+                hint = _migration_hint(key)
+                if hint is None:
+                    near = _did_you_mean(key, section_schema)
+                    if near is not None:
+                        hint = f"did you mean '{near}'?"
+                    else:
+                        valid = ", ".join(sorted(section_schema))
+                        hint = f"valid keys for [{section}]: {valid}"
                 raise ConfigError(
                     source,
                     "unknown key",
                     key_path=key_path,
-                    hint=_migration_hint(key),
+                    hint=hint,
                 )
             _validate_value(value, kind, source, key_path)
 
@@ -233,13 +273,49 @@ DEFAULT_PROFILES: dict[str, str] = {
     ),
     "exploit-test": (
         "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0"
-        " selinux=0 apparmor=0 panic_on_oops=1 kasan.fault=panic"
+        " selinux=0 apparmor=0 oops=panic kasan.fault=panic"
+    ),
+    # --- distro-target profiles (tools/mktarget.sh) -----------------------
+    #
+    # These deliberately do NOT carry `selinux=0 apparmor=0`. On a distro
+    # target AppArmor *is* part of what is being measured — Ubuntu builds with
+    # CONFIG_LSM="landlock,lockdown,yama,integrity,apparmor" and ships an
+    # `unprivileged_userns` profile in enforce mode that decides whether an
+    # unprivileged user namespace can be created at all. Disabling the LSM
+    # stack silently flips that primitive, and most modern LPEs open with it.
+    # They also omit `kasan.fault=panic`, which is inert and misleading on a
+    # distro kernel (no KASAN).
+    #
+    # `ubuntu-target` is the only one of these under which a claim like "this
+    # PoC works on Ubuntu 24.04" is valid: KASLR on, LSMs on, sysctls at the
+    # distro defaults.
+    "ubuntu-target": (
+        "console=ttyS0 root=/dev/sda rw earlyprintk=serial net.ifnames=0"
+    ),
+    # Reversing/GDB only. nokaslr makes symbols stable; an exploit that works
+    # here is NOT an exploit on Ubuntu, since KASLR bypass is a separate proof
+    # obligation.
+    "ubuntu-debug": (
+        "console=ttyS0 root=/dev/sda rw earlyprintk=serial net.ifnames=0 nokaslr"
+    ),
+    # Triage: KASLR and the LSM stack left alone, but panic on the first
+    # oops/warn so `qmu crash` yields one clean report.
+    "ubuntu-trigger": (
+        "console=ttyS0 root=/dev/sda rw earlyprintk=serial net.ifnames=0"
+        " panic_on_oops=1 panic_on_warn=1"
     ),
 }
 
 
 @dataclass
 class QMUConfig:
+    # boot — the launch recipe. Configurable so a project's qmu.toml can
+    # describe a whole boot and `qmu launch` needs no repeated flags.
+    kernel: str | None = None
+    initrd: str | None = None
+    cmdline: str | None = None
+    profile: str = "exploit-dev"
+
     # machine
     arch: str = "x86_64"
     memory: str = "4G"
@@ -294,6 +370,16 @@ def find_project_config(start: Path | None = None) -> Path | None:
 
 def _apply_toml(cfg: QMUConfig, raw: dict[str, Any], source: str) -> None:
     """Apply a parsed TOML dict onto a QMUConfig, recording the source."""
+    boot = raw.get("boot", {})
+    if "kernel" in boot:
+        cfg.kernel = boot["kernel"]
+    if "initrd" in boot:
+        cfg.initrd = boot["initrd"]
+    if "cmdline" in boot:
+        cfg.cmdline = boot["cmdline"]
+    if "profile" in boot:
+        cfg.profile = boot["profile"]
+
     machine = raw.get("machine", {})
     if "arch" in machine:
         cfg.arch = machine["arch"]
@@ -423,15 +509,25 @@ def render_starter_config(arch: str | None = None) -> str:
 # qmu.toml — QEMU VM configuration for qmu CLI
 #
 # Quick start:
-#   1. Edit the two `# CHANGE ME` lines below to point at your rootfs image
-#      and SSH private key.
+#   1. Edit the `# CHANGE ME` lines below to point at your kernel, rootfs
+#      image, and SSH private key.
 #   2. Run `qmu doctor` to verify everything resolves.
-#   3. Run `qmu launch --kernel /path/to/bzImage`.
+#   3. Run `qmu launch` — with [boot] kernel set you need no flags at all.
 #
 # For boot-and-die kernels (kernelCTF, syzkaller reproducers) you do not need
 # a rootfs or SSH key — see the harness-mode block at the bottom of this file.
 #
 # See `qmu config show` for the full resolved config.
+
+[boot]
+# kernel = "./bzImage"           # CHANGE ME — every launch flag has a config key,
+#                                #   so setting this makes `qmu launch` self-contained.
+#                                #   --kernel still overrides it for one-off boots.
+# initrd = "./initramfs.cpio.gz"
+# profile = "exploit-dev"        # named cmdline from [profiles.*] below
+# cmdline = "console=ttyS0 ..."  # full override; REPLACES the profile cmdline.
+#                                #   To add params on top of a profile instead, launch
+#                                #   with --append 'slub_debug=- nokaslr'.
 
 [machine]
 arch = "{host_arch}"
@@ -477,7 +573,7 @@ cmdline = "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0 selinux=
 cmdline = "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0 selinux=0 apparmor=0 panic_on_warn=1 kasan.fault=panic"
 
 [profiles.exploit-test]
-cmdline = "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0 selinux=0 apparmor=0 panic_on_oops=1 kasan.fault=panic"
+cmdline = "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0 selinux=0 apparmor=0 oops=panic kasan.fault=panic"
 
 # ---------------------------------------------------------------------------
 # Harness mode (boot-and-die kernels)

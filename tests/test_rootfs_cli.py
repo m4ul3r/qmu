@@ -55,7 +55,7 @@ def test_inject_image_missing_raises():
         rootfs_mod.inject("/nonexistent/img", [], partition=1)
 
 
-def _run_inject_capture_script(tmp_path, guest):
+def _run_inject_capture_script(tmp_path, guest, mkdir=False):
     """Run inject with guestfish/image stubbed out and return the script text
     piped to guestfish. Lets us assert on the generated commands directly."""
     local = tmp_path / "exploit"
@@ -68,14 +68,15 @@ def _run_inject_capture_script(tmp_path, guest):
         with mock.patch.object(
             rootfs_mod.subprocess, "run", return_value=completed
         ) as run:
-            rootfs_mod.inject(str(image), [(str(local), guest)], partition=1)
+            rootfs_mod.inject(
+                str(image), [(str(local), guest)], partition=1, mkdir=mkdir
+            )
     return run.call_args.kwargs["input"]
 
 
 def test_inject_treats_guest_without_trailing_slash_as_dir(tmp_path):
     # Regression: `/root` used to collapse to `/` via dirname().
     script = _run_inject_capture_script(tmp_path, "/root")
-    assert "-mkdir-p /root\n" in script
     assert "copy-in " in script and script.rstrip().endswith("/root")
 
 
@@ -83,9 +84,20 @@ def test_inject_trailing_slash_matches_no_slash(tmp_path):
     with_slash = _run_inject_capture_script(tmp_path, "/root/")
     no_slash = _run_inject_capture_script(tmp_path, "/root")
     assert with_slash == no_slash
-    assert "-mkdir-p /root\n" in with_slash
+    assert "copy-in " in with_slash
 
 
 def test_inject_root_guest_stays_root(tmp_path):
     script = _run_inject_capture_script(tmp_path, "/")
-    assert "-mkdir-p /\n" in script
+    assert script.rstrip().endswith(" /")
+
+
+def test_inject_does_not_create_the_guest_dir_by_default(tmp_path):
+    """A silent mkdir turns a typo'd destination into a reported success."""
+    script = _run_inject_capture_script(tmp_path, "/root")
+    assert "mkdir" not in script
+
+
+def test_inject_creates_the_guest_dir_when_asked(tmp_path):
+    script = _run_inject_capture_script(tmp_path, "/root", mkdir=True)
+    assert "-mkdir-p /root\n" in script

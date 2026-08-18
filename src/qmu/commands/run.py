@@ -37,10 +37,9 @@ from typing import Any
 
 # `extract_crash` deliberately also matches SURVIVED reports (a WARNING, a KASAN
 # splat), because those are worth showing. They are not evidence that the boot
-# failed, so the boot-failure classifier needs the stricter, terminal marker.
-# (The qmu-agent-ergonomics branch grows a shared `serial.has_terminal_panic()`;
-# consolidate onto it when that lands rather than keeping two spellings.)
-_TERMINAL_PANIC = re.compile(r"Kernel panic - not syncing", re.IGNORECASE)
+# failed, so the boot-failure classifier needs the stricter, terminal marker —
+# which is `serial.has_terminal_panic`, the single spelling shared with
+# `lifecycle._guest_state` and `wait --pattern`.
 
 # This is the ONLY code path that scans a whole boot from byte 0, which exposes a
 # sharp edge in the shared patterns: `CRASH_START_PATTERNS` carries a bare,
@@ -57,7 +56,7 @@ _REAL_REPORT_HEADER = re.compile(
 )
 
 from ..instance import VMInstance, instance_alive
-from ..serial import extract_crash
+from ..serial import extract_crash, has_terminal_panic
 from ..ssh import SSHClient
 from ..vm import launch_vm
 from .._cliutil import (
@@ -66,10 +65,9 @@ from .._cliutil import (
     _emit,
     _kill_vm,
     _make_ssh,
-    _resolve_config_from_args,
 )
 from .guest import _join_exec_command, _run_guest_command
-from .lifecycle import _replace_existing_named_vm
+from .lifecycle import _prepare_boot
 
 
 def _add_run(sub: argparse._SubParsersAction) -> None:
@@ -148,7 +146,11 @@ def _boot_failure_payload(
         if extracted and _REAL_REPORT_HEADER.search(extracted)
         else None
     )
-    crash = report if report and _TERMINAL_PANIC.search(report) else None
+    crash = (
+        report
+        if report and has_terminal_panic(inst.serial_log, start_offset=0)
+        else None
+    )
     if crash is not None:
         return (
             3,
@@ -215,21 +217,25 @@ def _boot_failure_payload(
 
 
 def _handle_run(args: argparse.Namespace) -> int:
-    config = _resolve_config_from_args(args)
-    _replace_existing_named_vm(args.name, args.no_replace)
+    # Same preparation `launch` runs: config layering, the [boot] kernel
+    # fallback, the profile-vs-cmdline warnings, namesake replacement and
+    # --inject. `run` registers the same flags, so it must apply them the same
+    # way or a flag would parse here and be silently ignored.
+    config, name = _prepare_boot(args)
 
     inst = launch_vm(
         config=config,
-        kernel=args.kernel,
-        profile=args.profile,
-        cmdline=args.cmdline,
+        kernel=config.kernel,
+        profile=config.profile,
+        cmdline=config.cmdline,
+        append=args.append,
         gdb=args.gdb,
-        name=args.name,
+        name=name,
         ssh_port=args.ssh_port,
         gdb_port=args.gdb_port,
         extra_args=args.extra or None,
         ssh_timeout=args.ssh_timeout,
-        initrd=args.initrd,
+        initrd=config.initrd,
         drives=args.drives,
         no_net=args.no_net,
         nic_model=args.nic_model,

@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
             "       snapshot op failed, no crash found, qmu operational errors\n"
             "       such as 'no running VM' or 'kernel not found')\n"
             "  2    usage / argparse error (bad flags or arguments) — ONLY\n"
-            "  3    guest kernel crash or SSH transport-loss\n"
+            "  3    guest kernel crash (corroborated by a fresh serial crash report)\n"
             "  4    infrastructure / internal error (QMP or SSH layer failures,\n"
             "       unexpected qmu errors, infra-subprocess failures such as a\n"
             "       pry/gdb hang)\n"

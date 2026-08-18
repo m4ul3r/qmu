@@ -8,6 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from difflib import get_close_matches
 from pathlib import Path
 
 from .config import QMUConfig
@@ -263,12 +264,112 @@ def build_qemu_command(
     return cmd
 
 
+# Dotted boot params qmu itself ships, or that show up constantly in kernel
+# exploit-dev cmdlines. A dotted param NEVER appears in the kernel's "Unknown
+# kernel command line parameters" line — the kernel routes `foo.bar=x` to the
+# module-param path instead — so `kasan.faul=panic` is silently ignored at boot
+# and invisible afterwards. This table exists only to catch near-misses of
+# names qmu knows about; unrelated dotted params are left alone.
+# Harvested from the kernel tree rather than hand-listed:
+#   grep -rhoE 'early_param\("[a-z0-9_.]+"' mm/ kernel/ arch/ drivers/
+# The kasan.* family matters most: all three built-in profiles enable KASAN, so
+# a typo of any of these is both silently ignored at boot and invisible in the
+# log. Shipping only kasan.fault left eight of its nine siblings unguarded.
+_KNOWN_DOTTED_PARAMS = frozenset({
+    # mm/kasan/{report,hw_tags,tags}.c
+    "kasan.fault",
+    "kasan.mode",
+    "kasan.vmalloc",
+    "kasan.write_only",
+    "kasan.stacktrace",
+    "kasan.stack_ring_size",
+    "kasan.page_alloc.sample",
+    "kasan.page_alloc.sample.order",
+    # mm/kfence
+    "kfence.fault",
+    "kfence.sample_interval",
+    # kernel/
+    "cpuhp.parallel",
+    # frequently used in exploit-dev cmdlines.
+    # Undotted names (slub_debug, init_on_alloc, init_on_free) do NOT belong
+    # here: suspect_dotted_params only considers tokens containing a dot, so
+    # they could never be matched as known — and as get_close_matches
+    # candidates they could only ever produce a WRONG suggestion, proposing an
+    # undotted name for a dotted param. The kernel's own unknown-parameter line
+    # already reports them, which is the mechanism this table exists to cover
+    # for precisely because it cannot see dotted params.
+    "net.ifnames",
+    "rcupdate.rcu_expedited",
+    "rcupdate.rcu_cpu_stall_suppress",
+    "vsyscall.emulate",
+    "kvm.nx_huge_pages",
+    "page_alloc.shuffle",
+    # drivers/ and arch/ early_params seen in embedded and arm64 work
+    "iommu.passthrough",
+    "iommu.strict",
+    "iommu.forcedac",
+    "iommu.debug_pagealloc",
+    "irqchip.gicv3_pseudo_nmi",
+    "irqchip.gicv2_force_probe",
+    "irqchip.gicv3_nolpi",
+    "fw_devlink.strict",
+    "fw_devlink.sync_state",
+    "random.trust_cpu",
+    "random.trust_bootloader",
+    "clocksource.arm_arch_timer.evtstrm",
+})
+
+
+def suspect_dotted_params(cmdline: str) -> list[tuple[str, str]]:
+    """Return (typo, suggestion) for dotted params that near-miss a known name.
+
+    The cutoff is high on purpose: a legitimate dotted param qmu has never
+    heard of (say `nvme.io_queue_depth=4`) is nowhere near any known name and
+    is correctly left alone.
+    """
+    suspects: list[tuple[str, str]] = []
+    for token in cmdline.split():
+        name = token.split("=", 1)[0]
+        if "." not in name or name in _KNOWN_DOTTED_PARAMS:
+            continue
+        close = get_close_matches(name, _KNOWN_DOTTED_PARAMS, n=1, cutoff=0.85)
+        if close:
+            suspects.append((name, close[0]))
+    return suspects
+
+
+def resolve_cmdline(
+    config: QMUConfig,
+    *,
+    profile: str = "exploit-dev",
+    cmdline: str | None = None,
+    append: str | None = None,
+) -> str:
+    """Resolve the kernel command line from profile, override, and extension.
+
+    `cmdline` replaces the profile wholesale; `append` extends whichever of the
+    two won. The distinction matters because every built-in profile carries
+    `root=`, so a caller who only wants to add one boot parameter must not be
+    forced through `--cmdline` — restating the whole line is how `root=` gets
+    dropped by accident.
+    """
+    if profile not in config.profiles:
+        valid = ", ".join(config.profiles.keys())
+        raise QMUError(f"Unknown profile '{profile}'. Valid: {valid}")
+
+    resolved = config.profiles[profile] if cmdline is None else cmdline
+    if append:
+        resolved = f"{resolved} {append}".strip()
+    return resolved
+
+
 def launch_vm(
     *,
     config: QMUConfig,
     kernel: str,
     profile: str = "exploit-dev",
     cmdline: str | None = None,
+    append: str | None = None,
     gdb: bool = False,
     name: str | None = None,
     ssh_port: int | None = None,
@@ -292,7 +393,10 @@ def launch_vm(
     if not harness and not drives:
         if config.rootfs is None:
             raise QMUError(
-                "No rootfs configured. Set [drive] rootfs in qmu.toml or pass --rootfs"
+                "No rootfs configured. Set [drive] rootfs in qmu.toml or pass --rootfs. "
+                "For a boot-and-die kernel (initramfs-only, kernelCTF, syzkaller repro) "
+                "pass --harness instead: it needs no rootfs or SSH key and implies "
+                "--no-wait-ssh + --no-net."
             )
         rootfs_path = Path(config.rootfs).expanduser().resolve()
         if not rootfs_path.exists():
@@ -320,13 +424,8 @@ def launch_vm(
         if not initrd_path.exists():
             raise QMUError(f"Initrd not found: {initrd}")
 
-    if profile not in config.profiles:
-        valid = ", ".join(config.profiles.keys())
-        raise QMUError(f"Unknown profile '{profile}'. Valid: {valid}")
-
-    # Resolve command line
-    if cmdline is None:
-        cmdline = config.profiles[profile]
+    cmdline_override = cmdline is not None
+    cmdline = resolve_cmdline(config, profile=profile, cmdline=cmdline, append=append)
     resolved_qemu = _preflight_native_passt(
         config=config,
         net_backend=net_backend,
@@ -494,6 +593,7 @@ def launch_vm(
             cpus=config.cpus,
             cmdline=cmdline,
             profile=profile,
+            cmdline_override=cmdline_override,
             started_at=datetime.now(timezone.utc).isoformat(),
             harness=harness,
             nic_model=resolved_nic,

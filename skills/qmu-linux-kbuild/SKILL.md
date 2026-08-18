@@ -7,6 +7,12 @@ description: Build Linux kernels (v4.x-latest) for QEMU exploit development via 
 
 Use this skill when the user needs a Linux kernel image for `qmu launch --kernel` and does not have a pre-built one, wants a specific kernel version, or needs a cross-architecture kernel. The script builds kernels inside Docker containers with GCC versions matched to the target kernel, so even 4.x kernels build reliably on modern hosts.
 
+> **Need a *distro* kernel rather than an upstream one?** Use
+> `qmu-ubuntu-target` (`tools/mktarget.sh`). This skill builds from kernel.org
+> with an exploit-dev config (KASAN, full DWARF, drivers built in) — ideal for
+> "is this a bug?". It cannot answer "does this work on Ubuntu?", which needs
+> Ubuntu's own patched kernel at a pinned ABI, its config, and its hardening.
+
 The script ships in the qmu project's `tools/` directory. It is not on `PATH`; resolve it relative to the install location — from this skill's directory that is `../../tools/kbuild.sh`, or from a checkout of the qmu repo just `tools/kbuild.sh` (the form used in the examples below).
 
 ## Quick reference

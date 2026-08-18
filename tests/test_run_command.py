@@ -24,9 +24,13 @@ import json
 import pytest
 
 from qmu import cli
-from qmu.commands import run
+from qmu.commands import lifecycle, run
 from qmu.instance import VMInstance
 from qmu.ssh import SSHError
+
+# Captured before any test stubs it: the fixture replaces this seam with a
+# no-op, and the --no-replace test needs the real guard back.
+_REAL_REPLACE_EXISTING = lifecycle._replace_existing_named_vm
 
 
 PANIC = (
@@ -115,8 +119,10 @@ def harness(monkeypatch, tmp_path):
         monkeypatch.setattr(run, "launch_vm", _launch)
         monkeypatch.setattr(run, "_make_ssh", lambda instance: ssh)
         monkeypatch.setattr(run, "instance_alive", lambda instance: alive)
+        # `run` boots through lifecycle._prepare_boot, which reads this name
+        # from lifecycle's namespace — so that is where the seam lives.
         monkeypatch.setattr(
-            run, "_replace_existing_named_vm", lambda name, no_replace: None
+            lifecycle, "_replace_existing_named_vm", lambda name, no_replace: None
         )
         monkeypatch.setattr(
             run,
@@ -396,6 +402,49 @@ def test_boot_flags_are_forwarded_to_launch(harness):
     assert kwargs["harness"] is False
 
 
+def test_append_extends_the_profile_cmdline_on_run(harness):
+    """`run` and `launch` register one flag set, so they must APPLY it alike.
+
+    A flag that parses on `run` but is only honored by `launch` is the
+    subcommand-divergence the shared registrar exists to close: it presents as
+    a boot that silently ignores the parameter the caller asked for.
+    """
+    install, state = harness
+    install(run_result=(0, "", ""))
+
+    cli.main(_argv("--append", "slub_debug=- nokaslr", "id"))
+
+    # append is resolved by launch_vm, so it must arrive there rather than
+    # being folded into (or dropped from) the cmdline here.
+    assert state["launch_kwargs"]["append"] == "slub_debug=- nokaslr"
+    # ...and it must NOT have replaced the profile.
+    assert state["launch_kwargs"]["cmdline"] is None
+
+
+def test_inject_runs_before_boot_on_run(monkeypatch, harness):
+    """--inject must land before the guest boots, on `run` as on `launch`.
+
+    A one-shot boot is exactly when the binary needs to be in the image
+    already, so registering the flag without honoring it would be worse than
+    not offering it: the run would report success against stale contents.
+    """
+    install, state = harness
+    install(run_result=(0, "", ""))
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        lifecycle, "_inject_into_rootfs",
+        lambda config, specs, partition=1, mkdir=False: calls.append(
+            (specs, partition, mkdir)
+        ),
+    )
+
+    cli.main(_argv("--inject", "./exploit:/root", "--mkdir", "id"))
+
+    assert calls == [(["./exploit:/root"], 1, True)]
+    assert state["launched"] is True
+
+
 def test_qemu_args_are_flag_carried(harness):
     """`run` spends its positional on the guest command, so QEMU passthrough has
     to be a flag — and it is not decoration: an aarch64/arm guest does not boot
@@ -533,13 +582,11 @@ def test_no_replace_refuses_to_launch_over_a_live_namesake(monkeypatch, harness,
     Launching over a live namesake reuses its vm_id and overwrites its instance
     JSON, QMP socket and serial log, leaving the original QEMU running untracked
     and still holding the rootfs."""
-    from qmu.commands import lifecycle
-
     install, state = harness
     install(run_result=(0, "", ""))
     # Undo the fixture's no-op stub so the real guard runs.
     monkeypatch.setattr(
-        run, "_replace_existing_named_vm", lifecycle._replace_existing_named_vm
+        lifecycle, "_replace_existing_named_vm", _REAL_REPLACE_EXISTING
     )
     monkeypatch.setattr(lifecycle, "load_instance", lambda name: state["inst"])
     monkeypatch.setattr(lifecycle, "instance_alive", lambda instance: True)

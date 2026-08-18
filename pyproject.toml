@@ -20,6 +20,11 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Test the checkout the tests live in, not whichever qmu happens to be
+# installed. Without this a `python -m pytest` inside a git worktree imports the
+# editable install from the main checkout, so the suite silently reports on code
+# that is not the code under test.
+pythonpath = ["src"]
 # The vendored kernel tree under tests/assets/ ships its own test_*.py files;
 # do NOT collect them as part of the qmu suite.
 addopts = "--ignore=tests/assets"
