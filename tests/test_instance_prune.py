@@ -313,7 +313,13 @@ def test_prune_keep_logs_preserves_both_logs_for_orphan_bundle(capsys):
     assert rc == 0
     assert json.loads(capsys.readouterr().out) == {
         "ok": True,
+        # Explicitly False, never absent: a caller must be able to tell that a
+        # --dry-run request was honored as a real prune vs. silently dropped.
+        "dry_run": False,
         "pruned": ["forensics"],
+        # Always present, so a script gating on `pruned` being empty cannot
+        # conclude the cache is clean while `qmu list` still shows a remnant.
+        "held_back": [],
         "keep_logs": True,
     }
     assert serial.exists()

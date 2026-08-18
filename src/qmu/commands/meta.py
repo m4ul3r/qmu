@@ -64,6 +64,13 @@ def _handle_config_show(args: argparse.Namespace) -> int:
     data = {
         "ok": True,
         "sources": config._sources,
+        "boot": {
+            "kernel": config.kernel,
+            "initrd": config.initrd,
+            "cmdline": config.cmdline,
+            "profile": config.profile,
+            "resolved_cmdline": config.cmdline or config.profiles.get(config.profile),
+        },
         "machine": {
             "arch": config.arch,
             "memory": config.memory,
@@ -90,6 +97,14 @@ def _handle_config_show(args: argparse.Namespace) -> int:
 
     lines = ["Resolved qmu config:"]
     lines.append(f"  Sources: {' -> '.join(config._sources)}")
+    lines.append(f"  Kernel:      {config.kernel or '(not set — pass --kernel)'}")
+    if config.initrd:
+        lines.append(f"  Initrd:      {config.initrd}")
+    lines.append(f"  Profile:     {config.profile}")
+    lines.append(
+        f"  Cmdline:     {config.cmdline or config.profiles.get(config.profile, '')}"
+        + ("" if config.cmdline else f"  (from profile '{config.profile}')")
+    )
     lines.append(f"  Arch:        {config.arch} ({config.qemu_binary()})")
     lines.append(f"  KVM:         {config.use_kvm()}")
     lines.append(f"  Memory:      {config.memory}")
@@ -168,8 +183,41 @@ def _add_rootfs(sub: argparse._SubParsersAction) -> None:
                    help="One or more LOCAL:GUEST pairs (GUEST is a directory)")
     s.add_argument("--partition", type=int, default=1,
                    help="Partition number (default: 1; use 0 for whole-disk image)")
+    s.add_argument("--mkdir", action="store_true",
+                   help="Create GUEST if it does not exist (default: a missing "
+                        "directory is an error, so a typo cannot report success)")
     _add_common_opts(s)
     s.set_defaults(handler=_handle_rootfs_inject)
+
+    s = sp.add_parser("ls", help="List a directory inside a rootfs image")
+    s.add_argument("image", help="Path to rootfs image")
+    s.add_argument("path", nargs="?", default="/", help="Guest directory (default: /)")
+    s.add_argument("--partition", type=int, default=1,
+                   help="Partition number (default: 1; use 0 for whole-disk image)")
+    _add_common_opts(s)
+    s.set_defaults(handler=_handle_rootfs_ls)
+
+    s = sp.add_parser("cat", help="Print a file from inside a rootfs image")
+    s.add_argument("image", help="Path to rootfs image")
+    s.add_argument("path", help="Guest file path")
+    s.add_argument("--partition", type=int, default=1,
+                   help="Partition number (default: 1; use 0 for whole-disk image)")
+    _add_common_opts(s)
+    s.set_defaults(handler=_handle_rootfs_cat)
+
+    s = sp.add_parser("rm", help="Delete files inside a rootfs image")
+    s.add_argument("image", help="Path to rootfs image")
+    s.add_argument("paths", nargs="+", metavar="GUEST_PATH",
+                   help="One or more guest file paths to remove")
+    s.add_argument("--partition", type=int, default=1,
+                   help="Partition number (default: 1; use 0 for whole-disk image)")
+    s.add_argument("--recursive", "-r", action="store_true",
+                   help="Remove directories and their contents")
+    s.add_argument("--force", "-f", action="store_true",
+                   help="Ignore paths that do not exist (default: a missing path "
+                        "is an error, so a typo cannot report success)")
+    _add_common_opts(s)
+    s.set_defaults(handler=_handle_rootfs_rm)
 
     s = sp.add_parser("shell", help="Drop into a guestfish interactive shell")
     s.add_argument("image", help="Path to rootfs image")
@@ -179,7 +227,9 @@ def _add_rootfs(sub: argparse._SubParsersAction) -> None:
 
 def _handle_rootfs_inject(args: argparse.Namespace) -> int:
     parsed = [rootfs_mod.parse_mapping(m) for m in args.mappings]
-    rootfs_mod.inject(args.image, parsed, partition=args.partition)
+    rootfs_mod.inject(
+        args.image, parsed, partition=args.partition, mkdir=args.mkdir
+    )
 
     summary = {
         "ok": True,
@@ -191,6 +241,64 @@ def _handle_rootfs_inject(args: argparse.Namespace) -> int:
     for local, guest in parsed:
         lines.append(f"  {local} -> {guest}")
     _emit(args, data=summary, text=lines, stem="rootfs-inject")
+    return 0
+
+
+def _handle_rootfs_ls(args: argparse.Namespace) -> int:
+    entries = rootfs_mod.listdir(args.image, args.path, partition=args.partition)
+    _emit(
+        args,
+        data={
+            "ok": True,
+            "image": args.image,
+            "partition": args.partition,
+            "path": args.path,
+            "entries": entries,
+        },
+        text=entries if entries else f"{args.path} is empty.",
+        stem="rootfs-ls",
+    )
+    return 0
+
+
+def _handle_rootfs_cat(args: argparse.Namespace) -> int:
+    content = rootfs_mod.read_file(args.image, args.path, partition=args.partition)
+    _emit(
+        args,
+        data={
+            "ok": True,
+            "image": args.image,
+            "partition": args.partition,
+            "path": args.path,
+            "content": content,
+        },
+        text=content,
+        stem="rootfs-cat",
+    )
+    return 0
+
+
+def _handle_rootfs_rm(args: argparse.Namespace) -> int:
+    rootfs_mod.remove(
+        args.image,
+        args.paths,
+        partition=args.partition,
+        recursive=args.recursive,
+        force=args.force,
+    )
+    lines = [f"Removed from {args.image} (partition {args.partition}):"]
+    lines.extend(f"  {p}" for p in args.paths)
+    _emit(
+        args,
+        data={
+            "ok": True,
+            "image": args.image,
+            "partition": args.partition,
+            "removed": args.paths,
+        },
+        text=lines,
+        stem="rootfs-rm",
+    )
     return 0
 
 

@@ -12,10 +12,16 @@ Use this skill when the user wants to boot, manage, or interact with QEMU VMs fo
 A fresh project has no `qmu.toml`. Drive setup through these steps — do not hand-write a config:
 
 1. **`qmu doctor`** — surfaces what's missing (prints a `qmu config init` tip if no config is found).
-2. **`qmu config init`** — drops a host-arch-aware starter `qmu.toml` with two `# CHANGE ME` lines.
-3. **Edit the two `# CHANGE ME` lines**: `[drive] rootfs` → rootfs image path, `[ssh] key` → private key matching the rootfs (relative, absolute, and `~` paths all work).
+2. **`qmu config init`** — drops a host-arch-aware starter `qmu.toml` with `# CHANGE ME` lines.
+3. **Edit the `# CHANGE ME` lines**: `[boot] kernel` → kernel image, `[drive] rootfs` → rootfs image path, `[ssh] key` → private key matching the rootfs (relative, absolute, and `~` paths all work).
 4. **`qmu doctor`** again — confirm `rootfs image`, `SSH key`, `SSH key permissions` show `[+]`; fix any `[!]` before launching.
-5. **Boot-and-die kernels** (kernelCTF judge envs, syzkaller reproducers): skip step 3, leave `[drive]`/`[ssh]` blank, and launch with `qmu launch --harness ...` (see Harness mode).
+5. **Boot-and-die kernels** (kernelCTF judge envs, syzkaller reproducers): skip the `[drive]`/`[ssh]` edits, leave those tables blank, and launch with `qmu launch --harness ...` (see Harness mode).
+
+Set `[boot] kernel` and the rest of the boot recipe in `qmu.toml` **before you
+start iterating**. Every launch flag has a config key, so a complete `[boot]`
+table reduces each subsequent boot to a bare `qmu launch` — flags then exist
+only for the one-off deviation, not for restating the same eight arguments
+dozens of times.
 
 Project-local `./qmu.toml` is right for per-project rootfs/kernel paths; per-user defaults (e.g. your SSH key) belong in `~/.config/qmu/config.toml`.
 
@@ -36,6 +42,7 @@ qmu config path         # Show config search paths
 
 TOML settings are table-scoped. The accepted schema is:
 
+- `[boot]`: `kernel`, `initrd`, `cmdline`, `profile`
 - `[machine]`: `arch`, `memory`, `cpus`, `cpu`, `nic_model`, `net_backend`, `extra_args`
 - `[drive]`: `rootfs`, `format`
 - `[ssh]`: `key`, `user`, `port_start`
@@ -83,12 +90,46 @@ qmu kill                                    # Stop the VM
 ### Launching
 
 ```bash
+qmu launch                                                     # with [boot] kernel set in qmu.toml
 qmu launch --kernel /path/to/bzImage
 qmu launch --kernel /path/to/bzImage --profile trigger-test    # panic_on_warn=1
 qmu launch --kernel /path/to/bzImage --gdb                     # enable GDB stub
 qmu launch --kernel /path/to/bzImage --name myvm --memory 8G --cpus 4 --cpu host
-qmu launch --kernel /path/to/bzImage --cmdline "console=ttyS0 root=/dev/sda custom=1"
+qmu launch --append "slub_debug=- nokaslr"                     # ADD params to the profile
+qmu launch --cmdline "console=ttyS0 root=/dev/sda custom=1"    # REPLACE the profile cmdline
 ```
+
+**`--append` vs `--cmdline`.** `--cmdline` replaces the profile's command line
+entirely, and every profile carries `root=/dev/sda`; a hand-written replacement
+that omits it boots into an emergency shell with no obvious cause. Use
+`--append` to add boot parameters on top of the profile. qmu warns on stderr
+when a `--cmdline` without `root=` is paired with an attached rootfs.
+
+**Profile vs `[boot] cmdline`.** A `[boot] cmdline` in `qmu.toml` is a full
+override and normally beats the default profile. But an explicit CLI
+`--profile` beats that config cmdline, and says so on stderr — otherwise
+`--profile exploit-test` would be a silent no-op against any project whose
+config sets a cmdline. CLI `--cmdline` still wins over both. When a full
+override does apply, `qmu status` marks the profile `(NOT applied — cmdline was
+overridden)` rather than printing a profile name whose parameters never
+reached the kernel.
+
+**`--profile` discards the whole config cmdline, and qmu names the casualties.**
+The profile replaces that command line rather than merging with it, so anything
+the config supplied and the profile does not is gone. qmu lists the dropped
+params on stderr and calls out the ones that silently invalidate work:
+
+```
+[qmu] --profile exploit-test overrides the [boot] cmdline in qmu.toml for this launch.
+[qmu]   dropped: nokaslr rw slub_debug=- init=/init.sh
+[qmu]   note: 'nokaslr' is gone — every kernel address changes; hardcoded offsets will be wrong
+[qmu]   note: 'init=/init.sh' is gone — the guest runs its default init, not your harness script
+[qmu]   re-add any you still need with --append.
+```
+
+Re-add them with `--append` in the same launch. `nokaslr` is the one to watch:
+a final-validation run under `--profile exploit-test` is exactly when you least
+want KASLR quietly back on.
 
 Advanced boot flags (initrd kernels, custom block/NIC topologies):
 
@@ -109,11 +150,13 @@ qmu launch --kernel ./bzImage --nic-model e1000   # NIC model (default virtio-ne
 Profiles (LSMs disabled + KASAN in all three):
 - `exploit-dev` (default) — no panic_on_warn
 - `trigger-test` — adds `panic_on_warn=1` (validate bug triggers)
-- `exploit-test` — adds `panic_on_oops=1` (final exploit validation)
+- `exploit-test` — adds `oops=panic` (final exploit validation). Note this is
+  the boot-parameter spelling; `panic_on_oops=1` is sysctl-only and is silently
+  ignored by the kernel.
 
 Rootfs/SSH-key/other settings come from config; override with CLI flags. The drive uses `snapshot=on`, so the base image is never modified.
 
-**Auto-replace.** Launching with a `--name` (or the default) that matches a running VM **replaces** it (kills the old one first) so a stale VM never blocks a fresh boot and QEMU processes don't leak. Pass `--no-replace` to fail instead.
+**Auto-replace.** Launching with a `--name` (or the default) that matches a running VM **replaces** it (kills the old one first) so a stale VM never blocks a fresh boot and QEMU processes don't leak. `--no-replace` makes that case a hard error (exit 1) naming the running pid — it does NOT launch alongside, because doing so would overwrite the first VM's metadata with the new pid and strand the original QEMU: untracked, still holding the rootfs, and unreachable by `qmu kill`.
 
 ### Multiple VMs
 
@@ -127,23 +170,78 @@ qmu exec --vm kasan-vm "uname -r"
 qmu kill --vm kasan-vm
 ```
 
+`launch` names the new VM with `--name`; it also accepts `--vm` as an alias so
+the selector spelling is the same across every subcommand.
+
+### VM state has two independent axes
+
+`qmu list` reports both, because they vary independently — a VM can be orphaned
+AND panicked at once, which is the normal outcome of a successful trigger on a
+VM whose metadata was lost.
+
+- **Existence** (`status` in JSON): `running`, `orphaned` (no metadata, process
+  alive), `stopped`, `absent`.
+- **Guest usability** (`guest` in JSON): `serving`; `paused` (vCPU halted —
+  `qmu gdb` leaves every VM here until `qmu cont`); `crashed` (a crash report is
+  retrievable **and the guest is still running**); `panicked` (a terminal
+  `Kernel panic - not syncing` — the guest is gone); `unknown`.
+
+`crashed` vs `panicked` matters because the label drives a destructive
+decision. Under the default `exploit-dev` profile — which deliberately omits
+`oops=panic` — an Oops kills only the faulting task and the guest keeps
+serving, so a successful trigger usually lands on `crashed`. **Pull the report,
+do not reap it.** Only `panicked` means the guest is actually gone. Use
+`--profile exploit-test` (`oops=panic`) when you want a trigger to be terminal.
+
+So `[running — GUEST PANICKED]`, `[running — crash report waiting]`, and
+`[running — vCPU paused]` are all "running" on the first axis. `qmu status`
+reports both axes too, and says which of the two crash states it found.
+
+Every command that answers about a VM agrees with `list` about whether it
+exists — `status`, `log`, `crash`, `prune`, `kill`, `wait`, and `exec` all
+describe a stopped or orphaned VM rather than reporting it missing.
+
 ### Other lifecycle commands
 
 ```bash
-qmu list                # List VMs (running + stopped) with status markers
-qmu status              # Detailed status (QMP state, SSH, kernel cmdline, ...)
+qmu list                # List VMs with existence AND guest state (see below)
+qmu status              # Detailed status (QMP state, SSH, kernel cmdline, ...); `qmu show` is an alias
 qmu kill                # Graceful shutdown via QMP, falls back to SIGTERM
 qmu kill --force        # SIGKILL
 qmu kill --no-clean     # Stop but keep .serial.log + .json for forensics
 qmu prune --vm <name>             # Remove a stopped VM's state files
 qmu prune --all                   # Remove every stopped VM's state files
 qmu prune --vm <name> --keep-logs # Drop .json + .qmp.sock but PRESERVE .serial.log and .qemu.log
+qmu prune --orphans               # Kill qmu-launched QEMUs no instance record claims
+qmu prune --orphans --dry-run     # ...list what that would kill, and kill nothing
+qmu prune --all --dry-run         # preview an instance prune without removing anything
 qmu prune --runtime --older-than 86400  # Age-gated prune of qmu-owned runtime artifacts
 ```
 
 `--keep-logs` preserves both `.serial.log` and `.qemu.log` (metadata and QMP sockets are still removed).
 
 `qmu prune --runtime` removes only aged **marked** automatic output spills and aged definitely stale direct `cm-*` Unix sockets under the runtime root. It skips live/uncertain SSH controls, explicit `--out` files, unmarked lookalikes, symlinks, and unrelated temp names (including arbitrary `/tmp/qmu-*`). Default age is 86400 seconds; use `--older-than SECONDS` (non-negative). The command is idempotent and never recursively deletes the runtime root.
+
+**`--dry-run` previews; it never acts.** Supported with `--orphans`, `--vm`,
+and `--all`. It prints what would be removed or killed, leaves everything in
+place, and reports `dry_run: true` with `pruned: []` plus a `would_prune` /
+`would_kill` list in JSON — so a script can always tell a preview from a real
+run. `--runtime` has no preview pass and rejects the flag rather than acting
+under it. A real prune reports `dry_run: false`.
+
+**Log-only remnants and the age gate.** If a VM's `.json` is gone but its logs
+remain, `qmu list` still synthesizes an entry for it. Those remnants are
+age-gated: `qmu prune --vm <id>` leaves one younger than `--older-than`
+(default 24h) alone and tells you so — re-run with `--older-than 0` to clear it
+now. `qmu list` also distinguishes a remnant whose QEMU is still alive
+(`[ORPHANED — process alive]`, `status: "orphaned"` in JSON) from a genuinely
+stopped one, so a live orphan holding your rootfs can never present as
+"nothing running". Reap it with `qmu prune --orphans` (use `--dry-run` first on
+a shared machine), or with `qmu kill --vm <id>` — kill handles an orphaned
+remnant by signalling its process and preserving the serial log.
+
+`qmu prune --all` names any remnant the age gate held back rather than
+reporting "No stopped VMs to prune" while `qmu list` still shows one.
 
 State files are **never silently removed** except by `qmu wait`'s harness auto-clean (below). After `kill --no-clean`, or a harness VM that powered off without `wait`, the `.serial.log` survives — read it with `qmu log`/`qmu crash`, then `qmu prune` when done. See [Files on disk](#files-on-disk).
 
@@ -159,11 +257,16 @@ qmu launch --harness --kernel ./bzImage --initrd ./ramdisk.img \
 qmu wait                  # block until the recorded QEMU process exits (no timeout by default)
 qmu wait --timeout 120    # give up after 120s
 qmu wait --no-clean       # keep .serial.log after confirmed process exit
+
+# Or block on serial output instead of exit — for a VM that keeps running:
+qmu wait --pattern "=== results ===" --timeout 120
 ```
 
 `--harness` implies `--no-wait-ssh` and `--no-net` and skips the rootfs/SSH-key requirement.
 
-`qmu wait` is the harness/judge primitive:
+`qmu wait` without `--pattern` is the harness/judge primitive (with
+`--pattern` it waits on serial output instead — see [the iterate
+loop](#the-boot-and-check-iterate-loop)):
 - **Exit 0** — the recorded QEMU process identity exited; the result carries the
   terminal crash (JSON `crash` field, null if none; text prints
   `Crash from serial log:`).
@@ -181,6 +284,109 @@ terminal crash from `wait`'s own output rather than a later `qmu crash` — afte
 a confirmed exit, the log may already be gone. Non-harness VMs are never
 auto-cleaned by `wait`.
 
+## The boot-and-check iterate loop
+
+This is the loop you will run dozens of times when developing an exploit
+against a VM with no working SSH. Use these commands rather than reaching
+around qmu into `~/.cache/qmu/instances/`.
+
+```bash
+# 1. Build on the host, bake into the rootfs, and boot — one command.
+qmu launch --name poc --inject ./exploit:/root/ --append "slub_debug=-"
+
+# 2. Block until the guest prints its marker. Bounded, and it aborts early
+#    on a kernel crash instead of hanging.
+qmu wait --vm poc --pattern "=== results ===" --timeout 120
+
+# 3. Pull just the interesting lines out of the serial log.
+qmu log --vm poc --grep "leaked|OOB|UAF" --context 3
+```
+
+**Never poll the serial log by hand.** `until grep -q ... ~/.cache/qmu/
+instances/<vm>.serial.log; do sleep 2; done` hangs forever if the guest panics
+before printing the marker, and hangs forever if the VM dies. `qmu wait
+--pattern` ends in all four cases with a distinct exit code:
+
+- **Exit 0** — the pattern matched. JSON carries `matched_line`.
+- **Exit 3** — a **terminal** kernel panic appeared first; the guest is gone
+  and the marker can never arrive. The report is in `crash`. A *survived*
+  crash (an Oops under the default `exploit-dev` profile, which has no
+  `oops=panic`) does NOT abort — the guest is still running, so the wait
+  continues. `--ignore-crash` suppresses even the terminal-panic abort; you
+  rarely need it now, and pasting it reflexively is how a real panic gets
+  missed.
+- **Exit 1** — the VM exited without ever printing the pattern.
+- **Exit 124** — `--timeout` elapsed with the VM still running.
+
+`--pattern` is a Python regex matched per line, e.g. `--pattern "leaked
+0x[0-9a-f]{16}"`. After a QMP `RESET` **that qmu observed** the scan starts at
+the new guest epoch. Note the limit: epoch advancement needs qmu connected when
+the reset fires, so a *guest-initiated* reboot between two commands (`panic=1`,
+kexec, a harness calling `reboot`) is invisible and a pre-reboot marker can
+still satisfy a wait. The guest-state axis does not share this limit — it
+re-scopes on the kernel's own boot banner.
+
+`qmu log` reads the same log after the fact:
+
+```bash
+qmu log --grep "BUG:|WARNING:" --context 5   # searches the WHOLE log
+qmu log --grep "BUG:" --tail 200             # ...unless you narrow it on purpose
+qmu log --full --out ./evidence.log          # whole log to a file for the record
+```
+
+**Scan scope.** A bare `qmu log` shows the last 50 lines. `--grep` searches the
+**whole** log instead, because a filtered read scoped to the tail returns
+confident false negatives — the crash you are looking for is usually not in the
+last 50 lines. An explicit `--tail` still narrows it, and the result reports
+which scope was searched (`scope` in JSON; named in the no-match message), so a
+zero-match answer is never ambiguous.
+
+`--full` ignores `--tail`; combined with `--out` it replaces `cp
+~/.cache/qmu/instances/<vm>.serial.log ./evidence.log`.
+
+**Do not pipe `--full` into `grep -c` under a JSON format.** The envelope wraps
+the log in one JSON string, so a line count counts the envelope, not the log.
+Use `--grep` (which counts for you, in `matches`), or `--format text`, or write
+it with `--out` and grep the file.
+
+**Unknown boot parameters.** `launch` (once SSH is up), `wait`, and `status`
+report any boot parameter the kernel did not claim
+(`unknown_kernel_params` in JSON, a stderr warning in text). This catches the
+silent class of bug where a cmdline parameter looks right and does nothing —
+`panic_on_oops=1` is a sysctl, not a boot parameter, so a profile built on it
+never panics and a kernel-corrupting exploit reads as a clean run. The boot
+form is `oops=panic`.
+
+Three deliberate exclusions keep the warning worth reading:
+
+- **Init-consumed** params (`root=`, `init=`, `console=`) always appear in the
+  kernel's list and are never actionable.
+- **Pre-parse** params are honored *before* the kernel's parameter table
+  exists, so the kernel reports them as unknown while acting on them. **This is
+  arch-specific and qmu gates it on the VM's arch.** On x86, `nokaslr` is read
+  by the decompressor with no `__setup` entry to claim it — there it works, and
+  you should not remove it on the strength of that kernel line; the same goes
+  for `no5lvl`, `acpi*`, `earlyprintk`, `forcepae`, `edd`, and `mem_encrypt`.
+  On **arm32 the opposite is true**: `arch/arm/` has no KASLR at all, so
+  `nokaslr` there really does nothing and qmu reports it. arm64 never lists it
+  (a do-nothing `early_param` claims it). An instance with no recorded arch
+  suppresses only `quiet`/`debug`, so an unknown arch never hides a real dud.
+- **Profile-supplied** params are reported on a separate, quieter `[qmu] Note:`
+  line. They come from qmu's own profile rather than from anything you typed,
+  and are usually unfixable by design (`apparmor=0` is unclaimed precisely
+  because AppArmor is not compiled in). Only params *you* supplied get the loud
+  warning.
+
+JSON keeps the same split: `unknown_kernel_params_by_source.operator` is the
+key to gate a script on — `unknown_kernel_params` stays as the flat list for
+back-compat, but it includes the perpetual profile noise.
+
+**Dotted params are a blind spot.** The kernel routes `foo.bar=x` to the
+module-param path, so a dotted param never appears in that unknown-parameter
+line at all — `kasan.faul=panic` is silently ignored at boot and invisible
+afterwards. `launch` spell-checks dotted params against the names qmu knows and
+warns on a near-miss; unrelated dotted params are left alone.
+
 ## File Transfer
 
 ```bash
@@ -192,15 +398,73 @@ qmu pull /root/output.txt ./results/
 
 ### Offline rootfs editing (no running VM, via libguestfs)
 
-To bake files into a rootfs **before** boot (e.g. a harness rootfs with no SSH), or inspect one, use `qmu rootfs` — operates on the image file directly. Needs libguestfs (`guestfish`):
+**When SSH is not up, this — not `sudo mount`/`cp`/`umount` — is how files get
+into the guest.** To bake files into a rootfs **before** boot (e.g. a harness
+rootfs with no SSH), or inspect one, use `qmu rootfs`, which operates on the
+image file directly. Needs libguestfs (`guestfish`):
 
 ```bash
 qmu rootfs inject ./rootfs.img ./exploit:/root ./run.sh:/   # each pair is LOCAL:GUEST, GUEST is a dir
 qmu rootfs inject ./rootfs.img ./exploit:/root --partition 0   # whole-disk/partitionless image
+qmu rootfs inject ./rootfs.img ./exploit:/new/dir --mkdir      # create GUEST if absent
+qmu rootfs ls   ./rootfs.img /root                          # verify what actually landed
+qmu rootfs cat  ./rootfs.img /root/run.sh                   # read a file back
+qmu rootfs rm   ./rootfs.img /root/marker                   # delete (inject only adds)
+qmu rootfs rm   ./rootfs.img /tmp/workdir --recursive        # directories
 qmu rootfs shell ./rootfs.img                               # interactive guestfish
 ```
 
-`--partition N` selects the partition (default `1`; `0` for whole-disk).
+**GUEST must already exist.** `inject` errors if the destination directory is
+missing, rather than creating it — a silent `mkdir` turns `./exploit:/rooot`
+into a reported success while `/root/exploit` still holds the previous build,
+which is precisely the stale-code failure injection is meant to rule out. Pass
+`--mkdir` when you mean to create it. For the same reason `rm` errors on a path
+that does not exist instead of `rm -f`'s silent success; `--force` opts back
+into tolerating a missing path, and `--recursive` handles directories.
+
+`qmu rootfs ls` and `cat` are read-only: they open the image `--ro` and work
+while a VM is running, which is when you actually want to ask "did my inject
+land?". `inject`, `rm`, and `shell` write, so they refuse an image a running VM
+holds and name the VM to kill. If qmu reports no such VM but libguestfs still
+cannot open the image, an **untracked** QEMU is holding it — `qmu prune
+--orphans` finds and reaps those (it matches only QEMUs launched by qmu, via
+the QMP socket path in their argv, so it can never touch an unrelated QEMU).
+
+`--partition N` selects the partition (default `1`; `0` for whole-disk). Images
+built by `qmu-linux-rootfs`, and Debian cloud images like `trixie.img`, are
+whole-disk ext4 — they need `--partition 0`. If you get it wrong, the error
+names the partitions guestfish actually found.
+
+**Verify after injecting.** A failed inject leaves the previous iteration's
+binary in place, so the next boot re-runs stale code while looking like a fresh
+result. `qmu rootfs ls`/`cat` is how you rule that out.
+
+`qmu launch --inject LOCAL:/guest/dir` runs the same injection against the
+configured rootfs immediately before boot (after any existing VM of the same
+name is killed, so it is safe to repeat), making the rebuild-and-reboot cycle a
+single command. Repeat the flag for several files; `--partition` applies here too:
+
+```bash
+qmu launch --name poc --inject ./exploit:/root/ --inject ./init.sh:/ --partition 0
+```
+
+### libguestfs prerequisite
+
+Everything in this section needs libguestfs, and it is frequently broken out of
+the box: Debian/Ubuntu ship `/boot/vmlinuz-*` as mode `0600`, the supermin
+appliance builds unprivileged, and the resulting failure is reported as an
+opaque "appliance closed the connection unexpectedly". **Run `qmu doctor`
+first** — it checks both `guestfish` and whether an appliance kernel is
+readable, and prints the fix:
+
+```bash
+sudo chmod 0644 /boot/vmlinuz-*
+# or, leaving system permissions alone:
+sudo install -m 0644 /boot/vmlinuz-$(uname -r) /var/tmp/vmlinuz
+export SUPERMIN_KERNEL=/var/tmp/vmlinuz \
+       SUPERMIN_KERNEL_VERSION=$(uname -r) \
+       SUPERMIN_MODULES=/lib/modules/$(uname -r)
+```
 
 ## Guest Execution
 
@@ -288,6 +552,10 @@ After `snapshot load`, the first SSH command may print a one-off `Broken pipe` o
 qmu dmesg              # full dmesg from guest (via SSH)
 qmu dmesg --tail 50
 ```
+
+For a VM with no SSH, read the serial console instead — `qmu log` takes the
+same `--tail`, plus `--grep`/`--context`/`--full` (see [the iterate
+loop](#the-boot-and-check-iterate-loop)).
 
 ## GDB Integration (with pry)
 
@@ -514,13 +782,13 @@ Use the exit code (not log scraping) to branch:
 | Code | Meaning |
 |------|---------|
 | `0`  | Success |
-| `1`  | Operational failure — no running VM, bad `--vm`, kernel not found, guest command non-zero, `doctor` unhealthy, or a snapshot op failed (any `QMUError`) |
+| `1`  | Operational failure — no running VM, bad `--vm`, kernel not found, guest command non-zero, `doctor` unhealthy, a snapshot op failed, or `wait --pattern` outlived the VM (any `QMUError`) |
 | `2`  | Usage / argument-parse error (argparse) |
-| `3`  | Guest kernel crash, or SSH transport loss under a panic |
-| `4`  | QMP or SSH transport-layer failure (`QMPError`/`SSHError`), or an internal/unexpected qmu error (the `main()` catch-all, a hung helper subprocess) |
+| `3`  | Guest kernel crash — always corroborated by a fresh serial crash report (a bare dropped connection is `4`) |
+| `4`  | QMP or SSH transport-layer failure (`QMPError`/`SSHError`), a dropped SSH/scp connection with NO fresh crash (guest merely unreachable — e.g. no sshd), or an internal/unexpected qmu error |
 | `124`| `qmu wait` timed out |
 
-Exit `3` is guest-side; an internal qmu/transport fault is `4`, so a tooling bug is never mistaken for a kernel panic. (Matches `qmu --help`.)
+Exit `3` is guest-side; an internal qmu/transport fault is `4`, so a tooling bug is never mistaken for a kernel panic. `exec`, `push`, and `pull` apply that rule identically: a lost connection returns `3` only when a fresh serial crash corroborates it, otherwise `4`. Branch on `3` to mean "the guest actually crashed"; check `crash_detected` in JSON for the same answer. (Matches `qmu --help`.)
 
 **Output spilling.** Large outputs (>10k estimated tokens) auto-spill to a file under the centralized spill root, in precedence order: `$QMU_TEMP_DIR/spills`, then `$XDG_RUNTIME_DIR/qmu/spills` when that XDG runtime directory is absolute/existing/writable/searchable, then `<platform temp>/qmu/spills`. Automatic spills are marked with an adjacent ownership sidecar; explicit `--out` paths are never marked as qmu-owned. **Callers must continue consuming `artifact_path`** — never reconstruct spill names or paths. Read the path from the result envelope's `artifact_path` field or the `[qmu] Output spilled to <path>` stderr line. The envelope's `{"token_estimate": <int>, "estimator": "chars/4"}` is a tokenizer-agnostic heuristic for sizing only.
 

@@ -8,6 +8,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
+from typing import Any
 
 from .paths import instance_json_path, instances_dir, qemu_log_path, serial_log_path
 from .runtime import probe_unix_socket
@@ -50,6 +51,11 @@ class VMInstance:
     # Byte offset at which the currently restored guest generation begins.
     # Zero preserves old instance JSON and includes all bytes from a new launch.
     guest_epoch_serial_offset: int = 0
+    # Whether `cmdline` came from a full override rather than from `profile`.
+    # Without this, `status` prints a Profile: whose parameters never reached
+    # the kernel, and unknown-param attribution credits a profile that
+    # contributed nothing. Defaulted so older instance JSON still loads.
+    cmdline_override: bool = False
 
 
 def _instance_from_dict(data: dict) -> VMInstance:
@@ -478,3 +484,148 @@ def find_instance(vm_id: str | None = None) -> VMInstance:
     for inst in stopped:
         lines.append(f"  {inst.vm_id}  (stopped)")
     raise QMUError("\n".join(lines))
+
+
+def find_orphan_qemus() -> list[dict[str, Any]]:
+    """Return qmu-launched QEMU processes that no live instance record claims.
+
+    Identified by the QMP socket path in their argv, which always points into
+    qmu's own instances directory — so this can never match an unrelated QEMU
+    the user is running. Matching on the process name is not viable: comm is
+    truncated to 15 chars, and a `pgrep -f` broad enough to catch the argv also
+    matches the calling shell.
+    """
+    marker = str(instances_dir())
+    claimed = {
+        inst.pid for inst in list_instances() if instance_alive(inst)
+    }
+
+    orphans: list[dict[str, Any]] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in claimed:
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().decode(errors="replace")
+        except OSError:
+            continue
+        parts = [p for p in argv.split("\0") if p]
+        if not parts or "qemu-system-" not in parts[0]:
+            continue
+        if marker not in argv:
+            continue
+        serial = next(
+            (p.split("file:", 1)[1] for p in parts if p.startswith("file:")),
+            None,
+        )
+        # The rootfs is in the orphan's own argv, so a holder can be named even
+        # though an orphan has no metadata to match on by definition.
+        rootfs = None
+        for part in parts:
+            if part.startswith("file=") and ",if=" in part or part.startswith("file="):
+                candidate = part.split("file=", 1)[1].split(",", 1)[0]
+                if candidate:
+                    rootfs = candidate
+                    break
+        orphans.append({
+            "pid": pid,
+            "serial_log": serial,
+            "rootfs": rootfs,
+            "qmp_socket": next(
+                (p.split("unix:", 1)[1].split(",", 1)[0]
+                 for p in parts if p.startswith("unix:")),
+                None,
+            ),
+            "cmdline": " ".join(parts),
+        })
+    return orphans
+
+
+def orphan_serial_logs() -> dict[str, int]:
+    """Map serial-log path -> pid for every untracked qmu QEMU."""
+    mapping: dict[str, int] = {}
+    for orphan in find_orphan_qemus():
+        serial = orphan.get("serial_log")
+        if serial:
+            mapping[serial] = orphan["pid"]
+    return mapping
+
+
+# Every observable state a vm_id can be in. Commands MUST classify through
+# `classify_vm` rather than each deciding for themselves what a name means:
+# six rounds of dogfooding produced the same defect repeatedly — one command
+# reporting "not found" for a VM another command was displaying — because
+# `status`/`kill` looked only at running instances while `list`/`log` also saw
+# remnants.
+VM_RUNNING = "running"
+VM_ORPHANED = "orphaned"      # remnant with no metadata, but its QEMU is alive
+VM_HELD_BACK = "held_back"    # stopped remnant the prune age gate withheld
+VM_STOPPED = "stopped"        # stopped remnant, eligible to prune
+VM_ABSENT = "absent"
+
+
+def classify_vm(
+    vm_id: str,
+    *,
+    older_than_seconds: float = 86400.0,
+    orphan_pids: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Return the single authoritative description of `vm_id`.
+
+    Keys: state, instance (VMInstance|None), pid (int|None), serial_log.
+    """
+    for inst in list_instances():
+        if inst.vm_id == vm_id:
+            return {
+                "state": VM_RUNNING,
+                "instance": inst,
+                "pid": inst.pid,
+                "serial_log": inst.serial_log,
+            }
+
+    stopped = {inst.vm_id: inst for inst in list_stopped_instances()}
+    inst = stopped.get(vm_id)
+    if inst is None:
+        return {
+            "state": VM_ABSENT, "instance": None, "pid": None, "serial_log": None,
+        }
+
+    if orphan_pids is None:
+        orphan_pids = orphan_serial_logs()
+    orphan_pid = orphan_pids.get(inst.serial_log)
+    if orphan_pid is not None:
+        return {
+            "state": VM_ORPHANED,
+            "instance": inst,
+            "pid": orphan_pid,
+            "serial_log": inst.serial_log,
+        }
+
+    prunable = set(
+        list_prunable_instance_ids(older_than_seconds=older_than_seconds)
+    )
+    state = VM_STOPPED if vm_id in prunable else VM_HELD_BACK
+    return {
+        "state": state, "instance": inst, "pid": None,
+        "serial_log": inst.serial_log,
+    }
+
+
+def held_back_vm_ids(
+    *,
+    older_than_seconds: float = 86400.0,
+    orphan_pids: dict[str, int] | None = None,
+) -> list[str]:
+    """Stopped remnants the age gate withheld, in a stable order."""
+    prunable = set(
+        list_prunable_instance_ids(older_than_seconds=older_than_seconds)
+    )
+    orphaned = set(
+        orphan_serial_logs() if orphan_pids is None else orphan_pids
+    )
+    return sorted(
+        inst.vm_id for inst in list_stopped_instances()
+        if inst.vm_id not in prunable and inst.serial_log not in orphaned
+    )
