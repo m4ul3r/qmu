@@ -235,6 +235,35 @@ DEFAULT_PROFILES: dict[str, str] = {
         "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0"
         " selinux=0 apparmor=0 panic_on_oops=1 kasan.fault=panic"
     ),
+    # --- distro-target profiles (tools/mktarget.sh) -----------------------
+    #
+    # These deliberately do NOT carry `selinux=0 apparmor=0`. On a distro
+    # target AppArmor *is* part of what is being measured — Ubuntu builds with
+    # CONFIG_LSM="landlock,lockdown,yama,integrity,apparmor" and ships an
+    # `unprivileged_userns` profile in enforce mode that decides whether an
+    # unprivileged user namespace can be created at all. Disabling the LSM
+    # stack silently flips that primitive, and most modern LPEs open with it.
+    # They also omit `kasan.fault=panic`, which is inert and misleading on a
+    # distro kernel (no KASAN).
+    #
+    # `ubuntu-target` is the only one of these under which a claim like "this
+    # PoC works on Ubuntu 24.04" is valid: KASLR on, LSMs on, sysctls at the
+    # distro defaults.
+    "ubuntu-target": (
+        "console=ttyS0 root=/dev/sda rw earlyprintk=serial net.ifnames=0"
+    ),
+    # Reversing/GDB only. nokaslr makes symbols stable; an exploit that works
+    # here is NOT an exploit on Ubuntu, since KASLR bypass is a separate proof
+    # obligation.
+    "ubuntu-debug": (
+        "console=ttyS0 root=/dev/sda rw earlyprintk=serial net.ifnames=0 nokaslr"
+    ),
+    # Triage: KASLR and the LSM stack left alone, but panic on the first
+    # oops/warn so `qmu crash` yields one clean report.
+    "ubuntu-trigger": (
+        "console=ttyS0 root=/dev/sda rw earlyprintk=serial net.ifnames=0"
+        " panic_on_oops=1 panic_on_warn=1"
+    ),
 }
 
 
