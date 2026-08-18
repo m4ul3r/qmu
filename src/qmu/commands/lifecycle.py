@@ -78,7 +78,23 @@ def _replace_existing_named_vm(name: str | None, no_replace: bool) -> None:
     module's namespace, so ``monkeypatch.setattr(lifecycle, "load_instance", ...)``
     keeps working for both callers.
     """
-    if not name or no_replace:
+    if not name:
+        return
+    if no_replace:
+        # --no-replace promised not to replace; it must not silently ORPHAN
+        # either. Launching over a live namesake reuses its vm_id and overwrites
+        # its instance JSON, QMP socket and serial log, leaving the original
+        # QEMU running untracked and still holding the rootfs. Refusing is the
+        # only reading of the flag that is not a lie. (PR #33 reaches the same
+        # conclusion on the ergonomics branch.)
+        existing = load_instance(name)
+        if existing is not None and instance_alive(existing):
+            raise QMUError(
+                f"VM '{name}' is already running (pid={existing.pid}) and "
+                "--no-replace was given, so it was left alone and nothing was "
+                f"launched. Use a different --name, drop --no-replace to "
+                f"replace it, or stop it first: qmu kill --vm {name}"
+            )
         return
     existing = load_instance(name)
     if existing is not None and instance_alive(existing):

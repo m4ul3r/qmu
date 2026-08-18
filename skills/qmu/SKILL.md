@@ -108,10 +108,12 @@ It takes every boot flag `launch` does, with three differences:
 - **QEMU passthrough is `--qemu-arg`**, repeatable — the positional is spent on
   the guest command. Use the `=` form for values starting with a dash:
   `--qemu-arg=-M --qemu-arg=virt`. Cross-arch guests need this.
-- **No `--harness` / `--no-wait-ssh` / `--no-net`.** `run` executes a guest
-  command over SSH, so a mode that guarantees no SSH cannot run one (argparse
-  rejects all three, exit 2). For boot-and-die kernels use `launch --harness` +
-  `wait` + `crash`.
+- **No `--harness` / `--no-wait-ssh`.** `run` executes a guest command over SSH,
+  so a mode that guarantees no SSH cannot run one (argparse rejects both,
+  exit 2). For boot-and-die kernels use `launch --harness` + `wait` + `crash`.
+  (`--no-net` *is* accepted: it suppresses qmu's own NIC so a manual one can
+  take over — see the arm32/MMIO recipe — so pair it with `--qemu-arg` and a
+  matching `--ssh-port`.)
 - **Reaping is conditional.** On a clean run the VM is fully removed and stdout
   is byte-identical to what `qmu exec` would have printed (so `qmu run ... | grep`
   works). The VM is stopped but the instance metadata and `.serial.log` are
@@ -336,6 +338,10 @@ JSON results use the **same keys** on both paths, with `compiled_on`
 (`"host"`/`"guest"`) recording which ran, so a consumer never has to branch.
 
 > **Crash detection is best-effort.** When a guest command crashes the kernel, qmu attempts to pull the crash report from the serial log — both when the command exceeds `--timeout` and when SSH is torn down (rc=255) by a panic. This is best-effort: after **any** suspected panic, including a bare `[exit code: 255]`, always confirm with `qmu crash` (and `qmu log --tail 200`). Never rely on the exit code alone to detect a crash.
+>
+> A `--timeout` expiry is only treated as a possible crash when the guest has
+> also stopped answering SSH. A command that simply ran long on a healthy guest
+> exits **124** with `timed_out: true` — it is not reported as a kernel crash.
 
 ## Crash Extraction
 
@@ -630,7 +636,7 @@ Use the exit code (not log scraping) to branch:
 | `2`  | Usage / argument-parse error (argparse) |
 | `3`  | Guest kernel crash, or SSH transport loss under a panic |
 | `4`  | QMP or SSH transport-layer failure (`QMPError`/`SSHError`), or an internal/unexpected qmu error (the `main()` catch-all, a hung helper subprocess) |
-| `124`| `qmu wait` timed out, or `qmu run` gave up waiting for the guest to answer SSH |
+| `124`| `qmu wait` timed out; `qmu run` gave up waiting for the guest to answer SSH; or an `exec`/`run`/`compile --run` guest command exceeded `--timeout` **while the guest was still reachable** |
 
 Exit `3` is guest-side; an internal qmu/transport fault is `4`, so a tooling bug is never mistaken for a kernel panic. (Matches `qmu --help`.)
 

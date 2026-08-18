@@ -616,3 +616,44 @@ qmu-compile-ok uid=0
 **1.24s host vs 6.29s in-guest** for an 8-line source on an emulated aarch64
 guest — and that ratio is the floor, since the in-guest cost scales with the
 size of the translation unit while the host cost barely moves.
+
+## Second review round — behavior changes re-verified live
+
+### $ qmu run --timeout 2 -- 'sleep 30'   # healthy guest, slow command
+```
+Guest command timed out after 2s (guest still reachable): sleep 30
+No crash detected. Raise --timeout if the command needs longer.
+
+VM 't124' stopped (state preserved). Serial log: ~/.cache/qmu/instances/t124.serial.log
+Inspect: qmu log --vm t124 --tail 200 | qmu crash --vm t124
+Clean up:  qmu prune --vm t124
+[exit=124]
+```
+
+Before the liveness probe this returned **exit 3** with `crash_detected:false` —
+a phantom kernel panic for a command that merely ran long on a perfectly healthy
+kernel.
+
+### $ qmu run --format json --ssh-timeout 12 --no-net --ssh-port 10099 -- 'id'
+```
+{
+  "crash": null,
+  "crash_detected": false,
+  "hint": "Guest did not answer SSH within 12s and did not panic. ...",
+  "kernel_warning": null,
+  "kernel_warning_detected": false,
+  "ok": false,
+  "vm_state": "stopped (state preserved)"
+}
+[exit=124]
+```
+
+The serial log for that boot contains 3 `kasan` lines. `CRASH_START_PATTERNS`
+carries a bare case-insensitive `KASAN:` that matches the ordinary banner
+`kasan: KernelAddressSanitizer initialized`, and with no end marker after it the
+extract ran to the end of the log — so this envelope previously carried several
+thousand tokens of ordinary boot output as a "kernel warning". Now `null`.
+
+This invocation also exercises `--no-net` being accepted on `run` again: it
+suppresses qmu's own NIC for the manual-netdev topology rather than being an
+SSH-less mode.

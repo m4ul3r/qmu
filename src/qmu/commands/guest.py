@@ -49,6 +49,7 @@ def _emit_transfer_transport_lost(
     remote: str,
     inst: VMInstance,
     start_offset: int,
+    stem: str | None = None,
 ) -> int:
     """Emit the scp-transport-lost envelope; exit 3 only with a fresh crash.
 
@@ -96,9 +97,20 @@ def _emit_transfer_transport_lost(
         args,
         data=result,
         text=[f"SCP transport lost during {operation}: {direction}", detail],
-        stem=operation,
+        stem=stem or operation,
     )
     return status
+
+
+class _DeliveryTransportLost(SSHError):
+    """A confirmed transport loss while delivering a host-built binary.
+
+    A distinct type, not a bare SSHError: the delivery handler must not treat
+    *every* untyped SSH failure as a dropped guest. `push`/`pull` re-raise an
+    SSHError with no returncode (an scp subprocess timeout, a missing local
+    file) rather than calling it transport loss, and the host path has to make
+    the same distinction or it reclassifies ordinary infra failures as crashes.
+    """
 
 
 def _add_push(sub: argparse._SubParsersAction) -> None:
@@ -270,6 +282,38 @@ def _emit_ssh_lost(
     return status
 
 
+def _command_timeout_payload(
+    command: str,
+    timeout: float,
+) -> tuple[int, dict[str, Any], list[str]]:
+    """The guest is alive and answering; the command just outlived --timeout.
+
+    Exit 124 is the contract's wait-timeout code, and it is what this is: no
+    crash, no transport loss, nothing to reap. Keeping the L1 booleans present
+    and false is what lets a caller branch on `crash_detected` without first
+    checking which envelope shape it received.
+    """
+    return (
+        124,
+        {
+            "ok": False,
+            "ssh_error": False,
+            "crash_detected": False,
+            "timed_out": True,
+            "command": command,
+            "timeout": timeout,
+            "hint": f"Guest command exceeded --timeout ({timeout:g}s) but the "
+                    "guest is still answering SSH. Raise --timeout, or check "
+                    "what the command is waiting on.",
+        },
+        [
+            f"Guest command timed out after {timeout:g}s (guest still reachable): "
+            f"{command}",
+            "No crash detected. Raise --timeout if the command needs longer.",
+        ],
+    )
+
+
 def _join_exec_command(command: list[str]) -> str:
     """Build the guest command string from `qmu exec` positionals.
 
@@ -300,7 +344,13 @@ def _run_guest_command(
     try:
         rc, stdout, stderr = ssh.run(command, timeout=timeout)
     except SSHError:
-        # SSH command exceeded qmu's own timeout — likely a hung/crashed guest.
+        # qmu's own timeout expired. That is NOT by itself a crash: a guest that
+        # still answers SSH merely ran longer than --timeout, and reporting exit
+        # 3 there told the caller a healthy kernel had died (reproduced live with
+        # `qmu run --timeout 1 -- 'sleep 10'`). Probe first; only an unreachable
+        # guest takes the crash/transport-loss path.
+        if not _transport_lost(ssh):
+            return _command_timeout_payload(command, timeout)
         return _ssh_lost_payload(
             command, inst, start_offset=command_start_offset
         )
@@ -411,12 +461,16 @@ def _compile_on_host(
         )
         result: dict[str, Any] = {
             "source": str(source),
-            "compile_cmd": " ".join(argv),
+            # shlex.join, not " ".join: a quoted flag that shlex.split correctly
+            # kept as ONE argv entry would otherwise be rendered back as two,
+            # so the reported command was not a runnable representation of what
+            # actually executed.
+            "compile_cmd": shlex.join(argv),
             "compile_exit": rc,
             "compile_stdout": stdout,
             "compile_stderr": stderr,
             "compiled_on": "host",
-            "compiler": " ".join(cc),
+            "compiler": shlex.join(cc),
             "guest_arch": inst.arch,
             "ssh_error": False,
             "crash_detected": False,
@@ -436,7 +490,7 @@ def _compile_on_host(
     # liveness probe exec uses and hand the caller the transport-loss path:
     # reporting a kernel panic as "compilation failed" would bury it.
     if chmod_rc == 255 and _transport_lost(ssh):
-        raise SSHError(
+        raise _DeliveryTransportLost(
             "SSH transport lost (rc=255) while delivering the host-built "
             "binary — guest likely crashed"
         )
@@ -474,17 +528,26 @@ def _handle_compile(args: argparse.Namespace) -> int:
             # that justifies the kernel-crash class (3); otherwise the guest is
             # merely unreachable (4). Without this the panic would surface as
             # either a bare infra error or a bogus "compilation failed".
-            if exc.returncode is not None and not is_transport_failure(
-                exc.returncode, exc.stderr
+            #
+            # The guard mirrors _handle_push's verbatim: an SSHError carrying no
+            # returncode (scp subprocess timeout, missing local file) is infra,
+            # NOT a dropped guest. Only a confirmed rc=255-plus-marker scp
+            # failure, or our own probed _DeliveryTransportLost, gets here.
+            if not isinstance(exc, _DeliveryTransportLost) and (
+                exc.returncode is None
+                or not is_transport_failure(exc.returncode, exc.stderr)
             ):
                 raise
             return _emit_transfer_transport_lost(
                 args,
                 operation="push",
-                local=str(source),
+                # The transferred file is the host-built binary, not the source,
+                # and the loss may have happened in the chmod that follows it.
+                local=f"{source.name} (host-built binary)",
                 remote=remote_bin,
                 inst=inst,
                 start_offset=delivery_offset,
+                stem="compile",
             )
     else:
         # Push source

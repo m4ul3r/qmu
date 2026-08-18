@@ -341,12 +341,16 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
                         help="QEMU -drive spec, repeatable (suppresses implicit rootfs drive)")
     parser.add_argument("--nic-model", default=None, dest="nic_model",
                         help="NIC model (default: virtio-net-pci)")
-    if not run_mode:
-        # Same reasoning as --harness/--no-wait-ssh: `run` reaches the guest over
-        # a forwarded SSH port, so -nic none guarantees a 124 and a preserved VM
-        # instead of the argparse error the caller deserves.
-        parser.add_argument("--no-net", action="store_true",
-                            help="Disable networking entirely (-nic none)")
+    # --no-net stays available on `run`, unlike --harness/--no-wait-ssh. It is
+    # not an SSH-less mode: it suppresses qmu's own NIC so a manually supplied
+    # one can take over, which is the documented arm32/MMIO topology
+    # (--no-net + --qemu-arg=-netdev ...hostfwd + virtio-net-device + a matching
+    # --ssh-port). Rejecting it would make that valid configuration unreachable
+    # from `run`.
+    parser.add_argument("--no-net", action="store_true",
+                        help="Disable qmu's own NIC (-nic none). On `run`, supply a "
+                             "replacement via --qemu-arg and a matching --ssh-port, "
+                             "or the guest will be unreachable.")
     parser.add_argument("--net-backend", default=None, dest="net_backend",
                         choices=["user", "passt"],
                         help="Network backend: 'user' (slirp, default) or 'passt' "

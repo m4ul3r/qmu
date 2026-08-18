@@ -45,12 +45,18 @@ class FakeSSH:
         run_raises=None,
         serial_path=None,
         append_on_run="",
+        ready_after_run=None,
     ):
         self.ready = ready
         self.run_result = run_result
         self.run_raises = run_raises
         self.serial_path = serial_path
         self.append_on_run = append_on_run
+        # A guest that panics DURING the command answered SSH a moment earlier —
+        # that is how `run` got as far as running anything. Modelling the panic
+        # as ready=False from the start instead makes the VM merely unreachable
+        # at boot, which is a different code path entirely.
+        self.ready_after_run = ready_after_run
         self.runs: list[str] = []
         self.probes = 0
 
@@ -66,6 +72,8 @@ class FakeSSH:
         if self.append_on_run and self.serial_path is not None:
             with open(self.serial_path, "a", encoding="utf-8") as stream:
                 stream.write(self.append_on_run)
+        if self.ready_after_run is not None:
+            self.ready = self.ready_after_run
         if self.run_raises is not None:
             raise self.run_raises
         return self.run_result
@@ -161,6 +169,9 @@ def test_crash_during_the_command_exits_3_and_preserves_state(harness, capsys):
     install, state = harness
     install(
         append_on_run=PANIC,
+        # Boots fine, then the command kills it: the post-command liveness probe
+        # is what separates this from a healthy command that outran --timeout.
+        ready_after_run=False,
         run_raises=SSHError("SSH command timed out after 60s: ./exploit"),
     )
 
@@ -353,6 +364,7 @@ def test_json_envelope_on_a_crash_reports_preserved_state(harness, capsys):
     install, state = harness
     install(
         append_on_run=PANIC,
+        ready_after_run=False,
         run_raises=SSHError("transport lost"),
     )
 
@@ -405,7 +417,7 @@ def test_no_qemu_args_passes_none(harness):
     assert state["launch_kwargs"]["extra_args"] is None
 
 
-@pytest.mark.parametrize("flag", ["--harness", "--no-wait-ssh", "--no-net"])
+@pytest.mark.parametrize("flag", ["--harness", "--no-wait-ssh"])
 def test_ssh_less_modes_are_a_usage_error(harness, flag):
     """`run` executes a guest command over SSH, so a mode that guarantees no SSH
     cannot run one. Rejected by argparse (exit 2) rather than booting a VM that
@@ -428,3 +440,114 @@ def test_command_is_required(harness):
         cli.main(_argv())
 
     assert exc.value.code == 2
+
+
+# --- second-round review regressions ---------------------------------------
+
+KASAN_BOOT_BANNER = (
+    "[    0.000] Linux version 6.9.0\n"
+    "[    0.101] kasan: KernelAddressSanitizer initialized\n"
+    "[    0.102] Memory: 4096K/8192K available\n"
+    "[    1.500] systemd 252 running in system mode\n"
+)
+
+
+def test_kasan_boot_banner_is_not_a_kernel_warning(harness, capsys):
+    """`CRASH_START_PATTERNS` carries a bare, case-insensitive `KASAN:` that also
+    matches the ordinary boot banner "kasan: KernelAddressSanitizer initialized".
+    With no end marker after it the extract runs to the end of the log, so every
+    KASAN kernel would report its own boot as a multi-thousand-token warning."""
+    install, state = harness
+    install(serial_text=KASAN_BOOT_BANNER, ready=False, alive=True)
+
+    rc = cli.main(_argv("--format", "json", "--ssh-timeout", "0", "./exploit"))
+
+    assert rc == 124
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kernel_warning_detected"] is False
+    assert payload["kernel_warning"] is None
+    assert payload["crash_detected"] is False
+
+
+def test_genuine_report_after_a_kasan_banner_is_still_reported(harness, capsys):
+    """The narrowing must not swallow a real splat that follows the banner."""
+    install, state = harness
+    install(
+        serial_text=KASAN_BOOT_BANNER + (
+            "[    2.000] BUG: KASAN: slab-use-after-free in evil+0x10/0x20\n"
+            "[    2.001] ---[ end trace 0000000000000000 ]---\n"
+        ),
+        ready=False,
+        alive=True,
+    )
+
+    rc = cli.main(_argv("--format", "json", "--ssh-timeout", "0", "./exploit"))
+
+    assert rc == 124
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kernel_warning_detected"] is True
+    assert "slab-use-after-free" in payload["kernel_warning"]
+
+
+def test_healthy_command_timeout_is_124_not_a_crash(harness, capsys):
+    """`qmu run --timeout 1 -- 'sleep 10'` against a healthy guest. Reproduced
+    live as exit 3 before the fix — a phantom panic for a slow command."""
+    install, state = harness
+    install(run_raises=SSHError("SSH command timed out after 1s: sleep 10"))
+
+    rc = cli.main(_argv("--format", "json", "--timeout", "1", "sleep 10"))
+
+    assert rc == 124
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["timed_out"] is True
+    assert payload["crash_detected"] is False
+    # Nothing crashed, but the run did not succeed either: the VM is preserved
+    # so the caller can look at what the command was stuck on.
+    assert state["kills"] == [False]
+
+
+def test_no_net_is_accepted_and_forwarded(harness):
+    """--no-net is NOT an SSH-less mode: it suppresses qmu's own NIC so a
+    manually supplied one can take over, which is the documented arm32/MMIO
+    topology (--no-net + --qemu-arg=-netdev ...hostfwd + a matching --ssh-port).
+    Rejecting it would make that valid configuration unreachable from `run`."""
+    install, state = harness
+    install(run_result=(0, "", ""))
+
+    rc = cli.main(_argv(
+        "--no-net", "--ssh-port", "10099",
+        "--qemu-arg=-netdev", "--qemu-arg=user,id=n0,hostfwd=tcp::10099-:22",
+        "id",
+    ))
+
+    assert rc == 0
+    kwargs = state["launch_kwargs"]
+    assert kwargs["no_net"] is True
+    assert kwargs["ssh_port"] == 10099
+    assert kwargs["extra_args"] == ["-netdev", "user,id=n0,hostfwd=tcp::10099-:22"]
+
+
+def test_no_replace_refuses_to_launch_over_a_live_namesake(monkeypatch, harness, capsys):
+    """--no-replace promised not to replace; it must not silently ORPHAN either.
+
+    Launching over a live namesake reuses its vm_id and overwrites its instance
+    JSON, QMP socket and serial log, leaving the original QEMU running untracked
+    and still holding the rootfs."""
+    from qmu.commands import lifecycle
+
+    install, state = harness
+    install(run_result=(0, "", ""))
+    # Undo the fixture's no-op stub so the real guard runs.
+    monkeypatch.setattr(
+        run, "_replace_existing_named_vm", lifecycle._replace_existing_named_vm
+    )
+    monkeypatch.setattr(lifecycle, "load_instance", lambda name: state["inst"])
+    monkeypatch.setattr(lifecycle, "instance_alive", lambda instance: True)
+
+    rc = cli.main(_argv("--name", "run-vm", "--no-replace", "id"))
+
+    assert rc == 1
+    assert state["launched"] is False          # nothing was booted over it
+    err = capsys.readouterr().err
+    assert "already running" in err
+    assert "qmu kill --vm run-vm" in err

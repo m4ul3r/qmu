@@ -42,6 +42,20 @@ from typing import Any
 # consolidate onto it when that lands rather than keeping two spellings.)
 _TERMINAL_PANIC = re.compile(r"Kernel panic - not syncing", re.IGNORECASE)
 
+# This is the ONLY code path that scans a whole boot from byte 0, which exposes a
+# sharp edge in the shared patterns: `CRASH_START_PATTERNS` carries a bare,
+# case-insensitive `KASAN:` that also matches the ordinary boot banner
+# "kasan: KernelAddressSanitizer initialized". With no end marker after it, the
+# extract runs to the end of the log, so every KASAN kernel would report a
+# multi-thousand-token "warning" that is really just its boot. Require a genuine
+# report header before believing the extract. Narrowing the shared pattern would
+# change `qmu crash` for every caller, so the check lives at this call site.
+_REAL_REPORT_HEADER = re.compile(
+    r"(BUG:|WARNING: CPU:|Oops:|general protection fault|UBSAN:|"
+    r"Kernel panic|slab-use-after-free|slab-out-of-bounds|stack-out-of-bounds|"
+    r"use-after-free in|double-free or invalid-free)"
+)
+
 from ..instance import VMInstance, instance_alive
 from ..serial import extract_crash
 from ..ssh import SSHClient
@@ -128,7 +142,12 @@ def _boot_failure_payload(
     ``start_offset=0`` is the whole log because the VM was launched by this
     command — every byte belongs to this boot.
     """
-    report = extract_crash(inst.serial_log, start_offset=0)
+    extracted = extract_crash(inst.serial_log, start_offset=0)
+    report = (
+        extracted
+        if extracted and _REAL_REPORT_HEADER.search(extracted)
+        else None
+    )
     crash = report if report and _TERMINAL_PANIC.search(report) else None
     if crash is not None:
         return (
@@ -212,8 +231,7 @@ def _handle_run(args: argparse.Namespace) -> int:
         ssh_timeout=args.ssh_timeout,
         initrd=args.initrd,
         drives=args.drives,
-        # `run` needs the forwarded SSH port; --no-net is not on its parser.
-        no_net=False,
+        no_net=args.no_net,
         nic_model=args.nic_model,
         net_backend=args.net_backend,
         harness=False,

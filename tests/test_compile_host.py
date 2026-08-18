@@ -392,3 +392,38 @@ def test_host_build_then_run_propagates_a_non_zero_guest_exit(wired, source):
     install(run_results=[(0, "", ""), (42, "", "boom")])
 
     assert cli.main(["compile", "--host", "--run", str(source)]) == 1
+
+
+def test_scp_timeout_during_delivery_stays_infra_not_transport_loss(wired, source):
+    """push/pull deliberately re-raise an SSHError carrying NO returncode (an scp
+    subprocess timeout, a missing local file) rather than calling it transport
+    loss. The host-delivery handler must make the same distinction, or it
+    reclassifies ordinary infra failures as guest crashes."""
+    install, _state = wired
+    install(
+        push_raises=SSHError("SCP push timed out after 30s: /tmp/x -> /root/x"),
+        append_on_run=PANIC,
+    )
+
+    # Exit 4 (infra), NOT 3 — even though a panic sits in the serial log, the
+    # failure carries no evidence that the transport is what dropped.
+    assert cli.main(["compile", "--host", str(source)]) == 4
+
+
+def test_compile_cmd_is_rendered_as_a_reusable_command(wired, source, capsys):
+    """A quoted flag that shlex.split correctly kept as ONE argv entry must not
+    be rendered back as two: the reported command should be runnable as shown."""
+    install, _state = wired
+    install()
+
+    rc = cli.main([
+        "compile", "--host", "--format", "json",
+        "--cflags", "-O0 -DMSG='hello world'", str(source),
+    ])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "'-DMSG=hello world'" in payload["compile_cmd"]
+    # Round-trips: splitting the rendered command recovers the exact argv.
+    import shlex
+    assert "-DMSG=hello world" in shlex.split(payload["compile_cmd"])
