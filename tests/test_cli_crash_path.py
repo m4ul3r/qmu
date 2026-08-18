@@ -489,3 +489,44 @@ def test_compile_run_reports_crash_appended_during_executable(
     assert rc == 3
     assert payload["crash_detected"] is True
     assert "panic" in payload["crash"].lower()
+
+
+# --- healthy command timeout: 124, not a phantom crash ----------------------
+
+def test_exec_timeout_with_a_live_guest_is_124_not_a_crash(patch_exec, capsys):
+    """A command that outran --timeout on a guest that STILL answers SSH is a
+    timeout, not a panic.
+
+    Reproduced live before this fix as `qmu run --timeout 1 -- 'sleep 10'`
+    returning exit 3 with crash_detected:false against a perfectly healthy
+    kernel — the strong "kernel may have crashed" class for an ordinary slow
+    command. The liveness probe is the discriminator; ready=False still takes
+    the transport-loss path (pinned by the tests above).
+    """
+    fake = patch_exec(0, ready=True, run_error=SSHError("command timed out"))
+
+    rc = cli.main(["--format", "json", "exec", "sleep 10"])
+
+    assert rc == 124
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["timed_out"] is True
+    assert payload["ssh_error"] is False
+    assert payload["crash_detected"] is False
+    assert fake.is_ready_calls >= 1
+
+
+def test_exec_timeout_with_a_dead_guest_is_still_the_crash_path(patch_exec, capsys):
+    """The other side of the same probe: no answer means the guest went away."""
+    patch_exec(
+        0,
+        ready=False,
+        serial_during_run=PANIC_LOG,
+        run_error=SSHError("command timed out"),
+    )
+
+    rc = cli.main(["--format", "json", "exec", "trigger"])
+
+    assert rc == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["crash_detected"] is True

@@ -70,6 +70,7 @@ from ..serial import (
 from ..vm import launch_vm, suspect_dotted_params
 from .._cliutil import (
     _add_common_opts,
+    _add_launch_opts,
     _emit,
     _kill_vm,
     _make_ssh,
@@ -86,60 +87,44 @@ from .._cliutil import (
 
 def _add_launch(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("launch", help="Start a QEMU VM")
-    p.add_argument("--kernel", default=None,
-                   help="Path to bzImage (overrides [boot] kernel in qmu.toml)")
-    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
-    p.add_argument("--rootfs", default=None, help="Path to rootfs image (overrides config)")
-    p.add_argument("--ssh-key", default=None, dest="ssh_key", help="SSH private key (overrides config)")
-    p.add_argument("--arch", default=None, help="Architecture (overrides config, e.g. x86_64, aarch64)")
-    p.add_argument("--memory", default=None, help="VM memory (overrides config)")
-    p.add_argument("--cpus", type=int, default=None, help="VM CPU count (overrides config)")
-    p.add_argument("--cpu", default=None, dest="cpu_model",
-                   help="QEMU -cpu model, e.g. 'host', 'max', 'qemu64' (overrides config)")
-    p.add_argument("--profile", default=None,
-                   help="Boot profile (default: exploit-dev, or [boot] profile in qmu.toml)")
-    p.add_argument("--cmdline", default=None,
-                   help="REPLACE the profile's kernel command line (see --append to extend it)")
-    p.add_argument("--append", default=None,
-                   help="Append params to the resolved cmdline instead of replacing it, "
-                        "e.g. --append 'slub_debug=- nokaslr'")
-    p.add_argument("--gdb", action="store_true", help="Enable GDB stub")
-    p.add_argument("--name", default=None, help="VM instance name")
-    p.add_argument("--inject", action="append", dest="injects", default=None,
-                   help="Copy LOCAL:/guest/dir into the rootfs image before boot "
-                        "(repeatable; needs libguestfs)")
-    p.add_argument("--partition", type=int, default=1,
-                   help="With --inject: rootfs partition (default 1; use 0 for a "
-                        "whole-disk/partitionless image)")
-    p.add_argument("--mkdir", action="store_true",
-                   help="With --inject: create the guest directory if missing "
-                        "(default: a missing directory is an error, so a typo'd "
-                        "path cannot report success)")
-    p.add_argument("--no-replace", action="store_true",
-                   help="Don't kill existing VM with same name (default: replace)")
-    p.add_argument("--ssh-port", type=int, default=None, help="SSH port (auto-allocated)")
-    p.add_argument("--gdb-port", type=int, default=None, help="GDB port (auto-allocated)")
-    p.add_argument("--ssh-timeout", type=int, default=60, help="SSH wait timeout in seconds")
-    p.add_argument("--no-wait-ssh", action="store_true", help="Don't wait for SSH to be ready")
-    p.add_argument("--initrd", default=None, help="Path to initramfs/initrd image")
-    p.add_argument("--drive", action="append", dest="drives", default=None,
-                   help="QEMU -drive spec, repeatable (suppresses implicit rootfs drive)")
-    p.add_argument("--nic-model", default=None, dest="nic_model",
-                   help="NIC model (default: virtio-net-pci)")
-    p.add_argument("--no-net", action="store_true",
-                   help="Disable networking entirely (-nic none)")
-    p.add_argument("--net-backend", default=None, dest="net_backend",
-                   choices=["user", "passt"],
-                   help="Network backend: 'user' (slirp, default) or 'passt' "
-                        "(migration-compatible when the selected QEMU advertises native passt). "
-                        "Overrides config.")
-    p.add_argument("--harness", action="store_true",
-                   help="Harness/judge VM mode: implies --no-wait-ssh + --no-net; "
-                        "skips rootfs/ssh-key requirement")
-    p.add_argument("extra", nargs="*", help="Extra QEMU arguments")
+    _add_launch_opts(p)
     _add_common_opts(p)
     p.set_defaults(handler=_handle_launch)
 
+
+def _replace_existing_named_vm(name: str | None, no_replace: bool) -> None:
+    """Clear the way for a named launch: kill a live namesake, reap a stale one.
+
+    Shared with ``qmu run`` (``commands.run``) so both boot paths treat a
+    same-named VM identically; a second copy would let one of them orphan a QEMU
+    process still holding the rootfs. The collaborators are read from this
+    module's namespace, so ``monkeypatch.setattr(lifecycle, "load_instance", ...)``
+    keeps working for both callers.
+    """
+    if not name:
+        return
+    if no_replace:
+        # --no-replace promised not to replace; it must not silently ORPHAN
+        # either. Launching over a live namesake reuses its vm_id and overwrites
+        # its instance JSON, QMP socket and serial log, leaving the original
+        # QEMU running untracked and still holding the rootfs. Refusing is the
+        # only reading of the flag that is not a lie.
+        existing = load_instance(name)
+        if existing is not None and instance_alive(existing):
+            raise QMUError(
+                f"VM '{name}' is already running (pid={existing.pid}) and "
+                "--no-replace was given, so it was left alone and nothing was "
+                f"launched. Use a different --name, drop --no-replace to "
+                f"replace it, or stop it first: qmu kill --vm {name}"
+            )
+        return
+    existing = load_instance(name)
+    if existing is not None and instance_alive(existing):
+        sys.stderr.write(f"[qmu] Replacing existing VM '{name}' (pid={existing.pid})\n")
+        _kill_vm(existing)
+    elif existing is not None:
+        # Stale metadata from dead process — just clean up
+        remove_instance(existing.vm_id)
 
 def _warn_if_cmdline_drops_root(args: argparse.Namespace, config: Any) -> None:
     """Flag the classic `--cmdline` footgun before the guest drops to initramfs.
@@ -148,7 +133,8 @@ def _warn_if_cmdline_drops_root(args: argparse.Namespace, config: Any) -> None:
     ``root=``. Hand-written command lines routinely omit it, and the only
     symptom is an unexplained emergency shell several boots later.
     """
-    if config.cmdline is None or args.harness or args.drives:
+    # --harness is launch-only; `run` shares this warning but has no such flag.
+    if config.cmdline is None or getattr(args, "harness", False) or args.drives:
         return
     if config.rootfs is None or "root=" in config.cmdline:
         return
@@ -315,11 +301,23 @@ def _inject_into_rootfs(
         sys.stderr.write(f"[qmu] Injected {local} -> {guest}\n")
 
 
-def _handle_launch(args: argparse.Namespace) -> int:
+def _prepare_boot(args: argparse.Namespace) -> tuple[Any, str | None]:
+    """Resolve config and clear the way for a boot; returns (config, name).
+
+    Shared by ``launch`` and ``run`` (``commands.run``). Both register the same
+    boot-describing flags through ``_add_launch_opts``, so both must ALSO apply
+    them the same way — a flag that parses on `run` but is only honored by
+    `launch` is the subcommand-divergence the shared registrar exists to close,
+    and it would present as a boot that silently ignores `--append` or
+    `--inject`.
+
+    ``--harness`` is launch-only (`run` needs SSH to run its command), so it is
+    read defensively rather than assumed present.
+    """
     config = _resolve_config_from_args(args)
 
     # Harness mode bundles --no-wait-ssh + --no-net
-    if args.harness:
+    if getattr(args, "harness", False):
         args.no_wait_ssh = True
         args.no_net = True
 
@@ -348,24 +346,7 @@ def _handle_launch(args: argparse.Namespace) -> int:
     _warn_suspect_dotted_params(config, args.append)
 
     # Replace existing VM with the same name (default behavior)
-    if name:
-        existing = load_instance(name)
-        if existing is not None and instance_alive(existing):
-            if args.no_replace:
-                # Launching anyway would overwrite this VM's metadata with the
-                # new pid and orphan the running QEMU — untracked, still
-                # holding the rootfs, and unreachable by `qmu kill`.
-                raise QMUError(
-                    f"VM '{name}' is already running (pid={existing.pid}) and "
-                    f"--no-replace was given. Stop it first with "
-                    f"`qmu kill --vm {name}`, or launch without --no-replace to "
-                    f"replace it."
-                )
-            sys.stderr.write(f"[qmu] Replacing existing VM '{name}' (pid={existing.pid})\n")
-            _kill_vm(existing)
-        elif existing is not None and not args.no_replace:
-            # Stale metadata from dead process — just clean up
-            remove_instance(existing.vm_id)
+    _replace_existing_named_vm(name, args.no_replace)
 
     # Inject only AFTER the previous VM is gone. libguestfs cannot open an
     # image a live QEMU still holds, and it reports that as an opaque
@@ -376,6 +357,12 @@ def _handle_launch(args: argparse.Namespace) -> int:
         _inject_into_rootfs(
             config, args.injects, partition=args.partition, mkdir=args.mkdir
         )
+
+    return config, name
+
+
+def _handle_launch(args: argparse.Namespace) -> int:
+    config, name = _prepare_boot(args)
 
     inst = launch_vm(
         config=config,
@@ -1296,6 +1283,11 @@ def _handle_list(args: argparse.Namespace) -> int:
         return 0
 
     if args.format != "text":
+        # Hoisted: _orphan_serial_logs() walks all of /proc, so calling it per
+        # stopped VM made `list --format json` scan the process table N times.
+        # The text branch below already does this once; both branches must also
+        # read the SAME snapshot, or they can disagree about who is orphaned.
+        orphan_logs = _orphan_serial_logs()
         data = []
         for inst in running:
             entry: dict[str, Any] = {
@@ -1315,7 +1307,7 @@ def _handle_list(args: argparse.Namespace) -> int:
                 entry["ssh_ready"] = _make_ssh(inst).is_ready()
             data.append(entry)
         for inst in stopped:
-            orphan_pid = _orphan_serial_logs().get(inst.serial_log)
+            orphan_pid = orphan_logs.get(inst.serial_log)
             data.append({
                 "vm_id": inst.vm_id,
                 "status": "orphaned" if orphan_pid else "stopped",

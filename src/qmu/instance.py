@@ -524,11 +524,12 @@ def find_orphan_qemus() -> list[dict[str, Any]]:
         # though an orphan has no metadata to match on by definition.
         rootfs = None
         for part in parts:
-            if part.startswith("file=") and ",if=" in part or part.startswith("file="):
-                candidate = part.split("file=", 1)[1].split(",", 1)[0]
-                if candidate:
-                    rootfs = candidate
-                    break
+            if not part.startswith("file="):
+                continue
+            candidate = part.split("file=", 1)[1].split(",", 1)[0]
+            if candidate:
+                rootfs = candidate
+                break
         orphans.append({
             "pid": pid,
             "serial_log": serial,

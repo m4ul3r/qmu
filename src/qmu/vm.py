@@ -290,16 +290,20 @@ _KNOWN_DOTTED_PARAMS = frozenset({
     "kfence.sample_interval",
     # kernel/
     "cpuhp.parallel",
-    # frequently used in exploit-dev cmdlines
+    # frequently used in exploit-dev cmdlines.
+    # Undotted names (slub_debug, init_on_alloc, init_on_free) do NOT belong
+    # here: suspect_dotted_params only considers tokens containing a dot, so
+    # they could never be matched as known — and as get_close_matches
+    # candidates they could only ever produce a WRONG suggestion, proposing an
+    # undotted name for a dotted param. The kernel's own unknown-parameter line
+    # already reports them, which is the mechanism this table exists to cover
+    # for precisely because it cannot see dotted params.
     "net.ifnames",
     "rcupdate.rcu_expedited",
     "rcupdate.rcu_cpu_stall_suppress",
-    "slub_debug",
     "vsyscall.emulate",
     "kvm.nx_huge_pages",
     "page_alloc.shuffle",
-    "init_on_alloc",
-    "init_on_free",
     # drivers/ and arch/ early_params seen in embedded and arm64 work
     "iommu.passthrough",
     "iommu.strict",
