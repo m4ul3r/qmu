@@ -27,6 +27,7 @@ RESUMED_WARNING_THEN_SYSRQ = (
     "[ 2.1] Kernel panic - not syncing: sysrq triggered crash\n"
 )
 EXPECTED_KEYS = {
+    "vm",
     "ok",
     "crash_detected",
     "scope",

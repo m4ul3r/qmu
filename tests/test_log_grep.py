@@ -193,7 +193,7 @@ def test_plain_log_payload_has_no_grep_keys(log_env, capsys):
     rc, payload = _run(capsys, "--tail", "1")
 
     assert rc == 0
-    assert set(payload) == {"ok", "log", "available", "empty"}
+    assert set(payload) == {"ok", "vm", "log", "available", "empty"}
 
 
 def test_invalid_grep_regex_is_reported_not_raised(log_env, capsys):

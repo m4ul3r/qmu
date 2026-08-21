@@ -224,7 +224,24 @@ Rootfs/SSH-key/other settings come from config; override with CLI flags. The dri
 
 ### Multiple VMs
 
-Each VM gets its own SSH port (from 10021+), QMP socket, and serial log. With one VM running, commands auto-select it; with several, pick one with `--vm <id>`.
+Each VM gets its own SSH port (from 10021+), QMP socket, and serial log. With one VM running, commands auto-select it; with several running, pick one with `--vm <id>`.
+
+**Auto-selection, precisely.** Most commands (`status`, `exec`, `kill`, `gdb`, …)
+consider only **running** VMs, so stopped remnants never make them ambiguous.
+`log` and `crash` also accept a **stopped** VM — that is how a dead VM's serial
+log stays readable — so they see more candidates. When they cannot narrow to
+one, they pick **the single running VM** and say so:
+
+```
+$ qmu log
+[qmu] Auto-selected the only running VM 'poc' (8 other VM(s) exist; use --vm <id> to pick one).
+```
+
+In JSON the same fact is `"vm": "poc"` plus `"autoselected": "..."`. Both
+commands always report which VM they read, auto-selected or not — never assume
+it from context. With **no** running VM and several stopped ones, they are
+genuinely ambiguous and error, naming the first few candidates and pointing at
+`qmu prune --all`.
 
 `--vm`, `--format`, and `--out` are accepted **both before and after** the subcommand — `qmu --vm <id> exec "..."` and `qmu exec --vm <id> "..."` are equivalent. Examples below put them after the subcommand.
 
