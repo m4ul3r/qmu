@@ -117,6 +117,7 @@ def write_artifact(relative, content):
 
 write_artifact("bzImage", "kernel image\\n")
 write_artifact("vmlinux", "ELF symbols\\n")
+write_artifact("System.map", "ffffffff81000000 T _text\\n")
 write_artifact("scripts/gdb/vmlinux-gdb.py", "# generated loader\\n")
 write_artifact("scripts/gdb/linux/constants.py", "LX_CONFIG_HZ = 250\\n")
 loader = output / "vmlinux-gdb.py"
@@ -388,3 +389,18 @@ def test_config_only_output_shell_quotes_literal_hostile_cache_path(
     assert not (tmp_path / "injected-cache").exists()
     assert evaluated.returncode == 0, evaluated.stderr
     assert evaluated.stdout == str(hostile.cache / "kernels/7.0/x86_64/.config") + "\n"
+
+
+def test_system_map_is_copied_to_the_output_directory(kbuild_env):
+    """kbuild never preserved System.map, so the source tree held the only copy.
+
+    mktarget.sh keeps System.map for its targets and the ubuntu-target skill
+    documents it as the kbase fallback, so the omission was a real gap. Note
+    this cannot recover the trees already affected: the cp block runs AFTER
+    `make $GDB_TARGET`, which is the step that fails on 4.x under pipefail.
+    """
+    result = kbuild_env.run()
+    assert result.returncode == 0, result.stderr
+    outdir = kbuild_env.cache / "kernels/7.0/x86_64"
+    assert (outdir / "System.map").is_file()
+    assert (outdir / "System.map").read_text().strip().endswith("_text")

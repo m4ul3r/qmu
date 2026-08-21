@@ -62,6 +62,9 @@ Environment:
   QMU_CACHE_DIR          Override ~/.cache/qmu
   QMU_KBUILD_MIRROR      Kernel mirror (default: cdn.kernel.org)
 
+Also written to the output directory: System.map (needed for symbol lookup
+when a vmlinux is unavailable).
+
 Output (eval-able; --config-only outputs only CONFIG and does not generate debugger helpers):
   KERNEL=/path/to/bzImage
   VMLINUX=/path/to/vmlinux
@@ -478,6 +481,7 @@ docker run --rm \
     # copy artifacts and preserve the upstream relative GDB-loader layout
     cp \$IMAGE_SUBPATH /output/
     cp vmlinux /output/vmlinux
+    cp System.map /output/System.map
     cp .config /output/.config
     rm -rf /output/scripts/gdb /output/vmlinux-gdb.py
     mkdir -p /output/scripts
