@@ -313,6 +313,15 @@ def test_prune_keep_logs_preserves_both_logs_for_orphan_bundle(capsys):
     assert rc == 0
     assert json.loads(capsys.readouterr().out) == {
         "ok": True,
+        # Disclosed on EVERY prune branch, from one helper: prune reaches
+        # instances/ and runtime_root() only, so a caller must be able to see
+        # that kernels/, targets/ and rootfs/ were not covered. Empty here
+        # because the isolated test cache has no such subtrees.
+        "unmanaged_cache": {
+            "subtrees": [],
+            "hint": "qmu cache du",
+            "reclaim_hint": "qmu prune --build-residue --dry-run",
+        },
         # Explicitly False, never absent: a caller must be able to tell that a
         # --dry-run request was honored as a real prune vs. silently dropped.
         "dry_run": False,
@@ -368,6 +377,11 @@ def test_prune_runtime_json_result_shape(capsys):
         assert rc == 0
         assert json.loads(capsys.readouterr().out) == {
             "ok": True,
+            "unmanaged_cache": {
+                "subtrees": [],
+                "hint": "qmu cache du",
+                "reclaim_hint": "qmu prune --build-residue --dry-run",
+            },
             "runtime": {
                 "older_than_seconds": 86400.0,
                 "removed": [{"kind": "spill", "path": str(artifact)}],
@@ -398,6 +412,11 @@ def test_prune_runtime_ndjson_is_one_valid_object_line(capsys):
     assert len(lines) == 1
     assert json.loads(lines[0]) == {
         "ok": True,
+        "unmanaged_cache": {
+            "subtrees": [],
+            "hint": "qmu cache du",
+            "reclaim_hint": "qmu prune --build-residue --dry-run",
+        },
         "runtime": {
             "older_than_seconds": 0.0,
             "removed": [],

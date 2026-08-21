@@ -56,6 +56,8 @@ stderr), always in this order:
 KERNEL=/home/user/.cache/qmu/kernels/6.6.75/x86_64/bzImage
 VMLINUX=/home/user/.cache/qmu/kernels/6.6.75/x86_64/vmlinux
 CONFIG=/home/user/.cache/qmu/kernels/6.6.75/x86_64/.config
+# also written (not an eval-able assignment):
+#   /home/user/.cache/qmu/kernels/6.6.75/x86_64/System.map
 KERNEL_SRC=/home/user/.cache/qmu/kernels/src/linux-6.6.75
 VMLINUX_GDB=/home/user/.cache/qmu/kernels/6.6.75/x86_64/vmlinux-gdb.py
 ```
@@ -223,6 +225,24 @@ For x86_64/i386, `kvm_guest.config` is also applied for QEMU-optimized virtio de
 To inspect the config inside a running guest: `zcat /proc/config.gz | grep KASAN`
 
 ## Cache layout
+
+**Build residue is cleaned by default.** The build runs in-tree, so
+`kernels/src/linux-<ver>/` fills with `*.o`, `*.a`, `.*.cmd` and friends — on a
+box with a few kernels that is commonly more than half of `~/.cache/qmu`. After a
+successful build kbuild removes them. It never touches `Makefile`, `.config`,
+`vmlinux`, `System.map` or `arch/*/boot/`, so the next run is still a cache hit.
+
+Pass `--keep-residue` to keep them — worth it only if you intend to
+`make -C $KERNEL_SRC` after patching, since kbuild itself runs `make mrproper` at
+the start of every containerised build and never reuses them.
+
+To reclaim residue left by builds that predate this behaviour:
+
+```bash
+qmu cache du                          # how much is there
+qmu prune --build-residue --dry-run   # preview
+qmu prune --build-residue
+```
 
 Built kernels are cached and reused on subsequent runs. Source is shared across
 architectures; artifacts (including GDB helpers) are architecture-specific:

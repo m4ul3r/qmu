@@ -19,6 +19,7 @@ CONTAINER_OVERRIDE=""
 OUTDIR_OVERRIDE=""
 JOBS="$(nproc)"
 NO_CACHE=false
+KEEP_RESIDUE=false
 CONFIG_ONLY=false
 VERBOSE=false
 VERSION=""
@@ -55,6 +56,11 @@ Optional:
   --jobs N               Parallel build jobs (default: nproc)
   --no-cache             Rebuild even if output exists
   --config-only          Generate .config and exit (don't build)
+  --keep-residue         Keep in-tree build intermediates (*.o, .*.cmd, ...)
+                         after a successful build. Default is to remove them:
+                         the next build mrpropers the tree anyway, so they
+                         carry no incremental value to kbuild. Keep them if
+                         you plan to `make -C \$KERNEL_SRC` after a patch.
   --verbose              Show Docker build + make output
   -h, --help             Show this help
 
@@ -89,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     --outdir)     OUTDIR_OVERRIDE="$2"; shift 2 ;;
     --jobs)       JOBS="$2"; shift 2 ;;
     --no-cache)   NO_CACHE=true; shift ;;
+    --keep-residue)    KEEP_RESIDUE=true; shift ;;
     --config-only) CONFIG_ONLY=true; shift ;;
     --verbose)    VERBOSE=true; shift ;;
     -h|--help)    usage ;;
@@ -219,6 +226,36 @@ emit_build_outputs() {
   printf 'CONFIG=%q\n' "$OUTDIR/.config"
   printf 'KERNEL_SRC=%q\n' "$SRCDIR"
   printf 'VMLINUX_GDB=%q\n' "$OUTDIR/vmlinux-gdb.py"
+}
+
+# Remove in-tree build intermediates after a successful build.
+#
+# Host-side on purpose, NOT inside the container's `bash -c "..."` body: that
+# body is a single host double-quoted string and this file already warns twice
+# that an unescaped quote in it silently truncates the script. It is also
+# executable by the test fixture, which never runs the container body.
+#
+# `make clean` is deliberately NOT used: it routes through vmlinuxclean ->
+# scripts/link-vmlinux.sh, which does `rm -f System.map` and `rm -f vmlinux`,
+# and archclean removes arch/*/boot/Image. Those are frequently the only copy
+# on disk -- kbuild's own `make scripts_gdb` step fails on 4.x kernels and,
+# under pipefail, aborts before the artifact copy above ever runs.
+#
+# This never touches Makefile, .config, vmlinux, System.map, vmlinux.unstripped
+# or arch/*/boot/, so build_cache_complete() still passes and the next
+# invocation is a cache hit. The removed classes carry no incremental value
+# because the container mrpropers the tree at the start of every build anyway.
+clean_build_residue() {
+  [[ "$KEEP_RESIDUE" == true ]] && return 0
+  [[ -d "$SRCDIR" ]] || return 0
+  step "Removing in-tree build residue (--keep-residue to skip)"
+  find "$SRCDIR" \
+    -path "$SRCDIR/arch/*/boot" -prune -o \
+    -type f \( \
+      -name '*.o' -o -name '*.a' -o -name '*.ko' -o -name '*.mod' \
+      -o -name '*.mod.c' -o -name '*.symtypes' -o -name '.*.cmd' \
+      -o -name '.tmp_vmlinux*' \
+    \) -print0 2>/dev/null | xargs -0 -r rm -f 2>/dev/null || true
 }
 
 config_cache_complete() {
@@ -509,6 +546,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$CONFIG_ONLY" == true ]]; then
   config_cache_complete || die "build appeared to succeed but $OUTDIR/.config not found"
+  clean_build_residue
   emit_config_output
 else
   if ! build_cache_complete; then
@@ -527,5 +565,6 @@ else
     die "build appeared to succeed but required products are incomplete"
   fi
   step "Build complete: $OUTDIR/$IMAGE_NAME"
+  clean_build_residue
   emit_build_outputs
 fi

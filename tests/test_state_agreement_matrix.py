@@ -13,6 +13,8 @@ Adding a state or a command that reports on one means adding a row here.
 from __future__ import annotations
 
 import json
+import os
+import time
 
 import pytest
 
@@ -697,3 +699,167 @@ def test_a_real_second_boot_still_scopes(cache, monkeypatch):
     _qmp(monkeypatch, True)
 
     assert lifecycle._guest_state(inst) == "serving"
+
+
+# ---------------------------------------------------------------------------
+# Cache states. Three commands report on build residue -- `cache du`,
+# `cache ls` and `prune --build-residue` -- so the matrix gains rows for the
+# states they can disagree about. A fourth (`unmanaged subtree exists`) crosses
+# every prune branch plus `doctor`.
+# ---------------------------------------------------------------------------
+
+
+def _residue_tree(cache, name="linux-7.0", *, files=3, age_seconds=None):
+    """Build a post-build source tree. age_seconds backdates every mtime so the
+    tree lands in `eligible` rather than `held_back` at the default cutoff."""
+    src = cache / "kernels" / "src" / name
+    (src / "kernel").mkdir(parents=True)
+    (src / "Makefile").write_text("# kbuild\n")
+    (src / "vmlinux").write_bytes(b"\x7fELF")
+    (src / "System.map").write_text("ffffffff81000000 T _text\n")
+    for i in range(files):
+        (src / "kernel" / f"f{i}.o").write_bytes(b"o" * 512)
+    if age_seconds is not None:
+        stamp = time.time() - age_seconds
+        for path in sorted(src.rglob("*"), reverse=True):
+            os.utime(path, (stamp, stamp))
+        os.utime(src, (stamp, stamp))
+    return src
+
+
+# Old enough to be eligible at _RESIDUE_AGE, so the rows below exercise the
+# eligible path rather than passing vacuously on an all-held-back cache.
+_OLD = 7200
+
+
+_RESIDUE_AGE = "600"
+_BUCKETS = ("total", "eligible", "held_back", "refused")
+
+
+def test_cache_du_and_prune_agree_bucket_for_bucket(cache, capsys):
+    """Axis 4: subcommand vs subcommand. Two commands, one dataset."""
+    _residue_tree(cache, age_seconds=_OLD)
+
+    cli.main(["--format", "json", "cache", "du", "--older-than", _RESIDUE_AGE])
+    du = json.loads(capsys.readouterr().out)["build_residue"]
+
+    cli.main(["--format", "json", "prune", "--build-residue",
+              "--older-than", _RESIDUE_AGE, "--dry-run"])
+    pr = json.loads(capsys.readouterr().out)["build_residue"]
+
+    for bucket in _BUCKETS:
+        assert du[bucket]["bytes"] == pr[bucket]["bytes"], bucket
+        assert sorted(du[bucket]["groups"]) == sorted(pr[bucket]["groups"]), bucket
+
+
+def test_residue_preview_and_real_agree(cache, capsys):
+    """Axis 1: preview vs real. Classification -- not deletion -- decides."""
+    _residue_tree(cache, age_seconds=_OLD)
+
+    cli.main(["--format", "json", "prune", "--build-residue",
+              "--older-than", _RESIDUE_AGE, "--dry-run"])
+    preview = json.loads(capsys.readouterr().out)
+
+    cli.main(["--format", "json", "prune", "--build-residue",
+              "--older-than", _RESIDUE_AGE])
+    real = json.loads(capsys.readouterr().out)
+
+    assert {i["path"] for i in preview["build_residue"]["would_remove"]} == {
+        i["path"] for i in real["build_residue"]["removed"]
+    }
+    assert preview["dry_run"] is True and real["dry_run"] is False
+
+
+def test_held_back_by_age_appears_in_both_text_and_json(cache, capsys):
+    """Axis 3. A freshly-touched tree is held back, and says so in both formats.
+
+    Named for the age gate, not for "in use by a build": there is no build
+    detection, and a row named for one would be read as proof it exists.
+    """
+    _residue_tree(cache)
+
+    cli.main(["prune", "--build-residue", "--dry-run"])
+    text = capsys.readouterr().out
+    cli.main(["--format", "json", "prune", "--build-residue", "--dry-run"])
+    data = json.loads(capsys.readouterr().out)
+
+    assert "Held back" in text
+    assert "linux-7.0" in text
+    assert data["build_residue"]["held_back"]["groups"] == ["linux-7.0"]
+    assert data["build_residue"]["eligible"]["files"] == 0
+    # This mode must never prescribe the flag that disables its only guard.
+    assert "--older-than 0" not in text
+
+
+def test_empty_and_populated_residue_are_equally_disclosing(cache, capsys):
+    """Axis 2: branch vs branch. 'Nothing eligible' must not read as 'clean'."""
+    cli.main(["--format", "json", "prune", "--build-residue", "--dry-run"])
+    empty = json.loads(capsys.readouterr().out)
+
+    _residue_tree(cache, age_seconds=_OLD)
+    cli.main(["--format", "json", "prune", "--build-residue", "--dry-run"])
+    populated = json.loads(capsys.readouterr().out)
+
+    for payload in (empty, populated):
+        assert set(_BUCKETS) <= set(payload["build_residue"])
+        assert "unmanaged_cache" in payload
+        assert payload["dry_run"] is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["prune", "--all", "--dry-run"],
+        ["prune", "--all"],
+        ["prune", "--runtime", "--older-than", "0"],
+        ["prune", "--orphans", "--dry-run"],
+        ["prune", "--build-residue", "--dry-run"],
+    ],
+)
+def test_every_prune_branch_discloses_the_unmanaged_cache(argv, cache, monkeypatch, capsys):
+    """Axis 2 + axis 3. prune reaches instances/ and runtime_root() only, so
+    every branch must say what it did NOT cover -- machine-readably.
+
+    Gating this on --all alone is the regression shape already recorded in
+    lifecycle.py ('Round 5 fixed only the ... branch').
+    """
+    (cache / "kernels").mkdir(exist_ok=True)
+    (cache / "targets").mkdir(exist_ok=True)
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
+
+    cli.main(["--format", "json", *argv])
+    data = json.loads(capsys.readouterr().out)
+
+    assert "unmanaged_cache" in data, argv
+    assert data["unmanaged_cache"]["subtrees"] == ["kernels", "targets"]
+    assert data["unmanaged_cache"]["hint"] == "qmu cache du"
+
+
+def test_doctor_reports_the_unmanaged_cache_without_going_unhealthy(cache, capsys):
+    """doctor treats only ok/info as healthy and returns 1 otherwise. A warn
+    here would exit 1 on every machine that ever built a kernel, with no way to
+    clear it -- breaking the health signal SKILL.md teaches."""
+    (cache / "kernels").mkdir(exist_ok=True)
+
+    cli.main(["--format", "json", "doctor"])
+    checks = {c["check"]: c for c in json.loads(capsys.readouterr().out)["checks"]}
+
+    assert "cache" in checks
+    assert checks["cache"]["status"] == "info"
+    assert "qmu cache du" in checks["cache"]["detail"]
+
+
+def test_cache_ls_never_presents_a_truncated_list_as_complete(cache, capsys):
+    """Axis 2. A partial result must be as honest as an empty one."""
+    for n in range(3):
+        _residue_tree(cache, f"linux-7.{n}", age_seconds=_OLD)
+
+    cli.main(["--format", "json", "cache", "ls", "--older-than", _RESIDUE_AGE,
+              "--top", "1"])
+    data = json.loads(capsys.readouterr().out)["build_residue"]["eligible"]
+
+    assert data["shown"] == 1
+    assert data["truncated"]["groups"] == 2
+    shown = sum(g["bytes"] for g in data["groups"])
+    assert shown + data["truncated"]["bytes"] == data["bytes"]

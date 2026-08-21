@@ -1,5 +1,5 @@
-"""Meta / housekeeping commands: config (show/init/path), rootfs (inject/shell),
-skill (install), version.
+"""Meta / housekeeping commands: cache (du/ls), config (show/init/path),
+rootfs (inject/shell), skill (install), version.
 
 These talk to config files, rootfs images via libguestfs, and the skill install
 roots — none touch a running VM. Shared helpers come from :mod:`.._cliutil`;
@@ -12,6 +12,12 @@ import argparse
 import shutil
 from pathlib import Path
 
+from ..cache import (
+    MIN_BUILD_RESIDUE_AGE,
+    human_bytes,
+    scan_cache,
+    source_tree_names,
+)
 from ..config import find_project_config, render_starter_config, resolve_config
 from ..instance import QMUError
 from ..paths import (
@@ -29,6 +35,271 @@ from .._cliutil import (
     _emit,
     _make_group_help_handler,
 )
+
+
+# ---------------------------------------------------------------------------
+# cache
+# ---------------------------------------------------------------------------
+#
+# READ-ONLY, deliberately. `qmu prune` stays the one and only verb that deletes;
+# splitting inspection from destruction is what keeps a second cleanup verb from
+# existing at all. `--older-than` here is a *predicate* parameter, not an action:
+# bucket membership is a function of it, so all three commands (cache du, cache
+# ls, prune --build-residue) must compute buckets at the same age or they report
+# different answers about the same cache.
+
+
+_BUCKETS = ("eligible", "held_back", "refused")
+
+
+def _add_cache(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "cache",
+        help="Inspect the qmu cache on disk (read-only)",
+        description=(
+            "Report what is in ~/.cache/qmu and how much of it is reclaimable. "
+            "Nothing here deletes; reclaim build residue with "
+            "`qmu prune --build-residue`."
+        ),
+    )
+    p.set_defaults(handler=_make_group_help_handler(p))
+    sp = p.add_subparsers(dest="cache_cmd")
+
+    s = sp.add_parser("du", help="Show cache size per subtree, and reclaimable totals")
+    _add_cache_age_opt(s)
+    _add_format_opts(s)
+    s.set_defaults(handler=_handle_cache_du)
+
+    s = sp.add_parser("ls", help="List reclaimable build-residue entries, largest first")
+    _add_cache_age_opt(s)
+    s.add_argument(
+        "--bucket", choices=("all", *_BUCKETS), default="eligible",
+        help="Which bucket to list (default: eligible — what can actually be reclaimed)",
+    )
+    s.add_argument(
+        "--top", type=int, default=20,
+        help="Show at most N groups per bucket (default: 20; 0 means no limit). "
+             "Withheld groups are always disclosed, never silently dropped.",
+    )
+    _add_format_opts(s)
+    s.set_defaults(handler=_handle_cache_ls)
+
+
+def _add_cache_age_opt(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--tree", action="append", default=None, metavar="NAME",
+        help="Restrict to this kernel source tree (e.g. linux-7.0.12). "
+             "Repeatable. A narrowing filter only. Matches the same flag on "
+             "`qmu prune --build-residue`, so both report the same buckets.",
+    )
+    parser.add_argument(
+        "--older-than",
+        type=_nonnegative_float,
+        default=86400.0,
+        help="Age threshold in seconds used to bucket residue (default: 86400). "
+             "Matches `qmu prune --older-than` so both commands report the same "
+             "buckets. Read-only commands accept any non-negative value.",
+    )
+
+
+def _validate_trees(names: list[str] | None) -> list[str] | None:
+    """Reject an unknown --tree by naming the trees that DO exist.
+
+    "Never report 'not found' for something another command displays" -- an
+    unknown name here must not send the reader to `rm` for a tree `qmu cache ls`
+    is showing them.
+    """
+    if not names:
+        return None
+    available = source_tree_names()
+    unknown = [n for n in names if n not in available]
+    if unknown:
+        listed = ", ".join(available) if available else "(none)"
+        raise QMUError(
+            f"No kernel source tree named {', '.join(unknown)}. "
+            f"Present: {listed}."
+        )
+    return names
+
+
+def _nonnegative_float(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from exc
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return seconds
+
+
+def _age_annotation(older_than: float) -> str | None:
+    """Disclose when an inspected age is below what prune will act on.
+
+    A read-only command has no reason to refuse a predicate — showing what an
+    aggressive value would select is the point of inspection. But then
+    `cache du --older-than 60` succeeds where the same prune invocation errors,
+    so the difference is stated rather than left latent.
+    """
+    if older_than >= MIN_BUILD_RESIDUE_AGE:
+        return None
+    return (
+        f"Note: --older-than {older_than:g}s is below the "
+        f"{MIN_BUILD_RESIDUE_AGE:g}s floor `qmu prune --build-residue` enforces, "
+        f"so it would refuse this value. Shown here for inspection only."
+    )
+
+
+def _handle_cache_du(args: argparse.Namespace) -> int:
+    older_than = getattr(args, "older_than", 86400.0)
+    trees = _validate_trees(getattr(args, "tree", None))
+    report = scan_cache(older_than_seconds=older_than, trees=trees)
+    residue = report.residue
+
+    data = {
+        "ok": True,
+        "cache_dir": str(report.root),
+        "total_bytes": report.total_bytes,
+        "total_apparent_bytes": report.total_apparent_bytes,
+        "total_files": report.total_files,
+        "subtrees": [s.as_dict() for s in report.subtrees],
+        "build_residue": residue.as_dict(),
+    }
+    note = _age_annotation(older_than)
+    if note:
+        data["note"] = note
+
+    lines = [f"qmu cache: {report.root}"]
+    if not report.subtrees:
+        lines.append("  (empty — nothing cached yet)")
+    for s in report.subtrees:
+        managed = s.managed_by or "NOT reclaimable by any qmu command"
+        flag = "" if s.known else "  [unknown to qmu]"
+        lines.append(
+            f"  {s.name:<12} {human_bytes(s.bytes):>8}  "
+            f"({s.files:,} files, {human_bytes(s.apparent_bytes)} apparent){flag}"
+        )
+        lines.append(f"  {'':<12}   {managed}")
+    lines.append(
+        f"  {'TOTAL':<12} {human_bytes(report.total_bytes):>8}  "
+        f"({report.total_files:,} files)"
+    )
+    lines.append("")
+    lines.append(f"Build residue (--older-than {older_than:g}s):")
+    lines.append(
+        f"  total      {human_bytes(residue.total.bytes):>8}  "
+        f"{residue.total.files:,} files in {len(residue.total.groups)} source tree(s)"
+    )
+    for name in _BUCKETS:
+        bucket = getattr(residue, name)
+        lines.append(
+            f"  {name:<10} {human_bytes(bucket.bytes):>8}  {bucket.files:,} files"
+        )
+        for reason in bucket.reasons[:3]:
+            lines.append(f"  {'':<10}   {reason}")
+    if residue.eligible.bytes:
+        lines.append("")
+        lines.append(
+            f"Reclaim with: qmu prune --build-residue "
+            f"--older-than {max(older_than, MIN_BUILD_RESIDUE_AGE):g} --dry-run"
+        )
+    if note:
+        lines.append(note)
+
+    _emit(args, data=data, text=lines, stem="cache-du")
+    return 0
+
+
+def _group_rows(report, bucket_name: str) -> list[dict]:
+    """Aggregate residue items into per-source-tree rows for one bucket."""
+    rows: dict[str, dict] = {}
+    for item in report.items:
+        if item.bucket != bucket_name:
+            continue
+        row = rows.setdefault(
+            item.group,
+            {"group": item.group, "bucket": bucket_name, "bytes": 0, "files": 0,
+             "reason": item.reason},
+        )
+        row["bytes"] += item.bytes
+        row["files"] += 1
+    return sorted(rows.values(), key=lambda r: -r["bytes"])
+
+
+def _handle_cache_ls(args: argparse.Namespace) -> int:
+    older_than = getattr(args, "older_than", 86400.0)
+    top = getattr(args, "top", 20)
+    if top < 0:
+        raise QMUError("--top must be non-negative (0 means no limit).")
+    if top == 0:
+        top = None
+    wanted = getattr(args, "bucket", "eligible")
+    trees = _validate_trees(getattr(args, "tree", None))
+    buckets = _BUCKETS if wanted == "all" else (wanted,)
+
+    report = scan_cache(older_than_seconds=older_than, trees=trees)
+    residue = report.residue
+
+    payload: dict[str, dict] = {}
+    lines = [f"Build residue in {report.root}/kernels/src (--older-than {older_than:g}s)"]
+    any_rows = False
+    for name in buckets:
+        rows = _group_rows(residue, name)
+        shown = rows if top is None else rows[:top]
+        withheld = [] if top is None else rows[top:]
+        # A truncated listing that does not say so silently contradicts
+        # `cache du`'s totals for the same bucket.
+        payload[name] = {
+            "groups": shown,
+            "shown": len(shown),
+            "truncated": {
+                "groups": len(withheld),
+                "bytes": sum(r["bytes"] for r in withheld),
+                "files": sum(r["files"] for r in withheld),
+            },
+            "bytes": getattr(residue, name).bytes,
+            "files": getattr(residue, name).files,
+        }
+        lines.append("")
+        bucket = getattr(residue, name)
+        lines.append(
+            f"{name} — {human_bytes(bucket.bytes)} in {bucket.files:,} files"
+        )
+        if not rows:
+            lines.append("  (none)")
+            continue
+        any_rows = True
+        for row in shown:
+            suffix = f"  [{row['reason']}]" if row["reason"] else ""
+            lines.append(
+                f"  {human_bytes(row['bytes']):>8}  {row['files']:>7,} files  "
+                f"{row['group']}{suffix}"
+            )
+        if withheld:
+            lines.append(
+                f"  ... {len(withheld)} more group(s) withheld by --top {top}: "
+                f"{human_bytes(sum(r['bytes'] for r in withheld))} in "
+                f"{sum(r['files'] for r in withheld):,} files. "
+                f"Re-run with --top 0 to see them all."
+            )
+
+    data = {
+        "ok": True,
+        "cache_dir": str(report.root),
+        "older_than_seconds": float(older_than),
+        "bucket": wanted,
+        "top": top,
+        "build_residue": payload,
+    }
+    note = _age_annotation(older_than)
+    if note:
+        data["note"] = note
+        lines.append(note)
+    if not any_rows:
+        lines.append("")
+        lines.append("Nothing to reclaim in this bucket.")
+
+    _emit(args, data=data, text=lines, stem="cache-ls")
+    return 0
 
 
 # ---------------------------------------------------------------------------

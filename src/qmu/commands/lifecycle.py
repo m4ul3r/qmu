@@ -48,6 +48,14 @@ from ..instance import (
     save_guest_epoch_serial_offset,
 )
 from .. import rootfs as rootfs_mod
+from ..cache import (
+    MIN_BUILD_RESIDUE_AGE,
+    classify_residue,
+    source_tree_names,
+    human_bytes,
+    remove_items,
+    unmanaged_subtree_names,
+)
 from ..runtime import prune_runtime_artifacts
 from ..paths import (
     all_skill_source_dirs,
@@ -688,19 +696,34 @@ def _add_prune(sub: argparse._SubParsersAction) -> None:
         help="Kill qmu-launched QEMU processes that no live instance record "
              "claims (untracked holders of a rootfs image)",
     )
+    g.add_argument(
+        "--build-residue",
+        dest="prune_build_residue",
+        action="store_true",
+        help="Reclaim in-tree kernel build intermediates under "
+             "kernels/src/linux-*/ (*.o, *.a, .*.cmd, ...). Never touches "
+             "vmlinux, System.map, .config, Makefile or arch/*/boot/ — those "
+             "are frequently the only copy. See `qmu cache du`.",
+    )
+    p.add_argument(
+        "--tree", action="append", default=None, metavar="NAME",
+        help="With --build-residue: restrict to this kernel source tree "
+             "(e.g. linux-7.0.12). Repeatable. A narrowing filter only, so it "
+             "can never remove more than the unfiltered run would.",
+    )
     p.add_argument(
         "--older-than",
         type=_nonnegative_seconds,
         default=86400.0,
-        help="Age threshold in seconds for runtime and remnant pruning (default: 86400)",
+        help="Age threshold in seconds for runtime, remnant and build-residue "
+             "pruning (default: 86400)",
     )
     p.add_argument(
         "--dry-run",
         dest="dry_run",
         action="store_true",
         help="Preview only: list what would be removed or killed, and do "
-             "nothing. Supported with --orphans, --vm, and --all "
-             "(not --runtime, which has no preview pass).",
+             "nothing. Supported with " + _previewable_modes_phrase() + ".",
     )
     p.add_argument(
         "--keep-logs",
@@ -724,6 +747,251 @@ def _add_prune(sub: argparse._SubParsersAction) -> None:
 
 
 
+# Single source of truth for prune's mode list. Five separate strings used to
+# enumerate these by hand — argparse help for --dry-run, the --runtime refusal,
+# the "Specify a mode" error, the --older-than help, and SKILL.md — and adding a
+# mode meant remembering all of them. A mode that is previewable but missing
+# from the refusal message actively withholds it from an agent that just hit
+# that refusal.
+_PRUNE_MODES: tuple[tuple[str, bool], ...] = (
+    ("--vm <name>", True),
+    ("--all", True),
+    ("--runtime", False),
+    ("--orphans", True),
+    ("--build-residue", True),
+)
+
+
+def _join_modes(names: list[str]) -> str:
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + ", and " + names[-1]
+
+
+def _previewable_modes_phrase() -> str:
+    previewable = [name for name, ok in _PRUNE_MODES if ok]
+    blocked = [name for name, ok in _PRUNE_MODES if not ok]
+    phrase = _join_modes(previewable)
+    if blocked:
+        phrase += f" (not {_join_modes(blocked)}, which has no preview pass)"
+    return phrase
+
+
+def _all_modes_phrase() -> str:
+    return _join_modes([name for name, _ok in _PRUNE_MODES])
+
+
+def _unmanaged_cache() -> dict[str, Any]:
+    """Disclose the cache subtrees prune cannot reclaim.
+
+    Emitted on EVERY prune branch in JSON, from one helper, so a branch cannot
+    be missed. Gating it on --all only would repeat the exact regression shape
+    already recorded in this file ("Round 5 fixed only the ... branch"). Uses
+    is_dir() probes only — a real inventory walks 600k files and costs ~2s,
+    which does not belong on prune's path. The number lives in `qmu cache du`.
+    """
+    names = unmanaged_subtree_names()
+    return {
+        "subtrees": names,
+        "hint": "qmu cache du",
+        "reclaim_hint": "qmu prune --build-residue --dry-run",
+    }
+
+
+def _unmanaged_cache_note(payload: dict[str, Any]) -> str | None:
+    names = payload.get("subtrees") or []
+    if not names:
+        return None
+    listed = ", ".join(f"{n}/" for n in names)
+    return (
+        f"Not covered by this prune: {listed}. "
+        f"Size them with `qmu cache du`; reclaim kernel build residue with "
+        f"`qmu prune --build-residue --dry-run`."
+    )
+
+
+# Per-file detail cap. On a real cache the eligible set is ~56k files, which
+# renders a 12.7 MB / ~3.2M-token JSON envelope -- 317x the spill limit -- so
+# `--dry-run --format json` spilled to an artifact pointer and was unusable
+# inline. The buckets already carry the totals and the per-tree groups, which is
+# what a caller actually branches on; the path list is detail. Capped and
+# disclosed, never silently truncated.
+_MAX_ITEM_DETAIL = 100
+
+
+def _capped(items: list[Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    shown = [i.as_dict() for i in items[:_MAX_ITEM_DETAIL]]
+    withheld = items[_MAX_ITEM_DETAIL:]
+    return shown, {
+        "files": len(withheld),
+        "bytes": sum(i.bytes for i in withheld),
+        "hint": (
+            f"per-file detail capped at {_MAX_ITEM_DETAIL}; totals above are "
+            f"complete. Use `qmu cache ls --bucket eligible --top 0` for the "
+            f"full per-tree breakdown."
+        ) if withheld else "",
+    }
+
+
+def _handle_prune_build_residue(args: argparse.Namespace) -> int:
+    """Reclaim in-tree kernel build intermediates.
+
+    The age gate is the only thing standing between this and a live build:
+    kbuild.sh bind-mounts the source tree read-write for the whole build, so
+    residue from a build still running must not be reclaimed. It is a
+    default-safe heuristic, not an invariant -- which is why values below
+    MIN_BUILD_RESIDUE_AGE are refused outright rather than clamped, and why this
+    mode never prescribes `--older-than 0` the way instance pruning does.
+    """
+    if args.keep_logs:
+        raise QMUError("--keep-logs applies only to instance pruning.")
+
+    older_than = float(args.older_than)
+    if older_than < MIN_BUILD_RESIDUE_AGE:
+        raise QMUError(
+            f"--older-than {older_than:g} is below the "
+            f"{MIN_BUILD_RESIDUE_AGE:g}s floor for --build-residue. kbuild "
+            f"bind-mounts the kernel source tree read-write for the whole "
+            f"build, so reclaiming residue from a build that may still be "
+            f"running corrupts it. Use `--older-than "
+            f"{MIN_BUILD_RESIDUE_AGE:g}` or higher, or inspect first with "
+            f"`qmu cache du --older-than {older_than:g}`."
+        )
+
+    trees = getattr(args, "tree", None)
+    if trees:
+        available = source_tree_names()
+        unknown = [t for t in trees if t not in available]
+        if unknown:
+            listed = ", ".join(available) if available else "(none)"
+            raise QMUError(
+                f"No kernel source tree named {', '.join(unknown)}. "
+                f"Present: {listed}."
+            )
+    report = classify_residue(older_than_seconds=older_than, trees=trees)
+    dry_run = getattr(args, "dry_run", False)
+    unmanaged = _unmanaged_cache()
+
+    # Classification -- not deletion -- decides membership, so preview and the
+    # real run agree by construction on a fixed cache.
+    payload: dict[str, Any] = report.as_dict()
+    payload["removed"] = []
+    payload["would_remove"] = []
+
+    if dry_run:
+        shown, withheld = _capped(report.bucket_items("eligible"))
+        payload["would_remove"] = shown
+        payload["would_remove_truncated"] = withheld
+        data = {
+            "ok": True,
+            "dry_run": True,
+            "build_residue": payload,
+            "unmanaged_cache": unmanaged,
+        }
+        _emit(args, data=data, text=_residue_lines(report, dry_run=True, older_than=older_than),
+              stem="prune-build-residue")
+        return 0
+
+    removed, failed = remove_items(report.bucket_items("eligible"))
+    shown, withheld = _capped(removed)
+    payload["removed"] = shown
+    payload["removed_truncated"] = withheld
+    payload["files_removed"] = len(removed)
+    payload["bytes_removed"] = sum(i.bytes for i in removed)
+    # A unlink that failed after classification is an outcome, not a prediction.
+    # Folding it into `removed` would recreate preview != real at the reporting
+    # layer, so it lands in `refused` with what actually happened.
+    if failed:
+        refused = dict(payload["refused"])
+        refused["groups"] = sorted(
+            set(refused["groups"]) | {item.group for item, _why in failed}
+        )
+        refused["bytes"] += sum(item.bytes for item, _why in failed)
+        refused["files"] += len(failed)
+        reasons = list(refused["reasons"])
+        for _item, why in failed:
+            if why not in reasons:
+                reasons.append(why)
+        refused["reasons"] = reasons
+        payload["refused"] = refused
+    data = {
+        "ok": True,
+        "dry_run": False,
+        "build_residue": payload,
+        "unmanaged_cache": unmanaged,
+    }
+    _emit(
+        args,
+        data=data,
+        text=_residue_lines(
+            report, dry_run=False, older_than=older_than,
+            removed_bytes=sum(i.bytes for i in removed),
+            removed_files=len(removed), failed=len(failed),
+        ),
+        stem="prune-build-residue",
+    )
+    # A refused group is a reported outcome, not a failure: exiting non-zero
+    # would make scripted use fail on any cache holding one root-owned tree.
+    return 0
+
+
+def _residue_lines(
+    report: Any,
+    *,
+    dry_run: bool,
+    older_than: float,
+    removed_bytes: int = 0,
+    removed_files: int = 0,
+    failed: int = 0,
+) -> list[str]:
+    eligible = report.eligible
+    lines: list[str] = []
+    if dry_run:
+        if not eligible.files:
+            lines.append("No build residue is eligible. Nothing would be removed.")
+        else:
+            lines.append(
+                f"Would remove {human_bytes(eligible.bytes)} of build residue "
+                f"({eligible.files:,} files) from "
+                f"{len(eligible.groups)} source tree(s): "
+                f"{', '.join(eligible.groups)}"
+            )
+            lines.append("Re-run without --dry-run to do it.")
+    else:
+        if not removed_files:
+            lines.append("No build residue was eligible; nothing removed.")
+        else:
+            lines.append(
+                f"Reclaimed {human_bytes(removed_bytes)} of build residue "
+                f"({removed_files:,} files) from "
+                f"{len(eligible.groups)} source tree(s): "
+                f"{', '.join(eligible.groups)}"
+            )
+        if failed:
+            lines.append(f"{failed} file(s) could not be removed; see `refused`.")
+
+    # Held-back and refused are disclosed on BOTH branches, in both formats.
+    if report.held_back.files:
+        lines.append(
+            f"Held back by the --older-than cutoff ({older_than:g}s): "
+            f"{', '.join(report.held_back.groups)}. These trees were modified "
+            f"recently and may be mid-build. Re-run later, or with a larger "
+            f"--older-than once the build has finished."
+        )
+    if report.refused.files:
+        lines.append(
+            f"Refused {human_bytes(report.refused.bytes)} "
+            f"({report.refused.files:,} files) in "
+            f"{', '.join(report.refused.groups)}: "
+            f"{report.refused.reasons[0] if report.refused.reasons else 'unavailable'}."
+        )
+        lines.append(
+            "  These are left in place, not lost. If they are root-owned from "
+            "an earlier build, `sudo chown -R $USER` the tree and re-run."
+        )
+    return lines
+
+
 def _handle_prune_orphans(args: argparse.Namespace) -> int:
     orphans = find_orphan_qemus()
 
@@ -734,6 +1002,7 @@ def _handle_prune_orphans(args: argparse.Namespace) -> int:
         data = {
             "ok": True,
             "dry_run": True,
+            "unmanaged_cache": _unmanaged_cache(),
             "orphans_found": len(orphans),
             "would_kill": [
                 {"pid": o["pid"], "serial_log": o.get("serial_log")}
@@ -772,6 +1041,7 @@ def _handle_prune_orphans(args: argparse.Namespace) -> int:
 
     data = {
         "ok": not failed,
+        "unmanaged_cache": _unmanaged_cache(),
         "orphans_found": len(orphans),
         "killed": killed,
         "failed": failed,
@@ -787,6 +1057,12 @@ def _handle_prune_orphans(args: argparse.Namespace) -> int:
 
 
 def _handle_prune(args: argparse.Namespace) -> int:
+    if getattr(args, "prune_build_residue", False):
+        return _handle_prune_build_residue(args)
+    # A mode-scoped flag must be implemented for every mode the parser accepts
+    # it on, or rejected explicitly -- never left to fall through silently.
+    if getattr(args, "tree", None):
+        raise QMUError("--tree applies only to --build-residue.")
     if getattr(args, "prune_orphans", False):
         if args.keep_logs:
             raise QMUError("--keep-logs applies only to instance pruning.")
@@ -809,8 +1085,8 @@ def _handle_prune(args: argparse.Namespace) -> int:
             raise QMUError(
                 "--dry-run is not supported with --runtime. Runtime artifacts "
                 "are aged out in one pass with no preview; use `--older-than` "
-                "to control what qualifies, or `qmu prune --orphans --dry-run` "
-                "/ `--all --dry-run` for the previewable modes."
+                "to control what qualifies, or one of the previewable modes: "
+                + _previewable_modes_phrase() + "."
             )
         result = prune_runtime_artifacts(older_than_seconds=args.older_than)
 
@@ -819,6 +1095,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
 
         data = {
             "ok": True,
+            "unmanaged_cache": _unmanaged_cache(),
             "runtime": {
                 "older_than_seconds": float(args.older_than),
                 "removed": [_art(item) for item in result.removed],
@@ -876,7 +1153,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
         targets = prunable
     else:
         raise QMUError(
-            "Specify a mode: --vm <name>, --all, --runtime, or --orphans."
+            "Specify a mode: " + _all_modes_phrase() + "."
         )
 
     # Disclosed unconditionally: on every branch, in both modes, and in JSON.
@@ -893,6 +1170,13 @@ def _handle_prune(args: argparse.Namespace) -> int:
         f"{', '.join(held_back)}. Re-run with `--older-than 0` to include them."
     ) if held_back else None
 
+    unmanaged = _unmanaged_cache()
+    # Text footer renders only where the branch implies "everything is now
+    # clean" -- axis 3 is JSON superset-of text, not equality, so an agent still
+    # gets the fact on every branch while a human running `prune --vm` in a loop
+    # is not shown 58 identical footers.
+    cache_note = _unmanaged_cache_note(unmanaged) if prune_all else None
+
     dry_run = getattr(args, "dry_run", False)
     if dry_run:
         # --dry-run must never delete. It previously applied only to --orphans
@@ -902,6 +1186,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
         data = {
             "ok": True,
             "dry_run": True,
+            "unmanaged_cache": unmanaged,
             "pruned": [],
             "would_prune": targets,
             "held_back": held_back,
@@ -915,6 +1200,8 @@ def _handle_prune(args: argparse.Namespace) -> int:
             text.append("Re-run without --dry-run to do it.")
         if held_note:
             text.append(held_note)
+        if cache_note:
+            text.append(cache_note)
         _emit(args, data=data, text=text, stem="prune")
         return 0
 
@@ -932,11 +1219,14 @@ def _handle_prune(args: argparse.Namespace) -> int:
         lines = [f"Pruned {len(pruned)} VM(s) ({verb}): {', '.join(pruned)}"]
     if held_note:
         lines.append(held_note)
+    if cache_note:
+        lines.append(cache_note)
     _emit(
         args,
         data={
             "ok": True,
             "dry_run": False,
+            "unmanaged_cache": unmanaged,
             "pruned": pruned,
             "held_back": held_back,
             "keep_logs": args.keep_logs,
@@ -1605,6 +1895,25 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             "check": "config",
             "status": "warn",
             "detail": "No qmu.toml or ~/.config/qmu/config.toml found. Run: qmu config init",
+        })
+
+    # Cache subtrees no qmu command fully reclaims. Status is deliberately
+    # "info", never "warn": _handle_doctor treats only ("ok", "info") as healthy
+    # and returns 1 otherwise, so a warn here would exit 1 on every machine that
+    # has ever built a kernel -- permanently red-lining the health signal
+    # skills/qmu/SKILL.md teaches, with no way for the user to clear it (the
+    # subtrees legitimately exist). Cheap is_dir() probes only; no walk.
+    unmanaged_names = unmanaged_subtree_names()
+    if unmanaged_names:
+        checks.append({
+            "check": "cache",
+            "status": "info",
+            "detail": (
+                ", ".join(f"{n}/" for n in unmanaged_names)
+                + " are not reclaimed by `qmu prune --vm/--all`. Size them with "
+                  "`qmu cache du`; reclaim kernel build residue with "
+                  "`qmu prune --build-residue --dry-run`."
+            ),
         })
 
     # QEMU binary (arch-aware). For configured passt, derive the reported path
