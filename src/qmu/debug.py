@@ -39,13 +39,24 @@ _TCP_ESTABLISHED = "01"
 
 _PROC_NET_TCP = ("/proc/net/tcp", "/proc/net/tcp6")
 
+# Loopback local addresses as /proc/net/tcp{,6} render them (host-byte-order
+# hex). qmu binds the gdb stub to 127.0.0.1 (`vm.py` -gdb tcp:127.0.0.1:PORT),
+# so a genuine attach is always loopback. Filtering on this means an unrelated
+# ESTABLISHED socket on another interface that merely reuses the port *number*
+# cannot masquerade as an attached debugger.
+_LOOPBACK_LOCAL_HEX = frozenset({
+    "0100007F",                          # IPv4 127.0.0.1
+    "00000000000000000000000001000000",  # IPv6 ::1
+})
+
 
 def established_local_ports(proc_net_tcp_text: str) -> set[int]:
-    """Parse /proc/net/tcp{,6} text into the set of ESTABLISHED local ports.
+    """ESTABLISHED **loopback** local ports parsed from /proc/net/tcp{,6} text.
 
     Pure so it can be unit-tested without a live socket. The local address is
-    ``HEXIP:HEXPORT`` (port big-endian hex); we only need the port. Malformed
-    lines are skipped rather than raised on — this feeds a best-effort probe.
+    ``HEXIP:HEXPORT`` (port big-endian hex); only loopback local IPs are kept
+    (the gdb stub binds 127.0.0.1). Malformed lines are skipped rather than
+    raised on — this feeds a best-effort probe.
     """
     ports: set[int] = set()
     for line in proc_net_tcp_text.splitlines()[1:]:  # skip the header row
@@ -55,8 +66,11 @@ def established_local_ports(proc_net_tcp_text: str) -> set[int]:
         local, state = fields[1], fields[3]
         if state != _TCP_ESTABLISHED or ":" not in local:
             continue
+        ip_hex, _, port_hex = local.rpartition(":")
+        if ip_hex not in _LOOPBACK_LOCAL_HEX:
+            continue
         try:
-            ports.add(int(local.rsplit(":", 1)[1], 16))
+            ports.add(int(port_hex, 16))
         except ValueError:
             continue
     return ports
@@ -86,12 +100,29 @@ def gdb_client_attached(inst: Any) -> bool | None:
     return False if read_any else None
 
 
+def debug_stub_present(inst: Any) -> bool:
+    """Whether the VM has a GDB stub at all (`--gdb` was passed at launch).
+
+    This is the correct gate for divergences whose damage **outlives an attached
+    client** — chiefly baked-in software-breakpoint int3s (#45): a bridge can arm
+    breakpoints, then die uncleanly (the #40 stranded-bridge case) leaving the
+    trap bytes resident while no client is connected. Requiring a live client
+    there would suppress exactly the warning that is needed. qmu cannot query pry
+    for whether breakpoints are armed, so "a stub ever existed" is the safe
+    predicate.
+    """
+    return getattr(inst, "gdb_port", None) is not None
+
+
 def debug_session_present(inst: Any) -> bool:
-    """Whether coherence warnings apply to `inst`.
+    """Whether a debugger's *live view* can diverge for `inst`.
 
     True when the VM has a GDB stub AND qmu cannot positively rule out an
-    attached client. A VM launched without ``--gdb`` (no ``gdb_port``) can never
-    diverge this way, so it is always False and no warning fires.
+    attached client. This is the gate for divergences that only matter while a
+    client is watching — stale registers after loadvm (#44), dropped breakpoints
+    after a reset (#46). A VM launched without ``--gdb`` (no ``gdb_port``) can
+    never diverge this way, so it is always False and no warning fires. For the
+    image-persistent int3 case use :func:`debug_stub_present` instead.
     """
     if getattr(inst, "gdb_port", None) is None:
         return False
@@ -111,9 +142,11 @@ def loadvm_stale_session_warning(vm_id: str) -> str:
         f"[qmu] WARNING: VM '{vm_id}' has a GDB stub and was just rewound by "
         "snapshot load. An attached debugger does NOT re-sync: it keeps its "
         "pre-load vCPU state (stale $rip and stop reason) and stale "
-        "breakpoint/memory bookkeeping, presenting them as current. Reconnect "
-        f"the debugger (re-run `qmu gdb --vm {vm_id}`) before trusting any "
-        "register or memory read, and re-arm breakpoints."
+        "breakpoint/memory bookkeeping, presenting them as current. Tear the "
+        "stale pry bridge down first (its connection survived the rewind, so a "
+        f"fresh `qmu gdb --vm {vm_id}` would spawn a SECOND one — see #40), then "
+        "reconnect and re-arm breakpoints before trusting any register or "
+        "memory read."
     )
 
 

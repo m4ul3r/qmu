@@ -27,7 +27,7 @@ from typing import Any
 from dataclasses import replace
 
 from ..config import resolve_config
-from ..debug import debug_session_present
+from ..debug import debug_session_present, reset_dropped_breakpoints_warning
 from ..instance import (
     QMUError,
     VM_ABSENT,
@@ -1014,6 +1014,7 @@ def _handle_wait(args: argparse.Namespace) -> int:
     event_data: Any = None
     stopped = False
     reset_persistence_in_progress = False
+    warned_reset_debug = False
 
     try:
         with _qmp_ctx(inst) as qmp:
@@ -1058,6 +1059,15 @@ def _handle_wait(args: argparse.Namespace) -> int:
                         reset_offset = serial_log_offset(inst.serial_log)
                         inst = save_guest_epoch_serial_offset(inst, reset_offset)
                         reset_persistence_in_progress = False
+                        # #46: an observed reset drops the gdbstub breakpoint set
+                        # without telling the client. `wait` is the one place qmu
+                        # sees a reset it did not itself issue, so warn here too
+                        # (once per wait) when a debugger is attached.
+                        if not warned_reset_debug and debug_session_present(inst):
+                            warned_reset_debug = True
+                            sys.stderr.write(
+                                reset_dropped_breakpoints_warning(inst.vm_id) + "\n"
+                            )
                     # Continue immediately so identity is checked after every
                     # observation; an event alone is never terminal.
                     continue
@@ -1704,15 +1714,26 @@ def _handle_doctor(args: argparse.Namespace) -> int:
     # "unavailable" so a deliberate TCG choice — e.g. to make gdbstub hardware
     # watchpoints deliver (#39) — is not misreported as a missing capability.
     if config.use_kvm():
-        checks.append({
-            "check": "KVM",
-            "status": "ok",
-            "detail": (
-                "KVM acceleration forced (accel=kvm)"
-                if config.accel == "kvm"
-                else "KVM acceleration available"
-            ),
-        })
+        if config.accel == "kvm" and not Path("/dev/kvm").exists():
+            # accel=kvm forces -enable-kvm unconditionally; if /dev/kvm is
+            # absent the launch will fail, so doctor must flag it rather than
+            # report a green "forced" it cannot back up.
+            checks.append({
+                "check": "KVM",
+                "status": "warn",
+                "detail": "accel=kvm forces -enable-kvm but /dev/kvm is missing; "
+                          "launch will fail. Use accel=auto/tcg or --no-kvm.",
+            })
+        else:
+            checks.append({
+                "check": "KVM",
+                "status": "ok",
+                "detail": (
+                    "KVM acceleration forced (accel=kvm)"
+                    if config.accel == "kvm"
+                    else "KVM acceleration available"
+                ),
+            })
     elif config.accel == "tcg":
         checks.append({
             "check": "KVM",

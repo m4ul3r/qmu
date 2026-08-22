@@ -28,6 +28,7 @@ from ..snapshot import (
 from ..serial import serial_log_offset
 from ..debug import (
     debug_session_present,
+    debug_stub_present,
     kvm_watchpoint_warning,
     loadvm_stale_session_warning,
     reset_dropped_breakpoints_warning,
@@ -118,9 +119,11 @@ def _handle_snapshot_save(args: argparse.Namespace) -> int:
     # #45: a snapshot of a debugged guest freezes any armed software-breakpoint
     # int3s into the image, so a later `snapshot load` + run Oopses at the
     # breakpointed address and reads as the PoC crashing the kernel. Warn only
-    # on a successful save (a failed one wrote no image) and only when a debug
-    # session is present.
-    if debug_session_present(inst):
+    # on a successful save (a failed one wrote no image). Gate on the STUB, not
+    # a live client: the int3 bytes are baked into the image and survive an
+    # uncleanly-detached bridge (the #40 case), so requiring a live client would
+    # suppress the very save where the risk is highest.
+    if debug_stub_present(inst):
         sys.stderr.write(savevm_breakpoint_warning(inst.vm_id) + "\n")
     return 0
 
@@ -542,9 +545,21 @@ def _handle_monitor(args: argparse.Namespace) -> int:
         text=result if result.strip() else "(no output)",
         stem="monitor",
     )
-    # #46: `qmu monitor system_reset` is the HMP path to the same reset that
-    # silently drops the gdbstub breakpoint set. Match the reset verb as a
-    # whole token so an unrelated command that merely mentions it is not caught.
-    if "system_reset" in args.command and debug_session_present(inst):
-        sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
+    # HMP is a raw escape hatch, so `qmu monitor {system_reset,savevm,loadvm}`
+    # reach the same VM-reality mutations as the dedicated handlers / `qmu qmp`
+    # but bypass their coherence warnings. Re-emit here, keyed on the HMP *verb*
+    # (the first token) so e.g. `monitor help system_reset` — which resets
+    # nothing — is not caught. loadvm/savevm suppress on a failed op (the same
+    # _snapshot_failed the snapshot handlers use), since a failed op mutated
+    # nothing.
+    verb = args.command[0] if args.command else ""
+    if verb == "system_reset":
+        if debug_session_present(inst):
+            sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
+    elif verb == "savevm":
+        if debug_stub_present(inst) and not _snapshot_failed(result):
+            sys.stderr.write(savevm_breakpoint_warning(inst.vm_id) + "\n")
+    elif verb == "loadvm":
+        if debug_session_present(inst) and not _snapshot_failed(result):
+            sys.stderr.write(loadvm_stale_session_warning(inst.vm_id) + "\n")
     return 0

@@ -47,15 +47,38 @@ def _proc_line(local_port_hex: str, state: str) -> str:
     )
 
 
-def test_established_local_ports_extracts_only_established():
+# A non-loopback (10.0.0.5) ESTABLISHED socket that reuses port 1234 — must be
+# excluded, so an unrelated connection can't masquerade as an attached debugger.
+_NONLOOPBACK_LINE = (
+    "   0: 0500000A:04D2 0100007F:AABB 01 00000000:00000000 "
+    "00:00000000 00000000     0        0 0"
+)
+# IPv6 loopback ::1:4321 (0x10E1) ESTABLISHED — the gdb stub may bind ::1.
+_TCP6_LOOPBACK_LINE = (
+    "   0: 00000000000000000000000001000000:10E1 "
+    "00000000000000000000000000000000:0000 01 00000000:00000000 "
+    "00:00000000 00000000     0        0 0"
+)
+
+
+def test_established_local_ports_extracts_only_established_loopback():
     text = "\n".join([
         _PROC_HEADER,
-        _proc_line("04D2", "01"),  # 1234 ESTABLISHED  -> included
-        _proc_line("04D3", "0A"),  # 1235 LISTEN       -> excluded
-        _proc_line("1F90", "01"),  # 8080 ESTABLISHED  -> included
+        _proc_line("04D2", "01"),  # 127.0.0.1:1234 ESTABLISHED  -> included
+        _proc_line("04D3", "0A"),  # 127.0.0.1:1235 LISTEN       -> excluded
+        _proc_line("1F90", "01"),  # 127.0.0.1:8080 ESTABLISHED  -> included
+        _NONLOOPBACK_LINE,          # 10.0.0.5:1234 ESTABLISHED   -> excluded (not loopback)
+        _TCP6_LOOPBACK_LINE,        # [::1]:4321 ESTABLISHED      -> included
         "garbage line with too few fields",
     ])
-    assert debug.established_local_ports(text) == {1234, 8080}
+    assert debug.established_local_ports(text) == {1234, 8080, 0x10E1}
+
+
+def test_established_local_ports_excludes_nonloopback_sharing_the_port():
+    # The dangerous false-positive from review: an unrelated ESTABLISHED socket
+    # on another interface reusing the gdb port number must NOT count.
+    text = "\n".join([_PROC_HEADER, _NONLOOPBACK_LINE])
+    assert debug.established_local_ports(text) == set()
 
 
 def test_established_local_ports_empty_on_header_only():
@@ -120,6 +143,19 @@ class _FakeQMP:
         return ""
 
 
+class _HmpQMP:
+    """QMP double whose execute_hmp returns a fixed string (for monitor tests)."""
+
+    def __init__(self, hmp_result):
+        self._hmp_result = hmp_result
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        return {}
+
+    def execute_hmp(self, command_line, timeout=30.0):
+        return self._hmp_result
+
+
 def _install_qmp_seams(monkeypatch, inst, *, present):
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(
@@ -155,6 +191,21 @@ def test_snapshot_save_silent_when_not_debugged(monkeypatch, capsys):
     assert err == ""
 
 
+def test_snapshot_save_warns_even_when_client_detached(monkeypatch, capsys):
+    # #45 / review finding: int3 bytes are baked into the image and survive an
+    # uncleanly-detached bridge, so a save must warn whenever a stub EVER existed
+    # (gdb_port set) — not only when a live client is probed. Force the live-view
+    # gate to say "no client" to prove savevm does not depend on it.
+    inst = _gdb_inst(1234)
+    _install_qmp_seams(monkeypatch, inst, present=False)
+    monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: False)
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: "Snapshot 'clean' saved.")
+    rc = qmp_cmds._handle_snapshot_save(_snap_args())
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "int3" in err
+
+
 def test_snapshot_save_failure_does_not_add_int3_warning(monkeypatch, capsys):
     # A failed save wrote no image, so the int3-baking warning is moot and must
     # not appear — only the existing failure hint.
@@ -182,7 +233,9 @@ def test_snapshot_load_warns_stale_session_when_debugged(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert rc == 0
     assert "does NOT re-sync" in err
-    assert "re-run `qmu gdb" in err
+    # Reworded per review: must steer away from the #40 double-bridge trap.
+    assert "Tear the stale pry bridge down first" in err
+    assert "#40" in err
 
 
 def test_snapshot_load_silent_when_not_debugged(monkeypatch, capsys):
@@ -194,6 +247,23 @@ def test_snapshot_load_silent_when_not_debugged(monkeypatch, capsys):
     rc = qmp_cmds._handle_snapshot_load(_snap_args())
     assert rc == 0
     assert capsys.readouterr().err == ""
+
+
+def test_snapshot_load_failure_does_not_warn_stale(monkeypatch, capsys):
+    # A failed load did not rewind, so there is no stale-session divergence to
+    # warn about — only the existing failure hint.
+    inst = _gdb_inst(1234)
+    _install_qmp_seams(monkeypatch, inst, present=True)
+    monkeypatch.setattr(
+        qmp_cmds, "load_snapshot", lambda qmp, name: "Error: Snapshot 'clean' does not exist"
+    )
+    monkeypatch.setattr(qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst)
+    monkeypatch.setattr(qmp_cmds, "serial_log_offset", lambda path: 0)
+    rc = qmp_cmds._handle_snapshot_load(_snap_args())
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "does NOT re-sync" not in err
+    assert "snapshot load failed" in err
 
 
 # --- reset drops breakpoints (#46) -----------------------------------------
@@ -248,6 +318,50 @@ def test_monitor_unrelated_command_does_not_warn(monkeypatch, capsys):
     rc = qmp_cmds._handle_monitor(_monitor_args(["info", "registers"]))
     assert rc == 0
     assert capsys.readouterr().err == ""
+
+
+def test_monitor_help_system_reset_does_not_warn(monkeypatch, capsys):
+    # The verb is the FIRST token; `help system_reset` shows help and resets
+    # nothing, so the reset warning must not fire (the superstring case).
+    inst = _gdb_inst(1234)
+    _install_qmp_seams(monkeypatch, inst, present=True)
+    rc = qmp_cmds._handle_monitor(_monitor_args(["help", "system_reset"]))
+    assert rc == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_monitor_savevm_warns_int3_when_stub_present(monkeypatch, capsys):
+    # The HMP escape hatch reaches the same mutation as `qmu snapshot save`, so
+    # it must carry the #45 warning too. Gated on the stub, not a live client.
+    inst = _gdb_inst(1234)
+    _install_qmp_seams(monkeypatch, inst, present=False)  # no live client
+    rc = qmp_cmds._handle_monitor(_monitor_args(["savevm", "clean"]))
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "int3" in err
+
+
+def test_monitor_loadvm_warns_stale_when_debugged(monkeypatch, capsys):
+    inst = _gdb_inst(1234)
+    _install_qmp_seams(monkeypatch, inst, present=True)
+    rc = qmp_cmds._handle_monitor(_monitor_args(["loadvm", "clean"]))
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "does NOT re-sync" in err
+
+
+def test_monitor_savevm_failure_suppresses_warning(monkeypatch, capsys):
+    # A failed HMP savevm mutated nothing, so no int3 warning.
+    inst = _gdb_inst(1234)
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx",
+        lambda inst: contextlib.nullcontext(_HmpQMP("Error: Could not open 'savevm' section")),
+    )
+    rc = qmp_cmds._handle_monitor(_monitor_args(["savevm", "clean"]))
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "int3" not in err
 
 
 # --- gdb attach: KVM hardware-watchpoint warning (#39) ---------------------
@@ -406,3 +520,89 @@ def test_kill_does_not_probe_for_non_gdb_vm(monkeypatch, capsys):
     rc = lifecycle._handle_kill(_kill_args())
     assert rc == 0
     assert "Multiple bridge instances" not in capsys.readouterr().err
+
+
+# --- wait warns on an observed reset (#46, the non-command path) -------------
+
+
+class _WaitQMP:
+    def __init__(self, events):
+        self._events = list(events)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        return {"running": True, "status": "running"}
+
+    def wait_event(self, event_names, timeout=None):
+        return self._events.pop(0) if self._events else None
+
+
+def test_wait_warns_on_observed_reset_when_debugged(monkeypatch, tmp_path, capsys):
+    from qmu.commands import lifecycle
+    inst = _gdb_vm(tmp_path, kvm=None)  # gdb_port=1234, harness=False
+    alive = [True, False]
+
+    monkeypatch.setattr(lifecycle, "_require_running", lambda vm, cmd: None)
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(
+        lifecycle, "_qmp_ctx", lambda sel: _WaitQMP([{"event": "RESET", "data": {}}])
+    )
+    monkeypatch.setattr(
+        lifecycle, "instance_alive",
+        lambda sel: alive.pop(0) if len(alive) > 1 else alive[0],
+    )
+    monkeypatch.setattr(lifecycle, "serial_log_offset", lambda p: 0)
+    monkeypatch.setattr(lifecycle, "save_guest_epoch_serial_offset", lambda i, off: i)
+    monkeypatch.setattr(lifecycle, "debug_session_present", lambda i: True)
+    monkeypatch.setattr(
+        lifecycle, "_warn_unknown_kernel_params",
+        lambda i: {"all": [], "operator": [], "profile": []},
+    )
+    monkeypatch.setattr(lifecycle, "extract_crash", lambda *a, **k: "")
+
+    args = argparse.Namespace(
+        vm="debug-vm", pattern=None, timeout=1.0, no_clean=True,
+        format="json", out=None, ignore_crash=False,
+    )
+    rc = lifecycle._handle_wait(args)
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "drops the gdbstub's breakpoint" in err
+
+
+def test_wait_reset_no_warning_without_debugger(monkeypatch, tmp_path, capsys):
+    from qmu.commands import lifecycle
+    inst = _gdb_vm(tmp_path, kvm=None)
+    alive = [True, False]
+
+    monkeypatch.setattr(lifecycle, "_require_running", lambda vm, cmd: None)
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(
+        lifecycle, "_qmp_ctx", lambda sel: _WaitQMP([{"event": "RESET", "data": {}}])
+    )
+    monkeypatch.setattr(
+        lifecycle, "instance_alive",
+        lambda sel: alive.pop(0) if len(alive) > 1 else alive[0],
+    )
+    monkeypatch.setattr(lifecycle, "serial_log_offset", lambda p: 0)
+    monkeypatch.setattr(lifecycle, "save_guest_epoch_serial_offset", lambda i, off: i)
+    monkeypatch.setattr(lifecycle, "debug_session_present", lambda i: False)
+    monkeypatch.setattr(
+        lifecycle, "_warn_unknown_kernel_params",
+        lambda i: {"all": [], "operator": [], "profile": []},
+    )
+    monkeypatch.setattr(lifecycle, "extract_crash", lambda *a, **k: "")
+
+    args = argparse.Namespace(
+        vm="debug-vm", pattern=None, timeout=1.0, no_clean=True,
+        format="json", out=None, ignore_crash=False,
+    )
+    rc = lifecycle._handle_wait(args)
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "drops the gdbstub's breakpoint" not in err

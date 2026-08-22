@@ -746,10 +746,10 @@ breakpoint.**
 
 | You run | What silently breaks | Recover |
 |---|---|---|
-| `qmu snapshot load` | Debugger keeps **pre-load** `$rip`/stop-reason and stale breakpoint/memory bookkeeping — it never re-syncs to the restored vCPU. | Re-run `qmu gdb --vm <id>` and re-arm breakpoints before inspecting. |
+| `qmu snapshot load` | Debugger keeps **pre-load** `$rip`/stop-reason and stale breakpoint/memory bookkeeping — it never re-syncs to the restored vCPU. | **Tear down the stale pry bridge first** (it survived the rewind, so a fresh `qmu gdb` would spawn a second — see #40), then reconnect and re-arm breakpoints before inspecting. |
 | `qmu snapshot save` (breakpoints armed) | Software breakpoints are `int3` (`0xCC`) bytes; the save **bakes them into the image**. A later `load` + run traps at that address with no live breakpoint → guest Oops/panic that mimics your PoC crashing the kernel. | Clear breakpoints before saving a clean image; treat a post-load `int3` crash at a breakpointed function as a debugger artifact, not an exploit result. |
 | `qmu qmp system_reset` / `qmu monitor system_reset` (or a guest reboot) | The gdbstub's breakpoint/watchpoint set is **dropped**; the client still lists them `[enabled]` but they never fire again (`hits=0`). | Re-set (re-arm) all breakpoints after the guest is back; confirm with a canary breakpoint you can prove is hit. |
-| Setting a **hardware watchpoint** under KVM | The watchpoint arms `[enabled]` but may **never deliver a hit** under KVM+gdbstub — a silent miss. Breakpoints are unaffected. | Relaunch with `qmu launch --no-kvm ...` (TCG) to make watchpoints deliver. |
+| Setting a **hardware watchpoint** under KVM | The watchpoint arms `[enabled]` but may **never deliver a hit** under KVM+gdbstub — a silent miss. Breakpoints are unaffected. | Relaunch with `qmu launch --no-kvm ...` and **retest under TCG** (watchpoint delivery under TCG for a given kernel is the documented workaround, not a guarantee — see #39). |
 
 A **guest-initiated reboot** hits the same reset failure as the last row but is
 not observable to qmu synchronously, so no warning fires: after any reboot,
@@ -987,6 +987,7 @@ Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
   job). See GDB Integration → *Debugger↔VM coherence* for the per-operation table.
 - **Hardware watchpoints can silently no-op under KVM** — they arm `[enabled]` but
   may never deliver a hit through the QEMU gdbstub under KVM. Breakpoints are fine.
-  Launch with `--no-kvm` (TCG) to debug with watchpoints.
+  Launch with `--no-kvm` and retest under TCG (the documented workaround; delivery
+  under TCG is not guaranteed for every kernel — see #39).
 - **Crash auto-extraction is best-effort** — confirm with `qmu crash` / `qmu log --tail 200` after any suspected panic (see Compile and Run).
 - **Serial log is write-only** — no interactive console; use SSH for interactive work.
