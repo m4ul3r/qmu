@@ -198,6 +198,41 @@ commands (`push`/`pull`/`exec`/`compile`/`dmesg`) then error via `_require_ssh`;
 serial/QMP commands (`log`/`crash`/`wait`/`qmp`/`monitor`/`kill`) work. `qmu wait`
 blocks on QMP `STOP`/`SHUTDOWN`/`POWERDOWN` events with PID-liveness fallback.
 
+### Debugger↔VM coherence (`debug.py`)
+
+The QEMU gdbstub protocol never tells an attached client that the machine
+changed underneath it, so qmu operations that mutate VM reality make the
+debugger's view silently diverge — the same wrong-answer-with-no-error class as
+the crash/transport and state-axis bugs above. qmu owns the lifecycle events and
+knows a VM has a stub (`gdb_port is not None`), so `debug.py` enforces the half
+of the contract the protocol doesn't: **invalidate loudly.** It does NOT drive
+pry, so it warns rather than auto re-syncing/re-arming (that is a pry-side
+capability).
+
+- `debug_session_present(inst)` is the single gate: true when `gdb_port` is set
+  AND `gdb_client_attached()` cannot positively rule out a connected client. The
+  attach probe parses `/proc/net/tcp{,6}` for an ESTABLISHED socket on the gdb
+  port; it returns `None` (can't tell → treated as present, fail-safe) rather
+  than `False` on any read failure, because a missed divergence is the whole bug.
+- Warnings fire on exactly the mutation events, all to **stderr** so the stdout
+  JSON envelope is untouched: `snapshot save` (#45, baked-in `int3`s),
+  `snapshot load` (#44, stale vCPU/bookkeeping), `qmp`/`monitor system_reset`
+  (#46, dropped breakpoint set), and `kill` (#40, stranded pry bridge). The
+  KVM-watchpoint warning (#39) is the exception: it rides in the `qmu gdb`
+  **stdout** payload next to the existing symbol warnings, keyed on the recorded
+  `VMInstance.kvm`, so `gdb`'s clean-stderr contract holds.
+- KVM opt-out (#39): `config.accel` (`auto`/`kvm`/`tcg`) gates `use_kvm()`; the
+  `--no-kvm` launch flag maps to `accel=tcg` through the same `_resolve_config_
+  from_args` layering as every other flag. `VMInstance.kvm` records the effective
+  decision at launch so `gdb` warns without re-deriving host state.
+
+A warning keyed on `gdb_port` alone would be noisy on the snapshot-rewind fast
+path when no debugger is attached; the attach probe is what keeps it quiet in
+that common case while still warning whenever a client is (or might be) present.
+Guest-*initiated* reboots are invisible to a one-shot command, so those stay
+doc-only (skill: *Debugger↔VM coherence*). This is the qmu-side stopgap layer of
+umbrella #48; auto re-sync/re-arm and true pry-bridge reap need pry-side work.
+
 ## Gotchas
 
 - **Snapshots need a qcow2 disk AND `net_backend=passt`.** HMP `savevm` can't

@@ -27,6 +27,7 @@ from typing import Any
 from dataclasses import replace
 
 from ..config import resolve_config
+from ..debug import debug_session_present, reset_dropped_breakpoints_warning
 from ..instance import (
     QMUError,
     VM_ABSENT,
@@ -638,6 +639,13 @@ def _handle_kill(args: argparse.Namespace) -> int:
                 f"--older-than 0`."
             )
     inst = choose_instance(args.vm)
+    # #40: `qmu gdb` spawns a pry bridge that qmu does not track, so killing the
+    # VM leaves that bridge pointing at a dead GDB stub — and the operator only
+    # discovers it as a "Multiple bridge instances" error on the next `pry`
+    # command. Probe for an attached client BEFORE the kill drops its
+    # connection, and if one is present, say so on stderr so cleanup is not a
+    # later surprise. qmu still does not manage the pry lifecycle.
+    had_bridge = debug_session_present(inst) if inst.gdb_port is not None else False
     _kill_vm(inst, force=args.force, clean=not args.no_clean)
     if args.no_clean:
         msg = f"VM '{inst.vm_id}' stopped. State preserved at {inst.serial_log}"
@@ -654,6 +662,14 @@ def _handle_kill(args: argparse.Namespace) -> int:
         text=msg,
         stem="kill",
     )
+    if had_bridge:
+        sys.stderr.write(
+            f"[qmu] Note: VM '{inst.vm_id}' had an attached debugger on GDB port "
+            f"{inst.gdb_port}. That pry bridge now points at a dead stub; qmu does "
+            "not manage it. If a later `pry` command reports \"Multiple bridge "
+            "instances\", this is the stale one — clean it up (`pry doctor`, then "
+            "kill it).\n"
+        )
     return 0
 
 
@@ -1288,6 +1304,7 @@ def _handle_wait(args: argparse.Namespace) -> int:
     event_data: Any = None
     stopped = False
     reset_persistence_in_progress = False
+    warned_reset_debug = False
 
     try:
         with _qmp_ctx(inst) as qmp:
@@ -1332,6 +1349,15 @@ def _handle_wait(args: argparse.Namespace) -> int:
                         reset_offset = serial_log_offset(inst.serial_log)
                         inst = save_guest_epoch_serial_offset(inst, reset_offset)
                         reset_persistence_in_progress = False
+                        # #46: an observed reset drops the gdbstub breakpoint set
+                        # without telling the client. `wait` is the one place qmu
+                        # sees a reset it did not itself issue, so warn here too
+                        # (once per wait) when a debugger is attached.
+                        if not warned_reset_debug and debug_session_present(inst):
+                            warned_reset_debug = True
+                            sys.stderr.write(
+                                reset_dropped_breakpoints_warning(inst.vm_id) + "\n"
+                            )
                     # Continue immediately so identity is checked after every
                     # observation; an event alone is never terminal.
                     continue
@@ -1993,12 +2019,35 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             "detail": "Set [ssh] key in qmu.toml or pass --ssh-key (skip for --harness)",
         })
 
-    # KVM
+    # KVM. Distinguish "explicitly disabled" (accel=tcg / --no-kvm) from
+    # "unavailable" so a deliberate TCG choice — e.g. to make gdbstub hardware
+    # watchpoints deliver (#39) — is not misreported as a missing capability.
     if config.use_kvm():
+        if config.accel == "kvm" and not Path("/dev/kvm").exists():
+            # accel=kvm forces -enable-kvm unconditionally; if /dev/kvm is
+            # absent the launch will fail, so doctor must flag it rather than
+            # report a green "forced" it cannot back up.
+            checks.append({
+                "check": "KVM",
+                "status": "warn",
+                "detail": "accel=kvm forces -enable-kvm but /dev/kvm is missing; "
+                          "launch will fail. Use accel=auto/tcg or --no-kvm.",
+            })
+        else:
+            checks.append({
+                "check": "KVM",
+                "status": "ok",
+                "detail": (
+                    "KVM acceleration forced (accel=kvm)"
+                    if config.accel == "kvm"
+                    else "KVM acceleration available"
+                ),
+            })
+    elif config.accel == "tcg":
         checks.append({
             "check": "KVM",
-            "status": "ok",
-            "detail": "KVM acceleration available",
+            "status": "info",
+            "detail": "Disabled by accel=tcg (--no-kvm); using TCG emulation",
         })
     else:
         checks.append({

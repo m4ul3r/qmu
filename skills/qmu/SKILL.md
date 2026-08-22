@@ -210,6 +210,12 @@ qmu launch --kernel ./bzImage --nic-model e1000   # NIC model (default virtio-ne
 - `--initrd PATH` — attach an initramfs/initrd (`~` expansion works).
 - `--drive SPEC` — raw QEMU `-drive` spec, repeatable. **Any `--drive` suppresses the implicit rootfs drive** — include the rootfs explicitly if you still need it.
 - `--no-net` / `--nic-model MODEL` / `--cpu MODEL` — networking and CPU overrides.
+- `--no-kvm` — force TCG emulation (sets `[machine] accel=tcg`; the config key
+  also takes `auto`/`kvm`). KVM is otherwise auto-enabled when the guest arch
+  matches the host and `/dev/kvm` exists. A useful lever when a **hardware
+  watchpoint** doesn't fire on a write you expected: TCG isolates a possible KVM
+  guest-debug limitation (but check the VA-alias cause first — see GDB
+  Integration → coherence).
 
 Profiles (LSMs disabled + KASAN in all three):
 - `exploit-dev` (default) — no panic_on_warn
@@ -800,6 +806,33 @@ pry continue                # REQUIRED to resume before the parallel exec
 pry backtrace
 ```
 
+### Debugger↔VM coherence (which operations invalidate debug state)
+
+The QEMU gdbstub protocol does **not** tell an attached client when the machine
+changes underneath it, so several everyday qmu operations make the debugger's
+view silently diverge from the guest — no error, wrong answer. qmu knows a VM
+has a GDB stub (it was launched with `--gdb`) and warns on stderr at each such
+event. Treat every warning below as: **the debug state you can see is now
+suspect; re-establish it before trusting a register/memory read or a
+breakpoint.**
+
+| You run | What silently breaks | Recover |
+|---|---|---|
+| `qmu snapshot load` | Debugger keeps **pre-load** `$rip`/stop-reason and stale breakpoint/memory bookkeeping — it never re-syncs to the restored vCPU. | **Tear down the stale pry bridge first** (it survived the rewind, so a fresh `qmu gdb` would spawn a second — see #40), then reconnect and re-arm breakpoints before inspecting. |
+| `qmu snapshot save` (breakpoints armed) | Software breakpoints are `int3` (`0xCC`) bytes; the save **bakes them into the image**. A later `load` + run traps at that address with no live breakpoint → guest Oops/panic that mimics your PoC crashing the kernel. | Clear breakpoints before saving a clean image; treat a post-load `int3` crash at a breakpointed function as a debugger artifact, not an exploit result. |
+| `qmu qmp system_reset` / `qmu monitor system_reset` (or a guest reboot) | The gdbstub's breakpoint/watchpoint set is **dropped**; the client still lists them `[enabled]` but they never fire again (`hits=0`). | Re-set (re-arm) all breakpoints after the guest is back; confirm with a canary breakpoint you can prove is hit. |
+| A **hardware watchpoint** doesn't fire on a write you can prove happened | A watchpoint triggers only on writes through the **watched virtual address**. A kernel write to the same bytes via a *different* mapping (heap/physmap alias — common in LPEs corrupting e.g. `modprobe_path`) won't trip a watchpoint set on the symbol's VA. This reads as a "silent miss" but is not KVM's fault. (Separately, some QEMU/KVM builds can drop gdbstub watchpoints.) | Suspect the alias first — watch the VA the write actually goes through. To rule out a KVM guest-debug limitation, retest with `qmu launch --no-kvm ...` (TCG). *Tested: on qemu 8.2.2 + KVM a `jiffies` watchpoint fired fine, so KVM alone does not disable watchpoints.* |
+
+A **guest-initiated reboot** hits the same reset failure as the last row but is
+not observable to qmu synchronously, so no warning fires: after any reboot,
+assume breakpoints are gone until a canary confirms otherwise.
+
+These warnings are keyed on the VM having a GDB stub; qmu additionally
+suppresses them when it can positively confirm no client is connected, and errs
+toward warning when it cannot tell. Auto re-sync / auto re-arm is a pry-side
+capability qmu does not drive — the contract qmu enforces is "invalidate
+loudly," not "fix it for you."
+
 ## Cross-arch quickstarts (aarch64 / arm32)
 
 Booting a non-x86 guest needs three things the x86 defaults don't provide: the right
@@ -1023,5 +1056,16 @@ rest, which `prune --vm/--all` does not touch.
   (`symbols_rebased:false`). Discover the runtime base with `qmu kbase`, then apply
   it manually via `pry load ... --base "$KBASE"`. qmu never auto-rebases pry and
   never resumes/re-halts the guest for you.
+- **Debug state does not survive `snapshot load`, `snapshot save`, or a reset** —
+  the gdbstub protocol never tells the client the machine changed, so the debugger
+  silently keeps a stale view. qmu warns on stderr at each event for a `--gdb` VM
+  but only invalidates loudly; it does not auto re-sync or re-arm (that is pry's
+  job). See GDB Integration → *Debugger↔VM coherence* for the per-operation table.
+- **A hardware watchpoint that "silently misses"** is usually watching the wrong
+  virtual address — a watchpoint fires only on writes through the VA it's set on,
+  so a kernel write via a heap/physmap alias (common in LPEs hitting e.g.
+  `modprobe_path`) won't trip it. Suspect that first. Some QEMU/KVM builds can also
+  drop gdbstub watchpoints; `--no-kvm` (TCG) isolates that. (Tested: on qemu 8.2.2
+  + KVM a `jiffies` watchpoint fired reliably — KVM alone does not disable them.)
 - **Crash auto-extraction is best-effort** — confirm with `qmu crash` / `qmu log --tail 200` after any suspected panic (see Compile and Run).
 - **Serial log is write-only** — no interactive console; use SSH for interactive work.

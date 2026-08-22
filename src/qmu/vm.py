@@ -598,6 +598,11 @@ def launch_vm(
             harness=harness,
             nic_model=resolved_nic,
             pid_start=pid_start,
+            # Record the effective acceleration so `qmu gdb` can surface the
+            # hardware-watchpoint caveats that apply under KVM (#39) without
+            # re-deriving host state that may have changed since launch. This is
+            # the same predicate build_qemu_command used to decide -enable-kvm.
+            kvm=config.use_kvm(),
         )
         try:
             save_instance(inst)
