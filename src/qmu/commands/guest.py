@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import Any
 
 from ..hostcc import host_compile, resolve_host_cc
-from ..instance import QMUError, VMInstance, choose_instance, find_instance
+from ..instance import (
+    QMUError,
+    VMInstance,
+    autoselect_note,
+    choose_instance,
+    find_instance,
+)
 from ..serial import extract_crash, read_log, serial_log_offset, tail_log
 from ..ssh import SSHClient, SSHError, is_transport_failure
 from .._cliutil import (
@@ -744,6 +750,7 @@ def _add_crash(sub: argparse._SubParsersAction) -> None:
 
 def _handle_crash(args: argparse.Namespace) -> int:
     inst = find_instance(args.vm)
+    crash_autoselect_note = autoselect_note(inst, args.vm)
     history = args.full_history
     scope = "history" if history else "current"
     start_offset = 0 if history else inst.guest_epoch_serial_offset
@@ -767,19 +774,19 @@ def _handle_crash(args: argparse.Namespace) -> int:
         reason = f"no crash markers found in {scope_reason}"
         text = f"No crash detected in {scope_text}: {reason}."
 
-    _emit(
-        args,
-        data={
-            "ok": detected,
-            "crash_detected": detected,
-            "scope": scope,
-            "reason": reason,
-            "serial_log": inst.serial_log,
-            "crash": crash,
-        },
-        text=text,
-        stem="crash",
-    )
+    crash_data = {
+        "ok": detected,
+        "vm": inst.vm_id,
+        "crash_detected": detected,
+        "scope": scope,
+        "reason": reason,
+        "serial_log": inst.serial_log,
+        "crash": crash,
+    }
+    if crash_autoselect_note:
+        crash_data["autoselected"] = crash_autoselect_note
+        text = f"[qmu] {crash_autoselect_note}\n{text}"
+    _emit(args, data=crash_data, text=text, stem="crash")
     return 0 if detected else 1
 
 
@@ -836,6 +843,7 @@ def _grep_lines(text: str, pattern: str, context: int) -> tuple[str, int]:
 
 def _handle_log(args: argparse.Namespace) -> int:
     inst = find_instance(args.vm)
+    note = autoselect_note(inst, args.vm)
 
     # A filtered read defaults to the WHOLE log. Applying the 50-line tail
     # first would silently scope the search to the end of the boot and report
@@ -857,10 +865,15 @@ def _handle_log(args: argparse.Namespace) -> int:
     available = bool(value)
     data = {
         "ok": True,
+        "vm": inst.vm_id,
         "log": value,
         "available": available,
         "empty": not available,
     }
+    # Disclose an auto-selection rather than making it silently: with several
+    # VMs on disk, "which log am I reading" is not obvious from the content.
+    if note:
+        data["autoselected"] = note
     if args.grep is not None:
         data["grep"] = args.grep
         data["matches"] = matches or 0
@@ -876,5 +889,7 @@ def _handle_log(args: argparse.Namespace) -> int:
     else:
         text = "Serial log is empty or missing."
 
+    if note:
+        text = f"[qmu] {note}\n{text}"
     _emit(args, data=data, text=text, stem="log")
     return 0

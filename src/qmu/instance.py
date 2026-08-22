@@ -478,12 +478,66 @@ def find_instance(vm_id: str | None = None) -> VMInstance:
     if len(candidates) == 1:
         return candidates[0]
 
+    # Exactly one VM is running: that is the obvious intent, and it is what
+    # `choose_instance` (status/exec/kill) already does. Without this tie-break
+    # `log` and `crash` -- the two commands reached for during crash triage --
+    # were the ONLY ones that failed to auto-select, because they alone count
+    # stopped VMs as candidates. SKILL.md promised "with one VM running,
+    # commands auto-select it", and for these two that was false as soon as a
+    # single stopped remnant existed. Reading a stopped VM's log still works
+    # via an explicit --vm, so nothing that f792840 fixed is regressed.
+    #
+    # The caller is expected to disclose the pick (see autoselect_note): a
+    # SILENT auto-select is how an agent reads the wrong VM's log after a kill.
+    if len(running) == 1:
+        return running[0]
+
+    raise QMUError(ambiguous_vm_message(running, stopped))
+
+
+# How many stopped VMs to name before summarising. The list used to be
+# unbounded: on a cache with 58 stopped VMs a bare `qmu log` emitted a 60-line,
+# ~489-token error and never mentioned the remedy, on every call.
+_AMBIGUITY_LIST_LIMIT = 5
+
+
+def ambiguous_vm_message(
+    running: list[VMInstance], stopped: list[VMInstance]
+) -> str:
     lines = ["Multiple VMs found. Specify one with --vm <id>:"]
     for inst in running:
         lines.append(f"  {inst.vm_id}  (pid={inst.pid}, running)")
-    for inst in stopped:
+    shown = stopped[:_AMBIGUITY_LIST_LIMIT]
+    for inst in shown:
         lines.append(f"  {inst.vm_id}  (stopped)")
-    raise QMUError("\n".join(lines))
+    withheld = len(stopped) - len(shown)
+    if withheld > 0:
+        lines.append(
+            f"  ... and {withheld} more stopped VM(s) — see `qmu list`."
+        )
+    if stopped:
+        lines.append(
+            "Stopped VMs count as candidates so their logs stay readable. "
+            "Clear them with `qmu prune --all` (preview: `--dry-run`)."
+        )
+    return "\n".join(lines)
+
+
+def autoselect_note(inst: VMInstance, vm_id: str | None) -> str | None:
+    """Describe an auto-selection, when one actually happened and was ambiguous.
+
+    Returned so handlers can disclose it. None when the caller named a VM, or
+    when there was only ever one candidate (nothing to disclose).
+    """
+    if vm_id is not None:
+        return None
+    others = len(list_instances()) + len(list_stopped_instances()) - 1
+    if others <= 0:
+        return None
+    return (
+        f"Auto-selected the only running VM '{inst.vm_id}' "
+        f"({others} other VM(s) exist; use --vm <id> to pick one)."
+    )
 
 
 def find_orphan_qemus() -> list[dict[str, Any]]:
