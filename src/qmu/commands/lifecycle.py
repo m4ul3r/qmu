@@ -27,6 +27,7 @@ from typing import Any
 from dataclasses import replace
 
 from ..config import resolve_config
+from ..debug import debug_session_present
 from ..instance import (
     QMUError,
     VM_ABSENT,
@@ -630,6 +631,13 @@ def _handle_kill(args: argparse.Namespace) -> int:
                 f"--older-than 0`."
             )
     inst = choose_instance(args.vm)
+    # #40: `qmu gdb` spawns a pry bridge that qmu does not track, so killing the
+    # VM leaves that bridge pointing at a dead GDB stub — and the operator only
+    # discovers it as a "Multiple bridge instances" error on the next `pry`
+    # command. Probe for an attached client BEFORE the kill drops its
+    # connection, and if one is present, say so on stderr so cleanup is not a
+    # later surprise. qmu still does not manage the pry lifecycle.
+    had_bridge = debug_session_present(inst) if inst.gdb_port is not None else False
     _kill_vm(inst, force=args.force, clean=not args.no_clean)
     if args.no_clean:
         msg = f"VM '{inst.vm_id}' stopped. State preserved at {inst.serial_log}"
@@ -646,6 +654,14 @@ def _handle_kill(args: argparse.Namespace) -> int:
         text=msg,
         stem="kill",
     )
+    if had_bridge:
+        sys.stderr.write(
+            f"[qmu] Note: VM '{inst.vm_id}' had an attached debugger on GDB port "
+            f"{inst.gdb_port}. That pry bridge now points at a dead stub; qmu does "
+            "not manage it. If a later `pry` command reports \"Multiple bridge "
+            "instances\", this is the stale one — clean it up (`pry doctor`, then "
+            "kill it).\n"
+        )
     return 0
 
 
@@ -1684,12 +1700,24 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             "detail": "Set [ssh] key in qmu.toml or pass --ssh-key (skip for --harness)",
         })
 
-    # KVM
+    # KVM. Distinguish "explicitly disabled" (accel=tcg / --no-kvm) from
+    # "unavailable" so a deliberate TCG choice — e.g. to make gdbstub hardware
+    # watchpoints deliver (#39) — is not misreported as a missing capability.
     if config.use_kvm():
         checks.append({
             "check": "KVM",
             "status": "ok",
-            "detail": "KVM acceleration available",
+            "detail": (
+                "KVM acceleration forced (accel=kvm)"
+                if config.accel == "kvm"
+                else "KVM acceleration available"
+            ),
+        })
+    elif config.accel == "tcg":
+        checks.append({
+            "check": "KVM",
+            "status": "info",
+            "detail": "Disabled by accel=tcg (--no-kvm); using TCG emulation",
         })
     else:
         checks.append({

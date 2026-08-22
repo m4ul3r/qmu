@@ -26,6 +26,13 @@ from ..snapshot import (
     save_snapshot,
 )
 from ..serial import serial_log_offset
+from ..debug import (
+    debug_session_present,
+    kvm_watchpoint_warning,
+    loadvm_stale_session_warning,
+    reset_dropped_breakpoints_warning,
+    savevm_breakpoint_warning,
+)
 from .._cliutil import (
     _add_common_opts,
     _emit,
@@ -108,6 +115,13 @@ def _handle_snapshot_save(args: argparse.Namespace) -> int:
             "alone remains temporary because qmu still adds snapshot=on.\n"
         )
         return 1
+    # #45: a snapshot of a debugged guest freezes any armed software-breakpoint
+    # int3s into the image, so a later `snapshot load` + run Oopses at the
+    # breakpointed address and reads as the PoC crashing the kernel. Warn only
+    # on a successful save (a failed one wrote no image) and only when a debug
+    # session is present.
+    if debug_session_present(inst):
+        sys.stderr.write(savevm_breakpoint_warning(inst.vm_id) + "\n")
     return 0
 
 
@@ -141,6 +155,11 @@ def _handle_snapshot_load(args: argparse.Namespace) -> int:
                 "with QEMU's stream backend. qmu does not manage that external process.\n"
             )
         return 1
+    # #44: loadvm rewound the guest, but an attached debugger keeps its pre-load
+    # vCPU state and never re-syncs — a silent divergence in the rewind-iterate
+    # fast path. Warn only on a successful load (a failed one did not rewind).
+    if debug_session_present(inst):
+        sys.stderr.write(loadvm_stale_session_warning(inst.vm_id) + "\n")
     return 0
 
 
@@ -400,6 +419,17 @@ def _handle_gdb(args: argparse.Namespace) -> int:
                 "symbol_warning": symbol_warning,
             })
             text = f"{text}\n{symbol_warning}"
+        # #39: hardware watchpoints set through the QEMU gdbstub can be accepted
+        # yet silently never fire under KVM. Warn at attach time — the one
+        # moment qmu is on the debug path — but only when the VM was actually
+        # launched under KVM (recorded on the instance). Kept in the stdout
+        # payload alongside the other gdb warnings so the JSON envelope carries
+        # it and stderr stays clean.
+        if getattr(inst, "kvm", None) is True:
+            kvm_warning = kvm_watchpoint_warning(inst.vm_id)
+            data["kvm"] = True
+            data["kvm_watchpoint_warning"] = kvm_warning
+            text = f"{text}\n{kvm_warning}"
         _emit(
             args,
             data=data,
@@ -481,6 +511,11 @@ def _handle_qmp(args: argparse.Namespace) -> int:
     # json mode wraps it so the universal {"ok": ...} contract holds, with the
     # original payload under "result".
     _emit(args, data={"ok": True, "result": result}, text=result, stem="qmp")
+    # #46: a machine reset silently drops the gdbstub breakpoint set. `qmu qmp
+    # system_reset` is the raw path that triggers it; warn when a debug session
+    # is present so the operator re-arms instead of trusting frozen hits=0.
+    if args.command == "system_reset" and debug_session_present(inst):
+        sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
     return 0
 
 
@@ -507,4 +542,9 @@ def _handle_monitor(args: argparse.Namespace) -> int:
         text=result if result.strip() else "(no output)",
         stem="monitor",
     )
+    # #46: `qmu monitor system_reset` is the HMP path to the same reset that
+    # silently drops the gdbstub breakpoint set. Match the reset verb as a
+    # whole token so an unrelated command that merely mentions it is not caught.
+    if "system_reset" in args.command and debug_session_present(inst):
+        sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
     return 0

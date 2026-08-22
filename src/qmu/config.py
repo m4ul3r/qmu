@@ -53,6 +53,7 @@ _FIXED_SCHEMA: dict[str, dict[str, str]] = {
         "cpu": "string",
         "nic_model": "string",
         "net_backend": "net_backend",
+        "accel": "accel",
         "extra_args": "string_array",
     },
     "drive": {
@@ -86,6 +87,8 @@ _MIGRATION_DESTINATIONS: dict[str, tuple[str, ...]] = {
     "cpu_model": ("[machine] cpu",),
     "nic_model": ("[machine] nic_model",),
     "net_backend": ("[machine] net_backend",),
+    "accel": ("[machine] accel",),
+    "no_kvm": ("[machine] accel",),
     "extra_args": ("[machine] extra_args",),
     "rootfs": ("[drive] rootfs",),
     "format": ("[drive] format",),
@@ -169,6 +172,20 @@ def _validate_value(value: Any, kind: str, source: Path, key_path: str) -> None:
             raise ConfigError(
                 source,
                 "expected one of: user, passt",
+                key_path=key_path,
+            )
+        return
+    elif kind == "accel":
+        if not isinstance(value, str):
+            raise ConfigError(
+                source,
+                f"expected string, got {_value_type_name(value)}",
+                key_path=key_path,
+            )
+        if value not in ("auto", "kvm", "tcg"):
+            raise ConfigError(
+                source,
+                "expected one of: auto, kvm, tcg",
                 key_path=key_path,
             )
         return
@@ -323,6 +340,13 @@ class QMUConfig:
     cpu_model: str | None = None
     nic_model: str = "virtio-net-pci"
     net_backend: str = "user"  # "user" (slirp) or native "passt" when advertised by QEMU
+    # Acceleration selection: "auto" (KVM when guest arch == host arch and
+    # /dev/kvm exists), "kvm" (force -enable-kvm — the operator's explicit
+    # choice; QEMU errors if unavailable), or "tcg" (pure emulation, no
+    # -enable-kvm). The TCG escape hatch exists because hardware watchpoints
+    # set through the QEMU gdbstub can silently never fire under KVM (#39), and
+    # the documented workaround is to retest under TCG.
+    accel: str = "auto"
     extra_args: list[str] = field(default_factory=list)
 
     # drive
@@ -347,7 +371,21 @@ class QMUConfig:
         return f"qemu-system-{self.arch}"
 
     def use_kvm(self) -> bool:
-        """Enable KVM only when guest arch matches host."""
+        """Whether QEMU should be launched with -enable-kvm.
+
+        `accel` gates the automatic decision:
+        - "tcg": never — the operator asked for pure emulation (e.g. to make
+          gdbstub hardware watchpoints deliver, see #39).
+        - "kvm": always — the operator's explicit choice; if /dev/kvm is
+          missing or the arch does not match, QEMU itself will refuse, which
+          is the correct place for that failure to surface.
+        - "auto" (default): only when the guest arch matches the host and
+          /dev/kvm exists — the historical behavior.
+        """
+        if self.accel == "tcg":
+            return False
+        if self.accel == "kvm":
+            return True
         host = platform.machine()
         mapping = {"x86_64": "x86_64", "aarch64": "aarch64"}
         return mapping.get(self.arch) == host and Path("/dev/kvm").exists()
@@ -398,6 +436,13 @@ def _apply_toml(cfg: QMUConfig, raw: dict[str, Any], source: str) -> None:
                 f"Invalid net_backend '{backend}': must be 'user' or 'passt'"
             )
         cfg.net_backend = backend
+    if "accel" in machine:
+        accel = str(machine["accel"])
+        if accel not in ("auto", "kvm", "tcg"):
+            raise QMUError(
+                f"Invalid accel '{accel}': must be 'auto', 'kvm', or 'tcg'"
+            )
+        cfg.accel = accel
     if "extra_args" in machine:
         cfg.extra_args = list(machine["extra_args"])
 
@@ -535,6 +580,11 @@ arch = "{host_arch}"
 memory = "4G"
 cpus = 2
 # cpu = "host"                   # passes -cpu to QEMU; "host" is recommended with KVM
+# accel = "auto"                 # "auto" (KVM when guest arch == host arch and
+#                                #   /dev/kvm exists), "kvm" (force), or "tcg" (pure
+#                                #   emulation). Use "tcg", or launch with --no-kvm,
+#                                #   when gdbstub hardware watchpoints must fire —
+#                                #   they can silently no-op under KVM.
 # nic_model = "virtio-net-pci"   # or "e1000", "rtl8139", ...
 # net_backend = "passt"          # Optional migration-compatible backend. The selected
 #                                #   QEMU must advertise native passt; qmu probes whether it

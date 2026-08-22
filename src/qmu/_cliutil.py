@@ -73,6 +73,14 @@ def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
         if val is not None:
             cli_overrides[cfg_field] = val
 
+    # --no-kvm is a boolean launch flag, not a value flag, so it cannot go
+    # through flag_map (which copies non-None values). Translate it into the
+    # same `accel` config field a `[machine] accel` key sets, so flag-beats-
+    # config layering stays uniform: --no-kvm on the CLI overrides accel from
+    # qmu.toml, exactly as every other launch flag overrides its config key.
+    if getattr(args, "no_kvm", False):
+        cli_overrides["accel"] = "tcg"
+
     config_path = getattr(args, "config", None)
     return resolve_config(
         cli_overrides=cli_overrides or None,
@@ -340,6 +348,12 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
                         help="Append params to the resolved cmdline instead of replacing it, "
                              "e.g. --append 'slub_debug=- nokaslr'")
     parser.add_argument("--gdb", action="store_true", help="Enable GDB stub")
+    parser.add_argument(
+        "--no-kvm", dest="no_kvm", action="store_true",
+        help="Disable KVM acceleration (force TCG emulation; sets [machine] "
+             "accel=tcg). Needed when gdbstub hardware watchpoints must fire — "
+             "they can silently no-op under KVM.",
+    )
     parser.add_argument("--name", default=None, help="VM instance name")
     parser.add_argument("--inject", action="append", dest="injects", default=None,
                         help="Copy LOCAL:/guest/dir into the rootfs image before boot "
