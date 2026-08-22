@@ -396,10 +396,16 @@ def test_gdb_attach_warns_about_kvm_watchpoints(monkeypatch, tmp_path, capsys):
     _install_gdb_seams(monkeypatch, _gdb_vm(tmp_path, kvm=True))
     rc = cli.main(["--format", "json", "gdb", "--vm", "debug-vm"])
     payload = json.loads(capsys.readouterr().out)
+    w = payload["kvm_watchpoint_warning"]
     assert rc == 0
     assert payload["kvm"] is True
-    assert "watchpoint" in payload["kvm_watchpoint_warning"].lower()
-    assert "--no-kvm" in payload["kvm_watchpoint_warning"]
+    assert "watchpoint" in w.lower()
+    assert "--no-kvm" in w
+    # The reworded (evidence-backed) message must lead with the real cause — the
+    # watched virtual address / alias — not assert KVM breaks watchpoints.
+    assert "virtual address" in w.lower()
+    assert "alias" in w.lower()
+    assert "never deliver" not in w.lower()
 
 
 def test_gdb_attach_no_kvm_warning_when_tcg_or_unknown(monkeypatch, tmp_path, capsys):

@@ -343,9 +343,12 @@ class QMUConfig:
     # Acceleration selection: "auto" (KVM when guest arch == host arch and
     # /dev/kvm exists), "kvm" (force -enable-kvm — the operator's explicit
     # choice; QEMU errors if unavailable), or "tcg" (pure emulation, no
-    # -enable-kvm). The TCG escape hatch exists because hardware watchpoints
-    # set through the QEMU gdbstub can silently never fire under KVM (#39), and
-    # the documented workaround is to retest under TCG.
+    # -enable-kvm). The TCG escape hatch is a retest lever for hardware-
+    # watchpoint issues under KVM (#39): a watchpoint that "misses" is usually
+    # watching the wrong VA (a heap/physmap alias), but some QEMU/KVM builds do
+    # drop gdbstub watchpoints and --no-kvm isolates that. (Live-tested: on
+    # qemu 8.2.2 + KVM a jiffies watchpoint fired fine — KVM alone is not the
+    # cause.)
     accel: str = "auto"
     extra_args: list[str] = field(default_factory=list)
 
@@ -582,9 +585,9 @@ cpus = 2
 # cpu = "host"                   # passes -cpu to QEMU; "host" is recommended with KVM
 # accel = "auto"                 # "auto" (KVM when guest arch == host arch and
 #                                #   /dev/kvm exists), "kvm" (force), or "tcg" (pure
-#                                #   emulation). Use "tcg", or launch with --no-kvm,
-#                                #   when gdbstub hardware watchpoints must fire —
-#                                #   they can silently no-op under KVM.
+#                                #   emulation). "tcg" / --no-kvm is a retest lever
+#                                #   if a gdbstub hardware watchpoint misses under
+#                                #   KVM (usually a VA-alias issue — see #39).
 # nic_model = "virtio-net-pci"   # or "e1000", "rtl8139", ...
 # net_backend = "passt"          # Optional migration-compatible backend. The selected
 #                                #   QEMU must advertise native passt; qmu probes whether it

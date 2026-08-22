@@ -177,12 +177,22 @@ def reset_dropped_breakpoints_warning(vm_id: str) -> str:
 
 
 def kvm_watchpoint_warning(vm_id: str) -> str:
-    """#39 — hardware watchpoints can silently no-op under KVM + gdbstub."""
+    """#39 — hardware-watchpoint "silent miss" caveats on a KVM VM.
+
+    Reworded after live testing (PR #50): on qemu 8.2.2 + KVM a hw write-
+    watchpoint on `jiffies` fired reliably, so the original "watchpoints never
+    deliver under KVM" framing was wrong. The reproducible cause of a "silent
+    miss" is the virtual-address one below; a KVM guest-debug limitation is a
+    secondary possibility that `--no-kvm` isolates.
+    """
     return (
-        "WARNING: this VM runs under KVM acceleration. Hardware watchpoints set "
-        "through the QEMU gdbstub (e.g. `pry watch set`) may be accepted and "
-        "reported [enabled] yet never deliver a hit under KVM — a silent miss. "
-        "Breakpoints are unaffected. If a watchpoint does not fire on a write "
-        f"you can prove happened, relaunch with `qmu launch --no-kvm ...` (TCG "
-        "emulation) to debug it."
+        "WARNING: a hardware watchpoint (e.g. `pry watch set`) fires only on "
+        "writes through the WATCHED virtual address. A kernel write to the same "
+        "bytes via a different mapping — a heap/physmap alias, common in LPEs "
+        "that corrupt e.g. modprobe_path — will NOT trip a watchpoint set on the "
+        "symbol's VA; that looks like a silent miss but is not KVM's fault. "
+        "Separately, some QEMU/KVM builds can drop gdbstub watchpoints entirely. "
+        "If a watchpoint does not fire on a write you can prove happened, suspect "
+        f"the alias first, then retest under `qmu launch --no-kvm ...` (TCG) to "
+        "rule out a KVM guest-debug limitation."
     )

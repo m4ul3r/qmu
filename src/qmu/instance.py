@@ -57,10 +57,10 @@ class VMInstance:
     # contributed nothing. Defaulted so older instance JSON still loads.
     cmdline_override: bool = False
     # Whether QEMU was launched with `-enable-kvm`. Recorded so a later
-    # `qmu gdb` can warn that hardware watchpoints set through the gdbstub may
-    # silently never fire under KVM (#39) without re-deriving host state that
-    # may have changed since launch. None keeps instance JSON written before
-    # this field existed loadable (accel unknown).
+    # `qmu gdb` can surface the hardware-watchpoint caveats that apply under KVM
+    # (#39) without re-deriving host state that may have changed since launch.
+    # None keeps instance JSON written before this field existed loadable
+    # (accel unknown).
     kvm: bool | None = None
 
 
