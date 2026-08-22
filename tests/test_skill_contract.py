@@ -36,7 +36,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="qmu")
     _add_top_level_common_opts(parser)
     sub = parser.add_subparsers(dest="subcommand")
-    for register in (
+    registrars = [
         lifecycle._add_launch, run._add_run, lifecycle._add_kill,
         lifecycle._add_prune, lifecycle._add_wait, lifecycle._add_list,
         lifecycle._add_status, lifecycle._add_doctor,
@@ -46,7 +46,18 @@ def _build_parser() -> argparse.ArgumentParser:
         qmp_cmds._add_gdb, qmp_cmds._add_kbase, qmp_cmds._add_cont,
         qmp_cmds._add_qmp, qmp_cmds._add_monitor,
         meta._add_rootfs, meta._add_skill, meta._add_version,
-    ):
+    ]
+    # This mirror re-lists cli.main's registrars by hand, so a subcommand that
+    # arrives on a sibling branch (e.g. `qmu cache`, meta._add_cache) would
+    # otherwise desync it: the command's own documented lines in SKILL.md would
+    # fail to parse here even though the real CLI accepts them. Pick up such
+    # registrars by name when the symbol is present, absorbing the drift instead
+    # of hard-failing on the very lines the sibling PR also adds to the skill.
+    for owner, name in ((meta, "_add_cache"),):
+        fn = getattr(owner, name, None)
+        if fn is not None:
+            registrars.append(fn)
+    for register in registrars:
         register(sub)
     return parser
 
