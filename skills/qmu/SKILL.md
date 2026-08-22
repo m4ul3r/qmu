@@ -280,14 +280,17 @@ qmu prune --orphans               # Kill qmu-launched QEMUs no instance record c
 qmu prune --orphans --dry-run     # ...list what that would kill, and kill nothing
 qmu prune --all --dry-run         # preview an instance prune without removing anything
 qmu prune --runtime --older-than 86400  # Age-gated prune of qmu-owned runtime artifacts
+qmu prune --build-residue --dry-run     # preview reclaiming kernel build residue
+qmu cache du                      # size every cache subtree; what is reclaimable
+qmu cache ls --top 10             # biggest reclaimable source trees
 ```
 
 `--keep-logs` preserves both `.serial.log` and `.qemu.log` (metadata and QMP sockets are still removed).
 
 `qmu prune --runtime` removes only aged **marked** automatic output spills and aged definitely stale direct `cm-*` Unix sockets under the runtime root. It skips live/uncertain SSH controls, explicit `--out` files, unmarked lookalikes, symlinks, and unrelated temp names (including arbitrary `/tmp/qmu-*`). Default age is 86400 seconds; use `--older-than SECONDS` (non-negative). The command is idempotent and never recursively deletes the runtime root.
 
-**`--dry-run` previews; it never acts.** Supported with `--orphans`, `--vm`,
-and `--all`. It prints what would be removed or killed, leaves everything in
+**`--dry-run` previews; it never acts.** Supported with `--vm`, `--all`,
+`--orphans`, and `--build-residue`. It prints what would be removed or killed, leaves everything in
 place, and reports `dry_run: true` with `pruned: []` plus a `would_prune` /
 `would_kill` list in JSON — so a script can always tell a preview from a real
 run. `--runtime` has no preview pass and rejects the flag rather than acting
@@ -308,6 +311,57 @@ remnant by signalling its process and preserving the serial log.
 reporting "No stopped VMs to prune" while `qmu list` still shows one.
 
 State files are **never silently removed** except by `qmu wait`'s harness auto-clean (below). After `kill --no-clean`, or a harness VM that powered off without `wait`, the `.serial.log` survives — read it with `qmu log`/`qmu crash`, then `qmu prune` when done. See [Files on disk](#files-on-disk).
+
+## Cache on disk
+
+`qmu prune` reaches `~/.cache/qmu/instances/` and the runtime root — **not** the
+rest of the cache. `tools/kbuild.sh`, `tools/mkrootfs.sh` and `tools/mktarget.sh`
+write `kernels/`, `rootfs/` and `targets/` into the same directory, and on a
+working research box those are ~99.99% of the bytes. `qmu prune --all` can
+report success while 30 GB sits untouched, so every `prune` result carries an
+`unmanaged_cache` key naming what it did not cover.
+
+```bash
+qmu cache du                  # per-subtree sizes + what is reclaimable
+qmu cache ls --top 10         # biggest reclaimable source trees
+qmu cache ls --bucket all     # including held-back and refused entries
+```
+
+Sizes are **allocated** blocks, not apparent size. `targets/` and `rootfs/` hold
+sparse ext4 images, so `st_size` overstates a real cache by ~70%; `apparent_bytes`
+is reported alongside for reference.
+
+**Reclaiming kernel build residue.** `kbuild.sh` builds in-tree, so
+`kernels/src/linux-*/` accumulates `*.o`, `*.a`, `.*.cmd` and friends — commonly
+more than half the cache. They carry no value to kbuild, which runs `make
+mrproper` at the start of every containerised build:
+
+```bash
+qmu prune --build-residue --dry-run   # always preview first
+qmu prune --build-residue
+```
+
+It **never** removes `vmlinux`, `vmlinux.unstripped`, `System.map`, `Makefile`,
+`.config`, anything under `arch/*/boot/`, or any symlink. That is not caution for
+its own sake: when kbuild's `make scripts_gdb` step fails (it does on 4.x, under
+`pipefail`, before the artifact copy), the source tree holds the *only* copy of
+that build's kernel. Reclaiming residue leaves the build a cache hit.
+
+Results are bucketed, and the buckets partition the total:
+
+| Bucket | Meaning |
+|---|---|
+| `eligible` | will be removed |
+| `held_back` | tree modified inside `--older-than`; may be mid-build |
+| `refused` | parent dir not writable, or referenced by an instance record |
+
+`--older-than` defaults to 86400 and is **floored at 600s** for this mode:
+kbuild bind-mounts the source tree read-write for the whole build, so a lower
+value is refused rather than clamped. `qmu cache du`/`ls` accept any value (they
+never delete) and annotate when you ask for one prune would refuse.
+
+Prevent residue at the source with `tools/kbuild.sh --keep-residue` (default is
+to clean after a successful build).
 
 ## Harness mode (boot-and-die kernels)
 
@@ -920,7 +974,9 @@ Exits non-zero if no config is found (prints a `qmu config init` tip). SSH key e
 
 ## Files on disk
 
-Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
+Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`). That is
+only one of four subtrees in the cache — see [Cache on disk](#cache-on-disk) for the
+rest, which `prune --vm/--all` does not touch.
 
 | File                | Purpose                              | Removed by |
 |---------------------|--------------------------------------|------------|
@@ -930,6 +986,8 @@ Each VM keeps state under `~/.cache/qmu/instances/` (or `$QMU_CACHE_DIR`):
 | `<name>.qemu.log`   | QEMU stdout/stderr log               | `kill`, `prune`, `wait` harness auto-clean — **kept** by `kill --no-clean`, `prune --keep-logs`, `wait --no-clean` |
 
 `qmu list` shows running and stopped VMs with a status marker so you can see what's recoverable.
+`qmu cache du` does the same for the cache as a whole, including the `kernels/`,
+`rootfs/` and `targets/` subtrees no instance command reports on.
 
 ## Known Limitations
 

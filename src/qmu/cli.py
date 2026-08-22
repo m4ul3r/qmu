@@ -74,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     lifecycle._add_list(sub)
     lifecycle._add_status(sub)
     lifecycle._add_doctor(sub)
+    meta._add_cache(sub)
     meta._add_config(sub)
     qmp_cmds._add_snapshot(sub)
     guest._add_push(sub)

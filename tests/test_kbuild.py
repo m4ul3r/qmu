@@ -117,6 +117,21 @@ def write_artifact(relative, content):
 
 write_artifact("bzImage", "kernel image\\n")
 write_artifact("vmlinux", "ELF symbols\\n")
+write_artifact("System.map", "ffffffff81000000 T _text\\n")
+
+# The real build leaves intermediates in the bind-mounted source tree, plus the
+# artifacts kbuild copies out. clean_build_residue runs host-side, after this.
+(source / "kernel").mkdir(parents=True, exist_ok=True)
+(source / "arch/x86/boot").mkdir(parents=True, exist_ok=True)
+(source / "kernel/fork.o").write_text("obj\\n")
+(source / "kernel/.fork.o.cmd").write_text("savedcmd := gcc\\n")
+(source / "built-in.a").write_text("ar\\n")
+(source / "kernel/mod.ko").write_text("ko\\n")
+(source / "vmlinux").write_text("ELF symbols\\n")
+(source / "System.map").write_text("ffffffff81000000 T _text\\n")
+(source / "vmlinux.unstripped").write_text("ELF unstripped\\n")
+(source / ".config").write_text("CONFIG_X=y\\n")
+(source / "arch/x86/boot/bzImage").write_text("kernel image\\n")
 write_artifact("scripts/gdb/vmlinux-gdb.py", "# generated loader\\n")
 write_artifact("scripts/gdb/linux/constants.py", "LX_CONFIG_HZ = 250\\n")
 loader = output / "vmlinux-gdb.py"
@@ -388,3 +403,71 @@ def test_config_only_output_shell_quotes_literal_hostile_cache_path(
     assert not (tmp_path / "injected-cache").exists()
     assert evaluated.returncode == 0, evaluated.stderr
     assert evaluated.stdout == str(hostile.cache / "kernels/7.0/x86_64/.config") + "\n"
+
+
+# ---------------------------------------------------------------------------
+# System.map preservation + host-side residue clean
+# ---------------------------------------------------------------------------
+
+RESIDUE = ("kernel/fork.o", "kernel/.fork.o.cmd", "built-in.a", "kernel/mod.ko")
+PROTECTED = (
+    "Makefile", ".config", "vmlinux", "System.map", "vmlinux.unstripped",
+    "arch/x86/boot/bzImage",
+)
+
+
+def test_system_map_is_copied_to_the_output_directory(kbuild_env):
+    """kbuild never preserved System.map, so the source tree held the only copy.
+
+    mktarget.sh keeps System.map for its targets and the ubuntu-target skill
+    documents it as the kbase fallback, so the omission was a real gap.
+    """
+    result = kbuild_env.run()
+    assert result.returncode == 0, result.stderr
+    outdir = kbuild_env.cache / "kernels/7.0/x86_64"
+    assert (outdir / "System.map").is_file()
+    assert (outdir / "System.map").read_text().strip().endswith("_text")
+
+
+def test_residue_is_cleaned_by_default_and_artifacts_survive(kbuild_env):
+    result = kbuild_env.run()
+    assert result.returncode == 0, result.stderr
+    src = kbuild_env.source_makefile.parent
+
+    for relative in RESIDUE:
+        assert not (src / relative).exists(), f"{relative} should have been cleaned"
+    for relative in PROTECTED:
+        assert (src / relative).is_file(), f"{relative} must never be cleaned"
+
+
+def test_keep_residue_leaves_everything_in_place(kbuild_env):
+    result = kbuild_env.run("--keep-residue")
+    assert result.returncode == 0, result.stderr
+    src = kbuild_env.source_makefile.parent
+    for relative in RESIDUE + PROTECTED:
+        assert (src / relative).is_file(), f"{relative} should have been kept"
+
+
+def test_cleaned_tree_is_still_a_cache_hit_with_no_docker_run(kbuild_env):
+    """The whole point: cleaning must not invalidate the build cache.
+
+    build_cache_complete() needs only $SRCDIR/Makefile from the source tree,
+    and the clean never touches it.
+    """
+    first = kbuild_env.run()
+    assert first.returncode == 0, first.stderr
+    kbuild_env.clear_docker_log()
+
+    second = kbuild_env.run(fail_if_docker_runs=True)
+    assert second.returncode == 0, second.stderr
+    assert kbuild_env.docker_runs() == [], "a cleaned tree forced a rebuild"
+    assert _parse_assignments(second.stdout)["KERNEL_SRC"].endswith("linux-7.0")
+
+
+def test_clean_is_scoped_to_the_source_tree_and_spares_arch_boot(kbuild_env):
+    result = kbuild_env.run()
+    assert result.returncode == 0, result.stderr
+    src = kbuild_env.source_makefile.parent
+    # arch/*/boot is pruned wholesale: firmware-over-qmu recovers Image from there
+    # when kbuild's scripts_gdb step aborts the artifact copy on 4.x.
+    assert (src / "arch/x86/boot/bzImage").is_file()
