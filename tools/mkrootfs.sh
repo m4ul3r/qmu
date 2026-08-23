@@ -15,6 +15,7 @@ CACHE="${QMU_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/qmu}"
 ARCH="x86_64"
 RELEASE="bookworm"
 SIZE="${QMU_ROOTFS_SIZE:-2G}"
+DEFAULT_SIZE="$SIZE"   # legacy-path reference, captured before option parsing
 SSH_KEY_ARG=""
 PACKAGES=""
 OUTDIR_OVERRIDE=""
@@ -46,6 +47,10 @@ Optional:
   --outdir DIR           Override output directory
   --no-cache             Rebuild even if output exists
   --verbose              Show Docker build output
+  Caching: builds that differ from the defaults (--packages, --size,
+  --ssh-key) get their own cache directory keyed by those options;
+  default-argument builds keep using the legacy unkeyed path.
+
   -h, --help             Show this help
 
 Environment:
@@ -104,16 +109,85 @@ case "$ARCH" in
 esac
 
 # ---------------------------------------------------------------------------
-# output directory
+# SSH key (validated here, before the build key, which hashes the public half)
 # ---------------------------------------------------------------------------
+if [[ -n "$SSH_KEY_ARG" ]]; then
+  [[ -f "$SSH_KEY_ARG" ]] || die "SSH private key not found: $SSH_KEY_ARG"
+  [[ -f "${SSH_KEY_ARG}.pub" ]] || die "SSH public key not found: ${SSH_KEY_ARG}.pub"
+fi
+
+# ---------------------------------------------------------------------------
+# build key -- a digest of everything that changes the image produced
+#
+# Mirrors mktarget.sh: the cache directory name stays human-findable (release,
+# arch), and every OTHER build-affecting input goes into this digest. The
+# completion stamp records it and every cache hit re-checks it, so an image
+# built with different --packages / --size / --ssh-key is never silently
+# served for a run asking for something else.
+# ---------------------------------------------------------------------------
+build_key_material() {
+  echo "arch=$ARCH"
+  echo "release=$RELEASE"
+  echo "size=$SIZE"
+  echo "packages=$(printf '%s' "$PACKAGES" | tr ',' ' ' | awk '{$1=$1; print}')"
+  if [[ -n "$SSH_KEY_ARG" ]]; then
+    echo "ssh_pubkey=$(sha256sum -- "${SSH_KEY_ARG}.pub" | awk '{print $1}')"
+  fi
+}
+BUILD_KEY="$(build_key_material | sha256sum | awk '{print $1}')"
+
+# ---------------------------------------------------------------------------
+# output directory
+#
+# Same DEFAULT_SHAPE/VARIANT scheme as mktarget.sh: the legacy unkeyed path
+# keeps serving builds made with exactly the default arguments, so pre-existing
+# caches stay valid. A build that differs from the defaults in any way gets its
+# own directory keyed by the build digest, so alternating variants cache side
+# by side instead of evicting each other. Correctness does not rest on this --
+# the stamp check does -- it only stops two legitimate variants from sharing a
+# directory.
+# ---------------------------------------------------------------------------
+DEFAULT_SHAPE=true
+[[ "$SIZE"           == "$DEFAULT_SIZE" ]] || DEFAULT_SHAPE=false
+[[ -z "$PACKAGES"    ]]                   || DEFAULT_SHAPE=false
+[[ -z "$SSH_KEY_ARG" ]]                   || DEFAULT_SHAPE=false
+
 if [[ -n "$OUTDIR_OVERRIDE" ]]; then
   OUTDIR="$OUTDIR_OVERRIDE"
 else
   OUTDIR="$CACHE/rootfs/$RELEASE/$ARCH"
+  [[ "$DEFAULT_SHAPE" == true ]] || OUTDIR="$CACHE/rootfs/$RELEASE/${ARCH}-${BUILD_KEY:0:8}"
 fi
+STAMP_OUT="$OUTDIR/.mkrootfs-stamp"
 
-# idempotency check
-if [[ "$NO_CACHE" == false && -f "$OUTDIR/rootfs.img" ]]; then
+# ---------------------------------------------------------------------------
+# cache gate
+#
+# A hit requires the image AND a stamp whose recorded build key equals this
+# run's. Two deliberate exceptions:
+#   * --no-cache skips the gate entirely.
+#   * a directory written before stamps existed holds an image built under the
+#     old contract -- default arguments only -- so a default-shaped request may
+#     still serve it. Any non-default request is routed to its own keyed
+#     directory above and never sees a legacy image.
+# The stamp is removed before a build starts and written last, so an
+# interrupted build can never look complete.
+# ---------------------------------------------------------------------------
+MISMATCH_NOTE=""
+cache_hit() {
+  [[ -f "$OUTDIR/rootfs.img" ]] || return 1
+  if [[ -f "$STAMP_OUT" ]]; then
+    local recorded
+    recorded="$(sed -n 's/^build_key=//p' "$STAMP_OUT" | head -n1)"
+    if [[ "$recorded" == "$BUILD_KEY" ]]; then return 0; fi
+    MISMATCH_NOTE="cached image at $OUTDIR/rootfs.img was built with different options than requested (requested: size=$SIZE packages='${PACKAGES:-<none>}' ssh-key=${SSH_KEY_ARG:-<generated>})"
+    return 1
+  fi
+  # No stamp: only the legacy default path may serve an unstamped image.
+  [[ "$DEFAULT_SHAPE" == true ]]
+}
+
+if [[ "$NO_CACHE" == false ]] && cache_hit; then
   log "cached rootfs found at $OUTDIR/rootfs.img"
   echo "ROOTFS=$OUTDIR/rootfs.img"
   if [[ -n "$SSH_KEY_ARG" ]]; then
@@ -123,6 +197,10 @@ if [[ "$NO_CACHE" == false && -f "$OUTDIR/rootfs.img" ]]; then
   fi
   exit 0
 fi
+if [[ -n "$MISMATCH_NOTE" ]]; then
+  log "note: $MISMATCH_NOTE"
+  log "note: rebuilding with the requested options (previous image will be replaced)"
+fi
 
 mkdir -p "$OUTDIR"
 
@@ -131,8 +209,6 @@ mkdir -p "$OUTDIR"
 # ---------------------------------------------------------------------------
 if [[ -n "$SSH_KEY_ARG" ]]; then
   PRIVKEY="$SSH_KEY_ARG"
-  [[ -f "$PRIVKEY" ]] || die "SSH private key not found: $PRIVKEY"
-  [[ -f "${PRIVKEY}.pub" ]] || die "SSH public key not found: ${PRIVKEY}.pub"
 else
   PRIVKEY="$OUTDIR/id_ed25519"
   if [[ ! -f "$PRIVKEY" ]]; then
@@ -142,6 +218,10 @@ else
 fi
 chmod 600 "$PRIVKEY"
 PUBKEY_CONTENT="$(cat "${PRIVKEY}.pub")"
+
+# From here on the directory is mid-build; drop any stale stamp so an
+# interrupted run can never satisfy the cache gate.
+rm -f -- "$STAMP_OUT"
 
 # ---------------------------------------------------------------------------
 # Docker buildx / binfmt check
@@ -284,6 +364,24 @@ fi
 # output
 # ---------------------------------------------------------------------------
 if [[ -f "$OUTDIR/rootfs.img" ]]; then
+  # completion stamp -- written LAST, and only here. Its existence plus a
+  # matching build key is what makes this directory a cache hit; it is
+  # assembled beside the final name and renamed into place so even a kill
+  # during the write cannot leave a partial stamp that parses.
+  {
+    echo "build_key=$BUILD_KEY"
+    echo "arch=$ARCH"
+    echo "release=$RELEASE"
+    echo "size=$SIZE"
+    echo "packages=$PACKAGES"
+    if [[ -n "$SSH_KEY_ARG" ]]; then
+      echo "ssh_key=external:$SSH_KEY_ARG"
+    else
+      echo "ssh_key=generated:$OUTDIR/id_ed25519"
+    fi
+    echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$STAMP_OUT.part"
+  mv -f "$STAMP_OUT.part" "$STAMP_OUT"
   step "Rootfs ready: $OUTDIR/rootfs.img"
   echo "ROOTFS=$OUTDIR/rootfs.img"
   echo "SSH_KEY=$PRIVKEY"

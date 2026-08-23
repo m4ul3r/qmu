@@ -125,10 +125,16 @@ recipe, including the arm32 virtio-MMIO drive form and pry rebasing.
 ```
 ~/.cache/qmu/rootfs/
   bookworm/
-    x86_64/
+    x86_64/                       # default-argument builds (legacy path)
       rootfs.img        # raw ext4 image
       id_ed25519        # SSH private key (auto-generated)
       id_ed25519.pub    # SSH public key
+      .mkrootfs-stamp   # records the build key + options
+    x86_64-<key8>/                # builds that differ from the defaults
+      rootfs.img                  # (--packages / --size / --ssh-key each
+      id_ed25519                  #  select a variant keyed by those options)
+      id_ed25519.pub
+      .mkrootfs-stamp
     arm64/
       rootfs.img
       id_ed25519
@@ -136,6 +142,14 @@ recipe, including the arm32 virtio-MMIO drive form and pry rebasing.
   bullseye/
     ...
 ```
+
+A cache hit requires an image plus a completion stamp whose recorded build key
+matches the requested options. Default-argument runs still serve pre-existing
+unkeyed directories written before stamps existed. An image built with
+different `--packages` / `--size` / `--ssh-key` is never silently returned:
+the request gets its own keyed variant, or — when the directory already holds a
+stamp for different options — the mismatched options are named and the image is
+rebuilt.
 
 Use `--no-cache` to force a rebuild. Use `--outdir` to place output elsewhere.
 
