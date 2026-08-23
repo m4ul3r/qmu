@@ -12,6 +12,7 @@ modules import their shared helpers from here verbatim.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import sys
@@ -134,7 +135,21 @@ def _emit(
         else None
     )
     if getattr(args, "format", "text") == "text":
-        rendered = "\n".join(text) if isinstance(text, list) else text
+        # QMP results can be lists of non-strings (e.g. a list of dicts from
+        # introspection commands). Render one line per item: strings as-is,
+        # anything else (dicts, scalars) as compact single-line JSON so text
+        # mode never raises on a list-of-* payload. JSON mode still receives
+        # `data` untouched below, so its output is byte-identical.
+        rendered = (
+            "\n".join(
+                item
+                if isinstance(item, str)
+                else json.dumps(item, separators=(",", ":"))
+                for item in text
+            )
+            if isinstance(text, list)
+            else text
+        )
         _output(rendered, args, stem=stem, source_ok=source_ok)
     else:
         _output(data, args, stem=stem, source_ok=source_ok)
