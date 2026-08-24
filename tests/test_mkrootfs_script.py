@@ -121,7 +121,7 @@ class MkrootfsEnv:
                     img=""
                     for arg in "$@"; do
                       case "$arg" in
-                        *.img) img="$arg" ;;
+                        *.img*) img="$arg" ;;
                       esac
                     done
                     if [[ -n "$img" ]]; then

@@ -134,7 +134,7 @@ build_key_material() {
   echo "arch=$ARCH"
   echo "release=$RELEASE"
   echo "size=$SIZE"
-  echo "packages=$(printf '%s' "$PACKAGES" | tr ',' ' ' | awk '{$1=$1; print}')"
+  echo "packages=$(printf '%s' "$PACKAGES" | tr ',' ' ' | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd, -)"
   if [[ -n "$SSH_KEY_ARG" ]]; then
     echo "ssh_pubkey=$(sha256sum -- "${SSH_KEY_ARG}.pub" | awk '{print $1}')"
   fi
@@ -240,6 +240,11 @@ PUBKEY_CONTENT="$(cat "${PRIVKEY}.pub")"
 # From here on the directory is mid-build; drop any stale stamp so an
 # interrupted run can never satisfy the cache gate.
 rm -f -- "$STAMP_OUT"
+
+# Same atomicity rule as the stamp: the image is built under a .part name and
+# renamed into place only on success, so an interrupted run can never leave a
+# partial image at the final path for a later cache hit to serve.
+rm -f -- "$OUTDIR/rootfs.img.part"
 
 # ---------------------------------------------------------------------------
 # Docker buildx / binfmt check
@@ -364,7 +369,7 @@ if docker export "$CID" | docker run --rm -i \
   bash -c "
     mkdir /rootfs && tar -x -C /rootfs &&
     apt-get update -qq && apt-get install -y -qq e2fsprogs >/dev/null 2>&1 &&
-    mke2fs -F -q -t ext4 -d /rootfs -L qmu-root /output/rootfs.img $SIZE
+    mke2fs -F -q -t ext4 -d /rootfs -L qmu-root /output/rootfs.img.part $SIZE
   "; then
   :
 else
@@ -374,9 +379,10 @@ else
   ROOTDIR="$(mktemp -d)"
   docker export "$CID" | sudo tar -x -C "$ROOTDIR"
   sudo mke2fs -F -q -t ext4 -d "$ROOTDIR" -L qmu-root \
-    "$OUTDIR/rootfs.img" "$SIZE"
-  sudo chown "$(id -u):$(id -g)" "$OUTDIR/rootfs.img"
+    "$OUTDIR/rootfs.img.part" "$SIZE"
+  sudo chown "$(id -u):$(id -g)" "$OUTDIR/rootfs.img.part"
 fi
+mv -f -- "$OUTDIR/rootfs.img.part" "$OUTDIR/rootfs.img"
 
 # ---------------------------------------------------------------------------
 # output

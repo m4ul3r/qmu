@@ -143,15 +143,22 @@ recipe, including the arm32 virtio-MMIO drive form and pry rebasing.
     ...
 ```
 
-A cache hit requires an image plus a completion stamp whose recorded build key
-matches the requested options. Default-argument runs still serve pre-existing
-unkeyed directories written before stamps existed, but print a note that the
-image's `--packages` / `--size` / `--ssh-key` are unverified (the old script
-routed every build there, so its options are unknown) — pass `--no-cache` to
-force a rebuild. An image built with different options is never silently
-returned: non-default requests get their own keyed variant, and a stamped hit
-whose recorded key differs names the mismatched options (image path rendered
-shell-quoted) before rebuilding with the requested ones.
+A stamped cache hit requires an image plus a completion stamp whose recorded
+build key matches the requested options. Default-argument runs may still serve
+pre-existing unkeyed directories written before stamps existed — without any
+stamp check — but print a note that the image's `--packages` / `--size` /
+`--ssh-key` are unverified (the old script routed every build there, so its
+options are unknown) — pass `--no-cache` to force a rebuild. An image built
+with different options is never silently returned: non-default requests get
+their own keyed variant, and a stamped hit whose recorded key differs names
+the mismatched options (image path rendered shell-quoted) before rebuilding
+with the requested ones.
+
+Partial builds can never be served as hits: the image is created under
+`rootfs.img.part` and renamed into place only after mke2fs succeeds (the same
+atomicity rule as the stamp), so an interrupted run leaves nothing at the
+final path. Package lists are order-insensitive in the build key (`strace,htop`
+and `htop,strace` share one cache entry), matching mktarget's normalization.
 
 The default shape is compared against the literal defaults (`2G`, no
 `--packages`, no `--ssh-key`), so an env-overridden `QMU_ROOTFS_SIZE` also
