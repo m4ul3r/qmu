@@ -23,7 +23,11 @@ from .instance import QMUError
 from .qmp import QMPError
 from .ssh import SSHError
 
-from ._cliutil import _add_top_level_common_opts, _emit_error
+from ._cliutil import (
+    _add_top_level_common_opts,
+    _emit_error,
+    _resolve_config_from_args,
+)
 from .commands import guest, lifecycle, meta, qmp_cmds, run
 
 # Re-exported solely so test_snapshot_exit can reach it as ``cli._snapshot_failed``.
@@ -104,7 +108,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
 
+    # Uniform project-config gate (#37): any command operating in a project
+    # context refuses a fatally-invalid project/explicit qmu.toml, byte-
+    # matching `config show`'s refusal — no sibling verb may disagree about
+    # whether the project is valid. Exempt verbs: those that never read
+    # qmu.toml (version/skill), author it (config init), diagnose it
+    # read-only (doctor), or operate purely on host artifact dirs
+    # (cache/rootfs build-side). Gated handlers may resolve again; the
+    # resolution is idempotent and the error identical.
+    _CONFIG_EXEMPT_SUBCOMMANDS = frozenset({
+        "cache", "completion", "config", "doctor", "rootfs", "skill",
+        "version",
+    })
     try:
+        if args.subcommand not in _CONFIG_EXEMPT_SUBCOMMANDS:
+            _resolve_config_from_args(args)
         return handler(args)
     except QMUError as exc:
         # Exit-code contract: 2 is reserved for argparse usage errors (argparse

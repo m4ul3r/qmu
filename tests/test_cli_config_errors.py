@@ -429,3 +429,27 @@ def test_sibling_instance_commands_work_with_valid_project_config(
     captured = capsys.readouterr()
     assert rc == 0, captured.err
     assert "[qmu] Error:" not in captured.err
+
+
+def test_config_gate_is_uniform_across_dispatch(config_cli_env, capsys):
+    """The #37 contract at the dispatch layer: with a fatally-invalid project
+    qmu.toml, EVERY non-exempt subcommand refuses with exit 1 naming the
+    source path and offending key — before any handler logic runs — while
+    exempt verbs keep working."""
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+
+    gated = ["status", "list", "log", "crash", "kill", "prune", "wait",
+             "cont", "snapshot", "dmesg"]
+    for verb in gated:
+        rc = cli.main([verb])
+        captured = capsys.readouterr()
+        assert rc == 1, f"{verb}: expected fatal config refusal, got rc={rc}"
+        assert "[qmu] Error:" in captured.err, verb
+        assert str(config_cli_env["project"].resolve()) in captured.err, verb
+        assert UNKNOWN_KEY in captured.err, verb
+
+    # Exempt verbs keep working. (doctor self-manages the project layer:
+    # it reports the same fatal finding itself, by design.)
+    rc = cli.main(["version"])
+    captured = capsys.readouterr()
+    assert rc == 0 and UNKNOWN_KEY not in captured.err
