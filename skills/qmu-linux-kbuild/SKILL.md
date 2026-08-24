@@ -75,6 +75,14 @@ Use `eval "$(tools/kbuild.sh ...)"` to capture these into shell variables.
 **`--config-only`** prints only `CONFIG=...`. It does not build a kernel, does
 not run `scripts_gdb`, and cannot provide `VMLINUX_GDB` or `lx-*` helpers.
 
+Same-version invocations serialize on a per-version lock
+(`$CACHE/kernels/.src-linux-$VERSION.lock`): a `--config-only` run waits for
+an in-flight build of the same version to finish, and vice versa. This is
+required because every invocation for one version shares the single extracted
+tree in `$CACHE/kernels/src/linux-$VERSION`, and config generation mrpropers
+and reconfigures that tree — interleaving it with a running build corrupts the
+shared tree. Different versions use different lock files and build in parallel.
+
 ### GDB helper setup
 
 After a normal build, wire Linux's generated helpers into pry/GDB:
