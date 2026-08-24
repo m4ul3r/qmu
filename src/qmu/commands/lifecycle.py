@@ -1689,6 +1689,7 @@ def _add_status(sub: argparse._SubParsersAction) -> None:
     # "show" is the common wrong guess for this verb; alias it rather than
     # making the caller spend a round trip discovering the right name.
     p = sub.add_parser("status", aliases=["show"], help="Detailed VM status")
+    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_status)
 
@@ -1760,8 +1761,16 @@ def describe_non_running(
         )
     return None
 
-
 def _handle_status(args: argparse.Namespace) -> int:
+    # Resolve project/explicit config through the shared validating path
+    # (_resolve_config_from_args -> resolve_config -> load_config_file)
+    # exactly like launch/run/doctor/config-show. status reads no boot
+    # settings from qmu.toml, but it operates in project context, so a
+    # fatally-invalid config must gate it identically instead of letting a
+    # caller probe a VM under a config every other command refuses. A broken
+    # GLOBAL config stays warn-and-continue inside resolve_config. The
+    # "show" alias shares this handler, so both verbs refuse together.
+    _resolve_config_from_args(args)
     explanation = describe_non_running(args.vm) if args.vm else None
     if explanation is not None:
         raise QMUError(explanation)
