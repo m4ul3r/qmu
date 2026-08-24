@@ -391,3 +391,41 @@ def test_valid_project_config_keeps_status_working(
     assert payload["ok"] is True
     assert payload["vm_id"] == "live"
 
+
+
+@pytest.mark.parametrize("argv", [
+    ["list"],
+    ["log", "--vm", "live"],
+    ["crash", "--vm", "live"],
+], ids=["list", "log", "crash"])
+def test_sibling_instance_commands_fatal_on_invalid_project_config(
+    argv, config_cli_env, running_instance, capsys
+):
+    """Same bypass class as pre-fix #37 status: list/log/crash answer from
+    instance records but operate in project context, so a fatally-invalid
+    project qmu.toml must refuse them exactly like config show/status —
+    exit 1 naming the source path and the offending key."""
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "[qmu] Error:" in captured.err
+    assert str(config_cli_env["project"].resolve()) in captured.err
+    assert UNKNOWN_KEY in captured.err
+
+
+@pytest.mark.parametrize("argv", [
+    ["list"],
+    ["log", "--vm", "live"],
+])
+def test_sibling_instance_commands_work_with_valid_project_config(
+    argv, config_cli_env, running_instance, capsys
+):
+    """The gate must not break the happy path: with a valid (or absent)
+    project qmu.toml the sibling commands behave exactly as before."""
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "[qmu] Error:" not in captured.err

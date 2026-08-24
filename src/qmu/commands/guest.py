@@ -40,6 +40,7 @@ from .._cliutil import (
     _make_ssh,
     _preflight_ssh_guest,
     _require_ssh,
+    _resolve_config_from_args,
 )
 
 
@@ -745,10 +746,16 @@ def _add_crash(sub: argparse._SubParsersAction) -> None:
         ),
     )
     _add_common_opts(p)
+    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
     p.set_defaults(handler=_handle_crash)
 
 
 def _handle_crash(args: argparse.Namespace) -> int:
+    # Same project-context gate as status/list (see lifecycle._handle_status):
+    # crash triage runs under the project's qmu.toml, so a fatally-invalid
+    # config refuses it identically instead of leaving a sibling verb that
+    # answers while every config-resolving command refuses.
+    _resolve_config_from_args(args)
     inst = find_instance(args.vm)
     crash_autoselect_note = autoselect_note(inst, args.vm)
     history = args.full_history
@@ -808,6 +815,7 @@ def _add_log(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--context", "-C", type=int, default=0, dest="context",
                    help="With --grep: also keep N lines around each match")
     _add_common_opts(p)
+    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
     p.set_defaults(handler=_handle_log)
 
 
@@ -842,6 +850,10 @@ def _grep_lines(text: str, pattern: str, context: int) -> tuple[str, int]:
 
 
 def _handle_log(args: argparse.Namespace) -> int:
+    # Same project-context gate as status/list/crash (lifecycle._handle_status):
+    # log reads run under the project's qmu.toml, so a fatally-invalid config
+    # refuses here identically — one validity answer for every sibling verb.
+    _resolve_config_from_args(args)
     inst = find_instance(args.vm)
     note = autoselect_note(inst, args.vm)
 

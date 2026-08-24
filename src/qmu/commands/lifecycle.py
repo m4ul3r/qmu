@@ -1588,10 +1588,16 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
 def _add_list(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("list", help="List VMs (running and stopped)")
     _add_common_opts(p)
+    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
     p.set_defaults(handler=_handle_list)
 
 
 def _handle_list(args: argparse.Namespace) -> int:
+    # Same project-context gate as status (see _handle_status): list answers
+    # from instance records but operates under the project's qmu.toml, so a
+    # fatally-invalid config must refuse it exactly like every command that
+    # resolves config — no validity disagreement between sibling verbs.
+    _resolve_config_from_args(args)
     running = list_instances()
     stopped = list_stopped_instances()
     if not running and not stopped:
