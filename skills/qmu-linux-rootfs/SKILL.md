@@ -145,11 +145,17 @@ recipe, including the arm32 virtio-MMIO drive form and pry rebasing.
 
 A cache hit requires an image plus a completion stamp whose recorded build key
 matches the requested options. Default-argument runs still serve pre-existing
-unkeyed directories written before stamps existed. An image built with
-different `--packages` / `--size` / `--ssh-key` is never silently returned:
-the request gets its own keyed variant, or — when the directory already holds a
-stamp for different options — the mismatched options are named and the image is
-rebuilt.
+unkeyed directories written before stamps existed, but print a note that the
+image's `--packages` / `--size` / `--ssh-key` are unverified (the old script
+routed every build there, so its options are unknown) — pass `--no-cache` to
+force a rebuild. An image built with different options is never silently
+returned: non-default requests get their own keyed variant, and a stamped hit
+whose recorded key differs names the mismatched options (image path rendered
+shell-quoted) before rebuilding with the requested ones.
+
+The default shape is compared against the literal defaults (`2G`, no
+`--packages`, no `--ssh-key`), so an env-overridden `QMU_ROOTFS_SIZE` also
+routes to a keyed variant rather than the legacy path.
 
 Use `--no-cache` to force a rebuild. Use `--outdir` to place output elsewhere.
 

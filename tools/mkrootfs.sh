@@ -15,7 +15,12 @@ CACHE="${QMU_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/qmu}"
 ARCH="x86_64"
 RELEASE="bookworm"
 SIZE="${QMU_ROOTFS_SIZE:-2G}"
-DEFAULT_SIZE="$SIZE"   # legacy-path reference, captured before option parsing
+# Literal "2G", never "$SIZE": capturing the reference after the expansion
+# above makes the DEFAULT_SHAPE check below tautological, so an env-overridden
+# QMU_ROOTFS_SIZE would pass as a default-shaped build and get routed to the
+# legacy unkeyed directory. mktarget.sh:606 compares against its '4G' literal
+# for exactly this reason.
+DEFAULT_SIZE="2G"
 SSH_KEY_ARG=""
 PACKAGES=""
 OUTDIR_OVERRIDE=""
@@ -164,31 +169,44 @@ STAMP_OUT="$OUTDIR/.mkrootfs-stamp"
 # cache gate
 #
 # A hit requires the image AND a stamp whose recorded build key equals this
-# run's. Two deliberate exceptions:
+# run's. Three deliberate exceptions, each of which must SAY so -- silence on a
+# hit whose options may not match is exactly bug #51:
 #   * --no-cache skips the gate entirely.
+#   * a stamped image whose key differs from this run's gets named: the note
+#     lists the requested options and the run rebuilds with them.
 #   * a directory written before stamps existed holds an image built under the
-#     old contract -- default arguments only -- so a default-shaped request may
-#     still serve it. Any non-default request is routed to its own keyed
-#     directory above and never sees a legacy image.
+#     old contract, which routed EVERY build here regardless of options -- so
+#     its options are unrecorded and unknown. A default-shaped request may
+#     still serve it (that keeps pre-existing caches valid), but prints a note
+#     saying the options are unverified. Any non-default request is routed to
+#     its own keyed directory above and never sees a legacy image.
 # The stamp is removed before a build starts and written last, so an
 # interrupted build can never look complete.
 # ---------------------------------------------------------------------------
 MISMATCH_NOTE=""
+LEGACY_NOTE=""
 cache_hit() {
   [[ -f "$OUTDIR/rootfs.img" ]] || return 1
   if [[ -f "$STAMP_OUT" ]]; then
     local recorded
     recorded="$(sed -n 's/^build_key=//p' "$STAMP_OUT" | head -n1)"
     if [[ "$recorded" == "$BUILD_KEY" ]]; then return 0; fi
-    MISMATCH_NOTE="cached image at $OUTDIR/rootfs.img was built with different options than requested (requested: size=$SIZE packages='${PACKAGES:-<none>}' ssh-key=${SSH_KEY_ARG:-<generated>})"
+    MISMATCH_NOTE="$(printf 'cached image at %q was built with different options than requested (requested: size=%q packages=%q ssh-key=%q)' \
+      "$OUTDIR/rootfs.img" "$SIZE" "${PACKAGES:-<none>}" "${SSH_KEY_ARG:-<generated>}")"
     return 1
   fi
   # No stamp: only the legacy default path may serve an unstamped image.
-  [[ "$DEFAULT_SHAPE" == true ]]
+  if [[ "$DEFAULT_SHAPE" == true ]]; then
+    LEGACY_NOTE="$(printf 'cached image at %q has no completion stamp; it was built before option tracking existed, so its --packages/--size/--ssh-key are UNVERIFIED (use --no-cache to force a rebuild with the current request)' \
+      "$OUTDIR/rootfs.img")"
+    return 0
+  fi
+  return 1
 }
 
 if [[ "$NO_CACHE" == false ]] && cache_hit; then
   log "cached rootfs found at $OUTDIR/rootfs.img"
+  [[ -z "$LEGACY_NOTE" ]] || log "note: $LEGACY_NOTE"
   echo "ROOTFS=$OUTDIR/rootfs.img"
   if [[ -n "$SSH_KEY_ARG" ]]; then
     echo "SSH_KEY=$SSH_KEY_ARG"
