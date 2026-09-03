@@ -92,6 +92,10 @@ def test_second_invocation_blocks_while_version_lock_held(kbuild_env):
             _release(holder)
         stdout, stderr = proc.communicate(timeout=60)
         assert proc.returncode == 0, stderr
+        # A blocked invocation must SAY it is waiting: silence for the length of
+        # a full build is indistinguishable from a hang.
+        assert "waiting for another kbuild invocation" in stderr
+        assert "acquired linux-7.0 source-tree lock" in stderr
         values = _parse_assignments(stdout)
         assert Path(values["KERNEL"]).is_file()
         assert Path(values["VMLINUX"]).is_file()

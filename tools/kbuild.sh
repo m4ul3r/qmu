@@ -229,7 +229,14 @@ SRCDIR="$CACHE/kernels/src/linux-$VERSION"
 # different lock files and stay parallel.
 mkdir -p "$CACHE/kernels"
 exec 9>"$CACHE/kernels/.src-linux-$VERSION.lock"
-flock 9
+# Announce a wait: without this a blocked invocation is silent for the length
+# of a full build, which reads as a hang. log() writes to stderr, so the
+# eval-able stdout contract is untouched.
+if ! flock -n 9; then
+  log "waiting for another kbuild invocation holding the linux-$VERSION source tree..."
+  flock 9
+  log "acquired linux-$VERSION source-tree lock"
+fi
 
 emit_config_output() {
   printf 'CONFIG=%q\n' "$OUTDIR/.config"

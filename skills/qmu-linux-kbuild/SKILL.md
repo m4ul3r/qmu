@@ -82,6 +82,8 @@ required because every invocation for one version shares the single extracted
 tree in `$CACHE/kernels/src/linux-$VERSION`, and config generation mrpropers
 and reconfigures that tree — interleaving it with a running build corrupts the
 shared tree. Different versions use different lock files and build in parallel.
+A blocked invocation prints `kbuild: waiting for another kbuild invocation…` on
+stderr and then proceeds, so a wait is distinguishable from a hang.
 
 ### GDB helper setup
 
