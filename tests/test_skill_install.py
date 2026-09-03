@@ -143,15 +143,64 @@ def test_doctor_reports_ok_on_every_root_the_installer_wrote(install_env, monkey
     assert "partial: 3 installed, 1 missing" in skills["detail"]
 
 
-def test_unusable_agents_root_does_not_half_install_claude(install_env, capsys):
-    """A bad third root must not leave the two working roots partially linked."""
+def _agents_home_is_a_file(home):
+    (home / ".agents").write_text("not a directory")
+    return home / ".agents"
+
+
+def _agents_skills_is_a_file(home):
+    (home / ".agents").mkdir()
+    (home / ".agents" / "skills").write_text("not a directory")
+    return home / ".agents" / "skills"
+
+
+def _agents_skills_is_a_dangling_symlink(home):
+    (home / ".agents").mkdir()
+    (home / ".agents" / "skills").symlink_to(home / "gone")
+    return home / ".agents" / "skills"
+
+
+@pytest.mark.parametrize(
+    "make_blocker",
+    [_agents_home_is_a_file, _agents_skills_is_a_file, _agents_skills_is_a_dangling_symlink],
+    ids=["agents-home-is-file", "agents-skills-is-file", "agents-skills-dangling-symlink"],
+)
+def test_unusable_agents_root_fails_operationally_without_half_installing(
+    install_env, capsys, make_blocker
+):
+    """An unusable auto-detected root aborts before any link, as exit 1 with a remedy.
+
+    Exit 1 (QMUError, operational) and not 4: the offending state is the
+    caller's own filesystem, not a qmu-internal fault. And nothing may be
+    linked into ~/.claude, or the run leaves the roots that DID work partially
+    installed — which the next `qmu doctor` then reports as `partial`.
+    """
     (install_env.home / ".omp" / "agent").mkdir(parents=True)
-    (install_env.home / ".agents").write_text("not a directory")
+    blocker = make_blocker(install_env.home)
 
     rc = cli.main(["skill", "install"])
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
 
-    assert rc != 0
-    assert "Skill installed" not in out
+    assert rc == 1
+    assert "Skill installed" not in captured.out
+    assert str(blocker) in captured.err
+    assert "not a directory" in captured.err
+    assert "AGENTS_HOME" in captured.err
     claude_skills = install_env.home / ".claude" / "skills"
     assert not claude_skills.exists() or not list(claude_skills.iterdir())
+
+
+def test_install_accepts_a_root_symlinked_to_a_real_directory(install_env, tmp_path, capsys):
+    """A dotfiles layout that symlinks ~/.agents/skills elsewhere still installs."""
+    real = tmp_path / "dotfiles-skills"
+    real.mkdir()
+    (install_env.home / ".agents").mkdir()
+    (install_env.home / ".agents" / "skills").symlink_to(real)
+
+    rc = cli.main(["skill", "install"])
+    capsys.readouterr()
+
+    assert rc == 0
+    for name, src in zip(install_env.names, install_env.sources):
+        assert (real / name).is_symlink()
+        assert (real / name).resolve() == src.resolve()

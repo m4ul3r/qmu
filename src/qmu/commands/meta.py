@@ -591,18 +591,52 @@ def _add_skill(sub: argparse._SubParsersAction) -> None:
     s.set_defaults(handler=_handle_skill_install)
 
 
+def _prepare_install_roots(roots: list[Path]) -> None:
+    """Create every install root before the first symlink is written.
+
+    Linking is skill-outer/root-inner, so a root that cannot be created (e.g.
+    ~/.agents exists as a regular file) would otherwise abort mid-loop with
+    ~/.claude holding only the first skill — an auto-detected root breaking the
+    two that already worked.
+
+    mkdir() is the probe as well as the creation: with exist_ok=True it succeeds
+    on a real dir (and on a symlink to one, which is a legitimate dotfiles
+    layout) and raises on every unusable shape — NotADirectoryError when a
+    parent is a file, FileExistsError when the root itself is a file or a
+    dangling symlink, PermissionError when the home is not writable. Those are
+    all the caller's own filesystem state, i.e. operational, so they become
+    QMUError (exit 1, with the remedy) instead of reaching cli's catch-all as a
+    bare errno string on exit 4, which the contract reserves for infra and
+    internal faults.
+    """
+    for root in roots:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            blocker = next(
+                (p for p in (root, *root.parents) if p.is_symlink() or p.exists()),
+                None,
+            )
+            if blocker is not None and not blocker.is_dir():
+                raise QMUError(
+                    f"Cannot install skills into {root}: {blocker} exists but is "
+                    f"not a directory. Remove or move it — or point "
+                    f"CLAUDE_HOME/CODEX_HOME/AGENTS_HOME at another location — "
+                    f"then re-run `qmu skill install`."
+                ) from exc
+            raise QMUError(
+                f"Cannot create skill install root {root}: "
+                f"{exc.strerror or exc}"
+            ) from exc
+
+
 def _handle_skill_install(args: argparse.Namespace) -> int:
     skill_dirs = all_skill_source_dirs()
     if not skill_dirs:
         raise QMUError("No skill sources found under skills/")
 
     roots = skill_install_roots()
-    # Create every root up front: linking is skill-outer/root-inner, so a root
-    # that cannot be created (e.g. ~/.agents is a regular file) would otherwise
-    # abort mid-loop with ~/.claude holding only the first skill — a root the
-    # user never asked for breaking the ones that already worked.
-    for root in roots:
-        root.mkdir(parents=True, exist_ok=True)
+    _prepare_install_roots(roots)
     for src in skill_dirs:
         name = src.name
         for root in roots:

@@ -9,7 +9,7 @@ uv tool install -e .
 qmu skill install
 ```
 
-`qmu skill install` symlinks the bundled skills into `~/.claude/skills/`. It also installs into `~/.codex/skills/` when `~/.codex/` exists and into `~/.agents/skills/` when an OMP/agents install is detected (`~/.agents/` or `~/.omp/agent/`). Restart your agent to pick up the new skills.
+`qmu skill install` symlinks the bundled skills into `~/.claude/skills/`. It also installs into `~/.codex/skills/` when `~/.codex/` exists and into `~/.agents/skills/` when an OMP/agents install is detected (`~/.agents/`, `~/.omp/agent/`, or an explicit `AGENTS_HOME`). `CLAUDE_HOME`, `CODEX_HOME`, and `AGENTS_HOME` relocate the corresponding root. Restart your agent to pick up the new skills.
 
 ## Quick Start
 
