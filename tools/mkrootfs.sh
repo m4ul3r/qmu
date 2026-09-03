@@ -6,6 +6,11 @@
 #
 # Output is eval-able:  eval $(tools/mkrootfs.sh --arch arm64)
 #                        qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS"
+# STDOUT carries nothing but those VAR=value assignments, shell-quoted with
+# printf %q (the same discipline as kbuild.sh) so a path with a space survives
+# the eval. Every log line, every note, and every build command's own chatter
+# goes to stderr -- a cache MISS used to leak `docker build -q`'s image id and
+# mke2fs's "Creating regular file" onto stdout, which broke the eval above.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -119,6 +124,11 @@ esac
 if [[ -n "$SSH_KEY_ARG" ]]; then
   [[ -f "$SSH_KEY_ARG" ]] || die "SSH private key not found: $SSH_KEY_ARG"
   [[ -f "${SSH_KEY_ARG}.pub" ]] || die "SSH public key not found: ${SSH_KEY_ARG}.pub"
+  # Readability is checked here rather than at the `cat` on the build path: an
+  # existing-but-unreadable public half is a permission fault, and reaching
+  # that `cat` with one produces a raw `cat: Permission denied` and no
+  # `mkrootfs: error:` line at all.
+  [[ -r "${SSH_KEY_ARG}.pub" ]] || die "cannot read SSH public key ${SSH_KEY_ARG}.pub: check its permissions"
 fi
 
 # ---------------------------------------------------------------------------
@@ -170,6 +180,22 @@ else
 fi
 STAMP_OUT="$OUTDIR/.mkrootfs-stamp"
 
+# An existing private half means this run will NOT regenerate the pair, so
+# the public half gets read twice -- to re-check a stamped hit's recorded
+# digest, and to bake into a rebuild. A missing or unreadable one is
+# therefore a fault, and it is reported HERE, before the cache gate, because
+# both alternatives are wrong answers: the gate would compare an empty digest
+# and announce a CHANGED SSH KEY when nothing about the key changed, and the
+# rebuild would die inside `cat` with a raw error and no `mkrootfs:` line.
+if [[ -z "$SSH_KEY_ARG" && -f "$OUTDIR/id_ed25519" ]]; then
+  if [[ ! -e "$OUTDIR/id_ed25519.pub" ]]; then
+    die "SSH public key missing: $OUTDIR/id_ed25519.pub (its private half is already in that directory, so mkrootfs will not regenerate the pair; restore it with: ssh-keygen -y -f $OUTDIR/id_ed25519 > $OUTDIR/id_ed25519.pub)"
+  fi
+  if [[ ! -f "$OUTDIR/id_ed25519.pub" || ! -r "$OUTDIR/id_ed25519.pub" ]]; then
+    die "cannot read $OUTDIR/id_ed25519.pub: check its permissions and that it is a regular file (its public half is needed to verify the cached image and to rebuild)"
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # cache gate
 #
@@ -179,18 +205,28 @@ STAMP_OUT="$OUTDIR/.mkrootfs-stamp"
 #   * --no-cache skips the gate entirely.
 #   * a stamped image whose key differs from this run's gets named: the note
 #     lists the requested options and the run rebuilds with them.
-#   * a directory written before stamps existed holds an image built under the
-#     old contract, which routed EVERY build here regardless of options -- so
-#     its options are unrecorded and unknown. A default-shaped request may
-#     still serve it (that keeps pre-existing caches valid), but prints a note
-#     saying the options are unverified. Any non-default request is routed to
-#     its own keyed directory above and never sees a legacy image.
-# The stamp is written exactly once, atomically (temp file + rename), right
-# after the new image itself is published the same way. A build that fails
-# before that point never touches the previous (image, stamp) pair, so it
-# stays exactly as coherent as it was; a build that fails cannot manufacture
-# a stamp that certifies an image it never finished.
+#   * a directory holding an image with no stamp at all. Its options are
+#     unrecorded and unknown -- it may predate stamps (the old contract
+#     routed EVERY build here regardless of options) or its stamp may have
+#     been removed. A default-shaped request may still serve it (that keeps
+#     pre-existing caches valid), but prints a note saying the options are
+#     unverified, naming the possibilities rather than asserting one. Any
+#     non-default request is routed to its own keyed directory above and
+#     never sees an unstamped image.
+# The stamp is published TWICE per build, each time atomically (temp file +
+# rename) and each under its own temp name: a poison value immediately before
+# the image's own publish, then the real one immediately after. A build that
+# fails before the poison never touches the previous (image, stamp) pair, so
+# it stays exactly as coherent as it was; a build that dies inside the publish
+# window leaves a stamp that matches no request at all, which is a named
+# mismatch and a rebuild -- never a stamp certifying an image it does not
+# describe.
 # ---------------------------------------------------------------------------
+# A real build key is always a sha256 hex digest, so a value carrying this
+# prefix can match no request. It is what the publish window writes, and
+# reading one back means a previous build died mid-publish.
+STAMP_PUBLISHING_KEY_PREFIX="publishing-"
+
 MISMATCH_NOTE=""
 LEGACY_NOTE=""
 cache_hit() {
@@ -201,12 +237,14 @@ cache_hit() {
     if [[ "$recorded" == "$BUILD_KEY" ]]; then
       # BUILD_KEY cannot cover an auto-generated key's public half (see the
       # comment above it), so a generating-mode hit re-checks the stamp's
-      # recorded pubkey hash against whatever key is on disk right now.
-      if [[ -z "$SSH_KEY_ARG" && -f "$OUTDIR/id_ed25519.pub" ]]; then
+      # recorded pubkey hash against whatever key is on disk right now. Gated
+      # on -r and on a non-empty digest: an unreadable .pub is a permission
+      # fault (reported before this gate), never a changed key.
+      if [[ -z "$SSH_KEY_ARG" && -r "$OUTDIR/id_ed25519.pub" ]]; then
         local recorded_pubkey current_pubkey
         recorded_pubkey="$(sed -n 's/^ssh_pubkey_sha256=//p' "$STAMP_OUT" | head -n1)"
-        current_pubkey="$(sha256sum -- "$OUTDIR/id_ed25519.pub" | awk '{print $1}')"
-        if [[ -n "$recorded_pubkey" && "$recorded_pubkey" != "$current_pubkey" ]]; then
+        current_pubkey="$(sha256sum -- "$OUTDIR/id_ed25519.pub" 2>/dev/null | awk '{print $1}')"
+        if [[ -n "$recorded_pubkey" && -n "$current_pubkey" && "$recorded_pubkey" != "$current_pubkey" ]]; then
           MISMATCH_NOTE="$(printf 'cached image at %q was built with a different SSH key than the one now at %s (its public half changed since the build)' \
             "$OUTDIR/rootfs.img" "$OUTDIR/id_ed25519")"
           return 1
@@ -214,13 +252,20 @@ cache_hit() {
       fi
       return 0
     fi
+    if [[ "$recorded" == "$STAMP_PUBLISHING_KEY_PREFIX"* ]]; then
+      # The poison value names no build, so it is never rendered as an option
+      # set. What it does say is exactly what happened.
+      MISMATCH_NOTE="$(printf 'cached image at %q was left by a build that died while publishing it (its stamp still reads publish-in-progress), so the image on disk answers no known request' \
+        "$OUTDIR/rootfs.img")"
+      return 1
+    fi
     MISMATCH_NOTE="$(printf 'cached image at %q was built with different options than requested (requested: size=%s packages=%s ssh-key=%s)' \
       "$OUTDIR/rootfs.img" "$SIZE" "${PACKAGES:-<none>}" "${SSH_KEY_ARG:-<generated>}")"
     return 1
   fi
   # No stamp: only the legacy default path may serve an unstamped image.
   if [[ "$DEFAULT_SHAPE" == true ]]; then
-    LEGACY_NOTE="$(printf 'cached image at %q has no completion stamp; it was built before option tracking existed, so its --packages/--size/--ssh-key are UNVERIFIED (use --no-cache to force a rebuild with the current request)' \
+    LEGACY_NOTE="$(printf 'cached image at %q has no completion stamp, so its --packages/--size/--ssh-key are UNVERIFIED (a cache directory written before option tracking existed, or one whose stamp was removed; use --no-cache to force a rebuild with the current request)' \
       "$OUTDIR/rootfs.img")"
     return 0
   fi
@@ -230,11 +275,11 @@ cache_hit() {
 if [[ "$NO_CACHE" == false ]] && cache_hit; then
   log "cached rootfs found at $OUTDIR/rootfs.img"
   [[ -z "$LEGACY_NOTE" ]] || log "note: $LEGACY_NOTE"
-  echo "ROOTFS=$OUTDIR/rootfs.img"
+  printf 'ROOTFS=%q\n' "$OUTDIR/rootfs.img"
   if [[ -n "$SSH_KEY_ARG" ]]; then
-    echo "SSH_KEY=$SSH_KEY_ARG"
+    printf 'SSH_KEY=%q\n' "$SSH_KEY_ARG"
   elif [[ -f "$OUTDIR/id_ed25519" ]]; then
-    echo "SSH_KEY=$OUTDIR/id_ed25519"
+    printf 'SSH_KEY=%q\n' "$OUTDIR/id_ed25519"
   fi
   exit 0
 fi
@@ -282,7 +327,7 @@ case "$ARCH" in
 esac
 
 if [[ "$NEED_BINFMT" == true ]]; then
-  if ! docker run --rm --platform "$PLATFORM" debian:${RELEASE}-slim true 2>/dev/null; then
+  if ! docker run --rm --platform "$PLATFORM" debian:${RELEASE}-slim true >/dev/null 2>&1; then
     die "cannot run $PLATFORM containers. Register binfmt_misc emulators:
   docker run --rm --privileged tonistiigi/binfmt:latest --install all"
   fi
@@ -330,7 +375,7 @@ docker build $DOCKER_QUIET \
   --build-arg "ROOT_DEV=$ROOT_DEV" \
   --build-arg "EXTRA_PACKAGES=$EXTRA_PACKAGES" \
   -t "$IMAGE_TAG" \
-  -f - "$local_ctx" <<'DOCKERFILE'
+  -f - "$local_ctx" >&2 <<'DOCKERFILE'
 ARG RELEASE=bookworm
 FROM debian:${RELEASE}-slim
 ARG PUBKEY
@@ -389,28 +434,46 @@ if docker export "$CID" | docker run --rm -i \
     mkdir /rootfs && tar -x -C /rootfs &&
     apt-get update -qq && apt-get install -y -qq e2fsprogs >/dev/null 2>&1 &&
     mke2fs -F -q -t ext4 -d /rootfs -L qmu-root /output/rootfs.img.part $SIZE
-  "; then
+  " >&2; then
   :
 else
   RC=$?
   log "ext4 image creation failed (exit $RC)"
   log "fallback: trying sudo mke2fs..."
   ROOTDIR="$(mktemp -d)"
-  docker export "$CID" | sudo tar -x -C "$ROOTDIR"
+  docker export "$CID" | sudo tar -x -C "$ROOTDIR" >&2
   sudo mke2fs -F -q -t ext4 -d "$ROOTDIR" -L qmu-root \
-    "$OUTDIR/rootfs.img.part" "$SIZE"
-  sudo chown "$(id -u):$(id -g)" "$OUTDIR/rootfs.img.part"
+    "$OUTDIR/rootfs.img.part" "$SIZE" >&2
+  sudo chown "$(id -u):$(id -g)" "$OUTDIR/rootfs.img.part" >&2
 fi
+
+# Publish window. Poisoning the stamp HERE, before the image is renamed into
+# place, is what keeps the pair honest. Between the two renames the directory
+# holds the new image, and anything that kills the run in that gap
+# (SIGINT/SIGTERM/OOM, ENOSPC or EIO on the stamp write -- which lands
+# immediately after writing a multi-GB image -- an unclean shutdown) would
+# otherwise leave the PREVIOUS stamp certifying an image it does not
+# describe, and the next request for the shape that stamp names would be
+# served at exit 0 with no note at all. Removing the stamp instead is not
+# equivalent: an image with no stamp is served by the legacy default-shape
+# exception as merely UNVERIFIED. A death after this write costs one rebuild.
+{
+  printf 'build_key=%s%s\n' "$STAMP_PUBLISHING_KEY_PREFIX" "$$"
+  printf 'publish_started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$STAMP_OUT.publishing"
+mv -f -- "$STAMP_OUT.publishing" "$STAMP_OUT"
 mv -f -- "$OUTDIR/rootfs.img.part" "$OUTDIR/rootfs.img"
 
 # ---------------------------------------------------------------------------
 # output
 # ---------------------------------------------------------------------------
 if [[ -f "$OUTDIR/rootfs.img" ]]; then
-  # completion stamp -- written LAST, and only here. Its existence plus a
-  # matching build key is what makes this directory a cache hit; it is
-  # assembled beside the final name and renamed into place so even a kill
-  # during the write cannot leave a partial stamp that parses.
+  # completion stamp -- the second and last of this build's two stamp
+  # publishes (the first is the poison above). Its existence plus a matching
+  # build key is what makes this directory a cache hit; it is assembled
+  # beside the final name and renamed into place so even a kill during the
+  # write cannot leave a partial stamp that parses, and so a publish over an
+  # unwritable predecessor still succeeds (rename needs only the directory).
   {
     echo "build_key=$BUILD_KEY"
     echo "arch=$ARCH"
@@ -425,10 +488,10 @@ if [[ -f "$OUTDIR/rootfs.img" ]]; then
     echo "ssh_pubkey_sha256=$(sha256sum -- "${PRIVKEY}.pub" | awk '{print $1}')"
     echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "$STAMP_OUT.part"
-  mv -f "$STAMP_OUT.part" "$STAMP_OUT"
+  mv -f -- "$STAMP_OUT.part" "$STAMP_OUT"
   step "Rootfs ready: $OUTDIR/rootfs.img"
-  echo "ROOTFS=$OUTDIR/rootfs.img"
-  echo "SSH_KEY=$PRIVKEY"
+  printf 'ROOTFS=%q\n' "$OUTDIR/rootfs.img"
+  printf 'SSH_KEY=%q\n' "$PRIVKEY"
 else
   die "build appeared to succeed but $OUTDIR/rootfs.img not found"
 fi

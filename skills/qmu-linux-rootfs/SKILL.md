@@ -51,6 +51,13 @@ ROOTFS=/home/user/.cache/qmu/rootfs/bookworm/x86_64/rootfs.img
 SSH_KEY=/home/user/.cache/qmu/rootfs/bookworm/x86_64/id_ed25519
 ```
 
+Stdout carries nothing but those assignments, on a cache hit and on a full
+build alike: every log line, every note, and every build command's own output
+(`docker build -q`'s image id, mke2fs's `Creating regular file …`) goes to
+stderr. The paths are shell-quoted with `printf %q`, matching
+`tools/kbuild.sh`, so an `--outdir` containing a space still survives the
+`eval`.
+
 ## What's in the rootfs
 
 A qmu-ready Debian base with everything needed for `qmu exec`, `qmu push`, and `qmu compile`:
@@ -79,8 +86,8 @@ Cross-arch builds require binfmt_misc QEMU user-mode emulators registered on the
 
 ## SSH key handling
 
-- **Default (no `--ssh-key`):** Auto-generates an ed25519 keypair into the output directory alongside rootfs.img. Reused on subsequent cached runs.
-- **With `--ssh-key PATH`:** Uses the provided private key; expects `PATH.pub` to exist alongside it.
+- **Default (no `--ssh-key`):** Auto-generates an ed25519 keypair into the output directory alongside rootfs.img. Reused on subsequent cached runs — but the generated key's public half is recorded in the completion stamp and re-checked on every hit, so *replacing* `id_ed25519`/`id_ed25519.pub` in a cache directory busts the hit and rebuilds the image rather than handing back one the new key cannot log into. If the private half is present and the `.pub` is missing or unreadable, the run stops with an error naming that file (restore it with `ssh-keygen -y -f DIR/id_ed25519 > DIR/id_ed25519.pub`) instead of claiming the key changed.
+- **With `--ssh-key PATH`:** Uses the provided private key; expects a readable `PATH.pub` alongside it.
 
 Wire the key into qmu.toml:
 ```toml
@@ -145,20 +152,30 @@ recipe, including the arm32 virtio-MMIO drive form and pry rebasing.
 
 A stamped cache hit requires an image plus a completion stamp whose recorded
 build key matches the requested options. Default-argument runs may still serve
-pre-existing unkeyed directories written before stamps existed — without any
-stamp check — but print a note that the image's `--packages` / `--size` /
-`--ssh-key` are unverified (the old script routed every build there, so its
-options are unknown) — pass `--no-cache` to force a rebuild. An image built
-with different options is never silently returned: non-default requests get
-their own keyed variant, and a stamped hit whose recorded key differs names
-the mismatched options (image path rendered shell-quoted) before rebuilding
-with the requested ones.
+an *unstamped* directory — without any stamp check — but print a note that the
+image's `--packages` / `--size` / `--ssh-key` are UNVERIFIED, naming the
+possibilities rather than asserting one (a directory written before stamps
+existed, or one whose stamp was removed) — pass `--no-cache` to force a
+rebuild. An image built with different options is never silently returned:
+non-default requests get their own keyed variant, and a stamped hit whose
+recorded key differs names the mismatched options (image path rendered
+shell-quoted) before rebuilding with the requested ones.
 
 Partial builds can never be served as hits: the image is created under
 `rootfs.img.part` and renamed into place only after mke2fs succeeds (the same
 atomicity rule as the stamp), so an interrupted run leaves nothing at the
 final path. Package lists are order-insensitive in the build key (`strace,htop`
 and `htop,strace` share one cache entry), matching mktarget's normalization.
+
+The image and its stamp are published as a *window*, not two independent
+writes: the stamp is first replaced with a `build_key=publishing-<pid>` poison,
+then the image is renamed into place, then the real stamp is written — each
+write temp-file-then-rename. A run killed inside that window therefore leaves a
+stamp that matches no request at all, so the next invocation reports that the
+image was left by a build that died while publishing it and rebuilds, instead
+of serving an image the surviving stamp only claimed to describe. A
+`publishing-` build key in a cache directory means exactly that; a completed
+build never leaves one.
 
 The default shape is compared against the literal defaults (`2G`, no
 `--packages`, no `--ssh-key`), so an env-overridden `QMU_ROOTFS_SIZE` also
