@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import pwd
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -110,6 +113,24 @@ def test_install_roots_order_and_membership(install_env):
 def test_doctor_and_installer_share_one_root_helper():
     assert meta.skill_install_roots is paths.skill_install_roots
     assert lifecycle.skill_install_roots is paths.skill_install_roots
+
+
+def test_autouse_isolation_keeps_install_roots_off_the_developer_home():
+    """No test may write skills into the real ~/.claude, ~/.codex or ~/.agents.
+
+    `skill install` is a MUTATING handler that the exempt-verb sweep in
+    test_cli_config_errors runs for real, so every root this returns is a
+    directory the suite will symlink into. The passwd entry is the ground truth
+    here precisely because $HOME is what conftest redirects: reading HOME to
+    check HOME would pass no matter what.
+    """
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+
+    for root in paths.skill_install_roots():
+        resolved = root.resolve()
+        assert resolved != real_home and real_home not in resolved.parents, (
+            f"install root {root} lies inside the developer's real home"
+        )
 
 
 def _skills_check(payload: dict) -> dict:

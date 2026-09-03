@@ -576,7 +576,7 @@ EXEMPT_MINIMAL_ARGV = {
 
 @pytest.mark.parametrize("verb", sorted(cli._CONFIG_EXEMPT_SUBCOMMANDS))
 def test_every_exempt_verb_never_surfaces_project_config_error(
-    verb, config_cli_env, monkeypatch, tmp_path, capsys
+    verb, config_cli_env, capsys
 ):
     """`_CONFIG_EXEMPT_SUBCOMMANDS <= _subcommand_names()` (the existing
     test_exempt_subcommands_are_real_and_stay_usable assertion) is satisfied
@@ -589,10 +589,11 @@ def test_every_exempt_verb_never_surfaces_project_config_error(
     assert verb in EXEMPT_MINIMAL_ARGV, (
         f"{verb!r}: add minimal argv to EXEMPT_MINIMAL_ARGV"
     )
-    # `skill install` symlinks into $CLAUDE_HOME/$CODEX_HOME; keep it off the
-    # real developer home.
-    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude-home"))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home-absent"))
+    # `skill install` really does symlink into every install root; conftest's
+    # autouse isolation redirects HOME (and clears CLAUDE_HOME/CODEX_HOME/
+    # AGENTS_HOME/PI_CODING_AGENT_DIR) so this sweep cannot reach the
+    # developer's own skill links. Guarding two of those roots here instead is
+    # what let the ~/.agents root escape when it was added.
     config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
 
     cli.main(EXEMPT_MINIMAL_ARGV[verb])
