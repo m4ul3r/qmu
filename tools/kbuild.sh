@@ -216,6 +216,28 @@ fi
 
 SRCDIR="$CACHE/kernels/src/linux-$VERSION"
 
+# ---------------------------------------------------------------------------
+# per-version source-tree lock
+# ---------------------------------------------------------------------------
+# Every invocation for a given version shares one extracted tree in SRCDIR,
+# and extraction, config generation and builds all mutate it concurrently
+# (a --config-only run mrpropers/reconfigures the same tree a build is using,
+# which has been observed to corrupt the shared tree). Serialize them with an
+# exclusive advisory lock keyed per version, acquired BEFORE any cache
+# mutation. The lock is held on an inherited fd, so the kernel releases it on
+# every exit path (die(), set -e aborts, signals). Different versions use
+# different lock files and stay parallel.
+mkdir -p "$CACHE/kernels"
+exec 9>"$CACHE/kernels/.src-linux-$VERSION.lock"
+# Announce a wait: without this a blocked invocation is silent for the length
+# of a full build, which reads as a hang. log() writes to stderr, so the
+# eval-able stdout contract is untouched.
+if ! flock -n 9; then
+  log "waiting for another kbuild invocation holding the linux-$VERSION source tree..."
+  flock 9
+  log "acquired linux-$VERSION source-tree lock"
+fi
+
 emit_config_output() {
   printf 'CONFIG=%q\n' "$OUTDIR/.config"
 }
