@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 
+from .config import reset_global_config_warnings
 from .instance import QMUError
 from .qmp import QMPError
 from .ssh import SSHError
@@ -115,6 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Per-command, not per-process: two separate `qmu` invocations must each
+    # warn on a broken global config; only resolve_config() calls WITHIN this
+    # one dispatch (the gate below plus a handler that resolves again) dedupe.
+    reset_global_config_warnings()
     parser = build_parser()
     args = parser.parse_args(argv)
 

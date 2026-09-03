@@ -132,3 +132,25 @@ def test_two_running_vms_are_still_ambiguous(cache, capsys):
     rc = cli.main(["log"])
     text = capsys.readouterr().out + capsys.readouterr().err
     assert rc == 1
+
+
+@pytest.mark.parametrize("cmd", ["status", "kill", "exec"])
+def test_near_miss_names_stopped_vms_too(cmd, cache, capsys):
+    """A one-character typo on a STOPPED vm_id used to answer
+    "not found. Running: live", hiding the very VM `qmu list` displays and the
+    caller was aiming at. The running-only inventory is narrower than `list`,
+    so the recovery hint has to carry both -- same shape find_instance already
+    emitted, which is how the two lookups stopped disagreeing.
+    """
+    _mk("live", alive=True)
+    _mk("c3-probe", alive=False)
+
+    argv = [cmd, "--vm", "c3-prube"] + (["true"] if cmd == "exec" else [])
+    rc = cli.main(argv)
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    assert "not found" in err
+    assert "Running: live" in err
+    assert "c3-probe" in err, f"`qmu {cmd}` hid the stopped VM `qmu list` shows"
+    assert "Stopped:" in err

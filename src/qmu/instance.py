@@ -448,8 +448,17 @@ def choose_instance(vm_id: str | None = None) -> VMInstance:
         for inst in instances:
             if inst.vm_id == vm_id:
                 return inst
-        names = ", ".join(i.vm_id for i in instances)
-        raise QMUError(f"VM '{vm_id}' not found. Running: {names}")
+        # The near-miss inventory must be as wide as `qmu list`. A one-character
+        # typo on a STOPPED vm_id used to answer "not found. Running: <live>",
+        # hiding the very VM the caller was aiming at and making the next move a
+        # second guess instead of a corrected name. Same wording as
+        # find_instance below, so the two lookups cannot drift.
+        stopped = list_stopped_instances()
+        raise QMUError(
+            f"VM '{vm_id}' not found. "
+            f"Running: {', '.join(i.vm_id for i in instances) or 'none'}; "
+            f"Stopped: {', '.join(i.vm_id for i in stopped) or 'none'}."
+        )
 
     if len(instances) == 1:
         return instances[0]

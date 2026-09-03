@@ -464,6 +464,14 @@ def _run_compile_crash_case(
 
 
 def test_compile_run_ignores_precommand_crash(monkeypatch, tmp_path, capsys):
+    """A pre-command panic must not be attributed to this run, and with no
+    fresh report the transport loss is exit 4 — not the kernel-crash class.
+
+    This asserted rc 3 while also asserting `crash_detected is False`, i.e. it
+    pinned exactly what the exit-code contract forbids ("exit 3 requires a
+    corroborating fresh serial crash report"), and made `compile --run` the one
+    SSH command disagreeing with exec/dmesg/push/pull about an unreachable guest.
+    """
     rc, payload = _run_compile_crash_case(
         monkeypatch,
         tmp_path,
@@ -471,7 +479,7 @@ def test_compile_run_ignores_precommand_crash(monkeypatch, tmp_path, capsys):
         initial_serial=PANIC_LOG,
         serial_during_run="",
     )
-    assert rc == 3
+    assert rc == 4
     assert payload["crash_detected"] is False
     assert payload["crash"] is None
 

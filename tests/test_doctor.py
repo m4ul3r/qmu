@@ -268,3 +268,125 @@ def test_doctor_rejects_launch_only_net_backend_override(capsys):
     error = capsys.readouterr().err
     assert "unrecognized arguments" in error
     assert "--net-backend" in error
+
+
+# ---------------------------------------------------------------------------
+# An invalid global config is not an absent one (F7). Measured before this:
+# `qmu doctor` printed "[~] config: No qmu.toml or ~/.config/qmu/config.toml
+# found. Run: qmu config init" while its own stderr said
+# "ignoring global config: Invalid config <path>: failed to parse TOML" — the
+# body contradicted the warning, and the prescribed action writes a PROJECT
+# file, so the broken global stays there re-warning forever. doctor is exempt
+# from the #37 dispatch gate on the grounds that it diagnoses the fault itself;
+# that only holds if it diagnoses the non-fatal layer too.
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_names_a_rejected_global_config_instead_of_claiming_none(
+    doctor_env, monkeypatch, capsys
+):
+    broken = "/home/agent/.config/qmu/config.toml"
+    doctor_env.config._sources = ["built-in defaults"]
+    doctor_env.config._skipped_sources = [
+        {"kind": "global", "path": broken, "problem": "failed to parse TOML"}
+    ]
+    monkeypatch.setattr(
+        lifecycle,
+        "probe_qemu_netdevs",
+        Mock(return_value=_caps()),
+        raising=False,
+    )
+
+    rc = cli.main(["--format", "json", "doctor"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    row = _check(payload, "global config")
+    assert row["status"] == "warn"
+    assert broken in row["detail"]
+    assert "failed to parse TOML" in row["detail"]
+    assert "Fix or delete that file" in row["detail"]
+    assert "will not clear this" in row["detail"]
+    # The false claim is gone, and the config row no longer sends the reader
+    # to `qmu config init` as the remedy for this fault.
+    config_row = _check(payload, "config")
+    assert "No qmu.toml" not in config_row["detail"]
+    assert config_row["status"] == "warn"
+    assert "built-in defaults only" in config_row["detail"]
+
+
+def test_doctor_still_reports_a_genuinely_absent_config(
+    doctor_env, monkeypatch, capsys
+):
+    """The not-found branch must survive: nothing was rejected here, so
+    `qmu config init` really is the right advice."""
+    doctor_env.config._sources = ["built-in defaults"]
+    doctor_env.config._skipped_sources = []
+    monkeypatch.setattr(
+        lifecycle,
+        "probe_qemu_netdevs",
+        Mock(return_value=_caps()),
+        raising=False,
+    )
+
+    rc = cli.main(["--format", "json", "doctor"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    config_row = _check(payload, "config")
+    assert config_row["detail"] == (
+        "No qmu.toml or ~/.config/qmu/config.toml found. Run: qmu config init"
+    )
+    assert not [c for c in payload["checks"] if c["check"] == "global config"]
+
+
+def test_doctor_reports_a_rejected_global_alongside_a_loaded_project(
+    doctor_env, monkeypatch, capsys
+):
+    """A valid project layer must not hide the broken global: the file is still
+    there, still re-warning on every command."""
+    broken = "/home/agent/.config/qmu/config.toml"
+    doctor_env.config._sources = ["built-in defaults", "project: /work/qmu.toml"]
+    doctor_env.config._skipped_sources = [
+        {"kind": "global", "path": broken, "problem": "key 'rootfs': belongs in [drive]"}
+    ]
+    monkeypatch.setattr(
+        lifecycle,
+        "probe_qemu_netdevs",
+        Mock(return_value=_caps()),
+        raising=False,
+    )
+
+    rc = cli.main(["--format", "json", "doctor"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert _check(payload, "config") == {
+        "check": "config",
+        "status": "ok",
+        "detail": "built-in defaults -> project: /work/qmu.toml",
+    }
+    assert broken in _check(payload, "global config")["detail"]
+
+
+def test_doctor_text_shows_the_rejected_global_as_a_warn_row(
+    doctor_env, monkeypatch, capsys
+):
+    broken = "/home/agent/.config/qmu/config.toml"
+    doctor_env.config._sources = ["built-in defaults"]
+    doctor_env.config._skipped_sources = [
+        {"kind": "global", "path": broken, "problem": "failed to parse TOML"}
+    ]
+    monkeypatch.setattr(
+        lifecycle,
+        "probe_qemu_netdevs",
+        Mock(return_value=_caps()),
+        raising=False,
+    )
+
+    rc = cli.main(["doctor"])
+    text = capsys.readouterr().out
+
+    assert rc == 1
+    assert f"[~] global config: {broken} EXISTS but is invalid" in text
+    assert "No qmu.toml or ~/.config/qmu/config.toml found" not in text

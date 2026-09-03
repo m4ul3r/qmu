@@ -336,6 +336,50 @@ def test_status_explicit_config_fatal_on_invalid_path(
     assert UNKNOWN_KEY in captured.err
 
 
+def test_status_missing_explicit_config_path_is_error(
+    config_cli_env, running_instance, capsys
+):
+    """A --config path that does not exist at all (not just invalid content)
+    used to fall straight through resolve_config's `if ppath.is_file()` guard
+    and answer on the pre-#37 message ("No running VMs") instead of refusing."""
+    missing = config_cli_env["explicit"]  # never written
+
+    rc = cli.main(["status", "--config", str(missing)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "[qmu] Error:" in captured.err
+    assert str(missing.resolve()) in captured.err
+
+
+def test_list_missing_explicit_config_path_is_error(
+    config_cli_env, running_instance, capsys
+):
+    """Same bypass through `list`: before the fix this silently dropped the
+    explicit layer and printed "No VMs." at rc 0 instead of refusing."""
+    missing = config_cli_env["explicit"]  # never written
+
+    rc = cli.main(["list", "--config", str(missing)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "[qmu] Error:" in captured.err
+    assert str(missing.resolve()) in captured.err
+
+
+def test_config_show_missing_explicit_config_path_is_error(
+    config_cli_env, capsys
+):
+    missing = config_cli_env["explicit"]  # never written
+
+    rc = cli.main(["config", "show", "--config", str(missing)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "[qmu] Error:" in captured.err
+    assert str(missing.resolve()) in captured.err
+
+
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
 def test_status_config_error_emits_exactly_one_false_record(
     config_cli_env, running_instance, capsys, fmt
@@ -457,6 +501,15 @@ MINIMAL_ARGV = {
 }
 
 
+def test_minimal_argv_matches_gated_verbs():
+    """MINIMAL_ARGV and the exempt set must partition the real subcommand
+    list identically. Without this, moving a verb INTO the exempt set (e.g.
+    appending "kill" to _CONFIG_EXEMPT_SUBCOMMANDS) silently deletes its row
+    from the parametrize list below instead of failing anything — the exact
+    #37 regression the reviewer reintroduced undetected."""
+    assert set(MINIMAL_ARGV) == _subcommand_names() - cli._CONFIG_EXEMPT_SUBCOMMANDS
+
+
 @pytest.mark.parametrize(
     "verb", sorted(_subcommand_names() - cli._CONFIG_EXEMPT_SUBCOMMANDS)
 )
@@ -503,3 +556,250 @@ def test_broken_global_config_warns_once_per_command(
     captured = capsys.readouterr()
     assert rc == 1
     assert captured.err.count("ignoring global config") == 1
+
+
+EXEMPT_MINIMAL_ARGV = {
+    # config's own handler (`config show`) independently resolves config and
+    # must keep reporting the fault itself — resolve_config only appears in
+    # _handle_config_show, not _handle_config_path/_handle_config_init.
+    "config": ["config", "show"],
+    "doctor": ["doctor"],
+    "cache": ["cache", "du"],
+    # rootfs requires the `image` positional on every leaf subcommand; a
+    # missing image is a legitimate "Image not found" QMUError, unrelated to
+    # project config.
+    "rootfs": ["rootfs", "ls", "does-not-exist.img"],
+    "skill": ["skill", "install"],
+    "version": ["version"],
+}
+
+
+@pytest.mark.parametrize("verb", sorted(cli._CONFIG_EXEMPT_SUBCOMMANDS))
+def test_every_exempt_verb_never_surfaces_project_config_error(
+    verb, config_cli_env, capsys
+):
+    """`_CONFIG_EXEMPT_SUBCOMMANDS <= _subcommand_names()` (the existing
+    test_exempt_subcommands_are_real_and_stay_usable assertion) is satisfied
+    by ANY registered verb name, so a verb that quietly grows a
+    resolve_config() call would join the exempt set with no failing test —
+    the #37 shape again. Actually run each exempt verb's real handler and
+    assert the project config's unknown key never reaches stderr — except
+    config/doctor, which read/diagnose qmu.toml themselves and MUST still
+    report it."""
+    assert verb in EXEMPT_MINIMAL_ARGV, (
+        f"{verb!r}: add minimal argv to EXEMPT_MINIMAL_ARGV"
+    )
+    # `skill install` really does symlink into every install root; conftest's
+    # autouse isolation redirects HOME (and clears CLAUDE_HOME/CODEX_HOME/
+    # AGENTS_HOME/PI_CODING_AGENT_DIR) so this sweep cannot reach the
+    # developer's own skill links. Guarding two of those roots here instead is
+    # what let the ~/.agents root escape when it was added.
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+
+    cli.main(EXEMPT_MINIMAL_ARGV[verb])
+    captured = capsys.readouterr()
+
+    if verb in ("config", "doctor"):
+        assert UNKNOWN_KEY in captured.err, verb
+    else:
+        assert UNKNOWN_KEY not in captured.err, verb
+
+
+def test_broken_global_config_warns_again_on_next_command(
+    config_cli_env, capsys
+):
+    """The dedup is per-command (cli.main resets it before each dispatch),
+    not per-process: a second, separate `qmu` invocation against the same
+    broken global config must warn again, exactly like a second real
+    invocation would."""
+    config_cli_env["global"].write_text("broken = [\n")
+
+    cli.main(["--format", "json", "config", "show"])
+    capsys.readouterr()
+
+    rc = cli.main(["--format", "json", "config", "show"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.err.count("ignoring global config") == 1
+
+
+# ---------------------------------------------------------------------------
+# The refusal has to be actionable. Measured on the branch before this: from a
+# project dir with one unknown key, `qmu kill --vm X` refused with nothing but
+# "Invalid config <path>: key '...': unknown top-level key" — no sign that the
+# check precedes every non-exempt verb rather than saying something about the
+# VM — and the obvious next move, `qmu kill --vm X --config good.toml`, is
+# argparse exit 2 with the TOP-LEVEL usage, so the caller could not even see
+# which flags `kill` accepts. Two round trips, then a dead end.
+# ---------------------------------------------------------------------------
+
+
+def test_project_config_refusal_names_the_gate_and_the_escape_hatch(
+    config_cli_env, capsys
+):
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+
+    rc = cli.main(["kill", "--vm", "anything"])
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    # First line unchanged: it is the line `config show` prints, and the #37
+    # contract is that every surface says the same thing about the same file.
+    first = err.splitlines()[0]
+    assert first == (
+        f"[qmu] Error: Invalid config {config_cli_env['project'].resolve()}: "
+        f"key '{UNKNOWN_KEY}': unknown top-level key"
+    )
+    # ...and then the two facts the caller cannot get anywhere else.
+    assert "before every non-exempt subcommand" in err
+    for verb in ("kill", "prune", "wait"):
+        assert f"`{verb}`" in err, verb
+    assert "re-run from a directory outside the project" in err
+    assert "walks up from the current directory" in err
+    # `kill` does not register --config, and the guidance must not send the
+    # caller to a flag whose answer is argparse exit 2.
+    assert "--config" not in err
+
+
+def test_kill_still_has_no_config_flag_so_the_hint_must_not_prescribe_one(
+    config_cli_env, capsys
+):
+    """Pins the premise of the message above. --config cannot simply be added
+    to every verb: _add_common_opts is applied to every subparser and
+    _add_launch_opts already registers --config for launch/run, so hoisting it
+    raises an argparse conflict. Verbs that DO take it are enumerated."""
+    parser = build_parser()
+    subparsers = next(
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+    )
+    with_config = {
+        name
+        for name, sub in subparsers.choices.items()
+        if any("--config" in a.option_strings for a in sub._actions)
+    }
+    assert with_config == {
+        "launch", "run", "status", "show", "list", "log", "crash", "doctor",
+    }
+    assert "kill" not in with_config
+
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["kill", "--vm", "anything", "--config", "/tmp/good.toml"])
+    assert exit_info.value.code == 2
+
+
+def test_gated_verb_and_config_show_still_refuse_byte_identically(
+    config_cli_env, running_instance, capsys
+):
+    """The guidance rides on the ConfigError, not on the gate in cli.main, so
+    the exempt diagnostic verbs reach the identical message through their own
+    resolve_config call. Putting it in the gate alone would have made `status`
+    and `config show` disagree about the same file — the text-vs-text sibling
+    divergence the #37 test exists to prevent."""
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+
+    assert cli.main(["status"]) == 1
+    status_err = capsys.readouterr().err
+    assert cli.main(["config", "show"]) == 1
+    show_err = capsys.readouterr().err
+    assert cli.main(["kill"]) == 1
+    kill_err = capsys.readouterr().err
+
+    assert status_err == show_err == kill_err
+    assert "before every non-exempt subcommand" in show_err
+
+
+def test_explicit_config_refusal_points_at_the_flag_not_at_cwd(
+    config_cli_env, capsys
+):
+    """With --config the caller named the file, so "run it from another
+    directory" is not a way out — dropping the flag is."""
+    source, explicit_args = _install_source(
+        config_cli_env, "explicit", f'{UNKNOWN_KEY} = "typo"\n'
+    )
+
+    rc = cli.main(["status", *explicit_args])
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    assert str(source) in err
+    assert "before every non-exempt subcommand" in err
+    assert "drop `--config`" in err
+    assert "outside the project" not in err
+
+
+def test_missing_explicit_config_path_also_carries_the_guidance(
+    config_cli_env, capsys
+):
+    missing = config_cli_env["explicit"]  # never written
+
+    rc = cli.main(["status", "--config", str(missing)])
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    assert f"Invalid config {missing.resolve()}: file not found" in err
+    assert "drop `--config`" in err
+
+
+def test_recovery_guidance_survives_json_as_one_record(config_cli_env, capsys):
+    """The message now spans two lines; the envelope must stay one object with
+    error_type ConfigError (the re-render rebuilds the class, not a wrapper)."""
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+
+    rc = cli.main(["--format", "ndjson", "kill"])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert len(out.strip().splitlines()) == 1
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "ConfigError"
+    assert payload["error"].startswith("Invalid config ")
+    assert "before every non-exempt subcommand" in payload["error"]
+
+
+# ---------------------------------------------------------------------------
+# doctor must not report an INVALID global config as an ABSENT one (F7).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_config_records_a_skipped_global_layer(config_cli_env):
+    """The skip was only ever announced on stderr, so `doctor` — which reads
+    config._sources — could not tell "rejected" from "never existed"."""
+    from qmu.config import resolve_config
+
+    config_cli_env["global"].write_text("broken = [\n")
+
+    cfg = resolve_config()
+
+    assert not any(s.startswith("global:") for s in cfg._sources)
+    assert len(cfg._skipped_sources) == 1
+    skipped = cfg._skipped_sources[0]
+    assert skipped["kind"] == "global"
+    assert skipped["path"] == str(config_cli_env["global"].resolve())
+    assert "failed to parse TOML" in skipped["problem"]
+    # The path belongs to the row that renders it, not to the problem text.
+    assert str(config_cli_env["global"].resolve()) not in skipped["problem"]
+
+
+def test_a_valid_global_records_no_skip(config_cli_env):
+    from qmu.config import resolve_config
+
+    config_cli_env["global"].write_text('[machine]\nmemory = "8G"\n')
+
+    cfg = resolve_config()
+
+    assert cfg.memory == "8G"
+    assert cfg._skipped_sources == []
+
+
+def test_schema_invalid_global_records_the_offending_key(config_cli_env):
+    from qmu.config import resolve_config
+
+    config_cli_env["global"].write_text('rootfs = "/tmp/rootfs.img"\n')
+
+    cfg = resolve_config()
+
+    problem = cfg._skipped_sources[0]["problem"]
+    assert "key 'rootfs'" in problem

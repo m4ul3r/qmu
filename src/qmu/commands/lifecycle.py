@@ -729,8 +729,13 @@ def _add_prune(sub: argparse._SubParsersAction) -> None:
         "--older-than",
         type=_nonnegative_seconds,
         default=86400.0,
-        help="Age threshold in seconds for runtime, remnant and build-residue "
-             "pruning (default: 86400)",
+        help="Age threshold in seconds (default: 86400). Gates --runtime and "
+             "--build-residue wholesale. With --vm/--all it gates ONLY "
+             "metadata-free remnants (a leftover .qemu.log or .qmp.sock with "
+             "no instance record): a VM that still has its record, and a "
+             "serial-log-only remnant, prune at any age — which is why "
+             "`--older-than 0` looks like a no-op on a stopped VM and is still "
+             "the right flag once the record is gone.",
     )
     p.add_argument(
         "--dry-run",
@@ -1913,19 +1918,46 @@ def _handle_doctor(args: argparse.Namespace) -> int:
     )
     checks: list[dict[str, Any]] = []
 
-    # Config sources — distinguish "loaded a file" from "defaults only"
+    # Config sources — distinguish "loaded a file" from "defaults only", and
+    # both of those from "a file was found and REJECTED". resolve_config skips
+    # an invalid global with a stderr warning; reporting "No qmu.toml or
+    # ~/.config/qmu/config.toml found. Run: qmu config init" for it
+    # contradicted that warning in the same breath and prescribed writing a
+    # PROJECT file, which leaves the broken global in place forever. doctor is
+    # exempt from the #37 dispatch gate because it diagnoses the project layer
+    # itself — that justification only holds if it diagnoses the global layer
+    # too, which is the layer that is deliberately non-fatal.
     file_sources = [s for s in config._sources if s.startswith(("global:", "project:", "config:"))]
+    skipped_sources = config._skipped_sources
     if file_sources:
         checks.append({
             "check": "config",
             "status": "ok",
             "detail": " -> ".join(config._sources),
         })
+    elif skipped_sources:
+        checks.append({
+            "check": "config",
+            "status": "warn",
+            "detail": "Running on built-in defaults only: every config file "
+                      "found was rejected (see below).",
+        })
     else:
         checks.append({
             "check": "config",
             "status": "warn",
             "detail": "No qmu.toml or ~/.config/qmu/config.toml found. Run: qmu config init",
+        })
+    for skipped in skipped_sources:
+        checks.append({
+            "check": f"{skipped['kind']} config",
+            "status": "warn",
+            "detail": (
+                f"{skipped['path']} EXISTS but is invalid and was skipped: "
+                f"{skipped['problem']}. Fix or delete that file — "
+                f"`qmu config init` writes a project qmu.toml and will not "
+                f"clear this."
+            ),
         })
 
     # Cache subtrees no qmu command fully reclaims. Status is deliberately

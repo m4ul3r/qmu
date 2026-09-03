@@ -143,15 +143,90 @@ def test_documented_command_parses(lineno, command):
 
 def test_skill_schema_section_matches_validator():
     """#55: the documented accepted-schema bullets must equal config._FIXED_SCHEMA.
-    The `accel` key existed in the validator for a release before the skill listed it."""
+    The `accel` key existed in the validator for a release before the skill listed it.
+
+    Two holes found in review of this guard itself: (a) building `documented` with
+    a plain dict is last-wins, so a second, differently-shaped bullet for a table
+    anywhere in the file silently masks a drifted authoritative one; (b) scanning
+    the whole bullet tail for backticked tokens turns trailing prose like
+    "(default `1234`, see `doctor`)" into phantom schema keys. Both are guarded
+    below: duplicate table bullets are a hard failure, and the key list is read
+    only from the leading comma-separated backtick run.
+    """
     from qmu.config import _FIXED_SCHEMA
 
+    bullet_re = re.compile(r"^- `\[(\w+)\]`: (.+)$")
+    key_run_re = re.compile(r"^`(\w+)`\s*")
+
+    def leading_key_run(tail: str) -> set[str]:
+        """The key list is a leading comma-separated run of `key` tokens;
+        trailing prose is not schema even when it contains inline code."""
+        keys: set[str] = set()
+        rest = tail
+        while True:
+            m = key_run_re.match(rest)
+            if not m:
+                break
+            keys.add(m.group(1))
+            rest = rest[m.end():]
+            if rest.startswith(","):
+                rest = rest[1:].lstrip()
+            else:
+                break
+        return keys
+
     documented: dict[str, set[str]] = {}
+    duplicate_tables: list[str] = []
     for line in SKILL.read_text().splitlines():
-        m = re.match(r"^- `\[(\w+)\]`: (.+)$", line.strip())
+        m = bullet_re.match(line.strip())
         if m:
-            documented[m.group(1)] = set(re.findall(r"`(\w+)`", m.group(2)))
+            table = m.group(1)
+            if table in documented:
+                duplicate_tables.append(table)
+            documented[table] = leading_key_run(m.group(2))
+
     assert documented, "schema bullets not found in SKILL.md"
+    assert not duplicate_tables, (
+        f"duplicate schema bullet(s) for table(s) {duplicate_tables}: a second "
+        "bullet for the same table silently masks the first"
+    )
     assert set(documented) == set(_FIXED_SCHEMA)
     for table, keys in _FIXED_SCHEMA.items():
         assert documented[table] == set(keys), table
+
+
+def test_config_init_table_enumeration_matches_the_generator():
+    """#55's recurrence class, one sentence over: SKILL.md enumerates the
+    tables `qmu config init` writes, and it omitted `[boot]` — the FIRST table
+    the generator emits and the one carrying the `# CHANGE ME` kernel line, so
+    an agent reading the skill did not learn that the boot settings can live in
+    the starter file at all. "All keys commented" is not the exclusion rule:
+    `[gdb]` was listed and its only key is commented too.
+    """
+    from qmu.config import render_starter_config
+
+    generated = [
+        line[1:-1]
+        for line in render_starter_config("x86_64").splitlines()
+        if line.startswith("[") and line.endswith("]")
+    ]
+
+    sentence = next(
+        line for line in SKILL.read_text().splitlines()
+        if line.startswith("`qmu config init` writes ")
+    )
+    documented = re.findall(r"`\[([\w.<>*-]+)\]`", sentence)
+
+    # `[profiles.*]` is documented as one collapsed bullet ("three
+    # `[profiles.*]` blocks"); every other table is named literally.
+    profiles = [t for t in generated if t.startswith("profiles.")]
+    literal = [t for t in generated if not t.startswith("profiles.")]
+
+    assert documented[:len(literal)] == literal, (
+        f"SKILL.md enumerates {documented} but `qmu config init` writes "
+        f"{literal} + {len(profiles)} profile blocks"
+    )
+    assert "profiles.*" in documented
+    assert f"{len(profiles)} `[profiles.*]` blocks" in sentence.replace(
+        "three", str(len(profiles))
+    )

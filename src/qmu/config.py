@@ -25,18 +25,33 @@ class ConfigError(QMUError):
         *,
         key_path: str | None = None,
         hint: str | None = None,
+        recovery: str | None = None,
     ) -> None:
         self.source = Path(source).resolve()
         self.key_path = key_path
         self.problem = problem
         self.hint = hint
+        self.recovery = recovery
         message = f"Invalid config {self.source}"
         if key_path is not None:
             message += f": key '{key_path}'"
         message += f": {problem}"
         if hint is not None:
             message += f"; {hint}"
+        if recovery is not None:
+            message += f"\n{recovery}"
         super().__init__(message)
+
+    def describe_problem(self) -> str:
+        """The fault without the `Invalid config <path>` prefix.
+
+        For renderers that already name the file themselves — `doctor`'s
+        skipped-global row — so the path is not printed twice.
+        """
+        text = f"key '{self.key_path}': {self.problem}" if self.key_path else self.problem
+        if self.hint is not None:
+            text += f"; {self.hint}"
+        return text
 
 
 _FIXED_SCHEMA: dict[str, dict[str, str]] = {
@@ -370,6 +385,16 @@ class QMUConfig:
     # tracking: which config files contributed
     _sources: list[str] = field(default_factory=list, repr=False)
 
+    # tracking: which config files EXISTED and were rejected. A layer that was
+    # found and skipped is not an absent layer, and only `_sources` recorded
+    # the difference before — so `doctor` reported "No qmu.toml or
+    # ~/.config/qmu/config.toml found. Run: qmu config init" for a broken
+    # global its own stderr warning had just named, prescribing an action
+    # (write a PROJECT file) that leaves the broken global in place forever.
+    # Kept out of `_sources` so its consumers (`config show`'s source chain,
+    # doctor's loaded-file check) keep meaning "contributed values".
+    _skipped_sources: list[dict[str, str]] = field(default_factory=list, repr=False)
+
     def qemu_binary(self) -> str:
         return f"qemu-system-{self.arch}"
 
@@ -498,11 +523,64 @@ def _apply_config_file(
     _apply_toml(cfg, raw, f"{source_kind}: {source}")
 
 
+# Recovery guidance for the FATAL layer. The project/explicit config is
+# validated at the cli.main dispatch choke point before every non-exempt
+# subcommand, so one unknown key in a qmu.toml refuses `kill`, `prune` and
+# `wait` as well — and the bare "Invalid config <path>: ..." line says nothing
+# about that, nor about the way out. Measured next move for an agent holding a
+# VM it cannot reap: `qmu kill --vm X --config good.toml`, which is exit 2
+# `unrecognized arguments` (only status/list/log/crash register --config, and
+# _add_common_opts cannot carry it without colliding with _add_launch_opts).
+# So the guidance never prescribes --config: it names the escape hatch that
+# works on every verb, grounded in find_project_config walking up from CWD only.
+#
+# It rides on the ConfigError itself, not on the gate in cli.main, because
+# `config show` and `doctor` reach the same fault through their own
+# resolve_config call — and the #37 contract is that every surface reports a
+# broken project config with one byte-identical message.
+_PROJECT_CONFIG_RECOVERY = (
+    "This file is validated before every non-exempt subcommand — `kill`, "
+    "`prune` and `wait` included — so VM cleanup is blocked until it parses. "
+    "Fix it, or re-run from a directory outside the project: the qmu.toml "
+    "search only walks up from the current directory."
+)
+_EXPLICIT_CONFIG_RECOVERY = (
+    "This file is validated before every non-exempt subcommand — `kill`, "
+    "`prune` and `wait` included — so VM cleanup is blocked until it parses. "
+    "Fix it, or drop `--config` to fall back to the project and global layers."
+)
+
+
+def _with_recovery(exc: ConfigError, recovery: str) -> ConfigError:
+    """Re-render a ConfigError with recovery guidance appended.
+
+    Rebuilt rather than mutated so the class (and therefore the JSON
+    `error_type`) and the leading message line stay byte-identical.
+    """
+    return ConfigError(
+        exc.source,
+        exc.problem,
+        key_path=exc.key_path,
+        hint=exc.hint,
+        recovery=recovery,
+    )
+
+
 # One command may resolve config twice (the dispatch-level project-config gate in
 # cli.main plus a handler that needs the QMUConfig object), and this warning is a
-# per-process diagnostic, not a per-layer one. Keyed on the rendered message so a
-# different file or a different error still warns.
+# per-COMMAND diagnostic, not a per-process one: cli.main clears the dedup set via
+# reset_global_config_warnings() before dispatching, so repeated resolve_config()
+# calls within one command still dedupe, but the next command warns again. Keyed
+# on the rendered message so a different file or a different error still warns.
 _global_config_warnings: set[str] = set()
+
+
+def reset_global_config_warnings() -> None:
+    """Clear the warn-once dedup set. Called once per CLI invocation by
+    cli.main (so the dedup is per-command, not per-process) and by the test
+    suite's isolate_qmu_env fixture (so a warning from one test cannot mask
+    the same message in the next)."""
+    _global_config_warnings.clear()
 
 
 def resolve_config(
@@ -529,20 +607,48 @@ def resolve_config(
         try:
             _apply_config_file(cfg, gpath, "global")
         except ConfigError as exc:
+            # Record the skip before warning: the file EXISTS and was rejected,
+            # which `doctor` must be able to tell apart from "no global config
+            # at all" — the branch that used to fire here and send the reader
+            # to `qmu config init` (a PROJECT file) while the broken global sat
+            # there re-warning on every command.
+            cfg._skipped_sources.append({
+                "kind": "global",
+                "path": str(gpath),
+                "problem": exc.describe_problem(),
+            })
             warning = f"[qmu] Warning: ignoring global config: {exc}\n"
             if warning not in _global_config_warnings:
                 _global_config_warnings.add(warning)
                 sys.stderr.write(warning)
 
-    # Layer 2: project config (or explicit --config)
+    # Layer 2: project config (or explicit --config). Unlike the project
+    # search (which simply finds nothing when no qmu.toml exists upward from
+    # CWD), an explicit --config naming a path that isn't there is a caller
+    # mistake, not "no project config": silently falling through used to both
+    # drop every layer above CLI flags AND defeat the #37 dispatch gate (a
+    # typo'd --config made `list` report "No VMs." instead of refusing).
     if config_path_override is not None:
         ppath = Path(config_path_override).resolve()
-        if ppath.is_file():
+        if not ppath.is_file():
+            raise ConfigError(
+                ppath, "file not found", recovery=_EXPLICIT_CONFIG_RECOVERY
+            )
+        try:
             _apply_config_file(cfg, ppath, "config")
+        except ConfigError as exc:
+            # `from exc.__cause__`, not `from exc`: the re-render replaces the
+            # error rather than wrapping it, and callers (and tests) pin the
+            # ORIGINAL cause — e.g. the tomllib.TOMLDecodeError behind a
+            # malformed file — as __cause__.
+            raise _with_recovery(exc, _EXPLICIT_CONFIG_RECOVERY) from exc.__cause__
     else:
         ppath = find_project_config()
         if ppath is not None:
-            _apply_config_file(cfg, ppath, "project")
+            try:
+                _apply_config_file(cfg, ppath, "project")
+            except ConfigError as exc:
+                raise _with_recovery(exc, _PROJECT_CONFIG_RECOVERY) from exc.__cause__
 
     # Layer 3: CLI overrides
     if cli_overrides:

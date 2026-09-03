@@ -64,24 +64,30 @@ precedence above.
 An invalid **global** config (`~/.config/qmu/config.toml`) is non-fatal: qmu
 prints a one-line `[qmu] Warning:` naming the file and continues from built-in
 defaults and any valid project/CLI layers, so a single stale global file never
-bricks every command (including `qmu doctor`, which diagnoses it). An invalid
-**project** (`qmu.toml`) or explicit `--config` file is fatal (exit 1) with the
-source path and offending key.
+bricks every command. `qmu doctor` then reports it as a `[~] global config` row
+naming the file and the parse error — it does not say "no config found", and
+`qmu config init` will not clear it, because that writes a *project* file. An
+invalid **project** (`qmu.toml`) or explicit `--config` file is fatal (exit 1)
+with the source path and offending key.
 
 Every subcommand validates the project/explicit layer before it runs — including
 `kill`, `prune`, `crash`, `log` and `wait`, which answer from instance records. Only
 `config`, `doctor`, `cache`, `rootfs`, `skill` and `version` are exempt (`config` and
 `doctor` report the same fault themselves; the rest never read `qmu.toml`). So a broken
 `qmu.toml` blocks VM cleanup too: fix the file, or run the command from a directory
-outside the project — the project search walks up from CWD only.
+outside the project — the project search walks up from CWD only. The refusal itself
+says both, so you do not have to remember it. Do **not** reach for `--config` as the
+way out: only `launch`, `run`, `status`, `show`, `list`, `log`, `crash` and `doctor`
+register that flag, so `qmu kill --vm X --config good.toml` is an argparse error
+(exit 2), not a recovery.
 
-`qmu config init` writes `[machine]` (arch/memory/cpus, with commented `cpu`/`nic_model`/`extra_args`), `[drive]`, `[ssh]`, `[gdb]`, three `[profiles.*]` blocks, and a commented harness-mode block. Notes:
+`qmu config init` writes `[boot]` (`kernel`/`initrd`/`profile`/`cmdline`, all commented — the `kernel` line is the first `# CHANGE ME`), `[machine]` (arch/memory/cpus, with commented `cpu`/`accel`/`nic_model`/`net_backend`/`extra_args`), `[drive]` (rootfs/format), `[ssh]` (key/user, with commented `port_start`), `[gdb]` (commented `port_start`), three `[profiles.*]` blocks, and a commented harness-mode block. Notes:
 
 - `[ssh] user` (default `root`) sets the guest login for `exec`/`push`/`pull`/`compile`; it is recorded on the VM at launch, so set it **before** `qmu launch`.
 - SSH and GDB ports start at `10021` / `1234` (uncomment `port_start` to override).
 - `arch` drives which `qemu-system-*` binary runs and whether KVM is enabled (only when guest arch == host). Use `extra_args` for arch-specific machine flags (e.g. aarch64 `-M virt -cpu cortex-a57`).
 - Path values (`rootfs`, `ssh.key`, `--kernel`, `--initrd`) accept `~` expansion.
-- Boot flags: `--append` ADDs parameters on top of the `[boot]` profile cmdline, `--cmdline` REPLACES it — details in Launching → `--append` vs `--cmdline`.
+- Boot flags: `--cmdline` REPLACES the whole resolved command line outright; `--append` ADDs parameters onto whichever line won that resolution — the `[boot] cmdline` when the config sets one (the profile then contributes nothing), otherwise the profile's cmdline. An explicit CLI `--profile` clears a config `[boot] cmdline` first, so `--append` then lands on the profile again — details in Launching → `--append` vs `--cmdline` and Profile vs `[boot] cmdline`.
 
 ## Quick Start
 
