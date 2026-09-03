@@ -172,3 +172,19 @@ def test_documented_command_parses(lineno, command):
             f"SKILL.md:{lineno} documents a command the CLI rejects:\n"
             f"  $ {command}\n  -> {reason}"
         )
+
+
+def test_skill_schema_section_matches_validator():
+    """#55: the documented accepted-schema bullets must equal config._FIXED_SCHEMA.
+    The `accel` key existed in the validator for a release before the skill listed it."""
+    from qmu.config import _FIXED_SCHEMA
+
+    documented: dict[str, set[str]] = {}
+    for line in SKILL.read_text().splitlines():
+        m = re.match(r"^- `\[(\w+)\]`: (.+)$", line.strip())
+        if m:
+            documented[m.group(1)] = set(re.findall(r"`(\w+)`", m.group(2)))
+    assert documented, "schema bullets not found in SKILL.md"
+    assert set(documented) == set(_FIXED_SCHEMA)
+    for table, keys in _FIXED_SCHEMA.items():
+        assert documented[table] == set(keys), table
