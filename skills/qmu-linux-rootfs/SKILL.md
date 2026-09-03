@@ -125,10 +125,16 @@ recipe, including the arm32 virtio-MMIO drive form and pry rebasing.
 ```
 ~/.cache/qmu/rootfs/
   bookworm/
-    x86_64/
+    x86_64/                       # default-argument builds (legacy path)
       rootfs.img        # raw ext4 image
       id_ed25519        # SSH private key (auto-generated)
       id_ed25519.pub    # SSH public key
+      .mkrootfs-stamp   # records the build key + options
+    x86_64-<key8>/                # builds that differ from the defaults
+      rootfs.img                  # (--packages / --size / --ssh-key each
+      id_ed25519                  #  select a variant keyed by those options)
+      id_ed25519.pub
+      .mkrootfs-stamp
     arm64/
       rootfs.img
       id_ed25519
@@ -136,6 +142,27 @@ recipe, including the arm32 virtio-MMIO drive form and pry rebasing.
   bullseye/
     ...
 ```
+
+A stamped cache hit requires an image plus a completion stamp whose recorded
+build key matches the requested options. Default-argument runs may still serve
+pre-existing unkeyed directories written before stamps existed — without any
+stamp check — but print a note that the image's `--packages` / `--size` /
+`--ssh-key` are unverified (the old script routed every build there, so its
+options are unknown) — pass `--no-cache` to force a rebuild. An image built
+with different options is never silently returned: non-default requests get
+their own keyed variant, and a stamped hit whose recorded key differs names
+the mismatched options (image path rendered shell-quoted) before rebuilding
+with the requested ones.
+
+Partial builds can never be served as hits: the image is created under
+`rootfs.img.part` and renamed into place only after mke2fs succeeds (the same
+atomicity rule as the stamp), so an interrupted run leaves nothing at the
+final path. Package lists are order-insensitive in the build key (`strace,htop`
+and `htop,strace` share one cache entry), matching mktarget's normalization.
+
+The default shape is compared against the literal defaults (`2G`, no
+`--packages`, no `--ssh-key`), so an env-overridden `QMU_ROOTFS_SIZE` also
+routes to a keyed variant rather than the legacy path.
 
 Use `--no-cache` to force a rebuild. Use `--outdir` to place output elsewhere.
 
