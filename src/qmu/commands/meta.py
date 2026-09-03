@@ -21,11 +21,12 @@ from ..cache import (
 from ..config import find_project_config, render_starter_config, resolve_config
 from ..instance import QMUError
 from ..paths import (
+    agents_home,
+    agents_skills_dir,
     all_skill_source_dirs,
-    claude_skills_dir,
-    codex_home,
-    codex_skills_dir,
     global_config_path,
+    omp_agent_dir,
+    skill_install_roots,
 )
 from .. import rootfs as rootfs_mod
 from ..version import VERSION
@@ -583,23 +584,11 @@ def _handle_rootfs_shell(args: argparse.Namespace) -> int:
 
 
 def _add_skill(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("skill", help="Manage Claude Code / Codex skill")
+    p = sub.add_parser("skill", help="Manage Claude Code / Codex / OMP skills")
     p.set_defaults(handler=_make_group_help_handler(p))
     sp = p.add_subparsers(dest="skill_cmd")
-    s = sp.add_parser("install", help="Install skill into ~/.claude (and ~/.codex if present)")
+    s = sp.add_parser("install", help="Install skills into ~/.claude (and ~/.codex / ~/.agents when present)")
     s.set_defaults(handler=_handle_skill_install)
-
-
-def _skill_install_roots() -> list[Path]:
-    """Return the destination dirs for `qmu skill install`.
-
-    Always installs into ~/.claude/skills/. Additionally installs into
-    ~/.codex/skills/ when ~/.codex/ exists.
-    """
-    roots = [claude_skills_dir()]
-    if codex_home().is_dir():
-        roots.append(codex_skills_dir())
-    return roots
 
 
 def _handle_skill_install(args: argparse.Namespace) -> int:
@@ -607,9 +596,10 @@ def _handle_skill_install(args: argparse.Namespace) -> int:
     if not skill_dirs:
         raise QMUError("No skill sources found under skills/")
 
+    roots = skill_install_roots()
     for src in skill_dirs:
         name = src.name
-        for root in _skill_install_roots():
+        for root in roots:
             dst = root / name
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.is_symlink() or dst.exists():
@@ -619,6 +609,11 @@ def _handle_skill_install(args: argparse.Namespace) -> int:
                     shutil.rmtree(dst)
             dst.symlink_to(src)
             print(f"Skill installed: {dst} -> {src}")
+    if agents_skills_dir() not in roots:
+        print(
+            f"Skipped {agents_skills_dir()} (OMP not detected: neither "
+            f"{agents_home()} nor {omp_agent_dir()} exists)"
+        )
     return 0
 
 
