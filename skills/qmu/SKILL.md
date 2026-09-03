@@ -75,13 +75,13 @@ Every subcommand validates the project/explicit layer before it runs — includi
 `qmu.toml` blocks VM cleanup too: fix the file, or run the command from a directory
 outside the project — the project search walks up from CWD only.
 
-`qmu config init` writes `[machine]` (arch/memory/cpus, with commented `cpu`/`nic_model`/`extra_args`), `[drive]`, `[ssh]`, `[gdb]`, three `[profiles.*]` blocks, and a commented harness-mode block. Notes:
+`qmu config init` writes `[machine]` (arch/memory/cpus, with commented `cpu`/`accel`/`nic_model`/`net_backend`/`extra_args`), `[drive]`, `[ssh]`, `[gdb]`, three `[profiles.*]` blocks, and a commented harness-mode block. Notes:
 
 - `[ssh] user` (default `root`) sets the guest login for `exec`/`push`/`pull`/`compile`; it is recorded on the VM at launch, so set it **before** `qmu launch`.
 - SSH and GDB ports start at `10021` / `1234` (uncomment `port_start` to override).
 - `arch` drives which `qemu-system-*` binary runs and whether KVM is enabled (only when guest arch == host). Use `extra_args` for arch-specific machine flags (e.g. aarch64 `-M virt -cpu cortex-a57`).
 - Path values (`rootfs`, `ssh.key`, `--kernel`, `--initrd`) accept `~` expansion.
-- Boot flags: `--append` ADDs parameters on top of the `[boot]` profile cmdline, `--cmdline` REPLACES it — details in Launching → `--append` vs `--cmdline`.
+- Boot flags: `--cmdline` REPLACES the whole resolved command line outright; `--append` ADDs parameters onto whichever line won that resolution — the `[boot] cmdline` when the config sets one (the profile then contributes nothing), otherwise the profile's cmdline. An explicit CLI `--profile` clears a config `[boot] cmdline` first, so `--append` then lands on the profile again — details in Launching → `--append` vs `--cmdline` and Profile vs `[boot] cmdline`.
 
 ## Quick Start
 
