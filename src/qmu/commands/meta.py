@@ -597,11 +597,16 @@ def _handle_skill_install(args: argparse.Namespace) -> int:
         raise QMUError("No skill sources found under skills/")
 
     roots = skill_install_roots()
+    # Create every root up front: linking is skill-outer/root-inner, so a root
+    # that cannot be created (e.g. ~/.agents is a regular file) would otherwise
+    # abort mid-loop with ~/.claude holding only the first skill — a root the
+    # user never asked for breaking the ones that already worked.
+    for root in roots:
+        root.mkdir(parents=True, exist_ok=True)
     for src in skill_dirs:
         name = src.name
         for root in roots:
             dst = root / name
-            dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.is_symlink() or dst.exists():
                 if dst.is_symlink():
                     dst.unlink()
@@ -611,8 +616,8 @@ def _handle_skill_install(args: argparse.Namespace) -> int:
             print(f"Skill installed: {dst} -> {src}")
     if agents_skills_dir() not in roots:
         print(
-            f"Skipped {agents_skills_dir()} (OMP not detected: neither "
-            f"{agents_home()} nor {omp_agent_dir()} exists)"
+            f"Skipped {agents_skills_dir()} (OMP not detected: no directory at "
+            f"{agents_home()} or {omp_agent_dir()})"
         )
     return 0
 

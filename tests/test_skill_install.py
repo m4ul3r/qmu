@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -109,3 +110,48 @@ def test_install_roots_order_and_membership(install_env):
 def test_doctor_and_installer_share_one_root_helper():
     assert meta.skill_install_roots is paths.skill_install_roots
     assert lifecycle.skill_install_roots is paths.skill_install_roots
+
+
+def _skills_check(payload: dict) -> dict:
+    return next(item for item in payload["checks"] if item["check"] == "skills")
+
+
+def test_doctor_reports_ok_on_every_root_the_installer_wrote(install_env, monkeypatch, capsys):
+    """Behavioral installer<->doctor agreement across MORE THAN ONE root.
+
+    The identity guard above only proves both modules import the same helper;
+    it never runs doctor's root loop with a multi-root list, which is exactly
+    the OMP host this feature exists for.
+    """
+    (install_env.home / ".agents").mkdir()
+    monkeypatch.setattr(lifecycle, "all_skill_source_dirs", lambda: list(install_env.sources))
+
+    assert cli.main(["skill", "install"]) == 0
+    capsys.readouterr()
+
+    cli.main(["--format", "json", "doctor"])
+    skills = _skills_check(json.loads(capsys.readouterr().out))
+    assert skills["status"] == "ok"
+    for name in install_env.names:
+        for root in (".claude", ".agents"):
+            assert str(install_env.home / root / "skills" / name) in skills["detail"]
+
+    (install_env.home / ".agents" / "skills" / install_env.names[0]).unlink()
+    cli.main(["--format", "json", "doctor"])
+    skills = _skills_check(json.loads(capsys.readouterr().out))
+    assert skills["status"] == "warn"
+    assert "partial: 3 installed, 1 missing" in skills["detail"]
+
+
+def test_unusable_agents_root_does_not_half_install_claude(install_env, capsys):
+    """A bad third root must not leave the two working roots partially linked."""
+    (install_env.home / ".omp" / "agent").mkdir(parents=True)
+    (install_env.home / ".agents").write_text("not a directory")
+
+    rc = cli.main(["skill", "install"])
+    out = capsys.readouterr().out
+
+    assert rc != 0
+    assert "Skill installed" not in out
+    claude_skills = install_env.home / ".claude" / "skills"
+    assert not claude_skills.exists() or not list(claude_skills.iterdir())
