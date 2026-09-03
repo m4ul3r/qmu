@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -218,13 +219,18 @@ class MkrootfsEnv:
         return result, self.scratch, self.calls
 
     def run_args(
-        self, *args: str, failing_stage: str | None = None
+        self,
+        *args: str,
+        failing_stage: str | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run mkrootfs.sh with arbitrary argv, in the fake-bin sandbox.
 
         Unlike run(), this passes no --outdir/--ssh-key of its own (so the
         cache-directory routing under QMU_CACHE_DIR is what is exercised) and
         deletes NO image, so a second call sees the first call's cache.
+        `env_overrides` layers extra environment (e.g. QMU_ROOTFS_SIZE) on
+        top of the sandboxed PATH/TMPDIR/QMU_CACHE_DIR.
         """
         env = os.environ.copy()
         env["PATH"] = f"{self.fake_bin}{os.pathsep}{env.get('PATH', '')}"
@@ -234,6 +240,8 @@ class MkrootfsEnv:
             env["MKROOTFS_FAIL_STAGE"] = failing_stage
         else:
             env.pop("MKROOTFS_FAIL_STAGE", None)
+        if env_overrides:
+            env.update(env_overrides)
         state = self.tmp_path / "docker-state"
         if state.exists():
             for child in state.iterdir():
@@ -335,6 +343,7 @@ def test_default_and_packages_builds_use_distinct_dirs(mkrootfs_env: MkrootfsEnv
 def test_package_order_does_not_change_cache_dir(mkrootfs_env: MkrootfsEnv):
     first = mkrootfs_env.run_args("--packages", "strace,htop")
     assert first.returncode == 0, first.stderr
+    assert VARIANT_DIR_RE.search(_rootfs_path(first)), _rootfs_path(first)
     second = mkrootfs_env.run_args("--packages", "htop,strace")
     assert second.returncode == 0, second.stderr
     assert _rootfs_path(second) == _rootfs_path(first)
@@ -399,3 +408,143 @@ def test_partial_image_is_never_served_and_interrupted_build_leaves_nothing(
     assert failed.returncode != 0
     assert not (target / "rootfs.img").exists()
     assert not (target / ".mkrootfs-stamp").exists()
+
+
+# ---------------------------------------------------------------------------
+# #59-review findings: stamp/image publish coherence (P1), auto-generated
+# ssh-key pinning, and the four previously-unpinned single-line clauses.
+# ---------------------------------------------------------------------------
+
+
+def test_failed_rebuild_after_mismatch_does_not_masquerade_as_legacy(
+    mkrootfs_env: MkrootfsEnv,
+):
+    """P1: the completion stamp used to be deleted before a rebuild even
+    started, so a mismatch-triggered rebuild that then failed left a GOOD
+    but mismatched image with NO stamp -- which the legacy default-shape
+    exception then served at exit 0 as merely 'UNVERIFIED', not what was
+    actually requested. The (image, stamp) pair must stay coherent until a
+    replacement build actually succeeds."""
+    outdir = mkrootfs_env.tmp_path / "shared-outdir"
+    built = mkrootfs_env.run_args("--outdir", str(outdir), "--packages", "strace")
+    assert built.returncode == 0, built.stderr
+    stamp = outdir / ".mkrootfs-stamp"
+    assert "packages=strace" in stamp.read_text()
+
+    failed = mkrootfs_env.run_args("--outdir", str(outdir), failing_stage="mke2fs")
+    assert failed.returncode != 0
+    # The old (mismatched) image is still on disk; its stamp must be too, so
+    # the next request can still tell the two disagree.
+    assert (outdir / "rootfs.img").is_file()
+    assert stamp.is_file(), "a failed rebuild must not destroy the previous stamp"
+    assert "packages=strace" in stamp.read_text()
+
+    retried = mkrootfs_env.run_args("--outdir", str(outdir))
+    assert retried.returncode == 0, retried.stderr
+    assert "no completion stamp" not in retried.stderr, (
+        "a mismatched-but-stamped image must never be served through the "
+        "unstamped-legacy exception"
+    )
+    assert "was built with different options than requested" in retried.stderr
+    assert _built(mkrootfs_env), "the mismatch must trigger a real rebuild"
+    new_stamp_text = stamp.read_text()
+    assert "packages=strace" not in new_stamp_text
+    assert "packages=" in new_stamp_text
+
+
+def test_stamp_part_is_renamed_into_place_after_build(mkrootfs_env: MkrootfsEnv):
+    """The stamp's publish-time replacement (the final `mv` into
+    `.mkrootfs-stamp`) is what now provides the P1 coherence guarantee;
+    a fresh build must leave the final name, never a stray `.part`."""
+    result = mkrootfs_env.run_args()
+    assert result.returncode == 0, result.stderr
+    target = mkrootfs_env.rootfs_cache / "x86_64"
+    assert (target / "rootfs.img").is_file()
+    assert (target / ".mkrootfs-stamp").is_file()
+    assert not (target / ".mkrootfs-stamp.part").exists()
+    assert "build_key=" in (target / ".mkrootfs-stamp").read_text()
+
+
+def test_swapped_generated_ssh_key_triggers_rebuild_not_silent_serve(
+    mkrootfs_env: MkrootfsEnv,
+):
+    """The auto-generated key's pubkey cannot be part of BUILD_KEY (it does
+    not exist until this directory's first build creates it), so a swapped
+    key in a generating-mode cache dir must be caught by the stamp's
+    recorded hash instead -- otherwise the stale image boots with a key the
+    caller no longer has, and every push/pull/exec fails auth silently."""
+    first = mkrootfs_env.run_args()
+    assert first.returncode == 0, first.stderr
+    keydir = Path(_rootfs_path(first)).parent
+    assert (keydir / "id_ed25519.pub").is_file()
+
+    replaced_pub = "ssh-ed25519 REPLACED swapped@qmu\n"
+    (keydir / "id_ed25519.pub").write_text(replaced_pub)
+    (keydir / "id_ed25519").write_text("REPLACED PRIVATE\n")
+
+    again = mkrootfs_env.run_args()
+    assert again.returncode == 0, again.stderr
+    assert "different SSH key" in again.stderr
+    assert _built(mkrootfs_env), "a swapped auto-generated key must never be served silently"
+    expected = hashlib.sha256(replaced_pub.encode()).hexdigest()
+    stamp_text = (keydir / ".mkrootfs-stamp").read_text()
+    assert f"ssh_pubkey_sha256={expected}" in stamp_text
+
+
+def test_distinct_ssh_keys_route_to_distinct_dirs_and_rebuild(mkrootfs_env: MkrootfsEnv):
+    key_a = mkrootfs_env.tmp_path / "key_a"
+    key_a.write_text("PRIVATE-A\n")
+    key_a.with_suffix(".pub").write_text("ssh-ed25519 AAAAA a@qmu\n")
+    key_b = mkrootfs_env.tmp_path / "key_b"
+    key_b.write_text("PRIVATE-B\n")
+    key_b.with_suffix(".pub").write_text("ssh-ed25519 BBBBB b@qmu\n")
+
+    first = mkrootfs_env.run_args("--ssh-key", str(key_a))
+    assert first.returncode == 0, first.stderr
+    path_a = _rootfs_path(first)
+    assert VARIANT_DIR_RE.search(path_a), path_a
+
+    second = mkrootfs_env.run_args("--ssh-key", str(key_b))
+    assert second.returncode == 0, second.stderr
+    path_b = _rootfs_path(second)
+    assert VARIANT_DIR_RE.search(path_b), path_b
+    assert path_b != path_a
+    assert _built(mkrootfs_env), "a different --ssh-key must not be served from key A's cache"
+
+
+def test_env_default_size_override_routes_to_keyed_dir(mkrootfs_env: MkrootfsEnv):
+    result = mkrootfs_env.run_args(env_overrides={"QMU_ROOTFS_SIZE": "5G"})
+    assert result.returncode == 0, result.stderr
+    path = _rootfs_path(result)
+    assert VARIANT_DIR_RE.search(path), path
+    assert "size=5G" in Path(path).with_name(".mkrootfs-stamp").read_text()
+
+
+def test_unstamped_image_in_keyed_dir_is_never_served(mkrootfs_env: MkrootfsEnv):
+    first = mkrootfs_env.run_args("--packages", "strace")
+    assert first.returncode == 0, first.stderr
+    path = Path(_rootfs_path(first))
+    assert VARIANT_DIR_RE.search(str(path)), path
+    (path.with_name(".mkrootfs-stamp")).unlink()
+
+    again = mkrootfs_env.run_args("--packages", "strace")
+    assert again.returncode == 0, again.stderr
+    assert _built(mkrootfs_env), (
+        "an unstamped image outside the legacy default dir must never be served"
+    )
+
+
+def test_mismatch_note_placeholder_values_are_plain_text(mkrootfs_env: MkrootfsEnv):
+    """#59 followup: %q-quoting the option placeholders rendered
+    `packages=\\<none\\>` / `ssh-key=\\<generated\\>`; only the image path
+    needs shell-quoting (SKILL.md documents it as such)."""
+    outdir = mkrootfs_env.tmp_path / "note-outdir"
+    first = mkrootfs_env.run_args("--outdir", str(outdir), "--packages", "strace")
+    assert first.returncode == 0, first.stderr
+
+    again = mkrootfs_env.run_args("--outdir", str(outdir))
+    assert again.returncode == 0, again.stderr
+    assert "packages=<none>" in again.stderr
+    assert "ssh-key=<generated>" in again.stderr
+    assert "\\<" not in again.stderr
+    assert "\\>" not in again.stderr

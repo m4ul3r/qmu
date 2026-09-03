@@ -125,9 +125,14 @@ fi
 # build key -- a digest of everything that changes the image produced
 #
 # Mirrors mktarget.sh: the cache directory name stays human-findable (release,
-# arch), and every OTHER build-affecting input goes into this digest. The
-# completion stamp records it and every cache hit re-checks it, so an image
-# built with different --packages / --size / --ssh-key is never silently
+# arch), and every OTHER build-affecting input goes into this digest -- EXCEPT
+# an auto-generated SSH key's public half, which cannot be hashed here: it
+# doesn't exist until the build below creates it inside the very directory
+# this digest names. The completion stamp separately records the sha256 of
+# whichever public key actually got baked into the image (generated or
+# explicit) and cache_hit() re-checks that value directly, so an image built
+# with different --packages / --size / --ssh-key, or whose auto-generated key
+# was swapped out from under a cache dir after the fact, is never silently
 # served for a run asking for something else.
 # ---------------------------------------------------------------------------
 build_key_material() {
@@ -180,8 +185,11 @@ STAMP_OUT="$OUTDIR/.mkrootfs-stamp"
 #     still serve it (that keeps pre-existing caches valid), but prints a note
 #     saying the options are unverified. Any non-default request is routed to
 #     its own keyed directory above and never sees a legacy image.
-# The stamp is removed before a build starts and written last, so an
-# interrupted build can never look complete.
+# The stamp is written exactly once, atomically (temp file + rename), right
+# after the new image itself is published the same way. A build that fails
+# before that point never touches the previous (image, stamp) pair, so it
+# stays exactly as coherent as it was; a build that fails cannot manufacture
+# a stamp that certifies an image it never finished.
 # ---------------------------------------------------------------------------
 MISMATCH_NOTE=""
 LEGACY_NOTE=""
@@ -190,8 +198,23 @@ cache_hit() {
   if [[ -f "$STAMP_OUT" ]]; then
     local recorded
     recorded="$(sed -n 's/^build_key=//p' "$STAMP_OUT" | head -n1)"
-    if [[ "$recorded" == "$BUILD_KEY" ]]; then return 0; fi
-    MISMATCH_NOTE="$(printf 'cached image at %q was built with different options than requested (requested: size=%q packages=%q ssh-key=%q)' \
+    if [[ "$recorded" == "$BUILD_KEY" ]]; then
+      # BUILD_KEY cannot cover an auto-generated key's public half (see the
+      # comment above it), so a generating-mode hit re-checks the stamp's
+      # recorded pubkey hash against whatever key is on disk right now.
+      if [[ -z "$SSH_KEY_ARG" && -f "$OUTDIR/id_ed25519.pub" ]]; then
+        local recorded_pubkey current_pubkey
+        recorded_pubkey="$(sed -n 's/^ssh_pubkey_sha256=//p' "$STAMP_OUT" | head -n1)"
+        current_pubkey="$(sha256sum -- "$OUTDIR/id_ed25519.pub" | awk '{print $1}')"
+        if [[ -n "$recorded_pubkey" && "$recorded_pubkey" != "$current_pubkey" ]]; then
+          MISMATCH_NOTE="$(printf 'cached image at %q was built with a different SSH key than the one now at %s (its public half changed since the build)' \
+            "$OUTDIR/rootfs.img" "$OUTDIR/id_ed25519")"
+          return 1
+        fi
+      fi
+      return 0
+    fi
+    MISMATCH_NOTE="$(printf 'cached image at %q was built with different options than requested (requested: size=%s packages=%s ssh-key=%s)' \
       "$OUTDIR/rootfs.img" "$SIZE" "${PACKAGES:-<none>}" "${SSH_KEY_ARG:-<generated>}")"
     return 1
   fi
@@ -236,10 +259,6 @@ else
 fi
 chmod 600 "$PRIVKEY"
 PUBKEY_CONTENT="$(cat "${PRIVKEY}.pub")"
-
-# From here on the directory is mid-build; drop any stale stamp so an
-# interrupted run can never satisfy the cache gate.
-rm -f -- "$STAMP_OUT"
 
 # Same atomicity rule as the stamp: the image is built under a .part name and
 # renamed into place only on success, so an interrupted run can never leave a
@@ -403,6 +422,7 @@ if [[ -f "$OUTDIR/rootfs.img" ]]; then
     else
       echo "ssh_key=generated:$OUTDIR/id_ed25519"
     fi
+    echo "ssh_pubkey_sha256=$(sha256sum -- "${PRIVKEY}.pub" | awk '{print $1}')"
     echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "$STAMP_OUT.part"
   mv -f "$STAMP_OUT.part" "$STAMP_OUT"
