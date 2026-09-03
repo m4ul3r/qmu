@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from qmu import cli
+from qmu.cli import build_parser
 from qmu.commands import lifecycle
 from qmu.instance import VMInstance, proc_pid_start, save_instance
 from qmu.paths import instances_dir
@@ -431,25 +433,73 @@ def test_sibling_instance_commands_work_with_valid_project_config(
     assert "[qmu] Error:" not in captured.err
 
 
-def test_config_gate_is_uniform_across_dispatch(config_cli_env, capsys):
-    """The #37 contract at the dispatch layer: with a fatally-invalid project
-    qmu.toml, EVERY non-exempt subcommand refuses with exit 1 naming the
-    source path and offending key — before any handler logic runs — while
-    exempt verbs keep working."""
+def _subcommand_names() -> set[str]:
+    parser = build_parser()
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return set(action.choices)
+    raise AssertionError("no subparsers action on the qmu parser")
+
+
+# Minimal argv that PARSES for each gated verb: argparse errors exit 2 before the
+# dispatch gate runs, so a verb with a required positional needs one supplied.
+MINIMAL_ARGV = {
+    "launch": ["launch"], "run": ["run", "true"], "kill": ["kill"],
+    "prune": ["prune"], "wait": ["wait"], "list": ["list"],
+    "status": ["status"], "show": ["show"], "snapshot": ["snapshot"],
+    "push": ["push", "f"], "pull": ["pull", "f"], "exec": ["exec", "true"],
+    "compile": ["compile", "x.c"], "dmesg": ["dmesg"], "crash": ["crash"],
+    "log": ["log"], "gdb": ["gdb"], "cont": ["cont"],
+    # kbase's --symbols is required, so a bare ["kbase"] would exit 2 in
+    # argparse before ever reaching the dispatch gate under test.
+    "kbase": ["kbase", "--symbols", "System.map"],
+    "qmp": ["qmp", "query-status"], "monitor": ["monitor", "info", "status"],
+}
+
+
+@pytest.mark.parametrize(
+    "verb", sorted(_subcommand_names() - cli._CONFIG_EXEMPT_SUBCOMMANDS)
+)
+def test_every_non_exempt_verb_refuses_invalid_project_config(
+    verb, config_cli_env, capsys
+):
+    """#37/#62: the gate is at the dispatch choke point, so EVERY non-exempt verb
+    refuses before its handler runs. A new verb with no MINIMAL_ARGV entry fails
+    here rather than silently joining the bypass class."""
+    assert verb in MINIMAL_ARGV, (
+        f"{verb!r}: add minimal argv here, or add it to "
+        "cli._CONFIG_EXEMPT_SUBCOMMANDS with a written reason"
+    )
     config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
-
-    gated = ["status", "list", "log", "crash", "kill", "prune", "wait",
-             "cont", "snapshot", "dmesg"]
-    for verb in gated:
-        rc = cli.main([verb])
-        captured = capsys.readouterr()
-        assert rc == 1, f"{verb}: expected fatal config refusal, got rc={rc}"
-        assert "[qmu] Error:" in captured.err, verb
-        assert str(config_cli_env["project"].resolve()) in captured.err, verb
-        assert UNKNOWN_KEY in captured.err, verb
-
-    # Exempt verbs keep working. (doctor self-manages the project layer:
-    # it reports the same fatal finding itself, by design.)
-    rc = cli.main(["version"])
+    rc = cli.main(MINIMAL_ARGV[verb])
     captured = capsys.readouterr()
-    assert rc == 0 and UNKNOWN_KEY not in captured.err
+    assert rc == 1, f"{verb}: expected fatal config refusal, got rc={rc}"
+    assert "[qmu] Error:" in captured.err, verb
+    assert str(config_cli_env["project"].resolve()) in captured.err, verb
+    assert UNKNOWN_KEY in captured.err, verb
+
+
+def test_exempt_subcommands_are_real_and_stay_usable(config_cli_env, capsys):
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+    assert cli._CONFIG_EXEMPT_SUBCOMMANDS <= _subcommand_names()
+    assert cli.main(["version"]) == 0
+    assert UNKNOWN_KEY not in capsys.readouterr().err
+    # doctor is exempt because it diagnoses the same fault itself.
+    assert cli.main(["doctor"]) == 1
+    assert UNKNOWN_KEY in capsys.readouterr().err
+
+
+def test_broken_global_config_warns_once_per_command(
+    config_cli_env, monkeypatch, capsys
+):
+    """launch resolves config twice (dispatch gate + _prepare_boot); the caller must
+    still see one warning line, not two."""
+    config_cli_env["global"].write_text("broken = [\n")
+    monkeypatch.setattr(
+        lifecycle, "launch_vm",
+        lambda **kw: pytest.fail("launch_vm must not run without a kernel"),
+    )
+    rc = cli.main(["launch", "--harness"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.err.count("ignoring global config") == 1

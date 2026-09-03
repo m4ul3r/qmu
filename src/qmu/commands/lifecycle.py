@@ -1593,11 +1593,8 @@ def _add_list(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_list(args: argparse.Namespace) -> int:
-    # Same project-context gate as status (see _handle_status): list answers
-    # from instance records but operates under the project's qmu.toml, so a
-    # fatally-invalid config must refuse it exactly like every command that
-    # resolves config — no validity disagreement between sibling verbs.
-    _resolve_config_from_args(args)
+    # The project-config gate lives at the cli.main dispatch choke point, so
+    # this handler is already running under a validated project config.
     running = list_instances()
     stopped = list_stopped_instances()
     if not running and not stopped:
@@ -1767,16 +1764,11 @@ def describe_non_running(
         )
     return None
 
+
 def _handle_status(args: argparse.Namespace) -> int:
-    # Resolve project/explicit config through the shared validating path
-    # (_resolve_config_from_args -> resolve_config -> load_config_file)
-    # exactly like launch/run/doctor/config-show. status reads no boot
-    # settings from qmu.toml, but it operates in project context, so a
-    # fatally-invalid config must gate it identically instead of letting a
-    # caller probe a VM under a config every other command refuses. A broken
-    # GLOBAL config stays warn-and-continue inside resolve_config. The
-    # "show" alias shares this handler, so both verbs refuse together.
-    _resolve_config_from_args(args)
+    # Validation of the project/explicit config happens once, at the cli.main
+    # dispatch gate (#37), so every sibling verb gives one answer about whether
+    # the project is valid. status reads no boot settings from qmu.toml.
     explanation = describe_non_running(args.vm) if args.vm else None
     if explanation is not None:
         raise QMUError(explanation)

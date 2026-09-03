@@ -39,7 +39,22 @@ from .commands.qmp_cmds import _snapshot_failed  # noqa: F401
 # ---------------------------------------------------------------------------
 
 
-def main(argv: list[str] | None = None) -> int:
+# Uniform project-config gate (#37): any command operating in a project
+# context refuses a fatally-invalid project/explicit qmu.toml, byte-
+# matching `config show`'s refusal — no sibling verb may disagree about
+# whether the project is valid. Exempt verbs: those that never read
+# qmu.toml (skill/version), author it (config init), diagnose it
+# read-only (doctor), or operate purely on host artifact dirs
+# (cache/rootfs build-side). Gated handlers may resolve again; the
+# resolution is idempotent and the error identical.
+_CONFIG_EXEMPT_SUBCOMMANDS = frozenset({
+    "cache", "config", "doctor", "rootfs", "skill", "version",
+})
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the full argparse tree. Separate from :func:`main` so tests can
+    exercise the REAL parser instead of a hand-mirrored copy that can desync."""
     parser = argparse.ArgumentParser(
         prog="qmu",
         description="Agent-friendly QEMU VM management CLI for kernel research",
@@ -96,7 +111,11 @@ def main(argv: list[str] | None = None) -> int:
     meta._add_rootfs(sub)
     meta._add_skill(sub)
     meta._add_version(sub)
+    return parser
 
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     if not args.subcommand:
@@ -108,18 +127,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
 
-    # Uniform project-config gate (#37): any command operating in a project
-    # context refuses a fatally-invalid project/explicit qmu.toml, byte-
-    # matching `config show`'s refusal — no sibling verb may disagree about
-    # whether the project is valid. Exempt verbs: those that never read
-    # qmu.toml (version/skill), author it (config init), diagnose it
-    # read-only (doctor), or operate purely on host artifact dirs
-    # (cache/rootfs build-side). Gated handlers may resolve again; the
-    # resolution is idempotent and the error identical.
-    _CONFIG_EXEMPT_SUBCOMMANDS = frozenset({
-        "cache", "completion", "config", "doctor", "rootfs", "skill",
-        "version",
-    })
     try:
         if args.subcommand not in _CONFIG_EXEMPT_SUBCOMMANDS:
             _resolve_config_from_args(args)

@@ -40,7 +40,6 @@ from .._cliutil import (
     _make_ssh,
     _preflight_ssh_guest,
     _require_ssh,
-    _resolve_config_from_args,
 )
 
 
@@ -751,11 +750,8 @@ def _add_crash(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_crash(args: argparse.Namespace) -> int:
-    # Same project-context gate as status/list (see lifecycle._handle_status):
-    # crash triage runs under the project's qmu.toml, so a fatally-invalid
-    # config refuses it identically instead of leaving a sibling verb that
-    # answers while every config-resolving command refuses.
-    _resolve_config_from_args(args)
+    # Already gated: cli.main validates the project/explicit config for every
+    # non-exempt verb before dispatching (#37).
     inst = find_instance(args.vm)
     crash_autoselect_note = autoselect_note(inst, args.vm)
     history = args.full_history
@@ -850,10 +846,8 @@ def _grep_lines(text: str, pattern: str, context: int) -> tuple[str, int]:
 
 
 def _handle_log(args: argparse.Namespace) -> int:
-    # Same project-context gate as status/list/crash (lifecycle._handle_status):
-    # log reads run under the project's qmu.toml, so a fatally-invalid config
-    # refuses here identically — one validity answer for every sibling verb.
-    _resolve_config_from_args(args)
+    # Already gated: cli.main validates the project/explicit config for every
+    # non-exempt verb before dispatching (#37).
     inst = find_instance(args.vm)
     note = autoselect_note(inst, args.vm)
 

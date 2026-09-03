@@ -68,6 +68,13 @@ bricks every command (including `qmu doctor`, which diagnoses it). An invalid
 **project** (`qmu.toml`) or explicit `--config` file is fatal (exit 1) with the
 source path and offending key.
 
+Every subcommand validates the project/explicit layer before it runs — including
+`kill`, `prune`, `crash`, `log` and `wait`, which answer from instance records. Only
+`config`, `doctor`, `cache`, `rootfs`, `skill` and `version` are exempt (`config` and
+`doctor` report the same fault themselves; the rest never read `qmu.toml`). So a broken
+`qmu.toml` blocks VM cleanup too: fix the file, or run the command from a directory
+outside the project — the project search walks up from CWD only.
+
 `qmu config init` writes `[machine]` (arch/memory/cpus, with commented `cpu`/`nic_model`/`extra_args`), `[drive]`, `[ssh]`, `[gdb]`, three `[profiles.*]` blocks, and a commented harness-mode block. Notes:
 
 - `[ssh] user` (default `root`) sets the guest login for `exec`/`push`/`pull`/`compile`; it is recorded on the VM at launch, so set it **before** `qmu launch`.

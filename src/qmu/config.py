@@ -498,6 +498,13 @@ def _apply_config_file(
     _apply_toml(cfg, raw, f"{source_kind}: {source}")
 
 
+# One command may resolve config twice (the dispatch-level project-config gate in
+# cli.main plus a handler that needs the QMUConfig object), and this warning is a
+# per-process diagnostic, not a per-layer one. Keyed on the rendered message so a
+# different file or a different error still warns.
+_global_config_warnings: set[str] = set()
+
+
 def resolve_config(
     cli_overrides: dict[str, Any] | None = None,
     config_path_override: Path | None = None,
@@ -522,7 +529,10 @@ def resolve_config(
         try:
             _apply_config_file(cfg, gpath, "global")
         except ConfigError as exc:
-            sys.stderr.write(f"[qmu] Warning: ignoring global config: {exc}\n")
+            warning = f"[qmu] Warning: ignoring global config: {exc}\n"
+            if warning not in _global_config_warnings:
+                _global_config_warnings.add(warning)
+                sys.stderr.write(warning)
 
     # Layer 2: project config (or explicit --config)
     if config_path_override is not None:
