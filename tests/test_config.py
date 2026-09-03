@@ -260,6 +260,18 @@ def test_flat_known_key_reports_migration_hint(
     assert destination in str(error)
 
 
+def test_missing_explicit_config_path_is_fatal(isolate_config):
+    """A --config path that does not exist must be an operational error, not
+    a silent fallthrough to defaults/global-only — the old `if
+    ppath.is_file()` guard dropped the whole explicit layer on a typo'd
+    path, both silently and while defeating the #37 dispatch gate."""
+    missing = isolate_config / "does-not-exist.toml"
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_config(config_path_override=missing)
+    assert excinfo.value.source == missing.resolve()
+    assert str(missing.resolve()) in str(excinfo.value)
+
+
 @pytest.mark.parametrize(("text", "key_path"), _UNKNOWN_KEYS)
 def test_unknown_key_reports_exact_source_and_path(isolate_config, text, key_path):
     path = _write_toml(isolate_config / "unknown.toml", text)

@@ -21,6 +21,8 @@ import tempfile
 
 import pytest
 
+from qmu.config import reset_global_config_warnings
+
 
 @pytest.fixture(autouse=True)
 def isolate_qmu_env(tmp_path_factory, monkeypatch):
@@ -37,6 +39,11 @@ def isolate_qmu_env(tmp_path_factory, monkeypatch):
     # TMPDIR is honored by tempfile.gettempdir() when tests exercise the
     # platform-temp fallback.
     monkeypatch.setattr(tempfile, "tempdir", None)
+
+    # A leftover warn-once entry from a previous test (or a test that calls
+    # resolve_config() directly, bypassing cli.main's own reset) must not
+    # mask the same message in this test.
+    reset_global_config_warnings()
 
     yield
 

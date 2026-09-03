@@ -500,9 +500,19 @@ def _apply_config_file(
 
 # One command may resolve config twice (the dispatch-level project-config gate in
 # cli.main plus a handler that needs the QMUConfig object), and this warning is a
-# per-process diagnostic, not a per-layer one. Keyed on the rendered message so a
-# different file or a different error still warns.
+# per-COMMAND diagnostic, not a per-process one: cli.main clears the dedup set via
+# reset_global_config_warnings() before dispatching, so repeated resolve_config()
+# calls within one command still dedupe, but the next command warns again. Keyed
+# on the rendered message so a different file or a different error still warns.
 _global_config_warnings: set[str] = set()
+
+
+def reset_global_config_warnings() -> None:
+    """Clear the warn-once dedup set. Called once per CLI invocation by
+    cli.main (so the dedup is per-command, not per-process) and by the test
+    suite's isolate_qmu_env fixture (so a warning from one test cannot mask
+    the same message in the next)."""
+    _global_config_warnings.clear()
 
 
 def resolve_config(
@@ -534,11 +544,17 @@ def resolve_config(
                 _global_config_warnings.add(warning)
                 sys.stderr.write(warning)
 
-    # Layer 2: project config (or explicit --config)
+    # Layer 2: project config (or explicit --config). Unlike the project
+    # search (which simply finds nothing when no qmu.toml exists upward from
+    # CWD), an explicit --config naming a path that isn't there is a caller
+    # mistake, not "no project config": silently falling through used to both
+    # drop every layer above CLI flags AND defeat the #37 dispatch gate (a
+    # typo'd --config made `list` report "No VMs." instead of refusing).
     if config_path_override is not None:
         ppath = Path(config_path_override).resolve()
-        if ppath.is_file():
-            _apply_config_file(cfg, ppath, "config")
+        if not ppath.is_file():
+            raise ConfigError(ppath, "file not found")
+        _apply_config_file(cfg, ppath, "config")
     else:
         ppath = find_project_config()
         if ppath is not None:

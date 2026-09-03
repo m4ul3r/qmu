@@ -336,6 +336,50 @@ def test_status_explicit_config_fatal_on_invalid_path(
     assert UNKNOWN_KEY in captured.err
 
 
+def test_status_missing_explicit_config_path_is_error(
+    config_cli_env, running_instance, capsys
+):
+    """A --config path that does not exist at all (not just invalid content)
+    used to fall straight through resolve_config's `if ppath.is_file()` guard
+    and answer on the pre-#37 message ("No running VMs") instead of refusing."""
+    missing = config_cli_env["explicit"]  # never written
+
+    rc = cli.main(["status", "--config", str(missing)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "[qmu] Error:" in captured.err
+    assert str(missing.resolve()) in captured.err
+
+
+def test_list_missing_explicit_config_path_is_error(
+    config_cli_env, running_instance, capsys
+):
+    """Same bypass through `list`: before the fix this silently dropped the
+    explicit layer and printed "No VMs." at rc 0 instead of refusing."""
+    missing = config_cli_env["explicit"]  # never written
+
+    rc = cli.main(["list", "--config", str(missing)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "[qmu] Error:" in captured.err
+    assert str(missing.resolve()) in captured.err
+
+
+def test_config_show_missing_explicit_config_path_is_error(
+    config_cli_env, capsys
+):
+    missing = config_cli_env["explicit"]  # never written
+
+    rc = cli.main(["config", "show", "--config", str(missing)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "[qmu] Error:" in captured.err
+    assert str(missing.resolve()) in captured.err
+
+
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
 def test_status_config_error_emits_exactly_one_false_record(
     config_cli_env, running_instance, capsys, fmt
@@ -457,6 +501,15 @@ MINIMAL_ARGV = {
 }
 
 
+def test_minimal_argv_matches_gated_verbs():
+    """MINIMAL_ARGV and the exempt set must partition the real subcommand
+    list identically. Without this, moving a verb INTO the exempt set (e.g.
+    appending "kill" to _CONFIG_EXEMPT_SUBCOMMANDS) silently deletes its row
+    from the parametrize list below instead of failing anything — the exact
+    #37 regression the reviewer reintroduced undetected."""
+    assert set(MINIMAL_ARGV) == _subcommand_names() - cli._CONFIG_EXEMPT_SUBCOMMANDS
+
+
 @pytest.mark.parametrize(
     "verb", sorted(_subcommand_names() - cli._CONFIG_EXEMPT_SUBCOMMANDS)
 )
@@ -502,4 +555,69 @@ def test_broken_global_config_warns_once_per_command(
     rc = cli.main(["launch", "--harness"])
     captured = capsys.readouterr()
     assert rc == 1
+    assert captured.err.count("ignoring global config") == 1
+
+
+EXEMPT_MINIMAL_ARGV = {
+    # config's own handler (`config show`) independently resolves config and
+    # must keep reporting the fault itself — resolve_config only appears in
+    # _handle_config_show, not _handle_config_path/_handle_config_init.
+    "config": ["config", "show"],
+    "doctor": ["doctor"],
+    "cache": ["cache", "du"],
+    # rootfs requires the `image` positional on every leaf subcommand; a
+    # missing image is a legitimate "Image not found" QMUError, unrelated to
+    # project config.
+    "rootfs": ["rootfs", "ls", "does-not-exist.img"],
+    "skill": ["skill", "install"],
+    "version": ["version"],
+}
+
+
+@pytest.mark.parametrize("verb", sorted(cli._CONFIG_EXEMPT_SUBCOMMANDS))
+def test_every_exempt_verb_never_surfaces_project_config_error(
+    verb, config_cli_env, monkeypatch, tmp_path, capsys
+):
+    """`_CONFIG_EXEMPT_SUBCOMMANDS <= _subcommand_names()` (the existing
+    test_exempt_subcommands_are_real_and_stay_usable assertion) is satisfied
+    by ANY registered verb name, so a verb that quietly grows a
+    resolve_config() call would join the exempt set with no failing test —
+    the #37 shape again. Actually run each exempt verb's real handler and
+    assert the project config's unknown key never reaches stderr — except
+    config/doctor, which read/diagnose qmu.toml themselves and MUST still
+    report it."""
+    assert verb in EXEMPT_MINIMAL_ARGV, (
+        f"{verb!r}: add minimal argv to EXEMPT_MINIMAL_ARGV"
+    )
+    # `skill install` symlinks into $CLAUDE_HOME/$CODEX_HOME; keep it off the
+    # real developer home.
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude-home"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home-absent"))
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+
+    cli.main(EXEMPT_MINIMAL_ARGV[verb])
+    captured = capsys.readouterr()
+
+    if verb in ("config", "doctor"):
+        assert UNKNOWN_KEY in captured.err, verb
+    else:
+        assert UNKNOWN_KEY not in captured.err, verb
+
+
+def test_broken_global_config_warns_again_on_next_command(
+    config_cli_env, capsys
+):
+    """The dedup is per-command (cli.main resets it before each dispatch),
+    not per-process: a second, separate `qmu` invocation against the same
+    broken global config must warn again, exactly like a second real
+    invocation would."""
+    config_cli_env["global"].write_text("broken = [\n")
+
+    cli.main(["--format", "json", "config", "show"])
+    capsys.readouterr()
+
+    rc = cli.main(["--format", "json", "config", "show"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
     assert captured.err.count("ignoring global config") == 1
