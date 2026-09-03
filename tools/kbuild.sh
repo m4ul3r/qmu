@@ -31,6 +31,23 @@ die()  { echo "kbuild: error: $*" >&2; exit 2; }
 step() { echo "=== [$(date +%H:%M:%S)] $* ===" >&2; }
 log()  { echo "kbuild: $*" >&2; }
 
+# The build mutates SRCDIR inside a `docker run` container parented by
+# dockerd, not by this shell -- a plain `set -e`/signal exit here does not
+# stop it. KBUILD_CONTAINER is set to a unique name right before that
+# container is started; reap_container force-removes it on every exit path
+# this shell CAN observe, so the mutation cannot outlive the lock below that
+# was supposed to serialize it. (Nothing in user space can trap an
+# unblockable SIGKILL to the whole process group; that gap is inherent to
+# SIGKILL, not this script.)
+KBUILD_CONTAINER=""
+reap_container() {
+  [[ -n "$KBUILD_CONTAINER" ]] || return 0
+  docker rm -f "$KBUILD_CONTAINER" >/dev/null 2>&1 || true
+}
+trap reap_container EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 version_ge() {
   local maj1=$1 min1=$2 maj2=$3 min2=$4
   (( maj1 > maj2 )) && return 0
@@ -225,17 +242,37 @@ SRCDIR="$CACHE/kernels/src/linux-$VERSION"
 # which has been observed to corrupt the shared tree). Serialize them with an
 # exclusive advisory lock keyed per version, acquired BEFORE any cache
 # mutation. The lock is held on an inherited fd, so the kernel releases it on
-# every exit path (die(), set -e aborts, signals). Different versions use
-# different lock files and stay parallel.
-mkdir -p "$CACHE/kernels"
-exec 9>"$CACHE/kernels/.src-linux-$VERSION.lock"
+# every exit path this shell can observe (die(), set -e aborts, INT/TERM) --
+# but the guarded mutation runs inside a `docker run` container parented by
+# dockerd, which does not die with this shell. reap_container (see the
+# helpers above, armed on EXIT/INT/TERM) force-removes that container on
+# every one of those paths, so the mutation cannot outlive the lock that was
+# supposed to serialize it. Different versions use different lock files and
+# stay parallel.
+mkdir -p "$CACHE/kernels" || die "cannot create $CACHE/kernels: check permissions"
+exec 9>"$CACHE/kernels/.src-linux-$VERSION.lock" || die "cannot open lock file $CACHE/kernels/.src-linux-$VERSION.lock: check permissions"
 # Announce a wait: without this a blocked invocation is silent for the length
 # of a full build, which reads as a hang. log() writes to stderr, so the
 # eval-able stdout contract is untouched.
-if ! flock -n 9; then
+#
+# flock's own exit status is sysexits.h-derived for a real failure (bad fd,
+# ENOLCK, a filesystem that can't flock(2)) and ONLY uses -E's code (default
+# 1, pinned here to avoid colliding with this script's own "build failed"
+# exit 1) to report a lost non-blocking race. Without -E, every non-zero
+# flock exit looked like contention: a real failure printed the bogus
+# "waiting..." line, then failed the same way again on the blocking retry
+# and aborted under set -e with no `kbuild:`-prefixed diagnostic at all.
+FLOCK_CONFLICT=99
+FLOCK_RC=0
+flock -n -E "$FLOCK_CONFLICT" 9 || FLOCK_RC=$?
+if [[ $FLOCK_RC -eq $FLOCK_CONFLICT ]]; then
   log "waiting for another kbuild invocation holding the linux-$VERSION source tree..."
-  flock 9
+  FLOCK_RC=0
+  flock -E "$FLOCK_CONFLICT" 9 || FLOCK_RC=$?
+  [[ $FLOCK_RC -eq 0 ]] || die "failed to acquire the linux-$VERSION source-tree lock (flock exit $FLOCK_RC)"
   log "acquired linux-$VERSION source-tree lock"
+elif [[ $FLOCK_RC -ne 0 ]]; then
+  die "failed to acquire the linux-$VERSION source-tree lock (flock exit $FLOCK_RC): check that $CACHE/kernels/.src-linux-$VERSION.lock supports flock(2) (e.g. not NFS/CIFS)"
 fi
 
 emit_config_output() {
@@ -407,7 +444,15 @@ if [[ "$CONFIG_ONLY" == false ]]; then
   GDB_TARGET="scripts_gdb"
 fi
 
+# Named so reap_container (armed on EXIT/INT/TERM, see the helpers near the
+# top of the script) can find and remove it regardless of how this shell
+# exits. Pre-clean defensively: a name collision from a PID-reused stale
+# leftover would otherwise fail this docker run outright.
+KBUILD_CONTAINER="qmu-kbuild-$VERSION-$ARCH-$$"
+docker rm -f "$KBUILD_CONTAINER" >/dev/null 2>&1 || true
+
 docker run --rm \
+  --name "$KBUILD_CONTAINER" \
   --user "$(id -u):$(id -g)" \
   -e HOME=/tmp \
   -e KBUILD_BUILD_USER=qmu -e KBUILD_BUILD_HOST=kbuild \

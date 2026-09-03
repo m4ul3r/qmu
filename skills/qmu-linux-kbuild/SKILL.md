@@ -75,15 +75,25 @@ Use `eval "$(tools/kbuild.sh ...)"` to capture these into shell variables.
 **`--config-only`** prints only `CONFIG=...`. It does not build a kernel, does
 not run `scripts_gdb`, and cannot provide `VMLINUX_GDB` or `lx-*` helpers.
 
-Same-version invocations serialize on a per-version lock
-(`$CACHE/kernels/.src-linux-$VERSION.lock`): a `--config-only` run waits for
-an in-flight build of the same version to finish, and vice versa. This is
-required because every invocation for one version shares the single extracted
-tree in `$CACHE/kernels/src/linux-$VERSION`, and config generation mrpropers
-and reconfigures that tree — interleaving it with a running build corrupts the
-shared tree. Different versions use different lock files and build in parallel.
-A blocked invocation prints `kbuild: waiting for another kbuild invocation…` on
-stderr and then proceeds, so a wait is distinguishable from a hang.
+Every invocation for a given kernel version — across **all architectures**,
+and regardless of whether it would otherwise have been a cache hit — takes
+one per-version lock (`$CACHE/kernels/.src-linux-$VERSION.lock`) before the
+cache fast path even runs. A `--config-only` run waits for an in-flight build
+of the same version to finish and vice versa, but so does a fully **cached**
+build, and so does a build of a *different* `--arch` of the same version
+(e.g. `arm64` blocks behind an in-flight `x86_64` build of the same version,
+and vice versa) — the lock is keyed on version only, not on version+arch,
+because every arch shares the one extracted tree in
+`$CACHE/kernels/src/linux-$VERSION`, and config generation mrpropers and
+reconfigures that tree — interleaving it with a running build corrupts the
+shared tree. Different versions use different lock files and build in
+parallel.
+
+A blocked invocation prints `kbuild: waiting for another kbuild invocation…`
+on stderr once, then blocks with **no timeout, no `-w`, and no opt-out** — so
+that message tells you a wait is happening but not how long it will last;
+past that first line a genuine wait and a hang look identical. To find out
+who actually holds the lock: `fuser -v $CACHE/kernels/.src-linux-$VERSION.lock`.
 
 ### GDB helper setup
 
