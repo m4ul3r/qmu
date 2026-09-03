@@ -30,11 +30,27 @@ AGENTS_HOME in the developer's shell cannot re-escape the sandbox.
 
 from __future__ import annotations
 
+import os
+import pwd
 import tempfile
+from pathlib import Path
 
 import pytest
 
 from qmu.config import reset_global_config_warnings
+
+
+@pytest.fixture
+def real_developer_home() -> Path:
+    """The developer's actual home directory, from the passwd entry.
+
+    Ground truth for every isolation assertion, and deliberately NOT $HOME:
+    that is the variable `isolate_qmu_env` redirects, so a check that reads
+    HOME to validate HOME passes unconditionally. Lives here so the one
+    derivation is shared by the invariant guard in test_skill_install and the
+    precondition on the mutating handler in test_cli_config_errors.
+    """
+    return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 
 
 @pytest.fixture(autouse=True)

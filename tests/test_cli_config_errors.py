@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -576,7 +577,7 @@ EXEMPT_MINIMAL_ARGV = {
 
 @pytest.mark.parametrize("verb", sorted(cli._CONFIG_EXEMPT_SUBCOMMANDS))
 def test_every_exempt_verb_never_surfaces_project_config_error(
-    verb, config_cli_env, capsys
+    verb, config_cli_env, capsys, real_developer_home
 ):
     """`_CONFIG_EXEMPT_SUBCOMMANDS <= _subcommand_names()` (the existing
     test_exempt_subcommands_are_real_and_stay_usable assertion) is satisfied
@@ -589,11 +590,20 @@ def test_every_exempt_verb_never_surfaces_project_config_error(
     assert verb in EXEMPT_MINIMAL_ARGV, (
         f"{verb!r}: add minimal argv to EXEMPT_MINIMAL_ARGV"
     )
-    # `skill install` really does symlink into every install root; conftest's
-    # autouse isolation redirects HOME (and clears CLAUDE_HOME/CODEX_HOME/
-    # AGENTS_HOME/PI_CODING_AGENT_DIR) so this sweep cannot reach the
-    # developer's own skill links. Guarding two of those roots here instead is
-    # what let the ~/.agents root escape when it was added.
+    # This sweep runs each verb's REAL handler, and `skill install` is the one
+    # that mutates: it symlinks into every paths.skill_install_roots() entry.
+    # conftest's autouse isolation redirects HOME so those roots land in a temp
+    # dir, but that containment is asserted where the mutation happens rather
+    # than assumed: Path.home() falls back to the passwd entry when HOME is
+    # merely UNSET, so a future test that delenv's it — or a revert of the
+    # redirect — would silently rewrite the developer's own skill links, which
+    # is exactly what happened when the ~/.agents root was added and only
+    # CLAUDE_HOME/CODEX_HOME were guarded here.
+    if verb == "skill":
+        assert Path.home().resolve() != real_developer_home, (
+            "refusing to run the mutating `skill install` handler against the "
+            "developer's real home; conftest's HOME redirect is not in effect"
+        )
     config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
 
     cli.main(EXEMPT_MINIMAL_ARGV[verb])
