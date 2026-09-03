@@ -1588,10 +1588,13 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
 def _add_list(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("list", help="List VMs (running and stopped)")
     _add_common_opts(p)
+    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
     p.set_defaults(handler=_handle_list)
 
 
 def _handle_list(args: argparse.Namespace) -> int:
+    # The project-config gate lives at the cli.main dispatch choke point, so
+    # this handler is already running under a validated project config.
     running = list_instances()
     stopped = list_stopped_instances()
     if not running and not stopped:
@@ -1689,6 +1692,7 @@ def _add_status(sub: argparse._SubParsersAction) -> None:
     # "show" is the common wrong guess for this verb; alias it rather than
     # making the caller spend a round trip discovering the right name.
     p = sub.add_parser("status", aliases=["show"], help="Detailed VM status")
+    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_status)
 
@@ -1762,6 +1766,9 @@ def describe_non_running(
 
 
 def _handle_status(args: argparse.Namespace) -> int:
+    # Validation of the project/explicit config happens once, at the cli.main
+    # dispatch gate (#37), so every sibling verb gives one answer about whether
+    # the project is valid. status reads no boot settings from qmu.toml.
     explanation = describe_non_running(args.vm) if args.vm else None
     if explanation is not None:
         raise QMUError(explanation)

@@ -745,10 +745,13 @@ def _add_crash(sub: argparse._SubParsersAction) -> None:
         ),
     )
     _add_common_opts(p)
+    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
     p.set_defaults(handler=_handle_crash)
 
 
 def _handle_crash(args: argparse.Namespace) -> int:
+    # Already gated: cli.main validates the project/explicit config for every
+    # non-exempt verb before dispatching (#37).
     inst = find_instance(args.vm)
     crash_autoselect_note = autoselect_note(inst, args.vm)
     history = args.full_history
@@ -808,6 +811,7 @@ def _add_log(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--context", "-C", type=int, default=0, dest="context",
                    help="With --grep: also keep N lines around each match")
     _add_common_opts(p)
+    p.add_argument("--config", default=None, help="Path to qmu.toml config file")
     p.set_defaults(handler=_handle_log)
 
 
@@ -842,6 +846,8 @@ def _grep_lines(text: str, pattern: str, context: int) -> tuple[str, int]:
 
 
 def _handle_log(args: argparse.Namespace) -> int:
+    # Already gated: cli.main validates the project/explicit config for every
+    # non-exempt verb before dispatching (#37).
     inst = find_instance(args.vm)
     note = autoselect_note(inst, args.vm)
 

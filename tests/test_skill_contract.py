@@ -12,7 +12,6 @@ mechanically checkable, so it is checked here rather than by review.
 
 from __future__ import annotations
 
-import argparse
 import io
 import re
 import shlex
@@ -21,45 +20,13 @@ from pathlib import Path
 
 import pytest
 
-from qmu._cliutil import _add_top_level_common_opts
-from qmu.commands import guest, lifecycle, meta, qmp_cmds, run
+from qmu.cli import build_parser
 
 SKILL = Path(__file__).resolve().parents[1] / "skills" / "qmu" / "SKILL.md"
 
 # A documented line containing any of these is a template, not a runnable
 # command; its VALUE checks may fail, but an unknown flag still must not.
 PLACEHOLDER = re.compile(r"[<>]|\.\.\.|\$\{|\$[A-Z_]|\*")
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    """Mirror cli.main's parser construction without dispatching handlers."""
-    parser = argparse.ArgumentParser(prog="qmu")
-    _add_top_level_common_opts(parser)
-    sub = parser.add_subparsers(dest="subcommand")
-    registrars = [
-        lifecycle._add_launch, run._add_run, lifecycle._add_kill,
-        lifecycle._add_prune, lifecycle._add_wait, lifecycle._add_list,
-        lifecycle._add_status, lifecycle._add_doctor,
-        meta._add_config, qmp_cmds._add_snapshot,
-        guest._add_push, guest._add_pull, guest._add_exec, guest._add_compile,
-        guest._add_dmesg, guest._add_crash, guest._add_log,
-        qmp_cmds._add_gdb, qmp_cmds._add_kbase, qmp_cmds._add_cont,
-        qmp_cmds._add_qmp, qmp_cmds._add_monitor,
-        meta._add_rootfs, meta._add_skill, meta._add_version,
-    ]
-    # This mirror re-lists cli.main's registrars by hand, so a subcommand that
-    # arrives on a sibling branch (e.g. `qmu cache`, meta._add_cache) would
-    # otherwise desync it: the command's own documented lines in SKILL.md would
-    # fail to parse here even though the real CLI accepts them. Pick up such
-    # registrars by name when the symbol is present, absorbing the drift instead
-    # of hard-failing on the very lines the sibling PR also adds to the skill.
-    for owner, name in ((meta, "_add_cache"),):
-        fn = getattr(owner, name, None)
-        if fn is not None:
-            registrars.append(fn)
-    for register in registrars:
-        register(sub)
-    return parser
 
 
 def _cut_at_unquoted(line: str) -> str:
@@ -150,7 +117,7 @@ def test_skill_documents_some_commands():
     ids=[f"L{n}" for n, _ in DOCUMENTED],
 )
 def test_documented_command_parses(lineno, command):
-    parser = _build_parser()
+    parser = build_parser()
     try:
         argv = shlex.split(command)[1:]
     except ValueError as exc:

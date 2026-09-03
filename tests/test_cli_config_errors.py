@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import argparse
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
 
 from qmu import cli
+from qmu.cli import build_parser
 from qmu.commands import lifecycle
+from qmu.instance import VMInstance, proc_pid_start, save_instance
+from qmu.paths import instances_dir
 
 
 @pytest.fixture
@@ -240,3 +245,261 @@ def test_harness_launch_accepts_machine_only_config(
     assert seen["config"].rootfs is None
     assert seen["config"].ssh_key is None
     assert f"config: {source}" in seen["config"]._sources
+
+
+# ---------------------------------------------------------------------------
+# status: the last command that answered in project context without resolving
+# project/explicit config (issue repro). status reads no boot settings from
+# qmu.toml, but it operates in project context like launch/run/doctor/
+# config-show, so a fatally-invalid project or --config source must gate it
+# with the same exit-1 ConfigError those commands emit.
+# ---------------------------------------------------------------------------
+
+UNKNOWN_KEY = "definitely_not_a_qmu_key"
+
+
+@pytest.fixture
+def running_instance():
+    """A real saved instance record whose pid is this test process, so
+    choose_instance auto-selects it exactly as it would for a live VM."""
+    d = instances_dir()
+    pid = os.getpid()
+    inst = VMInstance(
+        vm_id="live", pid=pid,
+        qmp_socket=str(d / "live.qmp.sock"),
+        ssh_port=None, ssh_key=None, gdb_port=None,
+        serial_log=str(d / "live.serial.log"), kernel="bzImage",
+        rootfs="r.img", memory="1G", cpus=1, cmdline="console=ttyS0",
+        profile="exploit-dev", started_at="now",
+        pid_start=proc_pid_start(pid),
+    )
+    save_instance(inst)
+    (d / "live.serial.log").write_text("serial-of-live\n")
+    (d / "live.qemu.log").write_text("")
+    return inst
+
+
+def _status_fatal_case(env, running_instance, capsys, argv):
+    """Run `argv` against an unknown-top-level-key qmu.toml; assert the
+    documented refusal names BOTH the source path and the offending key."""
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "[qmu] Error:" in captured.err
+    assert str(env["project"].resolve()) in captured.err
+    assert UNKNOWN_KEY in captured.err
+    assert "unknown top-level key" in captured.err
+    return captured
+
+
+def test_status_fatal_on_invalid_project_config(
+    config_cli_env, running_instance, capsys
+):
+    """The issue repro: a running instance exists and status would otherwise
+    answer, but the project qmu.toml next to it carries an unknown top-level
+    key — status must refuse with the exact error `config show` emits."""
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+
+    captured = _status_fatal_case(
+        config_cli_env, running_instance, capsys, ["status"]
+    )
+
+    # The refusal must match what `config show` emits byte-for-byte, so an
+    # agent triaging via either command sees one message, not two dialects.
+    rc = cli.main(["config", "show"])
+    show_captured = capsys.readouterr()
+    assert rc == 1
+    assert show_captured.err == captured.err
+
+
+def test_status_show_alias_fatal_on_invalid_project_config_too(
+    config_cli_env, running_instance, capsys
+):
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+    _status_fatal_case(config_cli_env, running_instance, capsys, ["show"])
+
+
+def test_status_explicit_config_fatal_on_invalid_path(
+    config_cli_env, running_instance, capsys
+):
+    """The explicit-source layer of the same bypass: --config pointing at a
+    fatally-invalid file must gate status like it gates config show."""
+    bad = config_cli_env["explicit"]
+    bad.write_text(f'{UNKNOWN_KEY} = "typo"\n')
+
+    rc = cli.main(["status", "--config", str(bad.resolve())])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "[qmu] Error:" in captured.err
+    assert str(bad.resolve()) in captured.err
+    assert UNKNOWN_KEY in captured.err
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_status_config_error_emits_exactly_one_false_record(
+    config_cli_env, running_instance, capsys, fmt
+):
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+
+    rc = cli.main(["--format", fmt, "status"])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    if fmt == "json":
+        payloads = [json.loads(captured.out)]
+    else:
+        out_lines = captured.out.splitlines()
+        assert len(out_lines) == 1
+        payloads = [json.loads(out_lines[0])]
+    (payload,) = payloads
+    assert payload["ok"] is False
+    assert payload["error_type"] == "ConfigError"
+    assert UNKNOWN_KEY in payload["error"]
+
+
+def test_broken_global_config_warns_and_status_continues(
+    config_cli_env, running_instance, capsys
+):
+    """A broken GLOBAL config is never fatal — not even for status. It warns
+    and answers on defaults, exactly like every other command."""
+    config_cli_env["global"].write_text("broken = [\n")
+
+    rc = cli.main(["--format", "json", "status"])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert rc == 0
+    assert "[qmu] Warning: ignoring global config" in captured.err
+    assert payload["ok"] is True
+    assert payload["vm_id"] == "live"
+
+
+def test_valid_project_config_keeps_status_working(
+    config_cli_env, running_instance, capsys
+):
+    """The fatal gate must not fire on a healthy project: a schema-valid
+    qmu.toml leaves status answering unchanged (exit 0, ok:true record)."""
+    config_cli_env["project"].write_text(
+        '[machine]\nmemory = "2G"\n[boot]\nkernel = "bzImage"\n'
+    )
+
+    rc = cli.main(["--format", "json", "status"])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert rc == 0
+    assert captured.err == ""
+    assert payload["ok"] is True
+    assert payload["vm_id"] == "live"
+
+
+
+@pytest.mark.parametrize("argv", [
+    ["list"],
+    ["log", "--vm", "live"],
+    ["crash", "--vm", "live"],
+], ids=["list", "log", "crash"])
+def test_sibling_instance_commands_fatal_on_invalid_project_config(
+    argv, config_cli_env, running_instance, capsys
+):
+    """Same bypass class as pre-fix #37 status: list/log/crash answer from
+    instance records but operate in project context, so a fatally-invalid
+    project qmu.toml must refuse them exactly like config show/status —
+    exit 1 naming the source path and the offending key."""
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "[qmu] Error:" in captured.err
+    assert str(config_cli_env["project"].resolve()) in captured.err
+    assert UNKNOWN_KEY in captured.err
+
+
+@pytest.mark.parametrize("argv", [
+    ["list"],
+    ["log", "--vm", "live"],
+])
+def test_sibling_instance_commands_work_with_valid_project_config(
+    argv, config_cli_env, running_instance, capsys
+):
+    """The gate must not break the happy path: with a valid (or absent)
+    project qmu.toml the sibling commands behave exactly as before."""
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "[qmu] Error:" not in captured.err
+
+
+def _subcommand_names() -> set[str]:
+    parser = build_parser()
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return set(action.choices)
+    raise AssertionError("no subparsers action on the qmu parser")
+
+
+# Minimal argv that PARSES for each gated verb: argparse errors exit 2 before the
+# dispatch gate runs, so a verb with a required positional needs one supplied.
+MINIMAL_ARGV = {
+    "launch": ["launch"], "run": ["run", "true"], "kill": ["kill"],
+    "prune": ["prune"], "wait": ["wait"], "list": ["list"],
+    "status": ["status"], "show": ["show"], "snapshot": ["snapshot"],
+    "push": ["push", "f"], "pull": ["pull", "f"], "exec": ["exec", "true"],
+    "compile": ["compile", "x.c"], "dmesg": ["dmesg"], "crash": ["crash"],
+    "log": ["log"], "gdb": ["gdb"], "cont": ["cont"],
+    # kbase's --symbols is required, so a bare ["kbase"] would exit 2 in
+    # argparse before ever reaching the dispatch gate under test.
+    "kbase": ["kbase", "--symbols", "System.map"],
+    "qmp": ["qmp", "query-status"], "monitor": ["monitor", "info", "status"],
+}
+
+
+@pytest.mark.parametrize(
+    "verb", sorted(_subcommand_names() - cli._CONFIG_EXEMPT_SUBCOMMANDS)
+)
+def test_every_non_exempt_verb_refuses_invalid_project_config(
+    verb, config_cli_env, capsys
+):
+    """#37/#62: the gate is at the dispatch choke point, so EVERY non-exempt verb
+    refuses before its handler runs. A new verb with no MINIMAL_ARGV entry fails
+    here rather than silently joining the bypass class."""
+    assert verb in MINIMAL_ARGV, (
+        f"{verb!r}: add minimal argv here, or add it to "
+        "cli._CONFIG_EXEMPT_SUBCOMMANDS with a written reason"
+    )
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+    rc = cli.main(MINIMAL_ARGV[verb])
+    captured = capsys.readouterr()
+    assert rc == 1, f"{verb}: expected fatal config refusal, got rc={rc}"
+    assert "[qmu] Error:" in captured.err, verb
+    assert str(config_cli_env["project"].resolve()) in captured.err, verb
+    assert UNKNOWN_KEY in captured.err, verb
+
+
+def test_exempt_subcommands_are_real_and_stay_usable(config_cli_env, capsys):
+    config_cli_env["project"].write_text(f'{UNKNOWN_KEY} = "typo"\n')
+    assert cli._CONFIG_EXEMPT_SUBCOMMANDS <= _subcommand_names()
+    assert cli.main(["version"]) == 0
+    assert UNKNOWN_KEY not in capsys.readouterr().err
+    # doctor is exempt because it diagnoses the same fault itself.
+    assert cli.main(["doctor"]) == 1
+    assert UNKNOWN_KEY in capsys.readouterr().err
+
+
+def test_broken_global_config_warns_once_per_command(
+    config_cli_env, monkeypatch, capsys
+):
+    """launch resolves config twice (dispatch gate + _prepare_boot); the caller must
+    still see one warning line, not two."""
+    config_cli_env["global"].write_text("broken = [\n")
+    monkeypatch.setattr(
+        lifecycle, "launch_vm",
+        lambda **kw: pytest.fail("launch_vm must not run without a kernel"),
+    )
+    rc = cli.main(["launch", "--harness"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.err.count("ignoring global config") == 1
