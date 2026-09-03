@@ -34,11 +34,8 @@ def doctor_env(tmp_path, monkeypatch):
     skill_source.mkdir(parents=True)
     claude_skills = tmp_path / "claude-skills"
     (claude_skills / "qmu").mkdir(parents=True)
-    absent_codex_home = tmp_path / "absent-codex-home"
     monkeypatch.setattr(lifecycle, "all_skill_source_dirs", lambda: [skill_source])
-    monkeypatch.setattr(lifecycle, "claude_skills_dir", lambda: claude_skills)
-    monkeypatch.setattr(lifecycle, "codex_home", lambda: absent_codex_home)
-    monkeypatch.setattr(lifecycle, "codex_skills_dir", lambda: tmp_path / "codex-skills")
+    monkeypatch.setattr(lifecycle, "skill_install_roots", lambda: [claude_skills])
 
     executables = {
         "qemu-system-aarch64": "/usr/bin/qemu-system-aarch64",

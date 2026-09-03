@@ -21,11 +21,12 @@ from ..cache import (
 from ..config import find_project_config, render_starter_config, resolve_config
 from ..instance import QMUError
 from ..paths import (
+    agents_home,
+    agents_skills_dir,
     all_skill_source_dirs,
-    claude_skills_dir,
-    codex_home,
-    codex_skills_dir,
     global_config_path,
+    omp_agent_dir,
+    skill_install_roots,
 )
 from .. import rootfs as rootfs_mod
 from ..version import VERSION
@@ -583,23 +584,50 @@ def _handle_rootfs_shell(args: argparse.Namespace) -> int:
 
 
 def _add_skill(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("skill", help="Manage Claude Code / Codex skill")
+    p = sub.add_parser("skill", help="Manage Claude Code / Codex / OMP skills")
     p.set_defaults(handler=_make_group_help_handler(p))
     sp = p.add_subparsers(dest="skill_cmd")
-    s = sp.add_parser("install", help="Install skill into ~/.claude (and ~/.codex if present)")
+    s = sp.add_parser("install", help="Install skills into ~/.claude (and ~/.codex / ~/.agents when present)")
     s.set_defaults(handler=_handle_skill_install)
 
 
-def _skill_install_roots() -> list[Path]:
-    """Return the destination dirs for `qmu skill install`.
+def _prepare_install_roots(roots: list[Path]) -> None:
+    """Create every install root before the first symlink is written.
 
-    Always installs into ~/.claude/skills/. Additionally installs into
-    ~/.codex/skills/ when ~/.codex/ exists.
+    Linking is skill-outer/root-inner, so a root that cannot be created (e.g.
+    ~/.agents exists as a regular file) would otherwise abort mid-loop with
+    ~/.claude holding only the first skill — an auto-detected root breaking the
+    two that already worked.
+
+    mkdir() is the probe as well as the creation: with exist_ok=True it succeeds
+    on a real dir (and on a symlink to one, which is a legitimate dotfiles
+    layout) and raises on every unusable shape — NotADirectoryError when a
+    parent is a file, FileExistsError when the root itself is a file or a
+    dangling symlink, PermissionError when the home is not writable. Those are
+    all the caller's own filesystem state, i.e. operational, so they become
+    QMUError (exit 1, with the remedy) instead of reaching cli's catch-all as a
+    bare errno string on exit 4, which the contract reserves for infra and
+    internal faults.
     """
-    roots = [claude_skills_dir()]
-    if codex_home().is_dir():
-        roots.append(codex_skills_dir())
-    return roots
+    for root in roots:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            blocker = next(
+                (p for p in (root, *root.parents) if p.is_symlink() or p.exists()),
+                None,
+            )
+            if blocker is not None and not blocker.is_dir():
+                raise QMUError(
+                    f"Cannot install skills into {root}: {blocker} exists but is "
+                    f"not a directory. Remove or move it — or point "
+                    f"CLAUDE_HOME/CODEX_HOME/AGENTS_HOME at another location — "
+                    f"then re-run `qmu skill install`."
+                ) from exc
+            raise QMUError(
+                f"Cannot create skill install root {root}: "
+                f"{exc.strerror or exc}"
+            ) from exc
 
 
 def _handle_skill_install(args: argparse.Namespace) -> int:
@@ -607,11 +635,12 @@ def _handle_skill_install(args: argparse.Namespace) -> int:
     if not skill_dirs:
         raise QMUError("No skill sources found under skills/")
 
+    roots = skill_install_roots()
+    _prepare_install_roots(roots)
     for src in skill_dirs:
         name = src.name
-        for root in _skill_install_roots():
+        for root in roots:
             dst = root / name
-            dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.is_symlink() or dst.exists():
                 if dst.is_symlink():
                     dst.unlink()
@@ -619,6 +648,11 @@ def _handle_skill_install(args: argparse.Namespace) -> int:
                     shutil.rmtree(dst)
             dst.symlink_to(src)
             print(f"Skill installed: {dst} -> {src}")
+    if agents_skills_dir() not in roots:
+        print(
+            f"Skipped {agents_skills_dir()} (OMP not detected: no directory at "
+            f"{agents_home()} or {omp_agent_dir()})"
+        )
     return 0
 
 

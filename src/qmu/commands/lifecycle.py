@@ -62,9 +62,7 @@ from ..paths import (
     all_skill_source_dirs,
     instances_dir,
     qmp_socket_path,
-    claude_skills_dir,
-    codex_home,
-    codex_skills_dir,
+    skill_install_roots,
 )
 from ..qemu import native_passt_problem, probe_qemu_netdevs
 from ..qmp import QMPError
@@ -2137,9 +2135,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
     skill_names = [d.name for d in all_skill_source_dirs()]
     if not skill_names:
         skill_names = ["qmu"]
-    roots = [claude_skills_dir()]
-    if codex_home().is_dir():
-        roots.append(codex_skills_dir())
+    roots = skill_install_roots()
     installed: list[Path] = []
     missing: list[Path] = []
     for name in skill_names:
