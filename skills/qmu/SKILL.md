@@ -43,7 +43,7 @@ qmu config path         # Show config search paths
 TOML settings are table-scoped. The accepted schema is:
 
 - `[boot]`: `kernel`, `initrd`, `cmdline`, `profile`
-- `[machine]`: `arch`, `memory`, `cpus`, `cpu`, `nic_model`, `net_backend`, `extra_args`
+- `[machine]`: `arch`, `memory`, `cpus`, `cpu`, `nic_model`, `net_backend`, `accel`, `extra_args`
 - `[drive]`: `rootfs`, `format`
 - `[ssh]`: `key`, `user`, `port_start`
 - `[gdb]`: `port_start`
@@ -74,6 +74,7 @@ source path and offending key.
 - SSH and GDB ports start at `10021` / `1234` (uncomment `port_start` to override).
 - `arch` drives which `qemu-system-*` binary runs and whether KVM is enabled (only when guest arch == host). Use `extra_args` for arch-specific machine flags (e.g. aarch64 `-M virt -cpu cortex-a57`).
 - Path values (`rootfs`, `ssh.key`, `--kernel`, `--initrd`) accept `~` expansion.
+- Boot flags: `--append` ADDs parameters on top of the `[boot]` profile cmdline, `--cmdline` REPLACES it — details in Launching → `--append` vs `--cmdline`.
 
 ## Quick Start
 
