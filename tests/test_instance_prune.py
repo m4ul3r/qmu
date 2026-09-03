@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -458,3 +459,48 @@ def test_prune_runtime_rejects_keep_logs(capsys):
 
     assert rc == 1
     assert "--keep-logs applies only to instance pruning." in capsys.readouterr().err
+
+
+def _option_help(subcommand: str, flag: str) -> str:
+    """The real argparse help string for one option of one subcommand.
+
+    Read off cli.build_parser() rather than mirrored here, so the assertion
+    cannot pass against a hand-copied string that has since drifted.
+    """
+    import argparse
+
+    from qmu.cli import build_parser
+
+    for action in build_parser()._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for option in action.choices[subcommand]._actions:
+                if flag in option.option_strings:
+                    return option.help or ""
+    raise AssertionError(f"no {flag} option on `qmu {subcommand}`")
+
+
+def test_older_than_help_states_where_it_does_and_does_not_gate(capsys):
+    """F10: the help read as a blanket age gate on "remnant" pruning, but a
+    stopped VM that still has its instance record prunes at ANY age — measured
+    below. `qmu status` on a stopped VM prescribes `--older-than 0`, so a
+    caller who cross-checks that advice against `--help` concluded the advice
+    was wrong (or the flag a no-op) instead of learning which artifacts the
+    cutoff actually covers.
+    """
+    save_instance(_instance("recorded"))
+    _touch("recorded", ".serial.log", mtime=time.time())
+
+    # Default cutoff is 86400s and the artifacts are seconds old, yet the
+    # record-backed VM is still eligible: the cutoff never applied here.
+    rc = cli.main(["prune", "--vm", "recorded", "--dry-run", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["would_prune"] == ["recorded"]
+    assert payload["held_back"] == []
+
+    help_text = _option_help("prune", "--older-than")
+    assert "--vm/--all" in help_text, "the VM-record path is unmentioned"
+    assert "metadata-free remnants" in help_text
+    assert "prune at any age" in help_text
+    assert "--older-than 0" in help_text

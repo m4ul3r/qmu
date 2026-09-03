@@ -193,3 +193,40 @@ def test_skill_schema_section_matches_validator():
     assert set(documented) == set(_FIXED_SCHEMA)
     for table, keys in _FIXED_SCHEMA.items():
         assert documented[table] == set(keys), table
+
+
+def test_config_init_table_enumeration_matches_the_generator():
+    """#55's recurrence class, one sentence over: SKILL.md enumerates the
+    tables `qmu config init` writes, and it omitted `[boot]` — the FIRST table
+    the generator emits and the one carrying the `# CHANGE ME` kernel line, so
+    an agent reading the skill did not learn that the boot settings can live in
+    the starter file at all. "All keys commented" is not the exclusion rule:
+    `[gdb]` was listed and its only key is commented too.
+    """
+    from qmu.config import render_starter_config
+
+    generated = [
+        line[1:-1]
+        for line in render_starter_config("x86_64").splitlines()
+        if line.startswith("[") and line.endswith("]")
+    ]
+
+    sentence = next(
+        line for line in SKILL.read_text().splitlines()
+        if line.startswith("`qmu config init` writes ")
+    )
+    documented = re.findall(r"`\[([\w.<>*-]+)\]`", sentence)
+
+    # `[profiles.*]` is documented as one collapsed bullet ("three
+    # `[profiles.*]` blocks"); every other table is named literally.
+    profiles = [t for t in generated if t.startswith("profiles.")]
+    literal = [t for t in generated if not t.startswith("profiles.")]
+
+    assert documented[:len(literal)] == literal, (
+        f"SKILL.md enumerates {documented} but `qmu config init` writes "
+        f"{literal} + {len(profiles)} profile blocks"
+    )
+    assert "profiles.*" in documented
+    assert f"{len(profiles)} `[profiles.*]` blocks" in sentence.replace(
+        "three", str(len(profiles))
+    )
