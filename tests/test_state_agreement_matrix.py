@@ -20,6 +20,7 @@ import pytest
 
 from qmu import cli
 from qmu import instance as instance_mod
+from qmu.commands import guest as guest_mod
 from qmu.commands import lifecycle
 from qmu.instance import (
     VM_ABSENT,
@@ -30,6 +31,7 @@ from qmu.instance import (
     VMInstance,
     classify_vm,
 )
+from qmu.ssh import SSHError
 
 
 VM = "subject"
@@ -863,3 +865,144 @@ def test_cache_ls_never_presents_a_truncated_list_as_complete(cache, capsys):
     assert data["truncated"]["groups"] == 2
     shown = sum(g["bytes"] for g in data["groups"])
     assert shown + data["truncated"]["bytes"] == data["bytes"]
+
+
+# ---------------------------------------------------------------------------
+# Axis 4 again: subcommand vs subcommand, for the SSH transport-loss state.
+#
+# "The guest died under my command" is an observable state, and four
+# subcommands report on it. Three agreed; `dmesg` carried its own ending
+# (`return 0 if rc == 0 else 1`) and reported a panicked guest as exit 1 with
+# `[dmesg failed, exit 255]` — the "guest command non-zero" class an agent
+# reads as "dmesg failed INSIDE the guest". Same defect shape as every other
+# row here: a fix landed on one path and its siblings kept contradicting it.
+# ---------------------------------------------------------------------------
+
+
+_LOST_PANIC = (
+    "[   12.501] general protection fault: 0000 [#1] PREEMPT SMP\n"
+    "[   12.502] Kernel panic - not syncing: Fatal exception\n"
+    "[   12.503] RIP: 0010:sysrq_handle_crash+0x16/0x20\n"
+)
+
+
+class _TransportLostSSH:
+    """One transport, dropped the way each command observes it dropping.
+
+    `ssh.run` returns 255 (often with only a banner-exchange timeout on
+    stderr); `scp` raises with rc 255 plus a transport marker. Both are the
+    ambiguous signal the liveness probe resolves, so `is_ready` stays False.
+    """
+
+    def __init__(self, serial_path, append):
+        self._serial_path = serial_path
+        self._append = append
+
+    def _drop(self):
+        if self._append:
+            with open(self._serial_path, "a") as stream:
+                stream.write(self._append)
+            self._append = ""
+
+    def run(self, command, timeout=30.0, check=False):
+        self._drop()
+        return 255, "", "Connection timed out during banner exchange"
+
+    def push(self, local, remote):
+        self._drop()
+        raise SSHError(
+            "SCP push failed: mux failed: Broken pipe",
+            returncode=255,
+            stderr="mux failed: Broken pipe",
+        )
+
+    def pull(self, remote, local):
+        self.push(local, remote)
+
+    def is_ready(self, timeout=2):
+        return False
+
+
+_LOST_ARGV = {
+    "exec": ["exec", "--vm", VM, "trigger"],
+    "dmesg": ["dmesg", "--vm", VM, "--tail", "5"],
+    "push": ["push", "--vm", VM, "/tmp/payload.bin", "/root/payload.bin"],
+    "pull": ["pull", "--vm", VM, "/root/payload.bin", "/tmp/payload.bin"],
+}
+
+
+def _agreement_view(rc, payload):
+    """The facts a caller branches on, independent of per-command wording."""
+    hint = payload.get("hint", "")
+    return {
+        "rc": rc,
+        "ok": payload.get("ok"),
+        "ssh_error": payload.get("ssh_error"),
+        "crash_detected": payload.get("crash_detected"),
+        "crash_present": payload.get("crash") is not None,
+        "names_qmu_crash": "qmu crash" in hint,
+        "names_qmu_log": "qmu log --tail 100" in hint,
+    }
+
+
+def _ssh_capable_instance(cache, vm_id=VM):
+    idir = cache / "instances"
+    idir.mkdir(parents=True, exist_ok=True)
+    return VMInstance(
+        vm_id=vm_id, pid=4242, qmp_socket=str(idir / f"{vm_id}.qmp.sock"),
+        ssh_port=10099, ssh_key=str(idir / f"{vm_id}.key"), gdb_port=None,
+        serial_log=str(idir / f"{vm_id}.serial.log"), kernel="/boot/bzImage",
+        rootfs="/var/rootfs.img", memory="4G", cpus=2, cmdline="console=ttyS0",
+        profile="exploit-dev", started_at="2026-09-02T00:00:00Z", harness=False,
+    )
+
+
+@pytest.mark.parametrize("panicked", [True, False])
+def test_every_ssh_command_agrees_on_a_lost_transport(
+    panicked, cache, monkeypatch, capsys
+):
+    """exec / dmesg / push / pull must classify one condition identically.
+
+    A fresh corroborating serial report is the only thing that promotes the
+    transport-layer code (4) to the kernel-crash code (3) callers branch on.
+    """
+    inst = _ssh_capable_instance(cache)
+    decoy = _decoy_running(monkeypatch)
+    assert decoy.vm_id != VM, "the decoy must not be the subject"
+    # Subject AND decoy are both running: the decoy is what keeps a handler
+    # from answering out of "the sole running VM" (this file's own rule), and
+    # the subject has to be running or `exec` refuses before any SSH happens.
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+    monkeypatch.setattr(guest_mod, "_preflight_ssh_guest", lambda *a, **kw: None)
+    monkeypatch.setattr(guest_mod.time, "sleep", lambda _: None)
+
+    views = {}
+    for command, argv in _LOST_ARGV.items():
+        # A second running VM stays in the roster for every cell: with only one
+        # instance a handler can answer from "the sole running VM" and never
+        # reach the branch the real CLI takes on a shared box.
+        monkeypatch.setattr(guest_mod, "choose_instance", lambda vm=None: inst)
+        with open(inst.serial_log, "w") as stream:
+            stream.write("boot ok\n")
+        monkeypatch.setattr(
+            guest_mod, "_make_ssh",
+            lambda selected: _TransportLostSSH(
+                inst.serial_log, _LOST_PANIC if panicked else ""
+            ),
+        )
+
+        rc = cli.main(["--format", "json", *argv])
+        views[command] = _agreement_view(rc, json.loads(capsys.readouterr().out))
+
+    expected = {
+        "rc": 3 if panicked else 4,
+        "ok": False,
+        "ssh_error": True,
+        "crash_detected": panicked,
+        "crash_present": panicked,
+        "names_qmu_crash": panicked,
+        "names_qmu_log": not panicked,
+    }
+    for command, view in views.items():
+        assert view == expected, f"`qmu {command}` disagrees: {view}"

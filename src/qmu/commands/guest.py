@@ -248,6 +248,26 @@ def _transport_lost(ssh: SSHClient) -> bool:
     return True
 
 
+def _ssh_lost_hint(crash: str | None) -> str:
+    """The SSH-lost hint text, in one place.
+
+    `exec`/`dmesg` (via :func:`_ssh_lost_payload`) and `compile --run` all
+    report the same condition, so the follow-up command a caller is told to run
+    must not differ between them: `compile --run` used to name no follow-up at
+    all, so an agent whose exploit panicked the guest was never pointed at
+    `qmu crash`.
+    """
+    if crash is not None:
+        return (
+            "SSH connection lost. Kernel may have crashed. "
+            "See crash field or run: qmu crash"
+        )
+    return (
+        "SSH connection lost; VM may be unreachable. "
+        "No fresh crash report in serial log. Check: qmu log --tail 100"
+    )
+
+
 def _ssh_lost_payload(
     command: str,
     inst: VMInstance,
@@ -275,17 +295,10 @@ def _ssh_lost_payload(
     # CORR-5: only assert a kernel crash when a crash report was actually
     # extracted; otherwise the connection merely dropped (VM unreachable) and we
     # must not send the agent chasing a phantom panic.
+    hint = _ssh_lost_hint(crash)
     if crash is not None:
-        hint = (
-            "SSH connection lost. Kernel may have crashed. "
-            "See crash field or run: qmu crash"
-        )
         text_msg = f"\nCrash from serial log:\n{crash}"
     else:
-        hint = (
-            "SSH connection lost; VM may be unreachable. "
-            "No fresh crash report in serial log. Check: qmu log --tail 100"
-        )
         text_msg = "\nNo fresh crash detected in serial log. Check: qmu log --tail 100"
     result: dict[str, Any] = {
         "ok": False,
@@ -307,10 +320,17 @@ def _emit_ssh_lost(
     inst: VMInstance,
     *,
     start_offset: int,
+    stem: str = "exec",
 ) -> int:
-    """Emit the SSH-lost / probable-crash envelope and return exit 3."""
+    """Emit the SSH-lost envelope; exit 3 only with a fresh corroborating crash.
+
+    `stem` names the spill artifact after the subcommand that lost the
+    transport, so `dmesg` reuses this classification instead of carrying its
+    own (which is how `dmesg` came to report a dead guest as exit 1, the
+    "guest command non-zero" class).
+    """
     status, data, text = _ssh_lost_payload(command, inst, start_offset=start_offset)
-    _emit(args, data=data, text=text, stem="exec")
+    _emit(args, data=data, text=text, stem=stem)
     return status
 
 
@@ -667,6 +687,10 @@ def _handle_compile(args: argparse.Namespace) -> int:
             "ssh_error": True,
             "crash_detected": crash is not None,
             "crash": crash,
+            # Same hint exec/dmesg emit: without it this envelope named no
+            # follow-up at all, so the one command that shows the panic
+            # (`qmu crash`) went unmentioned on the path most likely to hit it.
+            "hint": _ssh_lost_hint(crash),
         })
         lines = [f"SSH connection lost while running {name}."]
         # CORR-5: only the strong "Kernel may have crashed" wording when a
@@ -679,9 +703,12 @@ def _handle_compile(args: argparse.Namespace) -> int:
                 "No crash report in serial log. Check: qmu log --tail 100"
             )
         _emit(args, data=result, text=lines, stem="compile")
-        # Exit 3 = crash/transport-loss (distinct from exit 1 for an ordinary
-        # non-zero guest command), consistent with _emit_ssh_lost in exec.
-        return 3
+        # Exit 3 is reserved for a crash corroborated by a FRESH serial report
+        # (CLAUDE.md exit-code contract); a merely unreachable guest is 4, the
+        # class exec/dmesg/push/pull already report. `compile --run` returned 3
+        # unconditionally, so a dropped transport with no crash report told the
+        # caller their exploit had panicked the kernel when it had not.
+        return 3 if crash else 4
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +735,29 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
         # Clamp negatives to 0: like `tail -n 0`, both emit nothing (a negative
         # count would otherwise be misparsed as a tail option).
         cmd = f"dmesg | tail -n {max(args.tail, 0)}"
-    rc, stdout, stderr = ssh.run(cmd, timeout=15)
+    command_start_offset = serial_log_offset(inst.serial_log)
+    try:
+        rc, stdout, stderr = ssh.run(cmd, timeout=15)
+    except SSHError:
+        # qmu's own SSH timeout expired. A guest that still answers merely ran
+        # dmesg slowly, which stays an infra error (the re-raise -> 4); an
+        # unreachable one takes the shared crash-vs-transport-loss path.
+        if not _transport_lost(ssh):
+            raise
+        return _emit_ssh_lost(
+            args, cmd, inst, start_offset=command_start_offset, stem="dmesg"
+        )
+
+    # A panic during the read drops the connection and ssh exits 255, often
+    # with only a banner-exchange timeout on stderr. rc=255 is also a legal
+    # guest exit code, so disambiguate with the same probed liveness check
+    # exec/push/pull use. Without this, `qmu dmesg` on a dead guest returned
+    # exit 1 — the "guest command non-zero" class — reading as "dmesg failed
+    # inside the guest" while the kernel was gone.
+    if rc == 255 and _transport_lost(ssh):
+        return _emit_ssh_lost(
+            args, cmd, inst, start_offset=command_start_offset, stem="dmesg"
+        )
 
     # L3: honor the guest exit code; do not silently render stderr as if it were
     # the kernel log. The kernel log is stdout; stderr is labelled distinctly.
