@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -497,19 +498,68 @@ def _add_qmp(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_qmp)
 
 
+_QMP_METHOD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+_QMP_FORM_HINT = (
+    "pass the bare method name (e.g. `qmu qmp query-status`) or a JSON envelope "
+    "(`qmu qmp '{\"execute\": \"query-status\"}'`); arguments go in --args '{...}'"
+)
+
+
+def _parse_qmp_command(raw: str, args_json: str | None) -> tuple[str, dict | None]:
+    """Accept both call forms an agent actually types: the bare method name
+    (`query-status`) and the envelope QEMU's own docs show
+    (`{"execute": "query-status", "arguments": {...}}`, with or without braces).
+
+    Before this, a envelope-shaped string was sent to QEMU verbatim as the method
+    name, so QEMU answered CommandNotFound and the QMPError surfaced as exit 4 --
+    an infra code for a caller-input mistake (#36).
+    """
+    flag_args = json.loads(args_json) if args_json else None
+    if _QMP_METHOD_RE.match(raw):
+        return raw, flag_args
+
+    invalid = QMUError(f"Invalid QMP command {raw!r}: {_QMP_FORM_HINT}")
+    candidate = raw.strip()
+    if not candidate.startswith("{"):
+        candidate = "{" + candidate + "}"
+    try:
+        envelope = json.loads(candidate)
+    except json.JSONDecodeError:
+        raise invalid from None
+    if not isinstance(envelope, dict):
+        raise invalid
+    method = envelope.get("execute")
+    if not isinstance(method, str) or not _QMP_METHOD_RE.match(method):
+        raise invalid
+
+    if "arguments" not in envelope:
+        return method, flag_args
+    envelope_args = envelope["arguments"]
+    if not isinstance(envelope_args, dict):
+        raise QMUError("QMP 'arguments' must be a JSON object")
+    if args_json:
+        raise QMUError(
+            "QMP arguments given twice: envelope 'arguments' and --args; "
+            "pass them once"
+        )
+    return method, envelope_args
+
+
 def _handle_qmp(args: argparse.Namespace) -> int:
-    inst = choose_instance(args.vm)
     # M3: pre-validate --args JSON with a friendly QMUError instead of letting a
-    # raw JSONDecodeError escape as a traceback.
+    # raw JSONDecodeError escape as a traceback. Both this and the command-form
+    # normalization run before the VM is selected or connected, so a caller-input
+    # mistake is an exit-1 QMUError rather than an exit-4 infra failure.
     if args.args:
         try:
-            qmp_args = json.loads(args.args)
+            json.loads(args.args)
         except json.JSONDecodeError as exc:
             raise QMUError(f"Invalid --args JSON: {exc}") from exc
-    else:
-        qmp_args = None
+    method, qmp_args = _parse_qmp_command(args.command, args.args)
+    inst = choose_instance(args.vm)
     with _qmp_ctx(inst) as qmp:
-        result = qmp.execute(args.command, qmp_args)
+        result = qmp.execute(method, qmp_args)
     # Text mode passes the raw QMP return (any JSON type) straight to _output;
     # json mode wraps it so the universal {"ok": ...} contract holds, with the
     # original payload under "result".
@@ -517,7 +567,8 @@ def _handle_qmp(args: argparse.Namespace) -> int:
     # #46: a machine reset silently drops the gdbstub breakpoint set. `qmu qmp
     # system_reset` is the raw path that triggers it; warn when a debug session
     # is present so the operator re-arms instead of trusting frozen hits=0.
-    if args.command == "system_reset" and debug_session_present(inst):
+    # Keyed on the NORMALIZED method so the envelope form warns too.
+    if method == "system_reset" and debug_session_present(inst):
         sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
     return 0
 
