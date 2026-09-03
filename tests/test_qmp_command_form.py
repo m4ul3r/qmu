@@ -19,6 +19,7 @@ import pytest
 
 from qmu import cli
 from qmu.commands import qmp_cmds
+from qmu.qmp import QMPError
 
 
 class _FakeInst:
@@ -117,3 +118,62 @@ def test_malformed_flag_args_keep_the_friendly_message(qmp, capsys):
     assert cli.main(["qmp", "query-status", "--args", "{oops"]) == 1
     assert "Invalid --args JSON" in capsys.readouterr().err
     assert qmp.calls == []
+
+
+def test_trailing_newline_is_stripped_not_matched_as_part_of_the_method(qmp):
+    """A trailing newline must not ride along into the QMP method name on the
+    wire (that produced CommandNotFound / exit 4, the exact failure #36 exists
+    to prevent) -- match() let '$' match before it; fullmatch() on the
+    stripped candidate does not."""
+    assert cli.main(["qmp", "query-status\n"]) == 0
+    assert qmp.calls == [("query-status", None)]
+
+
+def test_leading_and_trailing_space_is_stripped(qmp):
+    """Padded whitespace must not misroute a bare method name into the
+    envelope branch, where it would be rejected with advice already followed."""
+    assert cli.main(["qmp", "  query-status  "]) == 0
+    assert qmp.calls == [("query-status", None)]
+
+
+def test_envelope_typo_key_is_rejected_not_silently_dropped(qmp, capsys):
+    """'argument' (missing the trailing s) must not silently execute with the
+    caller's arguments discarded and exit 0 -- that is a wrong answer with
+    nothing on stderr."""
+    argv = ["qmp", '{"execute":"qom-list-types","argument":{"implements":"device"}}']
+    assert cli.main(argv) == 1
+    err = capsys.readouterr().err
+    assert "argument" in err
+    assert "pass the bare method name" in err
+    assert qmp.calls == []
+
+
+def test_envelope_id_is_accepted_and_dropped(qmp):
+    """`id` is a real QMP protocol member; accept it in the envelope but do not
+    forward it -- QMPClient.execute has no id parameter."""
+    assert cli.main(["qmp", '{"execute":"query-status","id":"req-1"}']) == 0
+    assert qmp.calls == [("query-status", None)]
+
+
+def test_non_object_flag_args_are_refused(qmp, capsys):
+    """The array form on the wire made QEMU answer 'arguments must be an
+    object', which mapped to exit 4 (QMPError) -- identical to the envelope
+    mistake but only that one was caught. Reject both, alike, before connecting."""
+    assert cli.main(["qmp", "cont", "--args", "[1,2]"]) == 1
+    assert "'arguments' must be a JSON object" in capsys.readouterr().err
+    assert qmp.calls == []
+
+
+def test_malformed_command_is_rejected_before_choosing_the_instance(
+    monkeypatch, capsys
+):
+    """Nothing pinned parse-before-connect: every other test stubs
+    choose_instance to succeed. Here it raises, so a malformed command must
+    still be an exit-1 caller error, never reach choose_instance/QMP at all."""
+
+    def _boom(vm):
+        raise QMPError("dead socket")
+
+    monkeypatch.setattr(qmp_cmds, "choose_instance", _boom)
+    assert cli.main(["qmp", "not json"]) == 1
+    assert "pass the bare method name" in capsys.readouterr().err

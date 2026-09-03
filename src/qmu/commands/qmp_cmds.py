@@ -514,23 +514,48 @@ def _parse_qmp_command(raw: str, args_json: str | None) -> tuple[str, dict | Non
     Before this, a envelope-shaped string was sent to QEMU verbatim as the method
     name, so QEMU answered CommandNotFound and the QMPError surfaced as exit 4 --
     an infra code for a caller-input mistake (#36).
+
+    `raw` is stripped once, up front, and both branches match against the
+    stripped candidate with `fullmatch` (not `match`): the bare-name regex has
+    no `re.MULTILINE`, so unstripped `match` let a trailing newline sneak
+    through as part of the method name (exit 4 on the wire) while unstripped
+    leading whitespace wrongly fell into the envelope branch.
+
+    An envelope's `id` member (a real QMP protocol field, echoed back by QEMU
+    to correlate responses) is accepted but not forwarded — `QMPClient.execute`
+    has no id parameter and this CLI is a single-shot fire-and-wait-for-reply
+    caller with no concurrent in-flight requests to correlate, so there is
+    nothing to echo it against. Any other unknown key is rejected: silently
+    dropping a mistyped `argument` (missing the trailing "s") let the caller's
+    arguments vanish with the command still executing and exiting 0.
     """
-    flag_args = json.loads(args_json) if args_json else None
-    if _QMP_METHOD_RE.match(raw):
-        return raw, flag_args
+    if args_json:
+        flag_args = json.loads(args_json)
+        if not isinstance(flag_args, dict):
+            raise QMUError("QMP 'arguments' must be a JSON object")
+    else:
+        flag_args = None
+
+    candidate = raw.strip()
+    if _QMP_METHOD_RE.fullmatch(candidate):
+        return candidate, flag_args
 
     invalid = QMUError(f"Invalid QMP command {raw!r}: {_QMP_FORM_HINT}")
-    candidate = raw.strip()
-    if not candidate.startswith("{"):
-        candidate = "{" + candidate + "}"
+    envelope_text = candidate if candidate.startswith("{") else "{" + candidate + "}"
     try:
-        envelope = json.loads(candidate)
+        envelope = json.loads(envelope_text)
     except json.JSONDecodeError:
         raise invalid from None
     if not isinstance(envelope, dict):
         raise invalid
+    unknown_keys = set(envelope) - {"execute", "arguments", "id"}
+    if unknown_keys:
+        raise QMUError(
+            f"Invalid QMP command {raw!r}: unknown envelope key(s) "
+            f"{', '.join(sorted(unknown_keys))}; {_QMP_FORM_HINT}"
+        )
     method = envelope.get("execute")
-    if not isinstance(method, str) or not _QMP_METHOD_RE.match(method):
+    if not isinstance(method, str) or not _QMP_METHOD_RE.fullmatch(method):
         raise invalid
 
     if "arguments" not in envelope:
