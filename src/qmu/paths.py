@@ -38,6 +38,25 @@ def codex_home() -> Path:
     return Path.home() / ".codex"
 
 
+def agents_home() -> Path:
+    env = os.environ.get("AGENTS_HOME")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".agents"
+
+
+def omp_agent_dir() -> Path:
+    """OMP's per-user agent state dir; its existence means OMP has run here.
+
+    OMP's own override for this location is PI_CODING_AGENT_DIR (`omp config
+    path` prints it), so honor that rather than guessing from ~/.omp alone.
+    """
+    env = os.environ.get("PI_CODING_AGENT_DIR")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".omp" / "agent"
+
+
 def cache_home() -> Path:
     env = os.environ.get("QMU_CACHE_DIR")
     if env:
@@ -123,6 +142,41 @@ def claude_skills_dir() -> Path:
 
 def codex_skills_dir() -> Path:
     return codex_home() / "skills"
+
+
+def agents_skills_dir() -> Path:
+    return agents_home() / "skills"
+
+
+def omp_detected() -> bool:
+    """True when this host has somewhere for OMP-visible skills to go.
+
+    Any of: an explicit AGENTS_HOME (the caller opted in, so honor it even
+    before the dir exists), an existing ~/.agents/ (the root OMP's `agents`
+    skill provider scans), or an existing OMP agent dir (OMP has run here but
+    has never been given an ~/.agents/ tree).
+    """
+    return (
+        bool(os.environ.get("AGENTS_HOME"))
+        or agents_home().is_dir()
+        or omp_agent_dir().is_dir()
+    )
+
+
+def skill_install_roots() -> list[Path]:
+    """Destination dirs for `qmu skill install`, in install order.
+
+    Always ~/.claude/skills/. Adds ~/.codex/skills/ when ~/.codex/ exists and
+    ~/.agents/skills/ when omp_detected(). This is the single authority: the
+    installer and `qmu doctor`'s skills check must agree on the root set or
+    doctor reports "partial"/"ok" about a root the installer never writes.
+    """
+    roots = [claude_skills_dir()]
+    if codex_home().is_dir():
+        roots.append(codex_skills_dir())
+    if omp_detected():
+        roots.append(agents_skills_dir())
+    return roots
 
 
 def _candidate_skills_roots() -> list[Path]:
