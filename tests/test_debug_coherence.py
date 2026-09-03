@@ -364,6 +364,107 @@ def test_monitor_savevm_failure_suppresses_warning(monkeypatch, capsys):
     assert "int3" not in err
 
 
+# --- the third route: `qmu qmp human-monitor-command` (dogfood F4) ----------
+#
+# Live, with a debugger attached, `qmu qmp '{"execute":"human-monitor-command",
+# "arguments":{"command-line":"system_reset"}}'` reset the machine with rc 0
+# and an EMPTY stderr, while `qmu monitor system_reset` warned. The HMP verb
+# rides inside the arguments, so keying only on the QMP method name missed it —
+# and the envelope normalization made this shape trivially typeable.
+
+
+class _HmpViaQmp:
+    """Double whose *execute* returns a string, the shape QEMU answers
+    `human-monitor-command` with (the HMP console text)."""
+
+    def __init__(self, result=""):
+        self._result = result
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        return self._result
+
+    def execute_hmp(self, command_line, timeout=30.0):
+        return self._result
+
+
+def _install_hmp_via_qmp(monkeypatch, inst, *, present, result=""):
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(_HmpViaQmp(result))
+    )
+    monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: present)
+
+
+def _hmp_qmp_args(command_line):
+    return _qmp_args("human-monitor-command", json.dumps({"command-line": command_line}))
+
+
+def test_qmp_hmp_system_reset_warns_when_debugged(monkeypatch, capsys):
+    inst = _gdb_inst(1234)
+    _install_hmp_via_qmp(monkeypatch, inst, present=True)
+    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("system_reset"))
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "drops the gdbstub's breakpoint" in err
+
+
+def test_qmp_hmp_help_system_reset_does_not_warn(monkeypatch, capsys):
+    # Same first-token rule as `monitor`: `help system_reset` resets nothing.
+    inst = _gdb_inst(1234)
+    _install_hmp_via_qmp(monkeypatch, inst, present=True)
+    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("help system_reset"))
+    assert rc == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_qmp_hmp_unrelated_verb_does_not_warn(monkeypatch, capsys):
+    inst = _gdb_inst(1234)
+    _install_hmp_via_qmp(monkeypatch, inst, present=True, result="VM status: running")
+    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("info status"))
+    assert rc == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_qmp_hmp_system_reset_silent_when_not_debugged(monkeypatch, capsys):
+    inst = _gdb_inst(None)
+    _install_hmp_via_qmp(monkeypatch, inst, present=False)
+    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("system_reset"))
+    assert rc == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_qmp_hmp_savevm_warns_int3_when_stub_present(monkeypatch, capsys):
+    inst = _gdb_inst(1234)
+    _install_hmp_via_qmp(monkeypatch, inst, present=False)  # no live client
+    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("savevm clean"))
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "int3" in err
+
+
+def test_qmp_hmp_loadvm_warns_stale_when_debugged(monkeypatch, capsys):
+    inst = _gdb_inst(1234)
+    _install_hmp_via_qmp(monkeypatch, inst, present=True)
+    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("loadvm clean"))
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "does NOT re-sync" in err
+
+
+def test_qmp_hmp_savevm_failure_suppresses_warning(monkeypatch, capsys):
+    # A failed HMP savevm mutated nothing, so no int3 warning — the suppression
+    # must reach this route too, which means reading the returned HMP text.
+    inst = _gdb_inst(1234)
+    _install_hmp_via_qmp(
+        monkeypatch, inst, present=True,
+        result="Error: Could not open 'savevm' section",
+    )
+    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("savevm clean"))
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "int3" not in err
+
+
 # --- gdb attach: KVM hardware-watchpoint warning (#39) ---------------------
 
 

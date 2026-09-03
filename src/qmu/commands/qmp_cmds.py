@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ..instance import (
     QMUError,
+    VMInstance,
     choose_instance,
     save_guest_epoch_serial_offset,
 )
@@ -27,6 +28,7 @@ from ..snapshot import (
     save_snapshot,
 )
 from ..serial import serial_log_offset
+from ..qmp import QMPCommandError
 from ..debug import (
     debug_session_present,
     debug_stub_present,
@@ -491,9 +493,33 @@ def _handle_cont(args: argparse.Namespace) -> int:
 
 
 def _add_qmp(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("qmp", help="Send raw QMP command")
-    p.add_argument("command", help="QMP command name")
-    p.add_argument("--args", default=None, help="JSON arguments")
+    # The description carries the envelope contract because that is the surface
+    # an agent reads before typing (`qmu qmp --help`); a docstring is not one.
+    # Raw formatting (matching the top-level parser) so the literal envelope is
+    # copy-pasteable -- the default formatter re-wrapped it mid-token.
+    p = sub.add_parser(
+        "qmp",
+        help="Send raw QMP command",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Send a raw QMP command. COMMAND is either the bare method name\n"
+            "  qmu qmp query-status\n"
+            "or the JSON envelope QEMU's own documentation shows (braces\n"
+            "optional):\n"
+            "  qmu qmp '{\"execute\": \"query-status\"}'\n"
+            "\n"
+            "Envelope 'arguments' and --args are the same input: pass one, not\n"
+            "both. An envelope 'id' member is REJECTED rather than dropped --\n"
+            "qmu sends one command and hands back that reply's payload\n"
+            "directly, so an id has nothing to correlate against and accepting\n"
+            "it would only buy the caller a false belief that it round-tripped.\n"
+            "\n"
+            "A method QEMU has no command for, or arguments its schema rejects,\n"
+            "exits 1 (caller error). Exit 4 is reserved for the transport."
+        ),
+    )
+    p.add_argument("command", help="QMP method name or JSON envelope")
+    p.add_argument("--args", default=None, help="JSON object of arguments")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_qmp)
 
@@ -511,9 +537,11 @@ def _parse_qmp_command(raw: str, args_json: str | None) -> tuple[str, dict | Non
     (`query-status`) and the envelope QEMU's own docs show
     (`{"execute": "query-status", "arguments": {...}}`, with or without braces).
 
-    Before this, a envelope-shaped string was sent to QEMU verbatim as the method
-    name, so QEMU answered CommandNotFound and the QMPError surfaced as exit 4 --
-    an infra code for a caller-input mistake (#36).
+    Before this, an envelope-shaped string was sent to QEMU verbatim as the
+    method name, so QEMU answered CommandNotFound and the QMPError surfaced as
+    exit 4 -- an infra code for a caller-input mistake (#36). Normalizing here
+    is the form half; `_qmp_caller_error` handles the replies QEMU sends for a
+    method or arguments it does not accept.
 
     `raw` is stripped once, up front, and both branches match against the
     stripped candidate with `fullmatch` (not `match`): the bare-name regex has
@@ -521,18 +549,30 @@ def _parse_qmp_command(raw: str, args_json: str | None) -> tuple[str, dict | Non
     through as part of the method name (exit 4 on the wire) while unstripped
     leading whitespace wrongly fell into the envelope branch.
 
-    An envelope's `id` member (a real QMP protocol field, echoed back by QEMU
-    to correlate responses) is accepted but not forwarded — `QMPClient.execute`
-    has no id parameter and this CLI is a single-shot fire-and-wait-for-reply
-    caller with no concurrent in-flight requests to correlate, so there is
-    nothing to echo it against. Any other unknown key is rejected: silently
-    dropping a mistyped `argument` (missing the trailing "s") let the caller's
-    arguments vanish with the command still executing and exiting 0.
+    An envelope `id` member (a real QMP protocol field, echoed back by QEMU to
+    correlate responses) is REJECTED, not dropped. `QMPClient.execute` has no
+    id parameter and `_recv_response` unwraps the reply to its `return`
+    payload, so a forwarded id could never reach the caller — and this CLI
+    sends one command per process with nothing concurrent to correlate.
+    Accepting it therefore buys the caller nothing and costs them the belief
+    that a round-trip id worked, which is the same silent-drop failure that
+    made a mistyped `argument` (missing the trailing "s") execute the command
+    with the caller's arguments discarded and exit 0. Rejecting it puts the
+    contract on the surface an agent actually reads (this error, and
+    `qmu qmp --help`) instead of leaving it in a docstring.
     """
     if args_json:
         flag_args = json.loads(args_json)
         if not isinstance(flag_args, dict):
-            raise QMUError("QMP 'arguments' must be a JSON object")
+            # Name the FLAG the caller typed. Saying "'arguments' must be a
+            # JSON object" pointed at an envelope member they never supplied,
+            # while the sibling error in `_handle_qmp` for this same flag
+            # calls it "--args".
+            raise QMUError(
+                "Invalid --args JSON: must be a JSON object, got "
+                f"{type(flag_args).__name__} -- e.g. "
+                "--args '{\"command-line\": \"info status\"}'"
+            )
     else:
         flag_args = None
 
@@ -548,11 +588,18 @@ def _parse_qmp_command(raw: str, args_json: str | None) -> tuple[str, dict | Non
         raise invalid from None
     if not isinstance(envelope, dict):
         raise invalid
-    unknown_keys = set(envelope) - {"execute", "arguments", "id"}
+    unknown_keys = set(envelope) - {"execute", "arguments"}
     if unknown_keys:
+        extra = (
+            " ('id' is not forwarded: qmu sends one command and returns that "
+            "reply's payload, so there is nothing to correlate an id against "
+            "-- drop it)"
+            if "id" in unknown_keys
+            else ""
+        )
         raise QMUError(
             f"Invalid QMP command {raw!r}: unknown envelope key(s) "
-            f"{', '.join(sorted(unknown_keys))}; {_QMP_FORM_HINT}"
+            f"{', '.join(sorted(unknown_keys))}{extra}; {_QMP_FORM_HINT}"
         )
     method = envelope.get("execute")
     if not isinstance(method, str) or not _QMP_METHOD_RE.fullmatch(method):
@@ -562,13 +609,101 @@ def _parse_qmp_command(raw: str, args_json: str | None) -> tuple[str, dict | Non
         return method, flag_args
     envelope_args = envelope["arguments"]
     if not isinstance(envelope_args, dict):
-        raise QMUError("QMP 'arguments' must be a JSON object")
+        raise QMUError("QMP envelope 'arguments' must be a JSON object")
     if args_json:
         raise QMUError(
             "QMP arguments given twice: envelope 'arguments' and --args; "
             "pass them once"
         )
     return method, envelope_args
+
+
+# QEMU's QAPI input visitor produces exactly these desc shapes (all under class
+# GenericError) when the *arguments* do not match the command's schema. Grounded
+# in replies measured from QEMU 8.2.2:
+#   Parameter 'foo' is unexpected            (extra member)
+#   Parameter 'path' is missing              (required member absent)
+#   Parameter 'max-bandwidth' expects uint64 (wrong scalar)
+#   Parameter 'driver' does not accept value 'nope'      (bad enum member)
+#   Invalid parameter type for 'cpu-index', expected: integer
+#   QMP input member 'arguments' must be an object
+# "Invalid parameter 'x'" is the older (pre-6.0) wording for the enum case.
+# Deliberately anchored: an *operational* GenericError such as "failed to open
+# file '/x': No such file or directory" or "Property 'p' not found" describes
+# host/VM state, not the command text, and must NOT be reclassified.
+_QMP_ARG_SHAPE_RE = re.compile(
+    r"^(?:"
+    r"Parameter '[^']*' (?:is (?:missing|unexpected)|expects |does not accept value )"
+    r"|Invalid parameter (?:type for )?'[^']*'"
+    r"|QMP input member '[^']*' (?:is unexpected|must be )"
+    r")"
+)
+
+
+def _qmp_caller_error(method: str, exc: QMPCommandError) -> QMUError | None:
+    """Re-class a QEMU error *reply* that proves the fault is caller input.
+
+    Exit 4 means "QMP/SSH transport or internal qmu failure", so an agent
+    branching on it retries or declares infra breakage. `qmu qmp query-staus`
+    used to land there: the method reached QEMU intact and came back
+    CommandNotFound, which is the opposite of a transport fault and cannot be
+    fixed by retrying. That is the very defect #36 names -- "an infra code for
+    a caller-input mistake" -- and only the command-FORM half was closed
+    before. A method QEMU has no command for, and arguments its QAPI schema
+    rejects, are exit-1 caller errors with a correction attached.
+
+    Returns None for every other reply (DeviceNotFound, KVMMissingCap, an
+    operational GenericError like "failed to open file ..."): those report
+    host/VM state rather than what was typed, so the caller keeps the
+    QMPError -> 4 they have today instead of a wrong "you typo'd" verdict.
+    """
+    if exc.qmp_class == "CommandNotFound":
+        return QMUError(
+            f"Unknown QMP command {method!r}: {exc.desc}. "
+            "List the commands this QEMU accepts with `qmu qmp query-commands`"
+        )
+    if exc.qmp_class == "GenericError" and _QMP_ARG_SHAPE_RE.match(exc.desc):
+        return QMUError(
+            f"Invalid arguments for QMP command {method!r}: {exc.desc}. "
+            "Arguments must be a JSON object matching the command's QAPI "
+            "schema (`qmu qmp query-qmp-schema --out <file>` dumps it)"
+        )
+    return None
+
+
+def _hmp_verb(command_line: str) -> str:
+    """First whitespace-separated token of an HMP command line ("" if none).
+
+    The verb, not the whole line: `help system_reset` shows help and resets
+    nothing, so a substring test would warn on it.
+    """
+    tokens = command_line.split()
+    return tokens[0] if tokens else ""
+
+
+def _emit_mutation_coherence_warning(
+    inst: VMInstance, verb: str, output: str
+) -> None:
+    """Warn once for whichever VM-reality mutation `verb` just performed.
+
+    One switch for all three routes to these mutations -- `qmu monitor <verb>`,
+    `qmu qmp system_reset`, and `qmu qmp human-monitor-command` with the verb
+    inside `arguments['command-line']`. The last one was silent (dogfood F4):
+    it reset the machine with an attached debugger, rc 0 and an empty stderr,
+    which is precisely the wrong-answer-with-no-error class debug.py exists to
+    prevent -- and the envelope normalization made it trivially typeable.
+    savevm/loadvm suppress on a failed op (the same _snapshot_failed the
+    snapshot handlers use), since a failed op mutated nothing.
+    """
+    if verb == "system_reset":
+        if debug_session_present(inst):
+            sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
+    elif verb == "savevm":
+        if debug_stub_present(inst) and not _snapshot_failed(output):
+            sys.stderr.write(savevm_breakpoint_warning(inst.vm_id) + "\n")
+    elif verb == "loadvm":
+        if debug_session_present(inst) and not _snapshot_failed(output):
+            sys.stderr.write(loadvm_stale_session_warning(inst.vm_id) + "\n")
 
 
 def _handle_qmp(args: argparse.Namespace) -> int:
@@ -583,18 +718,34 @@ def _handle_qmp(args: argparse.Namespace) -> int:
             raise QMUError(f"Invalid --args JSON: {exc}") from exc
     method, qmp_args = _parse_qmp_command(args.command, args.args)
     inst = choose_instance(args.vm)
-    with _qmp_ctx(inst) as qmp:
-        result = qmp.execute(method, qmp_args)
+    try:
+        with _qmp_ctx(inst) as qmp:
+            result = qmp.execute(method, qmp_args)
+    except QMPCommandError as exc:
+        # A QEMU error REPLY, not a transport fault: the wire worked. Re-class
+        # the subset that proves caller input is at fault (exit 1); everything
+        # else keeps the QMPError -> exit 4 it has today.
+        caller_error = _qmp_caller_error(method, exc)
+        if caller_error is None:
+            raise
+        raise caller_error from exc
     # Text mode passes the raw QMP return (any JSON type) straight to _output;
     # json mode wraps it so the universal {"ok": ...} contract holds, with the
     # original payload under "result".
     _emit(args, data={"ok": True, "result": result}, text=result, stem="qmp")
-    # #46: a machine reset silently drops the gdbstub breakpoint set. `qmu qmp
-    # system_reset` is the raw path that triggers it; warn when a debug session
-    # is present so the operator re-arms instead of trusting frozen hits=0.
-    # Keyed on the NORMALIZED method so the envelope form warns too.
-    if method == "system_reset" and debug_session_present(inst):
-        sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
+    # #46: a machine reset silently drops the gdbstub breakpoint set. Both raw
+    # paths reach it -- the QMP method itself (keyed on the NORMALIZED method,
+    # so the envelope form warns too) and `human-monitor-command`, whose HMP
+    # verb rides inside arguments['command-line'] and was unguarded (F4).
+    if method == "system_reset":
+        _emit_mutation_coherence_warning(inst, "system_reset", "")
+    elif method == "human-monitor-command":
+        line = qmp_args.get("command-line") if isinstance(qmp_args, dict) else None
+        _emit_mutation_coherence_warning(
+            inst,
+            _hmp_verb(line) if isinstance(line, str) else "",
+            result if isinstance(result, str) else "",
+        )
     return 0
 
 
@@ -623,19 +774,8 @@ def _handle_monitor(args: argparse.Namespace) -> int:
     )
     # HMP is a raw escape hatch, so `qmu monitor {system_reset,savevm,loadvm}`
     # reach the same VM-reality mutations as the dedicated handlers / `qmu qmp`
-    # but bypass their coherence warnings. Re-emit here, keyed on the HMP *verb*
-    # (the first token) so e.g. `monitor help system_reset` — which resets
-    # nothing — is not caught. loadvm/savevm suppress on a failed op (the same
-    # _snapshot_failed the snapshot handlers use), since a failed op mutated
-    # nothing.
-    verb = args.command[0] if args.command else ""
-    if verb == "system_reset":
-        if debug_session_present(inst):
-            sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
-    elif verb == "savevm":
-        if debug_stub_present(inst) and not _snapshot_failed(result):
-            sys.stderr.write(savevm_breakpoint_warning(inst.vm_id) + "\n")
-    elif verb == "loadvm":
-        if debug_session_present(inst) and not _snapshot_failed(result):
-            sys.stderr.write(loadvm_stale_session_warning(inst.vm_id) + "\n")
+    # but bypass their coherence warnings. Re-emit through the shared switch,
+    # which is keyed on the HMP *verb* so e.g. `monitor help system_reset` --
+    # which resets nothing -- is not caught.
+    _emit_mutation_coherence_warning(inst, _hmp_verb(command), result)
     return 0

@@ -10,6 +10,28 @@ class QMPError(RuntimeError):
     pass
 
 
+class QMPCommandError(QMPError):
+    """A QEMU error *reply* to a command that was successfully sent.
+
+    Distinct from every other QMPError, which carries a transport fault (socket
+    refused, greeting rejected, connection closed, read timeout): here the wire
+    worked and QEMU answered "no". QEMU's error ``class`` is the only
+    machine-readable discriminator between a caller mistake (mistyped method ->
+    ``CommandNotFound``; arguments the QAPI schema rejects -> ``GenericError``)
+    and a host/VM-state failure, and carrying it out of ``_recv_response`` is
+    what lets `qmu qmp` map the former onto the caller-error exit code instead
+    of the infra one (#36: exit 4 made an agent retry or declare infra breakage
+    over a typo). Subclasses QMPError so every existing ``except QMPError``
+    site — the liveness/status probes in `_cliutil` and `lifecycle`, `kill`'s
+    best-effort `quit` — keeps behaving identically.
+    """
+
+    def __init__(self, desc: str, qmp_class: str) -> None:
+        super().__init__(desc)
+        self.desc = desc
+        self.qmp_class = qmp_class
+
+
 class QMPClient:
     """Synchronous QMP (QEMU Machine Protocol) client over Unix socket."""
 
@@ -121,8 +143,13 @@ class QMPClient:
                 return msg["return"]
             if "error" in msg:
                 err = msg["error"]
-                desc = err.get("desc", err.get("class", "unknown error"))
-                raise QMPError(f"QMP error: {desc}")
+                qmp_class = str(err.get("class", ""))
+                desc = str(err.get("desc", qmp_class or "unknown error"))
+                # No "QMP error: " prefix here: cli.main already renders a
+                # QMPError under its own "[qmu] QMP error:" heading, which
+                # produced "[qmu] QMP error: QMP error: The command ... has not
+                # been found" — the string agents regex-match and paste.
+                raise QMPCommandError(desc, qmp_class)
             if "event" in msg:
                 # Buffer for later wait_event() calls.
                 self._events.append(msg)
