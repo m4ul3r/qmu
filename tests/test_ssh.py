@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from qmu import ssh
 
 
@@ -46,11 +48,19 @@ def test_control_directory_creation_failure_disables_multiplexing(monkeypatch):
     assert ssh._control_opts() == []
 
 
+@pytest.mark.parametrize(
+    "root_name,safe",
+    [
+        pytest.param("x" * 35, True, id="safe-boundary"),
+        pytest.param("x" * 51, False, id="99-byte-expanded-path"),
+        pytest.param("x" * 80, False, id="overlong-root"),
+    ],
+)
 def test_ssh_and_scp_builders_share_current_bounded_control_options(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, root_name, safe
 ):
     monkeypatch.chdir(tmp_path)
-    runtime = Path("runtime")
+    runtime = Path(root_name)
     monkeypatch.setenv("QMU_TEMP_DIR", str(runtime))
     client = ssh.SSHClient(port=2222, key_path="test-key")
     expected = {
@@ -59,5 +69,9 @@ def test_ssh_and_scp_builders_share_current_bounded_control_options(
         f"ControlPath={runtime / 'ssh' / 'cm-%C'}",
     }
 
-    assert expected <= _options(client._ssh_base())
-    assert expected <= _options(client._scp_base())
+    for command in (client._ssh_base(), client._scp_base()):
+        options = _options(command)
+        if safe:
+            assert expected <= options
+        else:
+            assert not any(option.startswith("Control") for option in options)

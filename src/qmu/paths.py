@@ -9,6 +9,8 @@ from pathlib import Path
 SKILL_NAME = "qmu"
 
 
+# Conservative budget for the complete Unix socket pathname, including
+# OpenSSH's temporary "." plus 16-character suffix.
 SSH_CONTROL_PATH_MAX_BYTES = 100
 
 
@@ -126,8 +128,9 @@ def ssh_control_dir() -> Path:
 
 def ssh_control_path() -> Path | None:
     candidate = ssh_control_dir() / "cm-%C"
+    # %C expands to a 40-byte hash; OpenSSH binds a temporary name before rename.
     expanded = os.fsencode(str(candidate).replace("%C", "0" * 40))
-    if len(expanded) > SSH_CONTROL_PATH_MAX_BYTES:
+    if len(expanded) + 17 > SSH_CONTROL_PATH_MAX_BYTES:
         return None
     return candidate
 

@@ -10,6 +10,7 @@ import pytest
 from qmu import cli
 from qmu.commands import lifecycle
 from qmu.instance import VMInstance
+from qmu.qmp import QMPError
 
 
 class FakeClock:
@@ -19,15 +20,21 @@ class FakeClock:
     def monotonic(self):
         return self.now
 
+    def sleep(self, duration):
+        self.now += duration
+
 
 class FakeQMP:
-    def __init__(self, clock, *, status="running", events=()):
+    def __init__(self, clock, *, status="running", events=(), connection_error=None):
         self.clock = clock
         self.status = status
         self.events = list(events)
         self.wait_calls = []
+        self.connection_error = connection_error
 
     def __enter__(self):
+        if self.connection_error is not None:
+            raise self.connection_error
         return self
 
     def __exit__(self, *args):
@@ -40,7 +47,10 @@ class FakeQMP:
     def wait_event(self, event_names, timeout=None):
         self.wait_calls.append((event_names, timeout))
         if self.events:
-            return self.events.pop(0)
+            event = self.events.pop(0)
+            if isinstance(event, Exception):
+                raise event
+            return event
         self.clock.now += 0.0 if timeout is None else timeout
         return None
 
@@ -79,15 +89,20 @@ def _invoke_wait(
     no_clean=False,
     fmt="json",
     crash_text="terminal panic",
+    connection_error=None,
 ):
     inst = _instance(tmp_path, harness=harness)
     clock = FakeClock()
-    qmp = FakeQMP(clock, status=status, events=events)
-    alive_values = list(alive)
+    qmp = FakeQMP(
+        clock, status=status, events=events, connection_error=connection_error
+    )
+    alive_values = None if callable(alive) else list(alive)
     remove_calls = []
     crash_calls = []
 
     def identity_alive(selected):
+        if alive_values is None:
+            return alive(clock.now)
         value = alive_values[0]
         if len(alive_values) > 1:
             alive_values.pop(0)
@@ -101,6 +116,7 @@ def _invoke_wait(
         raise AssertionError("wait must not call _kill_vm after identity death")
 
     monkeypatch.setattr(lifecycle.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(lifecycle.time, "sleep", clock.sleep)
     monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
     monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda selected: qmp)
     monkeypatch.setattr(lifecycle, "instance_alive", identity_alive)
@@ -119,7 +135,9 @@ def _invoke_wait(
     )
     monkeypatch.setattr(lifecycle, "_kill_vm", forbidden_kill)
 
-    argv = ["wait", "--vm", "wait-vm", "--timeout", str(timeout)]
+    argv = ["wait", "--vm", "wait-vm"]
+    if timeout is not None:
+        argv.extend(["--timeout", str(timeout)])
     if no_clean:
         argv.append("--no-clean")
     if fmt != "text":
@@ -129,6 +147,115 @@ def _invoke_wait(
     captured = capsys.readouterr()
     payload = json.loads(captured.out) if fmt != "text" else None
     return rc, payload, captured.out, qmp, remove_calls, crash_calls
+
+
+@pytest.mark.parametrize("exit_at", [0.1, 1.0])
+def test_wait_qmp_eof_allows_bounded_identity_exit(
+    exit_at, monkeypatch, capsys, tmp_path
+):
+    rc, payload, _, qmp, remove_calls, crash_calls = _invoke_wait(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        events=[QMPError("QMP connection closed unexpectedly")],
+        alive=lambda now: now < exit_at,
+        timeout=None,
+    )
+
+    assert rc == 0
+    assert payload["stopped"] is True
+    assert payload["reason"] == "process_exited"
+    assert payload["elapsed"] == pytest.approx(exit_at)
+    assert qmp.clock.now == pytest.approx(exit_at)
+    assert remove_calls == ["wait-vm"]
+    assert len(crash_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("phase", "error"),
+    [
+        ("connection", QMPError("Cannot connect to QMP socket")),
+        ("wait", QMPError("QMP connection closed unexpectedly")),
+        ("connection", OSError("connection refused")),
+        ("wait", OSError("connection reset by peer")),
+    ],
+)
+def test_wait_persistent_transport_failure_is_infrastructure_and_keeps_state(
+    phase, error, monkeypatch, capsys, tmp_path
+):
+    rc, payload, _, qmp, remove_calls, crash_calls = _invoke_wait(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        connection_error=error if phase == "connection" else None,
+        events=[error] if phase == "wait" else [],
+        timeout=None,
+    )
+
+    assert rc == 4
+    assert payload["ok"] is False
+    assert payload["error_type"] == "QMPError"
+    assert str(error) in payload["error"]
+    assert "stopped" not in payload
+    assert qmp.clock.now == pytest.approx(1.0)
+    assert remove_calls == []
+    assert crash_calls == []
+
+
+@pytest.mark.parametrize("exits_at_deadline", [False, True])
+def test_wait_transport_grace_uses_remaining_deadline_and_checks_boundary(
+    exits_at_deadline, monkeypatch, capsys, tmp_path
+):
+    def delayed_eof(qmp, event_names, timeout=None):
+        qmp.clock.now = 0.875
+        raise QMPError("QMP connection closed unexpectedly")
+
+    monkeypatch.setattr(FakeQMP, "wait_event", delayed_eof)
+    rc, payload, _, qmp, remove_calls, crash_calls = _invoke_wait(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        alive=lambda now: not exits_at_deadline or now < 1.0,
+        timeout=1.0,
+    )
+
+    assert qmp.clock.now == pytest.approx(1.0)
+    if exits_at_deadline:
+        assert rc == 0
+        assert payload["reason"] == "process_exited"
+        assert remove_calls == ["wait-vm"]
+        assert len(crash_calls) == 1
+    else:
+        assert rc == 4
+        assert payload["error_type"] == "QMPError"
+        assert remove_calls == []
+        assert crash_calls == []
+
+
+@pytest.mark.parametrize("alive", [False, True])
+def test_wait_connection_failure_at_zero_deadline_checks_identity_without_grace(
+    alive, monkeypatch, capsys, tmp_path
+):
+    rc, payload, _, qmp, remove_calls, crash_calls = _invoke_wait(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        connection_error=OSError("connection refused"),
+        alive=[alive],
+        timeout=0,
+    )
+
+    assert qmp.clock.now == 0
+    if alive:
+        assert rc == 4
+        assert payload["error_type"] == "QMPError"
+        assert remove_calls == []
+        assert crash_calls == []
+    else:
+        assert rc == 0
+        assert payload["reason"] == "process_exited"
+        assert remove_calls == ["wait-vm"]
+        assert len(crash_calls) == 1
 
 
 def test_wait_reset_with_live_pid_times_out_and_preserves_observation(
@@ -529,8 +656,9 @@ def test_wait_repeated_reset_uses_latest_boundary(monkeypatch, capsys, tmp_path)
     assert saved_offsets == [len(old), len(old) + len(appended)]
 
 
+@pytest.mark.parametrize("alive_after_reset", [False, True])
 def test_wait_reset_persistence_failure_prevents_live_result(
-    monkeypatch, capsys, tmp_path
+    alive_after_reset, monkeypatch, capsys, tmp_path
 ):
     inst = _instance(tmp_path)
     Path(inst.serial_log).write_text("old epoch\n")
@@ -541,9 +669,10 @@ def test_wait_reset_persistence_failure_prevents_live_result(
     def identity_alive(selected):
         nonlocal alive_checks
         alive_checks += 1
-        return True
+        return alive_checks == 1 or alive_after_reset
 
     monkeypatch.setattr(lifecycle.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(lifecycle.time, "sleep", clock.sleep)
     monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
     monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda selected: qmp)
     monkeypatch.setattr(lifecycle, "instance_alive", identity_alive)
@@ -564,6 +693,7 @@ def test_wait_reset_persistence_failure_prevents_live_result(
     assert "metadata failed" in payload["error"]
     assert "stopped" not in payload
     assert alive_checks == 1
+    assert clock.now == 0
 
 
 def test_wait_terminal_crash_uses_current_epoch(monkeypatch, capsys, tmp_path):

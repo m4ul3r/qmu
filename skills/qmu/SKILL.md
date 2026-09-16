@@ -177,6 +177,15 @@ qmu launch --append "slub_debug=- nokaslr"                     # ADD params to t
 qmu launch --cmdline "console=ttyS0 root=/dev/sda custom=1"    # REPLACE the profile cmdline
 ```
 
+**Requested SSH readiness is part of launch success.** If its wait expires,
+`launch` returns **4** (`SSHError`) with `ok:false`, not success. It retains
+the VM, metadata and serial log; inspect the reported `vm_id` with `log` or
+`status` rather than relaunching over it. A ready connection gives
+`ssh_status: "ready"`; still perform the agreed benign operation. `--harness`
+and `--no-wait-ssh` deliberately skip readiness, so their exit 0 says nothing
+about SSH. `status`/`list` health and `guest:serving` are infrastructure
+observations, not proof that vendor services initialized or answered.
+
 **`--append` vs `--cmdline`.** `--cmdline` replaces the profile's command line
 entirely, and every profile carries `root=/dev/sda`; a hand-written replacement
 that omits it boots into an emergency shell with no obvious cause. Use
@@ -353,10 +362,8 @@ State files are **never silently removed** except by `qmu wait`'s harness auto-c
 
 `qmu prune` reaches `~/.cache/qmu/instances/` and the runtime root — **not** the
 rest of the cache. `tools/kbuild.sh`, `tools/mkrootfs.sh` and `tools/mktarget.sh`
-write `kernels/`, `rootfs/` and `targets/` into the same directory, and on a
-working research box those are ~99.99% of the bytes. `qmu prune --all` can
-report success while 30 GB sits untouched, so every `prune` result carries an
-`unmanaged_cache` key naming what it did not cover.
+write `kernels/`, `rootfs/` and `targets/` into the same directory. Every `prune`
+result carries an `unmanaged_cache` key naming the build caches it did not cover.
 
 ```bash
 qmu cache du                  # per-subtree sizes + what is reclaimable
@@ -365,13 +372,13 @@ qmu cache ls --bucket all     # including held-back and refused entries
 ```
 
 Sizes are **allocated** blocks, not apparent size. `targets/` and `rootfs/` hold
-sparse ext4 images, so `st_size` overstates a real cache by ~70%; `apparent_bytes`
-is reported alongside for reference.
+sparse ext4 images, so `st_size` can exceed their physical allocation;
+`apparent_bytes` is reported alongside for reference.
 
 **Reclaiming kernel build residue.** `kbuild.sh` builds in-tree, so
-`kernels/src/linux-*/` accumulates `*.o`, `*.a`, `.*.cmd` and friends — commonly
-more than half the cache. They carry no value to kbuild, which runs `make
-mrproper` at the start of every containerised build:
+`kernels/src/linux-*/` accumulates `*.o`, `*.a`, `.*.cmd` and other intermediates.
+They carry no value to kbuild, which runs `make mrproper` at the start of every
+containerised build:
 
 ```bash
 qmu prune --build-residue --dry-run   # always preview first
@@ -379,10 +386,10 @@ qmu prune --build-residue
 ```
 
 It **never** removes `vmlinux`, `vmlinux.unstripped`, `System.map`, `Makefile`,
-`.config`, anything under `arch/*/boot/`, or any symlink. That is not caution for
-its own sake: when kbuild's `make scripts_gdb` step fails (it does on 4.x, under
-`pipefail`, before the artifact copy), the source tree holds the *only* copy of
-that build's kernel. Reclaiming residue leaves the build a cache hit.
+`.config`, anything under `arch/*/boot/`, or any symlink. An interrupted build
+may leave the only usable outputs in its source tree. Residue cleanup preserves
+those artifacts; cache reuse still requires the builder's complete output and
+helper contract.
 
 Results are bucketed, and the buckets partition the total:
 
@@ -428,6 +435,11 @@ loop](#the-boot-and-check-iterate-loop)):
 - **Exit 124** — `--timeout` elapsed while the QEMU process remained alive.
   Structured output has `ok:false`, `stopped:false`, and retains `qemu_status`,
   `last_event`, and `event_data`.
+- **Exit 4** — QMP transport failed while the recorded process remained alive.
+  A connection can close just before normal process exit, so qmu allows up to
+  one second of identity polling, capped by the remaining `--timeout`. EOF alone
+  is never success. A persistent transport failure remains infrastructure
+  failure, not exit 1 or an ordinary timeout, and never cleans the live VM.
 - QMP `RESET`, `STOP`, `SHUTDOWN`, and `POWERDOWN`, plus non-running states such
   as `paused`, `postmigrate`, and `guest-panicked`, are observations rather than
   proof that QEMU exited.
@@ -470,16 +482,27 @@ before printing the marker, and hangs forever if the VM dies. `qmu wait
   continues. `--ignore-crash` suppresses even the terminal-panic abort; you
   rarely need it now, and pasting it reflexively is how a real panic gets
   missed.
-- **Exit 1** — the VM exited without ever printing the pattern.
+- **Exit 1** — the VM exited without the pattern and without terminal-panic
+  evidence. A survived Oops/KASAN report remains in `crash` as context but does
+  not promote a later process exit to 3. `--ignore-crash` suppresses the early
+  abort, not terminal-panic classification after the process actually exits.
 - **Exit 124** — `--timeout` elapsed with the VM still running.
 
+**A fast probe may already be stopped.** With explicit `--vm`, pattern waiting
+also inspects retained stopped logs (including log-only remnants), flushes the
+final unterminated line, and returns the same match/no-match outcomes. It never
+auto-cleans them. A missing/unreadable retained log is an inconclusive error,
+not evidence the operation failed. Without a selector, only running instances
+are candidates; an old stopped VM cannot silently satisfy a new wait. Bare
+`wait` without `--pattern` still requires a running tracked VM.
+
 `--pattern` is a Python regex matched per line, e.g. `--pattern "leaked
-0x[0-9a-f]{16}"`. After a QMP `RESET` **that qmu observed** the scan starts at
-the new guest epoch. Note the limit: epoch advancement needs qmu connected when
-the reset fires, so a *guest-initiated* reboot between two commands (`panic=1`,
-kexec, a harness calling `reboot`) is invisible and a pre-reboot marker can
-still satisfy a wait. The guest-state axis does not share this limit — it
-re-scopes on the kernel's own boot banner.
+0x[0-9a-f]{16}"`. At the start of the wait, scanning begins at the later of the
+recorded guest epoch and the latest timestamped kernel boot banner in the log.
+This excludes earlier-boot evidence even when a reboot was not observed over
+QMP. Keep run/boot identity in the receipt: a regex match alone does not prove
+the operation's meaning. Re-establish the observation scope after a reboot
+during an active wait; the initial boundary is not a live reboot monitor.
 
 `qmu log` reads the same log after the fact:
 
@@ -1021,7 +1044,7 @@ Use the exit code (not log scraping) to branch:
 | `1`  | Operational failure — no running VM, bad `--vm`, kernel not found, guest command non-zero, `doctor` unhealthy, a snapshot op failed, or `wait --pattern` outlived the VM (any `QMUError`) |
 | `2`  | Usage / argument-parse error (argparse) |
 | `3`  | Guest kernel crash — always corroborated by a fresh serial crash report (a bare dropped connection is `4`) |
-| `4`  | QMP or SSH transport-layer failure (`QMPError`/`SSHError`), a dropped SSH/scp connection with NO fresh crash (guest merely unreachable — e.g. no sshd), or an internal/unexpected qmu error (the `main()` catch-all, a hung helper subprocess) |
+| `4`  | QMP or SSH transport-layer failure (`QMPError`/`SSHError`), including requested `launch` SSH-readiness timeout; a dropped SSH/scp connection with NO fresh crash; or an internal/unexpected qmu error |
 | `124`| `qmu wait` timed out; `qmu run` gave up waiting for the guest to answer SSH; or an `exec`/`run`/`compile --run` guest command exceeded `--timeout` **while the guest was still reachable** |
 
 Exit `3` is guest-side; an internal qmu/transport fault is `4`, so a tooling bug is never mistaken for a kernel panic. `exec`, `push`, and `pull` apply that rule identically: a lost connection returns `3` only when a fresh serial crash corroborates it, otherwise `4`. Branch on `3` to mean "the guest actually crashed"; check `crash_detected` in JSON for the same answer. (Matches `qmu --help`.)

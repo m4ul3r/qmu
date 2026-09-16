@@ -25,6 +25,12 @@ qmu kill
 
 Run `qmu --help` for full usage.
 
+`launch` waits for SSH unless `--no-wait-ssh` or `--harness` is used. A requested
+SSH-readiness timeout exits **4** with `ok:false` / `error_type: "SSHError"`,
+while retaining the VM and serial evidence for `qmu log --vm ID` / `status`.
+Do not equate skipped readiness or infrastructure health with application
+readiness; exercise the intended benign operation after connecting.
+
 ## One-shot runs
 
 `qmu run` collapses `launch` → `exec` → `kill` into one command whose exit code
@@ -97,6 +103,16 @@ non-running QEMU states as observations, but reports `stopped:true` and exits
 `0` only after the recorded QEMU process identity has exited. If `--timeout`
 elapses while that process is still alive, it exits `124` with
 `stopped:false` and preserves the latest QMP observation.
+
+With `--pattern` and explicit `--vm`, `wait` also checks retained serial logs
+after a short-lived probe has stopped. It preserves logs/metadata and uses the
+recorded guest epoch or later kernel boot banner: exit `0` means the pattern
+matched; `3` requires terminal-panic evidence before the match. A VM that exits
+without a match returns `1` when no terminal panic was observed, even if it
+previously survived an Oops/KASAN report. Such a report remains diagnostic
+context, not proof that the kernel died. Missing/unreadable evidence is an error
+rather than a negative experiment. Pattern waiting without an explicit selector
+still selects running VMs only.
 
 `qmu crash` searches only the current guest epoch by default. A successful
 `snapshot load` or an observed guest reset advances that epoch, so an older

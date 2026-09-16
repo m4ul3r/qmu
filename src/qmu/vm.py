@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import time
 import uuid
@@ -16,6 +17,17 @@ from .instance import QMUError, VMInstance, proc_pid_start, save_instance
 from .paths import instances_dir, qmp_socket_path, qemu_log_path, serial_log_path
 from .qemu import native_passt_problem, probe_qemu_netdevs
 from .qmp import QMPClient
+
+
+def _resolve_boot_file(value: str, label: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        raise QMUError(f"{label} not found: {value}") from None
+    if not stat.S_ISREG(mode):
+        raise QMUError(f"{label} is not a regular file: {value!r}")
+    return path
 
 
 def _terminate_and_reap(
@@ -64,15 +76,24 @@ class _LaunchAttempt:
     committed: bool = False
     _primary_error: BaseException | None = field(default=None, repr=False)
 
-    def rollback(self) -> None:
+    def rollback(self, *, capture_output: bool = False) -> str:
         if self.committed:
-            return
+            return ""
+        output = ""
         cleanup_error: BaseException | None = None
         try:
             _terminate_and_reap(self.proc)
         except BaseException as exc:
             cleanup_error = exc
         finally:
+            if capture_output:
+                try:
+                    with self.qemu_log.open("rb") as log:
+                        log.seek(0, os.SEEK_END)
+                        log.seek(max(0, log.tell() - 2000))
+                        output = log.read().decode(errors="replace")
+                except OSError:
+                    pass
             try:
                 _remove_attempt_artifacts(
                     self.qmp_socket, self.serial_log, self.qemu_log
@@ -82,9 +103,11 @@ class _LaunchAttempt:
                     cleanup_error = unlink_exc
         if cleanup_error is not None:
             pid = getattr(self.proc, "pid", "?")
-            raise QMUError(
-                f"Launch cleanup failed for pid {pid}: could not reap child"
-            ) from cleanup_error
+            message = f"Launch cleanup failed for pid {pid}: could not reap child"
+            if output:
+                message += f"\nQEMU output:\n{output}"
+            raise QMUError(message) from cleanup_error
+        return output
 
     def commit(self) -> None:
         self.committed = True
@@ -385,9 +408,7 @@ def launch_vm(
 ) -> VMInstance:
     """Launch a QEMU VM and return the instance."""
     # Validate files
-    kernel_path = Path(kernel).expanduser().resolve()
-    if not kernel_path.exists():
-        raise QMUError(f"Kernel not found: {kernel}")
+    kernel_path = _resolve_boot_file(kernel, "Kernel")
 
     rootfs_path: Path | None = None
     if not harness and not drives:
@@ -420,9 +441,7 @@ def launch_vm(
 
     initrd_path: Path | None = None
     if initrd is not None:
-        initrd_path = Path(initrd).expanduser().resolve()
-        if not initrd_path.exists():
-            raise QMUError(f"Initrd not found: {initrd}")
+        initrd_path = _resolve_boot_file(initrd, "Initrd")
 
     cmdline_override = cmdline is not None
     cmdline = resolve_cmdline(config, profile=profile, cmdline=cmdline, append=append)
@@ -528,9 +547,13 @@ def launch_vm(
         else:
             primary = QMUError("Timed out waiting for QMP socket to appear")
             try:
-                attempt.rollback()
+                log_text = attempt.rollback(capture_output=True)
             except QMUError as cleanup_exc:
                 raise cleanup_exc from primary
+            if log_text:
+                primary = QMUError(
+                    f"{primary}\nCommand: {' '.join(cmd)}\nQEMU output:\n{log_text}"
+                )
             raise primary
 
         if exited:
@@ -571,9 +594,13 @@ def launch_vm(
             primary = QMUError(f"QMP connection failed after launch: {exc}")
             primary.__cause__ = exc
             try:
-                attempt.rollback()
+                log_text = attempt.rollback(capture_output=True)
             except QMUError as cleanup_exc:
                 raise cleanup_exc from primary
+            if log_text:
+                primary = QMUError(
+                    f"{primary}\nCommand: {' '.join(cmd)}\nQEMU output:\n{log_text}"
+                )
             raise primary from exc
 
         # Build and save instance under the attempt transaction.

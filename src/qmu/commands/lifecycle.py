@@ -68,6 +68,7 @@ from ..qemu import native_passt_problem, probe_qemu_netdevs
 from ..qmp import QMPError
 from ..serial import (
     SerialTail,
+    is_terminal_panic_start,
     extract_crash,
     has_terminal_panic,
     extract_unknown_params,
@@ -391,6 +392,7 @@ def _handle_launch(args: argparse.Namespace) -> int:
         harness=args.harness,
     )
 
+    exit_code = 0
     if inst.harness or inst.ssh_port is None:
         ssh_status = "n/a (harness)"
     elif not args.no_wait_ssh:
@@ -400,6 +402,7 @@ def _handle_launch(args: argparse.Namespace) -> int:
             ssh_status = "ready"
         else:
             ssh_status = "timeout (VM may still be booting)"
+            exit_code = 4
     else:
         ssh_status = "skipped"
 
@@ -412,7 +415,7 @@ def _handle_launch(args: argparse.Namespace) -> int:
     )
 
     result = {
-        "ok": True,
+        "ok": exit_code == 0,
         "vm_id": inst.vm_id,
         "pid": inst.pid,
         "ssh_port": inst.ssh_port,
@@ -444,8 +447,17 @@ def _handle_launch(args: argparse.Namespace) -> int:
     lines.append(f"  Kernel:  {inst.kernel}")
     lines.append(f"  Profile: {_profile_label(inst)}")
     lines.append(f"  Serial:  {inst.serial_log}")
+    if exit_code:
+        result["error_type"] = "SSHError"
+        result["error"] = (
+            f"SSH did not become ready within {args.ssh_timeout}s. "
+            f"VM state retained; inspect with `qmu log --vm {inst.vm_id}` "
+            f"or `qmu status --vm {inst.vm_id}`."
+        )
+        if args.format == "text":
+            sys.stderr.write(f"[qmu] Error: {result['error']}\n")
     _emit(args, data=result, text=lines, stem="launch")
-    return 0
+    return exit_code
 
 
 def _orphan_serial_logs() -> dict[str, int]:
@@ -1274,10 +1286,11 @@ def _add_wait(sub: argparse._SubParsersAction) -> None:
                    help="Max seconds to wait (default: no timeout)")
     p.add_argument("--pattern", default=None,
                    help="Block until this regex matches a serial console line, instead of "
-                        "waiting for the VM to exit. Exits 0 on match, 3 on kernel crash, "
-                        "1 if the VM dies first, 124 on timeout.")
+                        "waiting for the VM to exit. With explicit --vm, also reads retained "
+                        "stopped logs. Exits 0 on match, 3 on terminal panic, "
+                        "1 on exit without a match, 124 on timeout.")
     p.add_argument("--ignore-crash", action="store_true",
-                   help="With --pattern: keep waiting through a kernel crash instead of "
+                   help="With --pattern: keep waiting through a terminal panic instead of "
                         "aborting on it")
     p.add_argument("--no-clean", action="store_true",
                    help="Don't remove instance metadata after stop (harness VMs only)")
@@ -1292,9 +1305,9 @@ _PATTERN_POLL_INTERVAL = 0.25
 
 
 def _handle_wait(args: argparse.Namespace) -> int:
-    _require_running(args.vm, "wait")
     if getattr(args, "pattern", None) is not None:
         return _wait_for_pattern(args)
+    _require_running(args.vm, "wait")
     inst = choose_instance(args.vm)
 
     start = time.monotonic()
@@ -1367,11 +1380,23 @@ def _handle_wait(args: argparse.Namespace) -> int:
     except (QMPError, OSError) as exc:
         if reset_persistence_in_progress:
             raise
-        if not instance_alive(inst):
-            stopped = True
-            reason = "process_exited"
-        else:
-            raise QMUError(f"QMP error during wait: {exc}") from exc
+        # QEMU can close QMP just before its recorded process exits. Allow only
+        # a short identity-polling grace, never a reconnect or an extended wait.
+        grace_deadline = time.monotonic() + 1.0
+        if deadline is not None:
+            grace_deadline = min(grace_deadline, deadline)
+        while True:
+            # Check identity even at the deadline; EOF alone proves no exit.
+            if not instance_alive(inst):
+                stopped = True
+                reason = "process_exited"
+                break
+            remaining = grace_deadline - time.monotonic()
+            if remaining <= 0:
+                if isinstance(exc, QMPError):
+                    raise
+                raise QMPError(f"QMP transport error during wait: {exc}") from exc
+            time.sleep(min(0.05, remaining))
 
     elapsed = time.monotonic() - start
     _unknown_params = _warn_unknown_kernel_params(inst)
@@ -1458,8 +1483,17 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
     guest panics before printing the expected marker, and it hangs forever
     when the VM dies. Both terminate here with a distinguishable exit code.
     """
-    _require_running(args.vm, "wait")
-    inst = choose_instance(args.vm)
+    # A short-lived probe can exit before the caller starts waiting. Explicit
+    # selection may inspect its retained evidence; implicit selection remains
+    # running-only so an old stopped VM cannot silently satisfy a new wait.
+    inst = None
+    if args.vm:
+        info = classify_vm(args.vm, orphan_pids=_orphan_serial_logs())
+        if info["state"] in (VM_RUNNING, VM_STOPPED, VM_HELD_BACK):
+            inst = info["instance"]
+    if inst is None:
+        _require_running(args.vm, "wait")
+        inst = choose_instance(args.vm)
 
     try:
         matcher = re.compile(args.pattern)
@@ -1468,18 +1502,28 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
 
     start = time.monotonic()
     deadline = start + args.timeout if args.timeout is not None else None
-    # A RESET rebases the guest epoch; honor it so a pattern from the previous
-    # boot cannot satisfy a wait against the current one.
+    # Use the recorded RESET boundary and the log's latest boot banner. A
+    # guest-initiated reboot can occur while no qmu command is observing QMP.
     start_offset = inst.guest_epoch_serial_offset or 0
+    start_offset = max(
+        start_offset, last_boot_offset(inst.serial_log, start_offset=start_offset)
+    )
     tail = SerialTail(inst.serial_log, offset=start_offset)
 
     matched_line: str | None = None
     reason = "timeout"
     crash: str | None = None
     saw_dead = False
+    terminal_panic_seen = False
 
     while True:
-        lines = tail.read_lines()
+        try:
+            lines = tail.read_lines(missing_ok=not saw_dead)
+        except OSError as exc:
+            raise QMUError(
+                f"Cannot inspect serial log for '{inst.vm_id}': {exc}. "
+                "Pattern result is inconclusive."
+            ) from exc
         if saw_dead:
             # The process is already gone, so nothing more will be appended.
             # Release the withheld fragment: the marker may be the final,
@@ -1490,16 +1534,14 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
                 matched_line = line
                 reason = "pattern_matched"
                 break
+            if is_terminal_panic_start(line):
+                terminal_panic_seen = True
+                if not args.ignore_crash:
+                    break
         if matched_line is not None:
             break
 
-        if saw_dead:
-            reason = "process_exited"
-            break
-
-        if not args.ignore_crash and has_terminal_panic(
-            inst.serial_log, start_offset=start_offset
-        ):
+        if terminal_panic_seen and not args.ignore_crash:
             # Abort on a TERMINAL panic only. Aborting on any crash made the
             # wait unusable under the default `exploit-dev` profile, where a
             # survived Oops is the expected outcome of a trigger — so callers
@@ -1516,6 +1558,10 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
                 inst.serial_log, start_offset=start_offset
             )
             reason = "crash"
+            break
+
+        if saw_dead:
+            reason = "process_exited"
             break
 
         if not instance_alive(inst):
@@ -1576,7 +1622,7 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
 
     if matched:
         return 0
-    if crash:
+    if crash and terminal_panic_seen:
         return 3
     if reason == "process_exited":
         return 1

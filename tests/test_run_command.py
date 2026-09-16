@@ -502,10 +502,10 @@ KASAN_BOOT_BANNER = (
 
 
 def test_kasan_boot_banner_is_not_a_kernel_warning(harness, capsys):
-    """`CRASH_START_PATTERNS` carries a bare, case-insensitive `KASAN:` that also
-    matches the ordinary boot banner "kasan: KernelAddressSanitizer initialized".
-    With no end marker after it the extract runs to the end of the log, so every
-    KASAN kernel would report its own boot as a multi-thousand-token warning."""
+    """The former bare, case-insensitive `KASAN:` matcher classified the normal
+    initialization banner as a warning. The shared classifier must leave this
+    informational boot output unclassified; genuine `BUG: KASAN:` reports are
+    checked separately."""
     install, state = harness
     install(serial_text=KASAN_BOOT_BANNER, ready=False, alive=True)
 

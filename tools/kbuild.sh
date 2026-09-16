@@ -290,15 +290,13 @@ emit_build_outputs() {
 # Remove in-tree build intermediates after a successful build.
 #
 # Host-side on purpose, NOT inside the container's `bash -c "..."` body: that
-# body is a single host double-quoted string and this file already warns twice
-# that an unescaped quote in it silently truncates the script. It is also
-# executable by the test fixture, which never runs the container body.
+# body is a single host double-quoted string and an unescaped quote in it
+# silently truncates the script.
 #
 # `make clean` is deliberately NOT used: it routes through vmlinuxclean ->
 # scripts/link-vmlinux.sh, which does `rm -f System.map` and `rm -f vmlinux`,
-# and archclean removes arch/*/boot/Image. Those are frequently the only copy
-# on disk -- kbuild's own `make scripts_gdb` step fails on 4.x kernels and,
-# under pipefail, aborts before the artifact copy above ever runs.
+# and archclean removes arch/*/boot/Image. Preserve these usable artifacts
+# independently of whether the caller intends another build.
 #
 # This never touches Makefile, .config, vmlinux, System.map, vmlinux.unstripped
 # or arch/*/boot/, so build_cache_complete() still passes and the next
@@ -328,7 +326,8 @@ build_cache_complete() {
   [[ -f "$SRCDIR/Makefile" ]] &&
   [[ -f "$OUTDIR/vmlinux-gdb.py" ]] &&
   [[ -f "$OUTDIR/scripts/gdb/vmlinux-gdb.py" ]] &&
-  [[ -f "$OUTDIR/scripts/gdb/linux/constants.py" ]]
+  { [[ ! -f "$SRCDIR/scripts/gdb/linux/constants.py.in" ]] ||
+    [[ -f "$OUTDIR/scripts/gdb/linux/constants.py" ]]; }
 }
 
 if [[ "$NO_CACHE" == false ]]; then
@@ -441,7 +440,15 @@ fi
 
 GDB_TARGET=""
 if [[ "$CONFIG_ONLY" == false ]]; then
-  GDB_TARGET="scripts_gdb"
+  # Modern kernels expose a dedicated helper target. Older trees generate
+  # constants (when they have constants.py.in) through prepare -> Kbuild.
+  # Select by the actual rule, never by retrying a failed scripts_gdb build:
+  # a supported target's failure must remain fatal.
+  if grep -qE '^scripts_gdb[[:space:]]*:' "$SRCDIR/Makefile"; then
+    GDB_TARGET="scripts_gdb"
+  else
+    GDB_TARGET="prepare"
+  fi
 fi
 
 # Named so reap_container (armed on EXIT/INT/TERM, see the helpers near the
@@ -624,8 +631,10 @@ else
       "$SRCDIR/Makefile"
       "$OUTDIR/vmlinux-gdb.py"
       "$OUTDIR/scripts/gdb/vmlinux-gdb.py"
-      "$OUTDIR/scripts/gdb/linux/constants.py"
     )
+    if [[ -f "$SRCDIR/scripts/gdb/linux/constants.py.in" ]]; then
+      required_products+=("$OUTDIR/scripts/gdb/linux/constants.py")
+    fi
     for product in "${required_products[@]}"; do
       [[ -f "$product" ]] || die "build appeared to succeed but required product not found: $product"
     done

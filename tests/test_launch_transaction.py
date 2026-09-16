@@ -683,3 +683,47 @@ def test_launch_success_commits_metadata_without_stopping_child(tmp_path, monkey
     assert client.closed
     assert "connect" in client.calls
     assert "execute:query-status" in client.calls
+
+
+@pytest.mark.parametrize("phase", ["appearance", "connect", "query-status"])
+def test_launch_qmp_failure_preserves_final_diagnostic_before_cleanup(
+    tmp_path, monkeypatch, phase
+):
+    kernel = _kernel(tmp_path)
+    proc = FakeProcess(pid=901)
+    original_wait = proc.wait
+
+    def wait_with_final_output(timeout=None):
+        result = original_wait(timeout)
+        qemu_log_path("diagnostic-vm").write_bytes(
+            b"discarded-log-prefix\n" + b"x" * 3000
+            + b"\n\xffprivate-qemu-failure-token\n"
+        )
+        return result
+
+    proc.wait = wait_with_final_output
+
+    def fake_popen(*args, **kwargs):
+        if phase != "appearance":
+            qmp_socket_path("diagnostic-vm").write_text("socket")
+        return proc
+
+    monkeypatch.setattr(vm_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm_module, "proc_pid_start", lambda pid: "1")
+    monkeypatch.setattr(
+        vm_module, "QMPClient", lambda path: FakeQMP(path, fail_on=phase)
+    )
+    if phase == "appearance":
+        times = iter([0.0, 100.0])
+        monkeypatch.setattr(vm_module.time, "monotonic", lambda: next(times, 100.0))
+
+    with pytest.raises(vm_module.QMUError) as error:
+        launch_vm(
+            config=QMUConfig(), kernel=str(kernel), harness=True,
+            name="diagnostic-vm",
+        )
+
+    assert "private-qemu-failure-token" in str(error.value)
+    assert "discarded-log-prefix" not in str(error.value)
+    assert proc.returncode is not None
+    assert not any(path.exists() for path in _attempt_paths("diagnostic-vm"))
