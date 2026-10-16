@@ -124,7 +124,9 @@ def test_transfer_success_preserves_paths_and_status(
         if fmt == "ndjson":
             assert len(out.splitlines()) == 1
         payload = json.loads(out)
-        assert payload == {"ok": True, "local": local, "remote": remote}
+        assert payload == {
+            "ok": True, "vm_id": "xfer-vm", "local": local, "remote": remote,
+        }
 
 
 @pytest.mark.parametrize("fmt", ["text", "json", "ndjson"])

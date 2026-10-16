@@ -82,7 +82,7 @@ class FakeSSH:
             self._panic()
             raise self.push_raises
 
-    def run(self, command, timeout=None):
+    def run(self, command, timeout=None, **kwargs):
         self.runs.append(command)
         self._panic()
         if self._run_results:

@@ -645,12 +645,13 @@ def test_kill_does_not_probe_for_non_gdb_vm(monkeypatch, capsys):
 
 
 # --- wait warns on an observed reset (#46, the non-command path) -------------
+#
+# Bare `wait` no longer holds a QMP connection (one `query-status` per poll),
+# so it observes a reboot the way every other command scopes the guest: a new
+# kernel boot banner in the serial log after the wait began.
 
 
 class _WaitQMP:
-    def __init__(self, events):
-        self._events = list(events)
-
     def __enter__(self):
         return self
 
@@ -660,71 +661,54 @@ class _WaitQMP:
     def execute(self, command, arguments=None, timeout=30.0):
         return {"running": True, "status": "running"}
 
-    def wait_event(self, event_names, timeout=None):
-        return self._events.pop(0) if self._events else None
+
+def _wire_wait_reset(monkeypatch, inst, *, debugged):
+    from qmu.commands import lifecycle
+    alive = [True, False]
+
+    monkeypatch.setattr(lifecycle, "_require_running", lambda vm, cmd: None)
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda sel: _WaitQMP())
+    monkeypatch.setattr(
+        lifecycle, "instance_alive",
+        lambda sel: alive.pop(0) if len(alive) > 1 else alive[0],
+    )
+    # The log is empty when the wait starts; the first poll finds a banner.
+    monkeypatch.setattr(lifecycle, "last_boot_offset", lambda p, start_offset=0: 100)
+    monkeypatch.setattr(lifecycle, "serial_log_offset", lambda p: 100)
+    monkeypatch.setattr(lifecycle, "has_terminal_panic", lambda *a, **k: False)
+    monkeypatch.setattr(lifecycle, "save_guest_epoch_serial_offset", lambda i, off: i)
+    monkeypatch.setattr(lifecycle, "debug_session_present", lambda i: debugged)
+    monkeypatch.setattr(
+        lifecycle, "_warn_unknown_kernel_params",
+        lambda i, **kw: {"all": [], "operator": [], "profile": []},
+    )
+    monkeypatch.setattr(lifecycle, "extract_crash", lambda *a, **k: "")
+    return argparse.Namespace(
+        vm="debug-vm", pattern=None, timeout=1.0, no_clean=True,
+        format="json", out=None, ignore_crash=False,
+    )
 
 
 def test_wait_warns_on_observed_reset_when_debugged(monkeypatch, tmp_path, capsys):
     from qmu.commands import lifecycle
     inst = _gdb_vm(tmp_path, kvm=None)  # gdb_port=1234, harness=False
-    alive = [True, False]
+    args = _wire_wait_reset(monkeypatch, inst, debugged=True)
 
-    monkeypatch.setattr(lifecycle, "_require_running", lambda vm, cmd: None)
-    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
-    monkeypatch.setattr(
-        lifecycle, "_qmp_ctx", lambda sel: _WaitQMP([{"event": "RESET", "data": {}}])
-    )
-    monkeypatch.setattr(
-        lifecycle, "instance_alive",
-        lambda sel: alive.pop(0) if len(alive) > 1 else alive[0],
-    )
-    monkeypatch.setattr(lifecycle, "serial_log_offset", lambda p: 0)
-    monkeypatch.setattr(lifecycle, "save_guest_epoch_serial_offset", lambda i, off: i)
-    monkeypatch.setattr(lifecycle, "debug_session_present", lambda i: True)
-    monkeypatch.setattr(
-        lifecycle, "_warn_unknown_kernel_params",
-        lambda i: {"all": [], "operator": [], "profile": []},
-    )
-    monkeypatch.setattr(lifecycle, "extract_crash", lambda *a, **k: "")
-
-    args = argparse.Namespace(
-        vm="debug-vm", pattern=None, timeout=1.0, no_clean=True,
-        format="json", out=None, ignore_crash=False,
-    )
     rc = lifecycle._handle_wait(args)
-    err = capsys.readouterr().err
+    captured = capsys.readouterr()
     assert rc == 0
-    assert "drops the gdbstub's breakpoint" in err
+    assert json.loads(captured.out)["last_event"] == "RESET"
+    assert "drops the gdbstub's breakpoint" in captured.err
 
 
 def test_wait_reset_no_warning_without_debugger(monkeypatch, tmp_path, capsys):
     from qmu.commands import lifecycle
     inst = _gdb_vm(tmp_path, kvm=None)
-    alive = [True, False]
+    args = _wire_wait_reset(monkeypatch, inst, debugged=False)
 
-    monkeypatch.setattr(lifecycle, "_require_running", lambda vm, cmd: None)
-    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
-    monkeypatch.setattr(
-        lifecycle, "_qmp_ctx", lambda sel: _WaitQMP([{"event": "RESET", "data": {}}])
-    )
-    monkeypatch.setattr(
-        lifecycle, "instance_alive",
-        lambda sel: alive.pop(0) if len(alive) > 1 else alive[0],
-    )
-    monkeypatch.setattr(lifecycle, "serial_log_offset", lambda p: 0)
-    monkeypatch.setattr(lifecycle, "save_guest_epoch_serial_offset", lambda i, off: i)
-    monkeypatch.setattr(lifecycle, "debug_session_present", lambda i: False)
-    monkeypatch.setattr(
-        lifecycle, "_warn_unknown_kernel_params",
-        lambda i: {"all": [], "operator": [], "profile": []},
-    )
-    monkeypatch.setattr(lifecycle, "extract_crash", lambda *a, **k: "")
-
-    args = argparse.Namespace(
-        vm="debug-vm", pattern=None, timeout=1.0, no_clean=True,
-        format="json", out=None, ignore_crash=False,
-    )
     rc = lifecycle._handle_wait(args)
-    err = capsys.readouterr().err
+    captured = capsys.readouterr()
     assert rc == 0
-    assert "drops the gdbstub's breakpoint" not in err
+    assert json.loads(captured.out)["last_event"] == "RESET"
+    assert "drops the gdbstub's breakpoint" not in captured.err

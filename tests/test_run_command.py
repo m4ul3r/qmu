@@ -63,12 +63,17 @@ class FakeSSH:
         self.ready_after_run = ready_after_run
         self.runs: list[str] = []
         self.probes = 0
+        self.master_closes = 0
 
     def is_ready(self, timeout=2):
         self.probes += 1
         return self.ready
 
-    def run(self, command, timeout=None):
+    def close_control_master(self, timeout=5.0):
+        self.master_closes += 1
+        return True
+
+    def run(self, command, timeout=None, **kwargs):
         self.runs.append(command)
         # Crash detection is command-scoped: `_run_guest_command` records the
         # serial offset BEFORE the command, so a panic only counts if it lands
@@ -185,10 +190,12 @@ def test_crash_during_the_command_exits_3_and_preserves_state(harness, capsys):
 
     assert rc == 3
     assert state["kills"] == [False]         # clean=False -> serial log kept
-    out = capsys.readouterr().out
-    assert "Kernel panic - not syncing" in out
-    assert "qmu crash --vm run-vm" in out
-    assert "state preserved" in out
+    captured = capsys.readouterr()
+    assert "Kernel panic - not syncing" in captured.out
+    # Follow-up hints are stderr notes: stdout is what `qmu exec` would print.
+    assert "qmu crash --vm run-vm" in captured.err
+    assert "state preserved" in captured.err
+    assert "state preserved" not in captured.out
 
 
 def test_boot_panic_exits_3_with_the_report(harness, capsys):
@@ -321,8 +328,10 @@ def test_keep_leaves_the_vm_running(harness, capsys):
 
     assert rc == 0
     assert state["kills"] == []              # never killed
-    out = capsys.readouterr().out
-    assert "run-vm" in out and "running" in out
+    assert state["ssh"].master_closes == 0   # the VM stays up; so does its mux
+    captured = capsys.readouterr()
+    assert captured.out == "ok\n"
+    assert "run-vm" in captured.err and "running" in captured.err
 
 
 def test_unexpected_error_after_launch_still_stops_the_vm(monkeypatch, harness):
@@ -433,6 +442,10 @@ def test_inject_runs_before_boot_on_run(monkeypatch, harness):
 
     calls: list[tuple] = []
     monkeypatch.setattr(
+        lifecycle, "_preflight_injects",
+        lambda config, specs, partition=1, mkdir=False: None,
+    )
+    monkeypatch.setattr(
         lifecycle, "_inject_into_rootfs",
         lambda config, specs, partition=1, mkdir=False: calls.append(
             (specs, partition, mkdir)
@@ -467,10 +480,13 @@ def test_no_qemu_args_passes_none(harness):
 
 
 @pytest.mark.parametrize("flag", ["--harness", "--no-wait-ssh"])
-def test_ssh_less_modes_are_a_usage_error(harness, flag):
+def test_ssh_less_modes_are_a_usage_error_that_names_the_alternative(
+    harness, flag, capsys
+):
     """`run` executes a guest command over SSH, so a mode that guarantees no SSH
-    cannot run one. Rejected by argparse (exit 2) rather than booting a VM that
-    then reports a confusing SSH failure."""
+    cannot run one. Rejected as a usage error (exit 2) rather than booting a VM
+    that then reports a confusing SSH failure — and the message says what to
+    do instead; the bare "unrecognized arguments" pointed nowhere."""
     install, state = harness
     install()
 
@@ -479,6 +495,84 @@ def test_ssh_less_modes_are_a_usage_error(harness, flag):
 
     assert exc.value.code == 2
     assert state["launched"] is False
+    err = capsys.readouterr().err
+    assert (
+        f"{flag} is not accepted: run executes a guest command over SSH; "
+        "for boot-and-die kernels use launch --harness + wait + crash"
+    ) in err
+
+
+def test_ssh_less_mode_refusal_is_an_envelope_under_json(harness, capsys):
+    install, state = harness
+    install()
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(_argv("--format", "json", "--harness", "id"))
+
+    assert exc.value.code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "UsageError"
+    assert "launch --harness + wait + crash" in payload["error"]
+
+
+def test_double_dash_hands_dash_words_to_the_guest(harness):
+    """`qmu run -- uname -a`: after `--` the command's dash-words are the
+    command's, not qmu's."""
+    install, state = harness
+    ssh = install(run_result=(0, "", ""))
+
+    rc = cli.main(_argv("--", "uname", "-a"))
+
+    assert rc == 0
+    assert ssh.runs == ["uname -a"]
+
+
+def test_qmu_flags_after_the_command_are_qmus(harness):
+    install, state = harness
+    ssh = install(run_result=(0, "", ""))
+
+    rc = cli.main(_argv("./exploit", "--keep"))
+
+    assert rc == 0
+    assert ssh.runs == ["./exploit"]
+    assert state["kills"] == []
+
+
+def test_unquoted_dash_words_are_a_usage_error_with_a_hint(harness, capsys):
+    install, state = harness
+    install()
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(_argv("uname", "-a"))
+
+    assert exc.value.code == 2
+    assert state["launched"] is False
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: -a" in err
+    assert "Hint: quote the guest command ('uname -a') or put -- before it" in err
+
+
+def test_quoted_single_argument_is_passed_to_the_guest_shell_verbatim(harness):
+    install, state = harness
+    ssh = install(run_result=(0, "", ""))
+
+    rc = cli.main(_argv("cat /proc/slabinfo | grep kmalloc-192"))
+
+    assert rc == 0
+    assert ssh.runs == ["cat /proc/slabinfo | grep kmalloc-192"]
+
+
+def test_clean_run_closes_the_ssh_control_master_before_reaping(harness):
+    """The mux master (`ControlPersist=60`) would otherwise outlive the VM it
+    was opened to; `--keep` leaves it, since the VM stays up."""
+    install, state = harness
+    ssh = install(run_result=(0, "", ""))
+
+    cli.main(_argv("id"))
+
+    assert ssh.master_closes == 1
+    assert state["kills"] == [True]
 
 
 def test_command_is_required(harness):
@@ -542,7 +636,11 @@ def test_healthy_command_timeout_is_124_not_a_crash(harness, capsys):
     """`qmu run --timeout 1 -- 'sleep 10'` against a healthy guest. Reproduced
     live as exit 3 before the fix — a phantom panic for a slow command."""
     install, state = harness
-    install(run_raises=SSHError("SSH command timed out after 1s: sleep 10"))
+    install(run_raises=SSHError(
+        "SSH command timed out after 1s: sleep 10",
+        stdout="partial\n",
+        stderr="progress\n",
+    ))
 
     rc = cli.main(_argv("--format", "json", "--timeout", "1", "sleep 10"))
 
@@ -550,6 +648,10 @@ def test_healthy_command_timeout_is_124_not_a_crash(harness, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["timed_out"] is True
     assert payload["crash_detected"] is False
+    # What the command printed before the deadline is still reported.
+    assert payload["exit_code"] is None
+    assert payload["stdout"] == "partial\n"
+    assert payload["stderr"] == "progress\n"
     # Nothing crashed, but the run did not succeed either: the VM is preserved
     # so the caller can look at what the command was stuck on.
     assert state["kills"] == [False]

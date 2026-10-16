@@ -10,6 +10,17 @@ class QMPError(RuntimeError):
     pass
 
 
+class QMPBusyError(QMPError):
+    """The socket accepted the connection but QEMU never greeted it.
+
+    QEMU serves one QMP client at a time: a second connect() completes in the
+    kernel's listen backlog and then hears nothing until the first client
+    leaves. That silence is a positive contention signal, not a dead VM, and
+    it has to be told apart from "unreachable" — `status` used to stall 10 s
+    per connect behind a `wait` and then report `qmp: connected`.
+    """
+
+
 # HMP reports its own failures as ordinary result text: `human-monitor-command`
 # returns `{"return": "Error: ..."}` with no QMP error reply, so nothing raises
 # and a wrapper that trusts "the call returned" reports success for an op that
@@ -81,6 +92,12 @@ class QMPCommandError(QMPError):
 class QMPClient:
     """Synchronous QMP (QEMU Machine Protocol) client over Unix socket."""
 
+    # How long an accepted connection may stay silent before it is declared
+    # held by another client. QEMU writes the greeting from accept(), so a
+    # healthy server answers in microseconds; a main loop wedged in `savevm`
+    # is the only other way to miss this, and that is contention too.
+    greeting_timeout: float = 2.0
+
     def __init__(self, socket_path: str | Path):
         self.socket_path = str(socket_path)
         self._sock: socket.socket | None = None
@@ -91,21 +108,31 @@ class QMPClient:
     def connect(self) -> dict:
         """Connect to QMP socket and negotiate capabilities. Returns greeting."""
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.settimeout(10.0)
+        self._sock.settimeout(self.greeting_timeout)
         try:
             self._sock.connect(self.socket_path)
         except (ConnectionRefusedError, FileNotFoundError) as exc:
             self.close()
             raise QMPError(f"Cannot connect to QMP socket {self.socket_path}: {exc}") from exc
 
-        greeting = self._recv_json()
+        try:
+            greeting = self._recv_json()
+        except (socket.timeout, TimeoutError) as exc:
+            self.close()
+            raise QMPBusyError(
+                f"QMP socket {self.socket_path} accepted the connection but sent "
+                f"no greeting within {self.greeting_timeout:g}s. QEMU serves one "
+                "QMP client at a time, so it is most likely held by another qmu "
+                "command such as `wait`, or by a debugger bridge."
+            ) from exc
         if "QMP" not in greeting:
             self.close()
             raise QMPError(f"Unexpected QMP greeting: {greeting}")
+        self._sock.settimeout(10.0)
 
         # Negotiate capabilities
         self._send_json({"execute": "qmp_capabilities"})
-        resp = self._recv_response()
+        self._recv_response()
         return greeting
 
     def execute(

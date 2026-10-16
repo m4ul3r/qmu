@@ -727,3 +727,115 @@ def test_launch_qmp_failure_preserves_final_diagnostic_before_cleanup(
     assert "discarded-log-prefix" not in str(error.value)
     assert proc.returncode is not None
     assert not any(path.exists() for path in _attempt_paths("diagnostic-vm"))
+
+
+# ---------------------------------------------------------------------------
+# First QMP connect reset by peer. QEMU creates the listener before it serves
+# it, so under host load a concurrent launch saw ECONNRESET on the very first
+# connect and was reported failed — unlike the bind race, which retried.
+# ---------------------------------------------------------------------------
+
+
+class _FlakyQMP(FakeQMP):
+    """Fails the first `failures` connects with a transient fault, then works."""
+
+    plan: list[BaseException] = []
+    seen: list[str] = []
+
+    def connect(self):
+        self.calls.append("connect")
+        _FlakyQMP.seen.append("connect")
+        if _FlakyQMP.plan:
+            raise _FlakyQMP.plan.pop(0)
+        return {"QMP": {}}
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        ConnectionResetError(104, "Connection reset by peer"),
+        ConnectionRefusedError(111, "Connection refused"),
+        vm_module.QMPError("Cannot connect to QMP socket /x: [Errno 111] Connection refused"),
+        vm_module.QMPError("QMP connection closed unexpectedly"),
+    ],
+    ids=["econnreset", "econnrefused", "wrapped-refused", "closed-unexpectedly"],
+)
+def test_transient_first_qmp_connect_is_retried_while_qemu_lives(
+    tmp_path, monkeypatch, fault
+):
+    kernel = _kernel(tmp_path)
+    proc = FakeProcess(pid=1001)
+    _FlakyQMP.plan = [fault, fault]
+    _FlakyQMP.seen = []
+
+    def fake_popen(*a, **k):
+        qmp_socket_path("flaky-vm").parent.mkdir(parents=True, exist_ok=True)
+        qmp_socket_path("flaky-vm").write_text("x")
+        return proc
+
+    monkeypatch.setattr(vm_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm_module, "proc_pid_start", lambda pid: "1")
+    monkeypatch.setattr(vm_module, "QMPClient", _FlakyQMP)
+    monkeypatch.setattr(vm_module.time, "sleep", lambda _s: None)
+
+    inst = launch_vm(
+        config=QMUConfig(), kernel=str(kernel), harness=True, name="flaky-vm"
+    )
+
+    assert inst.vm_id == "flaky-vm"
+    assert _FlakyQMP.seen.count("connect") == 3
+    assert proc.returncode is None  # never terminated
+    assert load_instance("flaky-vm") is not None
+
+
+def test_transient_qmp_fault_gives_up_after_the_retry_budget(tmp_path, monkeypatch):
+    kernel = _kernel(tmp_path)
+    proc = FakeProcess(pid=1002)
+    _FlakyQMP.plan = [ConnectionResetError(104, "reset")] * 1000
+    _FlakyQMP.seen = []
+
+    def fake_popen(*a, **k):
+        qmp_socket_path("flaky-vm").parent.mkdir(parents=True, exist_ok=True)
+        qmp_socket_path("flaky-vm").write_text("x")
+        return proc
+
+    clock = iter(i / 10.0 for i in range(0, 1000000))
+    monkeypatch.setattr(vm_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm_module, "proc_pid_start", lambda pid: "1")
+    monkeypatch.setattr(vm_module, "QMPClient", _FlakyQMP)
+    monkeypatch.setattr(vm_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(vm_module.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(vm_module.QMUError, match="QMP connection failed"):
+        launch_vm(
+            config=QMUConfig(), kernel=str(kernel), harness=True, name="flaky-vm"
+        )
+
+    # Bounded: a handful of attempts, not thousands, then the usual rollback.
+    assert 1 < _FlakyQMP.seen.count("connect") < 50
+    assert proc.returncode is not None
+    assert not qmp_socket_path("flaky-vm").exists()
+
+
+def test_non_transient_qmp_fault_is_not_retried(tmp_path, monkeypatch):
+    kernel = _kernel(tmp_path)
+    proc = FakeProcess(pid=1003)
+    _FlakyQMP.plan = [vm_module.QMPError("Unexpected QMP greeting: {}")] * 5
+    _FlakyQMP.seen = []
+
+    def fake_popen(*a, **k):
+        qmp_socket_path("flaky-vm").parent.mkdir(parents=True, exist_ok=True)
+        qmp_socket_path("flaky-vm").write_text("x")
+        return proc
+
+    monkeypatch.setattr(vm_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm_module, "proc_pid_start", lambda pid: "1")
+    monkeypatch.setattr(vm_module, "QMPClient", _FlakyQMP)
+    monkeypatch.setattr(vm_module.time, "sleep", lambda _s: None)
+
+    with pytest.raises(vm_module.QMUError, match="Unexpected QMP greeting"):
+        launch_vm(
+            config=QMUConfig(), kernel=str(kernel), harness=True, name="flaky-vm"
+        )
+
+    assert _FlakyQMP.seen.count("connect") == 1

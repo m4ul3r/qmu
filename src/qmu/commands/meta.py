@@ -9,8 +9,11 @@ this module imports no other ``commands.*`` module and never imports ``cli``.
 from __future__ import annotations
 
 import argparse
+import base64
 import shutil
+import sys
 from pathlib import Path
+from typing import Any
 
 from ..cache import (
     MIN_BUILD_RESIDUE_AGE,
@@ -29,6 +32,7 @@ from ..paths import (
     skill_install_roots,
 )
 from .. import rootfs as rootfs_mod
+from ..output import write_bytes_result
 from ..version import VERSION
 from .._cliutil import (
     _add_common_opts,
@@ -327,15 +331,40 @@ def _add_config(sub: argparse._SubParsersAction) -> None:
     s.set_defaults(handler=_handle_config_path)
 
 
+def _resolved_path(config: Any, field_name: str) -> dict[str, Any] | None:
+    """As-written value, absolute form and existence of a configured path."""
+    value = getattr(config, field_name)
+    if value is None:
+        return None
+    resolved = Path(value).expanduser().resolve()
+    return {
+        "written": config.written_path(field_name),
+        "resolved": str(resolved),
+        "exists": resolved.exists(),
+    }
+
+
 def _handle_config_show(args: argparse.Namespace) -> int:
     config_path = getattr(args, "config", None)
     config = resolve_config(
         config_path_override=Path(config_path) if config_path else None,
     )
+    sources = config.source_layers()
+    paths = {
+        "boot.kernel": _resolved_path(config, "kernel"),
+        "boot.initrd": _resolved_path(config, "initrd"),
+        "drive.rootfs": _resolved_path(config, "rootfs"),
+        "ssh.key": _resolved_path(config, "ssh_key"),
+    }
 
     data = {
         "ok": True,
-        "sources": config._sources,
+        # The ordered layer chain, and per TOML key which layer set it — a
+        # starter qmu.toml's uncommented `[ssh] key` silently shadowing a
+        # global one was invisible with the chain alone.
+        "layers": config._sources,
+        "sources": sources,
+        "paths": paths,
         "boot": {
             "kernel": config.kernel,
             "initrd": config.initrd,
@@ -348,6 +377,9 @@ def _handle_config_show(args: argparse.Namespace) -> int:
             "memory": config.memory,
             "cpus": config.cpus,
             "cpu_model": config.cpu_model,
+            "nic_model": config.nic_model,
+            "net_backend": config.net_backend,
+            "accel": config.accel,
             "qemu_binary": config.qemu_binary(),
             "kvm": config.use_kvm(),
             "extra_args": config.extra_args,
@@ -367,30 +399,53 @@ def _handle_config_show(args: argparse.Namespace) -> int:
         "profiles": config.profiles,
     }
 
+    def row(label: str, value: str, key: str) -> str:
+        return f"  {label:<12} {value}  [{sources[key]}]"
+
+    def path_row(label: str, field_name: str, key: str, unset: str) -> str:
+        info = paths[key]
+        if info is None:
+            return row(label, unset, key)
+        shown = config.written_path(field_name)
+        if info["resolved"] != shown:
+            shown += f" -> {info['resolved']}"
+        if not info["exists"]:
+            shown += " (not found)"
+        return row(label, shown, key)
+
     lines = ["Resolved qmu config:"]
-    lines.append(f"  Sources: {' -> '.join(config._sources)}")
-    lines.append(f"  Kernel:      {config.kernel or '(not set — pass --kernel)'}")
+    lines.append(f"  Layers:      {' -> '.join(config._sources)}")
+    lines.append(path_row("Kernel:", "kernel", "boot.kernel", "(not set — pass --kernel)"))
     if config.initrd:
-        lines.append(f"  Initrd:      {config.initrd}")
-    lines.append(f"  Profile:     {config.profile}")
-    lines.append(
-        f"  Cmdline:     {config.cmdline or config.profiles.get(config.profile, '')}"
-        + ("" if config.cmdline else f"  (from profile '{config.profile}')")
-    )
-    lines.append(f"  Arch:        {config.arch} ({config.qemu_binary()})")
-    lines.append(f"  KVM:         {config.use_kvm()}")
-    lines.append(f"  Memory:      {config.memory}")
-    lines.append(f"  CPUs:        {config.cpus}")
-    lines.append(f"  CPU model:   {config.cpu_model or '(qemu default)'}")
-    lines.append(f"  Rootfs:      {config.rootfs or '(not set)'}")
-    lines.append(f"  Drive fmt:   {config.drive_format}")
-    lines.append(f"  SSH key:     {config.ssh_key or '(not set)'}")
-    lines.append(f"  SSH user:    {config.ssh_user}")
-    lines.append(f"  SSH port:    {config.ssh_port_start}+")
-    lines.append(f"  GDB port:    {config.gdb_port_start}+")
-    if config.extra_args:
-        lines.append(f"  Extra args:  {' '.join(config.extra_args)}")
-    lines.append(f"  Profiles:    {', '.join(config.profiles.keys())}")
+        lines.append(path_row("Initrd:", "initrd", "boot.initrd", "(not set)"))
+    lines.append(row("Profile:", config.profile, "boot.profile"))
+    if config.cmdline:
+        lines.append(row("Cmdline:", config.cmdline, "boot.cmdline"))
+    else:
+        lines.append(row(
+            "Cmdline:",
+            f"{config.profiles.get(config.profile, '')}  (from profile '{config.profile}')",
+            f"profiles.{config.profile}" if config.profile in config.profiles else "boot.profile",
+        ))
+    lines.append(row("Arch:", f"{config.arch} ({config.qemu_binary()})", "machine.arch"))
+    lines.append(row("Accel:", f"{config.accel} (kvm={config.use_kvm()})", "machine.accel"))
+    lines.append(row("Memory:", config.memory, "machine.memory"))
+    lines.append(row("CPUs:", str(config.cpus), "machine.cpus"))
+    lines.append(row("CPU model:", config.cpu_model or "(qemu default)", "machine.cpu"))
+    lines.append(row("NIC model:", config.nic_model, "machine.nic_model"))
+    lines.append(row("Net backend:", config.net_backend, "machine.net_backend"))
+    lines.append(row(
+        "Extra args:", " ".join(config.extra_args) or "(none)", "machine.extra_args",
+    ))
+    lines.append(path_row("Rootfs:", "rootfs", "drive.rootfs", "(not set)"))
+    lines.append(row("Drive fmt:", config.drive_format, "drive.format"))
+    lines.append(path_row("SSH key:", "ssh_key", "ssh.key", "(not set)"))
+    lines.append(row("SSH user:", config.ssh_user, "ssh.user"))
+    lines.append(row("SSH port:", f"{config.ssh_port_start}+", "ssh.port_start"))
+    lines.append(row("GDB port:", f"{config.gdb_port_start}+", "gdb.port_start"))
+    lines.append("  Profiles:")
+    for name in config.profiles:
+        lines.append(f"    {name}  [{sources[f'profiles.{name}']}]")
     _emit(args, data=data, text=lines, stem="config-show")
     return 0
 
@@ -449,40 +504,90 @@ def _add_rootfs(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_make_group_help_handler(p))
     sp = p.add_subparsers(dest="rootfs_cmd")
 
-    s = sp.add_parser("inject", help="Copy local files into a rootfs image")
+    s = sp.add_parser(
+        "inject",
+        help="Copy local files into a rootfs image",
+        description=(
+            "Copy local files or directories into a rootfs image (offline, via "
+            "guestfish). GUEST is always a DIRECTORY inside the image, with or "
+            "without a trailing slash; the local filename is kept, so "
+            "./exploit:/root lands at /root/exploit. Injected paths are chowned "
+            "to root (0:0); mode bits are preserved, so an executable stays "
+            "executable. Exit 1 when the image, a LOCAL file, or (without "
+            "--mkdir) a GUEST directory does not exist, or when a running VM "
+            "still holds the image — nothing is written in any of those cases."
+        ),
+    )
     s.add_argument("image", help="Path to rootfs image")
     s.add_argument("mappings", nargs="+", metavar="LOCAL:GUEST",
-                   help="One or more LOCAL:GUEST pairs (GUEST is a directory)")
+                   help="One or more LOCAL:GUEST pairs (GUEST is a directory, "
+                        "e.g. ./run.sh:/root or ./exploit:/root/)")
     s.add_argument("--partition", type=int, default=1,
-                   help="Partition number (default: 1; use 0 for whole-disk image)")
+                   help="Partition number to mount (default: 1 = /dev/sda1). Use "
+                        "0 for a whole-disk image with no partition table, such "
+                        "as the one tools/mkrootfs.sh produces")
     s.add_argument("--mkdir", action="store_true",
                    help="Create GUEST if it does not exist (default: a missing "
                         "directory is an error, so a typo cannot report success)")
     _add_common_opts(s)
     s.set_defaults(handler=_handle_rootfs_inject)
 
-    s = sp.add_parser("ls", help="List a directory inside a rootfs image")
+    s = sp.add_parser(
+        "ls",
+        help="List a directory inside a rootfs image",
+        description=(
+            "List a directory inside a rootfs image. Text output is one "
+            "ls -l-style line per entry (mode uid gid size mtime name); JSON "
+            "carries entries[] of {name, type, mode, uid, gid, size, mtime, "
+            "target}. Exit 1 when the image or the directory does not exist."
+        ),
+    )
     s.add_argument("image", help="Path to rootfs image")
     s.add_argument("path", nargs="?", default="/", help="Guest directory (default: /)")
     s.add_argument("--partition", type=int, default=1,
-                   help="Partition number (default: 1; use 0 for whole-disk image)")
+                   help="Partition number to mount (default: 1 = /dev/sda1; use "
+                        "0 for a whole-disk image with no partition table)")
     _add_common_opts(s)
     s.set_defaults(handler=_handle_rootfs_ls)
 
-    s = sp.add_parser("cat", help="Print a file from inside a rootfs image")
+    s = sp.add_parser(
+        "cat",
+        help="Print a file from inside a rootfs image",
+        description=(
+            "Print a file from inside a rootfs image, byte-exact (no trailing "
+            "newline is added, so the output checksums equal to the file). JSON "
+            "carries content, size and encoding ('utf-8', or 'base64' when the "
+            "bytes are not valid UTF-8). Exit 1 when the image or the file "
+            "does not exist."
+        ),
+    )
     s.add_argument("image", help="Path to rootfs image")
     s.add_argument("path", help="Guest file path")
     s.add_argument("--partition", type=int, default=1,
-                   help="Partition number (default: 1; use 0 for whole-disk image)")
+                   help="Partition number to mount (default: 1 = /dev/sda1; use "
+                        "0 for a whole-disk image with no partition table)")
     _add_common_opts(s)
     s.set_defaults(handler=_handle_rootfs_cat)
 
-    s = sp.add_parser("rm", help="Delete files inside a rootfs image")
+    s = sp.add_parser(
+        "rm",
+        help="Delete files inside a rootfs image",
+        description=(
+            "Delete files (or, with --recursive, directories) inside a rootfs "
+            "image. GUEST_PATH is the full path of the file itself, not its "
+            "directory. Exit 1 when the image does not exist, when a GUEST_PATH "
+            "is missing (unless --force, which reports it under 'missing' and "
+            "removes the rest), when a path is a directory and --recursive was "
+            "not given, or when a running VM still holds the image."
+        ),
+    )
     s.add_argument("image", help="Path to rootfs image")
     s.add_argument("paths", nargs="+", metavar="GUEST_PATH",
                    help="One or more guest file paths to remove")
     s.add_argument("--partition", type=int, default=1,
-                   help="Partition number (default: 1; use 0 for whole-disk image)")
+                   help="Partition number to mount (default: 1 = /dev/sda1). Use "
+                        "0 for a whole-disk image with no partition table, such "
+                        "as the one tools/mkrootfs.sh produces")
     s.add_argument("--recursive", "-r", action="store_true",
                    help="Remove directories and their contents")
     s.add_argument("--force", "-f", action="store_true",
@@ -503,15 +608,25 @@ def _handle_rootfs_inject(args: argparse.Namespace) -> int:
         args.image, parsed, partition=args.partition, mkdir=args.mkdir
     )
 
+    guest_dirs = rootfs_mod._inject_guest_dirs(parsed)
+    injected = []
+    for (local, guest), guest_dir in zip(parsed, guest_dirs):
+        name = Path(local).resolve().name
+        injected.append({
+            "local": local,
+            "guest": guest,
+            "path": guest_dir.rstrip("/") + "/" + name,
+            "owner": "0:0",
+        })
     summary = {
         "ok": True,
         "image": args.image,
         "partition": args.partition,
-        "injected": [{"local": l, "guest": g} for l, g in parsed],
+        "injected": injected,
     }
     lines = [f"Injected into {args.image} (partition {args.partition}):"]
-    for local, guest in parsed:
-        lines.append(f"  {local} -> {guest}")
+    for item in injected:
+        lines.append(f"  {item['local']} -> {item['path']} (owner 0:0)")
     _emit(args, data=summary, text=lines, stem="rootfs-inject")
     return 0
 
@@ -527,26 +642,52 @@ def _handle_rootfs_ls(args: argparse.Namespace) -> int:
             "path": args.path,
             "entries": entries,
         },
-        text=entries if entries else f"{args.path} is empty.",
+        text=[rootfs_mod.format_entry(e) for e in entries] if entries else f"{args.path} is empty.",
         stem="rootfs-ls",
     )
     return 0
 
 
 def _handle_rootfs_cat(args: argparse.Namespace) -> int:
-    content = rootfs_mod.read_file(args.image, args.path, partition=args.partition)
-    _emit(
-        args,
-        data={
-            "ok": True,
-            "image": args.image,
-            "partition": args.partition,
-            "path": args.path,
-            "content": content,
-        },
-        text=content,
-        stem="rootfs-cat",
+    raw = rootfs_mod.read_file(args.image, args.path, partition=args.partition)
+    try:
+        content, encoding = raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        content, encoding = base64.b64encode(raw).decode("ascii"), "base64"
+
+    if getattr(args, "format", "text") != "text":
+        _emit(
+            args,
+            data={
+                "ok": True,
+                "image": args.image,
+                "partition": args.partition,
+                "path": args.path,
+                "size": len(raw),
+                "encoding": encoding,
+                "content": content,
+            },
+            text="",
+            stem="rootfs-cat",
+        )
+        return 0
+
+    # Text mode is the file's bytes, verbatim: `_emit` would append a newline
+    # (and decode), so a checksum of the output never matched the source.
+    out = getattr(args, "out", None)
+    result = write_bytes_result(
+        raw, out_path=Path(out) if out else None, stem="rootfs-cat"
     )
+    if result.artifact is None:
+        sys.stdout.flush()
+        sys.stdout.buffer.write(raw)
+        sys.stdout.buffer.flush()
+    else:
+        sys.stdout.write(result.rendered)
+        if result.spilled:
+            sys.stderr.write(
+                f"[qmu] Output spilled to {result.artifact['artifact_path']}\n"
+            )
     return 0
 
 

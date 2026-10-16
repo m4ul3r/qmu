@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import platform
+import sys
 import tempfile
 from pathlib import Path
 
@@ -9,9 +10,27 @@ from pathlib import Path
 SKILL_NAME = "qmu"
 
 
-# Conservative budget for the complete Unix socket pathname, including
-# OpenSSH's temporary "." plus 16-character suffix.
-SSH_CONTROL_PATH_MAX_BYTES = 100
+# OpenSSH binds the ControlPath under a temporary name first: the path plus
+# "." and a 16-character random suffix, so that is the name that must fit.
+SSH_CONTROL_PATH_TEMP_SUFFIX_BYTES = 17
+
+
+def _sun_path_budget() -> int:
+    """Longest NUL-terminated `sun_path` this platform binds, in bytes.
+
+    Linux declares `sun_path[108]` (107 + NUL); macOS and the BSDs declare
+    104 (103 + NUL). A flat 100-byte guess lost multiplexing for ordinary
+    private roots (`QMU_TEMP_DIR=<home>/qmu-audit/x/run`, 85 bytes expanded),
+    and every exec/push then paid a full SSH handshake.
+    """
+    if sys.platform.startswith("linux"):
+        return 107
+    return 103
+
+
+# Budget for the complete control-socket pathname, before OpenSSH's temporary
+# suffix is added.
+SSH_CONTROL_PATH_MAX_BYTES = _sun_path_budget()
 
 
 def repo_root() -> Path:
@@ -130,7 +149,7 @@ def ssh_control_path() -> Path | None:
     candidate = ssh_control_dir() / "cm-%C"
     # %C expands to a 40-byte hash; OpenSSH binds a temporary name before rename.
     expanded = os.fsencode(str(candidate).replace("%C", "0" * 40))
-    if len(expanded) + 17 > SSH_CONTROL_PATH_MAX_BYTES:
+    if len(expanded) + SSH_CONTROL_PATH_TEMP_SUFFIX_BYTES > SSH_CONTROL_PATH_MAX_BYTES:
         return None
     return candidate
 

@@ -83,6 +83,29 @@ def test_format_after_double_dash_is_a_guest_argument(capsys):
     assert "qmu: error: unrecognized arguments: --bogus" in err
 
 
+def test_guest_command_dash_words_get_a_hint_in_text_and_json(capsys):
+    """`qmu exec uname -a` is "unrecognized arguments: -a"; the hint names the
+    two working forms. Other subcommands' usage errors carry no hint."""
+    hint = (
+        "Hint: quote the guest command ('uname -a') or put -- before it "
+        "(qmu exec -- uname -a); qmu flags may appear anywhere."
+    )
+    code, out, err = _run(["exec", "--vm", "x", "uname", "-a"], capsys)
+    assert code == 2
+    assert out == ""
+    assert err.rstrip().endswith(f"qmu: error: unrecognized arguments: -a\n{hint}")
+
+    code, out, _ = _run(["--vm", "x", "exec", "uname", "-a", "--format", "json"], capsys)
+    assert code == 2
+    payload = json.loads(out)
+    assert payload["error"] == "unrecognized arguments: -a"
+    assert payload["hint"] == hint
+
+    code, out, _ = _run(["launch", "--bogus", "--format", "json"], capsys)
+    assert code == 2
+    assert "hint" not in json.loads(out)
+
+
 def test_missing_subcommand_under_json_is_an_envelope(capsys):
     with pytest.raises(SystemExit) as exit_info:
         cli.main(["--format", "json"])
@@ -109,3 +132,45 @@ def test_help_still_exits_zero(capsys):
 
     assert exit_info.value.code == 0
     assert capsys.readouterr().out.startswith("usage: qmu launch")
+
+
+# ---------------------------------------------------------------------------
+# `qmu --version` was an exit-2 "unrecognized arguments"; every CLI answers it.
+# ---------------------------------------------------------------------------
+
+
+def test_top_level_version_flag_matches_the_version_subcommand(capsys):
+    from qmu.version import VERSION
+
+    code, out, err = _run(["--version"], capsys)
+    assert code == 0
+    assert err == ""
+    assert out == f"qmu {VERSION}\n"
+
+    assert cli.main(["version"]) == 0
+    assert capsys.readouterr().out == out
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_top_level_version_flag_honors_a_preceding_format(fmt, capsys):
+    from qmu.version import VERSION
+
+    code, out, err = _run(["--format", fmt, "--version"], capsys)
+    assert code == 0
+    assert json.loads(out) == {"ok": True, "version": VERSION}
+
+
+def test_launch_help_documents_no_reboot_and_ssh_timeout_expiry(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["launch", "--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert "--no-reboot" in text
+    assert "exits 4" in text and "RETAINS" in text and "no-console-output" in text
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["run", "--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert "--no-reboot" in text
+    assert "exits 124" in text

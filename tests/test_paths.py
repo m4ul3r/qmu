@@ -1,17 +1,25 @@
 from __future__ import annotations
 
 import stat
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from qmu import paths as paths_mod
 from qmu.paths import (
+    SSH_CONTROL_PATH_MAX_BYTES,
+    SSH_CONTROL_PATH_TEMP_SUFFIX_BYTES,
     runtime_root,
     spill_root,
     ssh_control_dir,
     ssh_control_path,
 )
+
+# A relative root `<name>/ssh/cm-<40-byte %C>` costs len(name) + 48 bytes;
+# the longest name that still fits with OpenSSH's temporary suffix is this.
+_FITTING_ROOT_LEN = SSH_CONTROL_PATH_MAX_BYTES - SSH_CONTROL_PATH_TEMP_SUFFIX_BYTES - 48
 
 
 def test_runtime_root_prefers_qmu_temp_dir(tmp_path, monkeypatch):
@@ -77,11 +85,13 @@ def test_runtime_children_derive_from_override_and_are_private(tmp_path, monkeyp
 @pytest.mark.parametrize(
     "root_name,safe",
     [
-        pytest.param("x" * 35, True, id="temporary-path-at-100-byte-boundary"),
-        pytest.param("x" * 36, False, id="temporary-path-one-byte-over"),
-        pytest.param("x" * 51, False, id="99-byte-expanded-path"),
-        pytest.param("é" * 17 + "x", True, id="utf8-at-byte-boundary"),
-        pytest.param("é" * 18, False, id="utf8-bytes-exceed-character-count"),
+        pytest.param("x" * _FITTING_ROOT_LEN, True, id="temporary-path-at-budget"),
+        pytest.param("x" * (_FITTING_ROOT_LEN + 1), False, id="temporary-path-one-byte-over"),
+        pytest.param("x" * (_FITTING_ROOT_LEN + 16), False, id="expanded-path-alone-near-budget"),
+        pytest.param("é" * (_FITTING_ROOT_LEN // 2) + "x" * (_FITTING_ROOT_LEN % 2), True,
+                     id="utf8-at-byte-boundary"),
+        pytest.param("é" * (_FITTING_ROOT_LEN // 2 + 1), False,
+                     id="utf8-bytes-exceed-character-count"),
     ],
 )
 def test_control_path_budgets_openssh_temporary_name(
@@ -92,6 +102,28 @@ def test_control_path_budgets_openssh_temporary_name(
     monkeypatch.setenv("QMU_TEMP_DIR", root_name)
     expected = root / "ssh" / "cm-%C" if safe else None
     assert ssh_control_path() == expected
+
+
+def test_budget_is_the_platform_sun_path_limit():
+    """Linux binds 107 bytes + NUL; macOS/BSD 103 + NUL. The old flat 100
+    lost multiplexing for a documented 85-byte private root (102 + NUL fits)."""
+    if sys.platform.startswith("linux"):
+        assert SSH_CONTROL_PATH_MAX_BYTES == 107
+    else:
+        assert SSH_CONTROL_PATH_MAX_BYTES == 103
+    assert paths_mod._sun_path_budget() == SSH_CONTROL_PATH_MAX_BYTES
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux sun_path budget")
+def test_documented_private_root_keeps_multiplexing_on_linux(monkeypatch):
+    """`QMU_TEMP_DIR=<home>/qmu-audit/<facet>/run` expands to 85 bytes with
+    the %C hash; 85 + 17 = 102 fits Linux's 107 and must keep ControlMaster."""
+    root = "/home/" + "u" * 6 + "/qmu-audit/issues-prs/run"
+    expanded = f"{root}/ssh/cm-" + "0" * 40
+    assert len(expanded.encode()) + 17 <= 107
+    assert 100 < len(expanded.encode()) + 17  # the old flat budget rejected it
+    monkeypatch.setattr(paths_mod, "_runtime_child", lambda name: Path(root) / name)
+    assert ssh_control_path() == Path(root) / "ssh" / "cm-%C"
 
 
 def test_overlong_explicit_root_disables_control_path(tmp_path, monkeypatch):

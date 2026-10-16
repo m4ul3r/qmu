@@ -28,7 +28,7 @@ from .instance import (
     remove_instance,
 )
 from .output import write_output_result
-from .qmp import QMPClient, QMPError
+from .qmp import QMPBusyError, QMPClient, QMPError
 from .serial import current_boot_offset, has_terminal_panic
 from .ssh import SSHClient
 
@@ -336,11 +336,15 @@ def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) 
     # Route the error envelope through _output so ndjson renders as one object
     # (output.py), spill/--out handling applies, and source_ok=False stamps the
     # authoritative ok:false — superseding the earlier direct json.dumps path.
-    payload = {
+    payload: dict[str, Any] = {
         "ok": False,
         "error": str(exc),
         "error_type": exc.__class__.__name__,
     }
+    # An exception that carries structured detail (ConfigError: source/key/
+    # hint/errors[]) merges it into the envelope; every other error is the
+    # three-key shape above.
+    payload.update(getattr(exc, "envelope_fields", dict)())
     _output(payload, args, stem="error", source_ok=False)
 
 
@@ -348,15 +352,31 @@ def _wait_pid_exit(pid: int, timeout: float) -> bool:
     """Poll until `pid` exits or `timeout` elapses. Returns True if it exited.
 
     Returns immediately when the process is already dead, so callers never
-    sleep for a process that has already gone away.
+    sleep for a process that has already gone away. A QEMU launched by THIS
+    process (`qmu run`) is its child, and a child that has exited stays a
+    zombie — `kill(pid, 0)` keeps succeeding — until it is reaped; without the
+    `waitpid` every escalation step burned its full budget on a VM that had
+    already quit (2 s per `run`). `waitpid` on a pid that is not our child
+    raises `ChildProcessError`, which is the common case and ignored.
     """
     deadline = time.monotonic() + timeout
     while True:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
         if not is_pid_alive(pid):
             return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.05)
+
+
+# A `quit` that cannot be delivered because another client holds QMP must
+# not pay the full greeting timeout: the graceful path is unavailable, and a
+# SIGTERM one second from now is strictly better than one three seconds from
+# now. Measured before the fix: `kill` during a `wait` took 14 s.
+_KILL_GREETING_TIMEOUT = 1.0
 
 
 def _kill_vm(inst: VMInstance, force: bool = False, clean: bool = True) -> None:
@@ -366,15 +386,26 @@ def _kill_vm(inst: VMInstance, force: bool = False, clean: bool = True) -> None:
     in place so the caller can still read .serial.log post-mortem.
 
     Each escalation step only waits while the process is actually still
-    alive (poll-with-timeout), so killing an already-dead VM is instant.
+    alive (poll-with-timeout), so killing an already-dead VM is instant. A QMP
+    socket held by another client (`QMPBusyError`) skips straight to the
+    signal: there is no graceful `quit` to wait for.
     """
     if not force:
+        quit_sent = False
+        qmp = _qmp_ctx(inst)
+        qmp.greeting_timeout = _KILL_GREETING_TIMEOUT
         try:
-            with _qmp_ctx(inst) as qmp:
+            with qmp:
                 qmp.execute("quit", timeout=5)
-        except (QMPError, OSError):
+                quit_sent = True
+        except QMPBusyError:
             pass
-        _wait_pid_exit(inst.pid, 1.0)
+        except (QMPError, OSError):
+            # `quit` closes the socket from QEMU's side, so a transport error
+            # here can still mean the command landed; give it its grace.
+            quit_sent = True
+        if quit_sent:
+            _wait_pid_exit(inst.pid, 1.0)
 
     if is_pid_alive(inst.pid):
         sig = signal.SIGKILL if force else signal.SIGTERM
@@ -448,9 +479,11 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
     boot-run-reap composition:
 
     - ``--harness`` / ``--no-wait-ssh`` — ``run`` executes a guest command over
-      SSH, so a mode that guarantees no SSH cannot run one. Left unregistered so
-      the attempt is an argparse usage error (exit 2), not a boot that comes up
-      and then reports a confusing SSH failure.
+      SSH, so a mode that guarantees no SSH cannot run one. ``run`` registers
+      them itself with a rejecting action, so the attempt is still an argparse
+      usage error (exit 2) but one that points at ``launch --harness`` +
+      ``wait`` + ``crash``, not a boot that comes up and then reports a
+      confusing SSH failure.
     - ``extra`` (trailing QEMU passthrough) — ``run`` spends its positional on
       the guest command instead; two greedy positionals cannot be disambiguated.
       The passthrough returns as the repeatable ``--qemu-arg`` flag, because an
@@ -497,7 +530,29 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
                         help="Don't kill existing VM with same name (default: replace)")
     parser.add_argument("--ssh-port", type=int, default=None, help="SSH port (auto-allocated)")
     parser.add_argument("--gdb-port", type=int, default=None, help="GDB port (auto-allocated)")
-    parser.add_argument("--ssh-timeout", type=int, default=60, help="SSH wait timeout in seconds")
+    if run_mode:
+        ssh_timeout_help = (
+            "Seconds to wait for the guest to answer SSH (default: 60). On "
+            "expiry `run` reaps the VM and exits 124 (the timeout class); a "
+            "guest that panicked first exits 3."
+        )
+    else:
+        ssh_timeout_help = (
+            "Seconds to wait for the guest to answer SSH (default: 60). On "
+            "expiry `launch` exits 4 (SSHError) and RETAINS the VM for "
+            "inspection — `qmu status`/`qmu log --vm <id>` — unlike `run`, "
+            "which exits 124. A serial log still empty after ~10 s fails "
+            "earlier with ssh_status 'no-console-output' (wrong console= or "
+            "machine type for this arch)."
+        )
+    parser.add_argument("--ssh-timeout", type=int, default=60, help=ssh_timeout_help)
+    parser.add_argument(
+        "--no-reboot", dest="no_reboot", action="store_true",
+        help="Pass -no-reboot to QEMU: a kernel panic under `panic=N` exits "
+             "QEMU instead of rebooting into a fresh boot that buries the "
+             "crash report (boot-and-die harnesses rely on this). Without the "
+             "flag the bare word would have to follow `--` as a raw QEMU arg.",
+    )
     if not run_mode:
         parser.add_argument("--no-wait-ssh", action="store_true", help="Don't wait for SSH to be ready")
     parser.add_argument("--initrd", default=None, help="Path to initramfs/initrd image")

@@ -106,12 +106,43 @@ def test_above_limit_spills(isolate_spill_runtime):
     )
     assert res.spilled is True
     assert res.artifact is not None
-    # rendered output is the JSON envelope, not the raw value
-    envelope = json.loads(res.rendered)
-    assert envelope == res.artifact
+    # text mode stays text: a one-line pointer, then the head of the output
+    lines = res.rendered.splitlines()
+    assert lines[0] == (
+        f"[qmu] Output spilled to {res.artifact['artifact_path']} "
+        f"(~{res.artifact['token_estimate']} tokens)"
+    )
+    assert lines[1:] == [value]
     # the spill file actually exists under the isolated runtime root
     artifact_path = Path(res.artifact["artifact_path"])
     assert artifact_path.is_relative_to(isolate_spill_runtime / "spills")
+
+
+def test_text_spill_keeps_only_the_head_on_stdout(isolate_spill_runtime):
+    """A 40000-line `exec` result used to print a 13-line JSON envelope under
+    --format text; now the pointer line plus the first lines of the text."""
+    from qmu.output import TEXT_SPILL_HEAD_LINES
+
+    body = "\n".join(f"line {i}" for i in range(1, 2001))
+    res = write_output_result(
+        body, fmt="text", out_path=None, stem="exec", spill_token_limit=50
+    )
+    lines = res.rendered.splitlines()
+    assert res.spilled is True
+    assert lines[0].startswith("[qmu] Output spilled to ")
+    assert lines[1:] == [f"line {i}" for i in range(1, TEXT_SPILL_HEAD_LINES + 1)]
+    assert "{" not in res.rendered
+    assert Path(res.artifact["artifact_path"]).read_text() == body + "\n"
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_json_spill_envelopes_are_unchanged(isolate_spill_runtime, fmt):
+    value = {"ok": True, "stdout": "x" * 400}
+    res = write_output_result(
+        value, fmt=fmt, out_path=None, stem="exec", spill_token_limit=20
+    )
+    assert res.spilled is True
+    assert json.loads(res.rendered) == res.artifact
 
 
 def test_auto_spill_writes_valid_ownership_marker():

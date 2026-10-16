@@ -259,6 +259,61 @@ def test_unterminated_final_line_matches_after_the_vm_dies(
     assert payload["matched_line"] == "EXPLOIT SUCCESS"
 
 
+def test_unterminated_prompt_matches_on_a_running_vm_once_the_console_is_idle(
+    wait_env, monkeypatch, capsys
+):
+    """`login:` never gets a newline: the guest is waiting for input. Holding
+    the fragment until the VM died burned the whole timeout on a live guest."""
+    wait_env.write_text("booting\nlocalhost login: ")  # no trailing newline
+
+    rc, payload = _run_json(capsys, "--pattern", "login:", "--timeout", "5")
+
+    assert rc == 0
+    assert payload["matched"] is True
+    assert payload["matched_line"] == "localhost login: "
+    assert payload["reason"] == "pattern_matched"
+
+
+def test_fragment_is_only_tested_after_an_idle_poll(wait_env, monkeypatch, capsys):
+    """A line still being written must not be matched by its prefix: the
+    fragment is tested only when a poll brought no new bytes."""
+    wait_env.write_text("booting\ndone")
+    polls = 0
+
+    def grow(_seconds):
+        nonlocal polls
+        polls += 1
+        if polls == 1:
+            with wait_env.open("a") as stream:
+                stream.write("-ish\nreal done\n")
+
+    monkeypatch.setattr(lifecycle.time, "sleep", grow)
+
+    rc, payload = _run_json(capsys, "--pattern", "done$", "--timeout", "5")
+
+    assert rc == 0
+    assert payload["matched_line"] == "real done"
+
+
+def test_peek_fragment_leaves_the_fragment_for_a_later_read(tmp_path):
+    log = tmp_path / "s.log"
+    log.write_text("comp")
+    tail = SerialTail(log)
+    assert tail.read_lines() == []
+    assert tail.peek_fragment() == "comp"
+    log.write_text("complete\n")
+    assert tail.read_lines() == ["complete"]
+    assert tail.peek_fragment() is None
+
+
+def test_peek_fragment_strips_the_serial_cr(tmp_path):
+    log = tmp_path / "s.log"
+    log.write_bytes(b"line\r\nlogin: \r")
+    tail = SerialTail(log)
+    assert tail.read_lines() == ["line"]
+    assert tail.peek_fragment() == "login: "
+
+
 def test_timeout_exits_124(wait_env, capsys):
     wait_env.write_text("booting\n")
 

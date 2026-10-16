@@ -26,6 +26,7 @@ from .instance import QMUError
 from .output import render_value
 from .qmp import QMPError
 from .ssh import SSHError
+from .version import VERSION
 
 from ._cliutil import (
     _add_top_level_common_opts,
@@ -83,6 +84,25 @@ class _QMUArgumentParser(argparse.ArgumentParser):
         raise _UsageError(self, message)
 
 
+class _VersionAction(argparse.Action):
+    """`qmu --version`: the same answer as `qmu version`, exit 0.
+
+    Every CLI answers `--version`; here it was an argparse exit 2. Honors a
+    `--format json|ndjson` given before it so the envelope contract holds.
+    """
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, **kwargs):
+        super().__init__(option_strings, dest=dest, nargs=0, help=kwargs.get("help"))
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        fmt = getattr(namespace, "format", None) or "text"
+        if fmt == "text":
+            sys.stdout.write(f"qmu {VERSION}\n")
+        else:
+            sys.stdout.write(render_value({"ok": True, "version": VERSION}, fmt))
+        parser.exit(0)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the full argparse tree. Separate from :func:`main` so tests can
     exercise the REAL parser instead of a hand-mirrored copy that can desync."""
@@ -116,6 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
     # are also added to each subparser (after the subcommand) via
     # _add_common_opts with SUPPRESS defaults so neither order clobbers the other.
     _add_top_level_common_opts(parser)
+    parser.add_argument(
+        "--version", action=_VersionAction,
+        help="Print the qmu version and exit (same as `qmu version`)",
+    )
     sub = parser.add_subparsers(dest="subcommand")
 
     lifecycle._add_launch(sub)
@@ -166,6 +190,44 @@ def _requested_format(argv: list[str]) -> str:
     return fmt if fmt in ("json", "ndjson") else "text"
 
 
+_GUEST_COMMAND_HINT = (
+    "Hint: quote the guest command ('uname -a') or put -- before it "
+    "(qmu exec -- uname -a); qmu flags may appear anywhere."
+)
+
+
+def _invoked_subcommand(argv: list[str]) -> str | None:
+    """The subcommand token in argv, scanned without parsing.
+
+    Skips the root options that take a value (`--vm X`, `--format json`,
+    `--out F`) and any `--x=y`; the first remaining non-dash token is the
+    subcommand. Stops at a bare `--`.
+    """
+    tokens = iter(argv)
+    for token in tokens:
+        if token == "--":
+            return None
+        if token in ("--vm", "--format", "--out"):
+            next(tokens, None)
+        elif not token.startswith("-"):
+            return token
+    return None
+
+
+def _usage_hint(exc: _UsageError, argv: list[str]) -> str | None:
+    """A follow-up for the usage errors whose fix is not obvious from argparse.
+
+    `qmu exec uname -a` is rejected with "unrecognized arguments: -a" because
+    the guest command's dash-words are classified as qmu options; the message
+    alone sends callers hunting for a qmu flag named `-a`.
+    """
+    if exc.message.startswith("unrecognized arguments:") and _invoked_subcommand(
+        argv
+    ) in ("exec", "run"):
+        return _GUEST_COMMAND_HINT
+    return None
+
+
 def _emit_usage_error(exc: _UsageError, argv: list[str]) -> NoReturn:
     """Report a usage error, then exit 2 exactly as argparse would have.
 
@@ -174,19 +236,24 @@ def _emit_usage_error(exc: _UsageError, argv: list[str]) -> NoReturn:
     same error is the documented `{"ok": false, ...}` envelope on stdout, so
     an agent branching on the envelope is never handed an empty stdout. The
     exit is still `parser.exit(2)` (a SystemExit), so callers that treated
-    argparse errors as SystemExit keep seeing one.
+    argparse errors as SystemExit keep seeing one. A :func:`_usage_hint`
+    follows the message in text mode and rides as `hint` in the envelope.
     """
     fmt = _requested_format(argv)
     usage = exc.parser.format_usage()
+    hint = _usage_hint(exc, argv)
     if fmt == "text":
         sys.stderr.write(usage)
-        exc.parser.exit(2, f"{exc.parser.prog}: error: {exc.message}\n")
+        trailer = f"\n{hint}\n" if hint else "\n"
+        exc.parser.exit(2, f"{exc.parser.prog}: error: {exc.message}{trailer}")
     payload = {
         "ok": False,
         "error": exc.message,
         "error_type": "UsageError",
         "usage": usage.strip(),
     }
+    if hint:
+        payload["hint"] = hint
     sys.stdout.write(render_value(payload, fmt))
     exc.parser.exit(2)
 

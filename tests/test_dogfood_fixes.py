@@ -57,6 +57,11 @@ def test_inject_runs_after_the_old_vm_is_killed(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         lifecycle,
+        "_preflight_injects",
+        lambda config, specs, partition=1, mkdir=False: order.append("preflight"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
         "_inject_into_rootfs",
         lambda config, specs, partition=1, mkdir=False: order.append("inject"),
     )
@@ -76,7 +81,9 @@ def test_inject_runs_after_the_old_vm_is_killed(monkeypatch, tmp_path):
     )
 
     assert rc == 0
-    assert order == ["kill", "inject", "launch"]
+    # Targets are validated read-only BEFORE the old VM is killed (a typo'd
+    # guest dir used to cost the healthy VM), then written after it is gone.
+    assert order == ["preflight", "kill", "inject", "launch"]
 
 
 def test_inject_partition_reaches_the_injector(monkeypatch, tmp_path):
@@ -84,6 +91,11 @@ def test_inject_partition_reaches_the_injector(monkeypatch, tmp_path):
     seen: dict = {}
 
     monkeypatch.setattr(lifecycle, "load_instance", lambda name: None)
+    monkeypatch.setattr(
+        lifecycle,
+        "_preflight_injects",
+        lambda config, specs, partition=1, mkdir=False: None,
+    )
     monkeypatch.setattr(
         lifecycle,
         "_inject_into_rootfs",
@@ -491,7 +503,7 @@ def test_inject_errors_on_a_missing_guest_dir(tmp_path, monkeypatch):
 
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
     monkeypatch.setattr(
-        rootfs_mod, "_missing_dirs", lambda fish, img, part, dirs: ["/rooot"]
+        rootfs_mod, "_missing_dirs", lambda fish, img, part, dirs, **kw: ["/rooot"]
     )
 
     with pytest.raises(QMUError) as exc:
