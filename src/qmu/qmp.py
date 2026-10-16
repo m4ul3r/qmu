@@ -10,6 +10,52 @@ class QMPError(RuntimeError):
     pass
 
 
+# HMP reports its own failures as ordinary result text: `human-monitor-command`
+# returns `{"return": "Error: ..."}` with no QMP error reply, so nothing raises
+# and a wrapper that trusts "the call returned" reports success for an op that
+# did nothing (`savevm 'has space'`, `monitor nonsense-cmd`). These are the
+# forms QEMU's HMP layer and the snapshot/block code emit, measured from QEMU
+# 8.2.2 and the captured QEMU 11 transcript. Deliberately NOT included: the
+# benign savevm slirp warning ("warning: Slirp: Save of field ... failed"),
+# which precedes a snapshot that still lists and loads.
+_HMP_ERROR_SUBSTRINGS = (
+    "Error:",                       # error_report via the monitor
+    "unknown command",              # HMP parser: no such verb
+    "extraneous characters",        # HMP parser: `savevm has space`
+    'Try "help',                    # HMP parser usage epilogue
+    "does not exist",               # loadvm: no such snapshot
+    "not found",                    # Device 'x' not found and kin
+    "does not support",             # savevm on a format without snapshots
+    "Could not open",
+    "No block device",
+    "Missing section footer",       # loadvm restore failures
+    "Section footer error",
+)
+# Anchored at a line start: these words are too common to match anywhere
+# (`info registers` could legitimately print "Invalid" inside a flag dump).
+_HMP_ERROR_LINE_PREFIXES = (
+    "Parameter '",                  # QAPI visitor: missing/unexpected member
+    "Invalid ",                     # Invalid parameter / Invalid JSON
+    "invalid ",
+)
+
+
+def hmp_failed(output: str) -> bool:
+    """Whether HMP result text describes a failed command.
+
+    The one classifier for every path that wraps `human-monitor-command`:
+    the snapshot handlers, `qmu monitor`, and `qmu qmp human-monitor-command`.
+    Empty output is success (most HMP verbs are silent when they work).
+    """
+    if any(marker in output for marker in _HMP_ERROR_SUBSTRINGS):
+        return True
+    return any(
+        line.lstrip().startswith(_HMP_ERROR_LINE_PREFIXES)
+        for line in output.splitlines()
+    )
+
+
+
 class QMPCommandError(QMPError):
     """A QEMU error *reply* to a command that was successfully sent.
 

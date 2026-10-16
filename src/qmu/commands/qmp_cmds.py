@@ -13,27 +13,34 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from ..instance import (
     QMUError,
     VMInstance,
     choose_instance,
+    proc_pid_start,
     save_guest_epoch_serial_offset,
+    save_instance,
 )
 from ..snapshot import (
+    SnapshotResult,
     delete_snapshot,
     list_snapshots,
     load_snapshot,
     save_snapshot,
 )
 from ..serial import serial_log_offset
-from ..qmp import QMPCommandError
+from ..qmp import QMPCommandError, hmp_failed
 from ..debug import (
+    bridge_alive,
     debug_session_present,
     debug_stub_present,
+    gdb_client_attached,
     kvm_watchpoint_warning,
     loadvm_stale_session_warning,
+    reap_bridge,
     reset_dropped_breakpoints_warning,
     savevm_breakpoint_warning,
 )
@@ -78,47 +85,111 @@ def _add_snapshot(sub: argparse._SubParsersAction) -> None:
     s.set_defaults(handler=_handle_snapshot_delete)
 
 
-# HMP error markers that indicate a snapshot operation actually failed.
-# Deliberately specific so benign savevm slirp *warnings* (e.g. "warning: Slirp:
-# Save of field ... failed") are NOT treated as hard failures — those lines
-# begin with "warning:" and contain none of the markers below, so save still
-# exits 0.
-_SNAPSHOT_ERROR_MARKERS = (
-    "Error:",
-    "Missing section footer",
-    "Section footer error",
-    "does not support",
-    "Could not open",
-    "No block device",
-)
-
-
 def _snapshot_failed(msg: str) -> bool:
-    return any(m in msg for m in _SNAPSHOT_ERROR_MARKERS)
+    """HMP text classifier for the raw savevm/loadvm routes (and `cli`, which
+    re-exports this name). The markers live in :func:`qmp.hmp_failed` so the
+    snapshot handlers, `qmu monitor` and `qmu qmp human-monitor-command` all
+    agree on what an HMP failure looks like."""
+    return hmp_failed(msg)
+
+
+def _drop_ssh_master(inst: VMInstance) -> None:
+    """Close the guest's multiplexed SSH ControlMaster, if any.
+
+    `snapshot load` and `system_reset` replace the guest's TCP state under a
+    master connection that outlives the command which opened it
+    (`ControlPersist=60`). The next SSH command then reuses the dead master
+    and stalls for the whole keepalive window (ServerAliveInterval 5 x
+    CountMax 3 = 15 s) before `Broken pipe` — which made the documented
+    rewind loop's first `exec` slower than a full relaunch (snapshot audit
+    #3, contract #1). Closing before AND after the mutation guarantees no
+    master straddles it. Best-effort and silent: harness VMs have no SSH.
+    """
+    if inst.ssh_port is None:
+        return
+    _make_ssh(inst).close_control_master()
+
+
+_SNAPSHOT_ERROR_TYPE = "SnapshotError"
+
+
+def _emit_snapshot_result(
+    args: argparse.Namespace,
+    op: str,
+    inst: VMInstance,
+    result: SnapshotResult,
+) -> int:
+    """Render one snapshot outcome. A failure carries `error` + `error_type`
+    like every other error envelope (not a bare `message`), and in text mode
+    goes to stderr under the `[qmu] Error:` prefix the skill promises, so an
+    `eval "$(...)"`-style consumer never executes prose."""
+    stem = f"snapshot-{op}"
+    if result.ok:
+        _emit(
+            args,
+            data={"ok": True, "name": args.name, "message": result.message},
+            text=result.message,
+            stem=stem,
+        )
+        return 0
+    error = f"snapshot {op} failed: {result.message}"
+    data: dict[str, object] = {
+        "ok": False,
+        "error": error,
+        "error_type": _SNAPSHOT_ERROR_TYPE,
+        "name": args.name,
+    }
+    notes: list[str] = []
+    if op == "load":
+        data["resumed"] = result.resumed
+        data["guest_paused"] = result.guest_paused
+        if result.resumed:
+            notes.append(
+                "loadvm paused the guest before failing; qmu resumed it "
+                "(resumed: true)."
+            )
+        elif result.guest_paused:
+            hint = (
+                "loadvm left the guest paused and qmu could not resume it. "
+                f"Resume with: qmu cont --vm {inst.vm_id}"
+            )
+            data["hint"] = hint
+            notes.append(hint)
+    if getattr(args, "format", "text") == "text":
+        sys.stderr.write(f"[qmu] Error: {error}\n")
+        for note in notes:
+            sys.stderr.write(f"[qmu] {note}\n")
+    else:
+        _emit(args, data=data, text=error, stem=stem)
+    return 1
 
 
 def _handle_snapshot_save(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
+    # A master alive at savevm time is frozen into the image as an established
+    # guest sshd session that every later load resurrects as an orphan; close
+    # it first so the checkpoint carries no half-open connection.
+    _drop_ssh_master(inst)
     with _qmp_ctx(inst) as qmp:
-        msg = save_snapshot(qmp, args.name)
-    failed = _snapshot_failed(msg)
-    _emit(
-        args,
-        data={"ok": not failed, "name": args.name, "message": msg},
-        text=msg,
-        stem="snapshot-save",
-    )
-    if failed:
-        sys.stderr.write(
-            f"[qmu] snapshot save failed: {msg}\n"
-            "[qmu] qmu's implicit rootfs uses a temporary snapshot=on overlay; "
-            "that overlay can hold in-session checkpoints with a raw or qcow2 base, "
-            "and those checkpoints disappear when QEMU exits. For durable internal "
-            "snapshots, attach a writable qcow2 drive without snapshot=on, for example "
-            "`--drive 'file=./rootfs.qcow2,format=qcow2'`. Changing [drive] format "
-            "alone remains temporary because qmu still adds snapshot=on.\n"
-        )
-        return 1
+        result = save_snapshot(qmp, args.name)
+    rc = _emit_snapshot_result(args, "save", inst, result)
+    if rc != 0:
+        if "extraneous characters" in result.message:
+            sys.stderr.write(
+                "[qmu] HMP parses the snapshot name as one token: it cannot "
+                "contain whitespace. Use e.g. "
+                f"'{'-'.join(args.name.split())}'.\n"
+            )
+        else:
+            sys.stderr.write(
+                "[qmu] qmu's implicit rootfs uses a temporary snapshot=on overlay; "
+                "that overlay can hold in-session checkpoints with a raw or qcow2 base, "
+                "and those checkpoints disappear when QEMU exits. For durable internal "
+                "snapshots, attach a writable qcow2 drive without snapshot=on, for example "
+                "`--drive 'file=./rootfs.qcow2,format=qcow2'`. Changing [drive] format "
+                "alone remains temporary because qmu still adds snapshot=on.\n"
+            )
+        return rc
     # #45: a snapshot of a debugged guest freezes any armed software-breakpoint
     # int3s into the image, so a later `snapshot load` + run Oopses at the
     # breakpointed address and reads as the PoC crashing the kernel. Warn only
@@ -137,21 +208,16 @@ def _snapshot_load_mentions_slirp(msg: str) -> bool:
 
 def _handle_snapshot_load(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
+    epoch_offset = serial_log_offset(inst.serial_log)
+    _drop_ssh_master(inst)
     with _qmp_ctx(inst) as qmp:
-        epoch_offset = serial_log_offset(inst.serial_log)
-        msg = load_snapshot(qmp, args.name)
-    failed = _snapshot_failed(msg)
-    if not failed:
+        result = load_snapshot(qmp, args.name)
+    if result.ok:
         inst = save_guest_epoch_serial_offset(inst, epoch_offset)
-    _emit(
-        args,
-        data={"ok": not failed, "name": args.name, "message": msg},
-        text=msg,
-        stem="snapshot-load",
-    )
-    if failed:
-        sys.stderr.write(f"[qmu] snapshot load failed: {msg}\n")
-        if _snapshot_load_mentions_slirp(msg):
+        _drop_ssh_master(inst)
+    rc = _emit_snapshot_result(args, "load", inst, result)
+    if rc != 0:
+        if _snapshot_load_mentions_slirp(result.message):
             sys.stderr.write(
                 "[qmu] This loadvm error names slirp. The user backend often works for "
                 "in-session restore, but this QEMU/build/device combination could not "
@@ -160,7 +226,7 @@ def _handle_snapshot_load(args: argparse.Namespace) -> int:
                 "may be build-optional), or use a manually managed external passt process "
                 "with QEMU's stream backend. qmu does not manage that external process.\n"
             )
-        return 1
+        return rc
     # #44: loadvm rewound the guest, but an attached debugger keeps its pre-load
     # vCPU state and never re-syncs — a silent divergence in the rewind-iterate
     # fast path. Warn only on a successful load (a failed one did not rewind).
@@ -187,18 +253,8 @@ def _handle_snapshot_list(args: argparse.Namespace) -> int:
 def _handle_snapshot_delete(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     with _qmp_ctx(inst) as qmp:
-        msg = delete_snapshot(qmp, args.name)
-    failed = _snapshot_failed(msg)
-    _emit(
-        args,
-        data={"ok": not failed, "name": args.name, "message": msg},
-        text=msg,
-        stem="snapshot-delete",
-    )
-    if failed:
-        sys.stderr.write(f"[qmu] snapshot delete failed: {msg}\n")
-        return 1
-    return 0
+        result = delete_snapshot(qmp, args.name)
+    return _emit_snapshot_result(args, "delete", inst, result)
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +421,39 @@ def _add_gdb(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_gdb)
 
 
+_PRY_LAUNCH_TIMEOUT = 15
+
+
+def _bridge_instance_id(inst: VMInstance) -> str:
+    """Stable pry `--instance-id` for this VM's bridge.
+
+    Lets `pry --instance qmu-<vm>` select the bridge without knowing its pid,
+    and makes pry itself refuse a second bridge under the same name — a second
+    line of defence behind the attach gate below.
+    """
+    return f"qmu-{inst.vm_id}"
+
+
+def _pry_launch_error(result: subprocess.CompletedProcess) -> str:
+    """Human text from a failed `pry launch --format json`."""
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+        return payload["error"]
+    return result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+
+
+def _pry_launch_pid(result: subprocess.CompletedProcess) -> int | None:
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    pid = payload.get("pid") if isinstance(payload, dict) else None
+    return pid if isinstance(pid, int) and pid > 0 else None
+
+
 def _handle_gdb(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     if inst.gdb_port is None:
@@ -376,7 +465,40 @@ def _handle_gdb(args: argparse.Namespace) -> int:
     if not pry:
         raise QMUError("pry not found in PATH. Install pry and ensure it is on PATH.")
 
-    cmd = ["pry", "launch", "--connect", f"localhost:{inst.gdb_port}"]
+    # #40 / debug audit D4: the QEMU gdbstub serves ONE client. A second
+    # `pry launch` against an attached stub blocks until the 15 s cap, exits 4
+    # with a raw TimeoutExpired, and leaks a bridge per attempt. Refuse up
+    # front when a client is positively attached; "cannot tell" (None) falls
+    # through so an unreadable /proc never locks the debugger out.
+    attached = gdb_client_attached(inst)
+    if attached is True:
+        known = bridge_alive(inst)
+        bridge = (
+            f" (pry bridge pid {inst.gdb_bridge_pid})" if known else ""
+        )
+        detach = (
+            f"pry kill --instance {inst.gdb_bridge_pid}"
+            if known
+            else "pry kill --instance <pid> (list pids with: pry doctor)"
+        )
+        raise QMUError(
+            f"A debugger client is already attached to port {inst.gdb_port}"
+            f"{bridge}. Reuse it, or detach with: {detach}"
+        )
+    # A recorded bridge that is alive while NO client is attached is the #40
+    # stranded case (its stub died under it, or it dropped the connection).
+    # It still holds this VM's instance-id, so pry would refuse the launch;
+    # reap it first. Only on a positive "not attached" — on None the bridge
+    # may be live and talking.
+    if attached is False and bridge_alive(inst):
+        reap_bridge(inst)
+
+    instance_id = _bridge_instance_id(inst)
+    cmd = [
+        "pry", "launch", "--format", "json",
+        "--instance-id", instance_id,
+        "--connect", f"localhost:{inst.gdb_port}",
+    ]
     symbols_path = (
         Path(args.symbols).expanduser().resolve() if args.symbols else None
     )
@@ -388,69 +510,96 @@ def _handle_gdb(args: argparse.Namespace) -> int:
     # interactive debugger session. So capturing output and capping at 15s (pry's
     # own bridge-start wait defaults to 10s) is correct; the agent drives the
     # halted session afterwards via the `pry` CLI.
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    if result.returncode == 0:
-        # H4: attaching to the gdb stub HALTS the vCPU. If the agent does not
-        # resume it, every subsequent exec/push/pull/compile will hang and fail
-        # with an ambiguous transport timeout. Warn loudly and tell them how to
-        # resume.
-        warning = (
-            "WARNING: the vCPU is now HALTED by the debugger. SSH (exec/push/"
-            "pull/compile) will hang until you resume it. Resume with `pry "
-            "continue` (in the debugger) or `qmu cont`."
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=_PRY_LAUNCH_TIMEOUT
         )
-        data = {
-            "ok": True,
-            "vm_id": inst.vm_id,
-            "gdb_port": inst.gdb_port,
-            "cpu_state": "halted",
-            "warning": warning,
-        }
-        text = (
-            f"pry connected to VM '{inst.vm_id}' GDB stub on port "
-            f"{inst.gdb_port}\n{warning}"
-        )
-        if symbols_path is not None:
-            symbol_warning = (
-                f"WARNING: symbols from '{symbols_path}' were loaded at ELF link-time "
-                "addresses; qmu gdb did not apply runtime rebasing. Obtain the runtime "
-                f"base with `qmu kbase --vm {inst.vm_id} --symbols {symbols_path}`, then "
-                f"reload with `pry load {symbols_path} --base <KBASE>`."
+    except subprocess.TimeoutExpired:
+        # The bridge pry detached may have outlived the launcher; reap it by
+        # the name we gave it so an attempt never leaves a process behind.
+        try:
+            subprocess.run(
+                [pry, "kill", "--instance", instance_id],
+                capture_output=True, text=True, timeout=10,
             )
-            data.update({
-                "symbols": str(symbols_path),
-                "symbols_rebased": False,
-                "symbol_base": "elf-link-time",
-                "kaslr_status": "unknown",
-                "symbol_warning": symbol_warning,
-            })
-            text = f"{text}\n{symbol_warning}"
-        # #39: hardware watchpoints set through the QEMU gdbstub can be accepted
-        # yet silently never fire under KVM. Warn at attach time — the one
-        # moment qmu is on the debug path — but only when the VM was actually
-        # launched under KVM (recorded on the instance). Kept in the stdout
-        # payload alongside the other gdb warnings so the JSON envelope carries
-        # it and stderr stays clean.
-        if getattr(inst, "kvm", None) is True:
-            kvm_warning = kvm_watchpoint_warning(inst.vm_id)
-            data["kvm"] = True
-            data["kvm_watchpoint_warning"] = kvm_warning
-            text = f"{text}\n{kvm_warning}"
-        _emit(
-            args,
-            data=data,
-            text=text,
-            stem="gdb",
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        raise QMUError(
+            f"pry launch did not connect to the GDB stub on port {inst.gdb_port} "
+            f"within {_PRY_LAUNCH_TIMEOUT} s. Another client may hold the stub "
+            "(QEMU serves one); check `pry doctor` and `ss -tnp` for an "
+            f"ESTABLISHED socket on port {inst.gdb_port}."
+        ) from None
+    if result.returncode != 0:
+        raise QMUError(f"pry launch failed: {_pry_launch_error(result)}")
+
+    bridge_pid = _pry_launch_pid(result)
+    inst = replace(
+        inst,
+        gdb_bridge_pid=bridge_pid,
+        gdb_bridge_pid_start=proc_pid_start(bridge_pid) if bridge_pid else None,
+    )
+    save_instance(inst)
+
+    # H4: attaching to the gdb stub HALTS the vCPU. Until it is resumed every
+    # SSH command (exec/push/pull/compile) refuses with exit 1 and a `qmu cont`
+    # hint. Say so and tell them how to resume.
+    warning = (
+        "WARNING: the vCPU is now HALTED by the debugger. SSH commands (exec/"
+        "push/pull/compile) fail fast with exit 1 until you resume it. Resume "
+        "with `pry continue` (in the debugger) or `qmu cont`."
+    )
+    data = {
+        "ok": True,
+        "vm_id": inst.vm_id,
+        "gdb_port": inst.gdb_port,
+        "bridge_pid": bridge_pid,
+        "bridge_instance_id": instance_id,
+        "cpu_state": "halted",
+        "warning": warning,
+    }
+    bridge_line = (
+        f"pry bridge pid {bridge_pid} (select it with `pry --instance "
+        f"{bridge_pid}` or `pry --instance {instance_id}`; `qmu kill` reaps it)"
+        if bridge_pid is not None
+        else "pry did not report a bridge pid; `qmu kill` cannot reap it"
+    )
+    text = (
+        f"pry connected to VM '{inst.vm_id}' GDB stub on port "
+        f"{inst.gdb_port}\n{bridge_line}\n{warning}"
+    )
+    if symbols_path is not None:
+        symbol_warning = (
+            f"WARNING: symbols from '{symbols_path}' were loaded at ELF link-time "
+            "addresses; qmu gdb did not apply runtime rebasing. Obtain the runtime "
+            f"base with `qmu kbase --vm {inst.vm_id} --symbols {symbols_path}`, then "
+            f"reload with `pry load {symbols_path} --base <KBASE>`."
         )
-    else:
-        output = result.stderr.strip() or result.stdout.strip()
-        _emit(
-            args,
-            data={"ok": False, "error": output},
-            text=f"pry launch failed: {output}",
-            stem="gdb",
-        )
-        return 1
+        data.update({
+            "symbols": str(symbols_path),
+            "symbols_rebased": False,
+            "symbol_base": "elf-link-time",
+            "kaslr_status": "unknown",
+            "symbol_warning": symbol_warning,
+        })
+        text = f"{text}\n{symbol_warning}"
+    # #39: hardware watchpoints set through the QEMU gdbstub can be accepted
+    # yet silently never fire under KVM. Warn at attach time — the one
+    # moment qmu is on the debug path — but only when the VM was actually
+    # launched under KVM (recorded on the instance). Kept in the stdout
+    # payload alongside the other gdb warnings so the JSON envelope carries
+    # it and stderr stays clean.
+    if getattr(inst, "kvm", None) is True:
+        kvm_warning = kvm_watchpoint_warning(inst.vm_id)
+        data["kvm"] = True
+        data["kvm_watchpoint_warning"] = kvm_warning
+        text = f"{text}\n{kvm_warning}"
+    _emit(
+        args,
+        data=data,
+        text=text,
+        stem="gdb",
+    )
     return 0
 
 
@@ -514,8 +663,11 @@ def _add_qmp(sub: argparse._SubParsersAction) -> None:
             "directly, so an id has nothing to correlate against and accepting\n"
             "it would only buy the caller a false belief that it round-tripped.\n"
             "\n"
-            "A method QEMU has no command for, or arguments its schema rejects,\n"
-            "exits 1 (caller error). Exit 4 is reserved for the transport."
+            "Any error reply from QEMU -- a method it has no command for,\n"
+            "arguments its schema rejects, a device it cannot find -- exits 1\n"
+            "(operational). Exit 4 is reserved for the transport. HMP text\n"
+            "returned by human-monitor-command that is itself an error report\n"
+            "(`unknown command: ...`, `Error: ...`) also exits 1."
         ),
     )
     p.add_argument("command", help="QMP method name or JSON envelope")
@@ -630,7 +782,8 @@ def _parse_qmp_command(raw: str, args_json: str | None) -> tuple[str, dict | Non
 # "Invalid parameter 'x'" is the older (pre-6.0) wording for the enum case.
 # Deliberately anchored: an *operational* GenericError such as "failed to open
 # file '/x': No such file or directory" or "Property 'p' not found" describes
-# host/VM state, not the command text, and must NOT be reclassified.
+# host/VM state, not the command text, and must NOT get the "fix your
+# arguments" correction attached (it is still exit 1 -- the wire worked).
 _QMP_ARG_SHAPE_RE = re.compile(
     r"^(?:"
     r"Parameter '[^']*' (?:is (?:missing|unexpected)|expects |does not accept value )"
@@ -640,22 +793,19 @@ _QMP_ARG_SHAPE_RE = re.compile(
 )
 
 
-def _qmp_caller_error(method: str, exc: QMPCommandError) -> QMUError | None:
-    """Re-class a QEMU error *reply* that proves the fault is caller input.
+def _qmp_caller_error(method: str, exc: QMPCommandError) -> QMUError:
+    """Re-class a QEMU error *reply* as the exit-1 operational class.
 
     Exit 4 means "QMP/SSH transport or internal qmu failure", so an agent
-    branching on it retries or declares infra breakage. `qmu qmp query-staus`
-    used to land there: the method reached QEMU intact and came back
-    CommandNotFound, which is the opposite of a transport fault and cannot be
-    fixed by retrying. That is the very defect #36 names -- "an infra code for
-    a caller-input mistake" -- and only the command-FORM half was closed
-    before. A method QEMU has no command for, and arguments its QAPI schema
-    rejects, are exit-1 caller errors with a correction attached.
-
-    Returns None for every other reply (DeviceNotFound, KVMMissingCap, an
-    operational GenericError like "failed to open file ..."): those report
-    host/VM state rather than what was typed, so the caller keeps the
-    QMPError -> 4 they have today instead of a wrong "you typo'd" verdict.
+    branching on it retries or declares infra breakage. Every QEMU error
+    REPLY is the opposite of that: the wire worked and QEMU answered "no",
+    which no retry fixes. `qmu qmp --help` promises exit 4 for the transport
+    only, and `device_del` with a bad id used to break that promise
+    (snapshot audit #9). A method QEMU has no command for and arguments its
+    QAPI schema rejects get a correction attached; every other class
+    (DeviceNotFound, KVMMissingCap, an operational GenericError like "failed
+    to open file ...") keeps QEMU's own words plus the reply class so the
+    caller still knows WHICH "no" it was.
     """
     if exc.qmp_class == "CommandNotFound":
         return QMUError(
@@ -668,7 +818,7 @@ def _qmp_caller_error(method: str, exc: QMPCommandError) -> QMUError | None:
             "Arguments must be a JSON object matching the command's QAPI "
             "schema (`qmu qmp query-qmp-schema --out <file>` dumps it)"
         )
-    return None
+    return QMUError(f"QMP command {method!r} failed ({exc.qmp_class}): {exc.desc}")
 
 
 def _hmp_verb(command_line: str) -> str:
@@ -681,29 +831,73 @@ def _hmp_verb(command_line: str) -> str:
     return tokens[0] if tokens else ""
 
 
-def _emit_mutation_coherence_warning(
-    inst: VMInstance, verb: str, output: str
-) -> None:
-    """Warn once for whichever VM-reality mutation `verb` just performed.
+def _hmp_error(command_line: str, output: str) -> QMUError:
+    """The exit-1 error for HMP result text that is itself a failure report.
 
-    One switch for all three routes to these mutations -- `qmu monitor <verb>`,
-    `qmu qmp system_reset`, and `qmu qmp human-monitor-command` with the verb
-    inside `arguments['command-line']`. The last one was silent (dogfood F4):
-    it reset the machine with an attached debugger, rc 0 and an empty stderr,
-    which is precisely the wrong-answer-with-no-error class debug.py exists to
-    prevent -- and the envelope normalization made it trivially typeable.
-    savevm/loadvm suppress on a failed op (the same _snapshot_failed the
-    snapshot handlers use), since a failed op mutated nothing.
+    `qmu monitor nonsense-cmd` and `qmu qmp human-monitor-command` used to
+    exit 0 / ok:true with "unknown command: 'nonsense-cmd'" inside the
+    payload (snapshot audit D8); `ok` must mean what it says.
     """
+    hint = ""
+    if _hmp_verb(command_line) == "loadvm":
+        hint = (
+            " (loadvm stops the guest before it looks for the tag and only "
+            "restarts it on success: check `qmu status`, resume with `qmu cont`)"
+        )
+    return QMUError(f"HMP command {command_line!r} failed: {output.strip()}{hint}")
+
+
+# HMP verbs / QMP methods that replace the guest's running state. Each needs
+# the same bookkeeping the dedicated `snapshot load` handler does, whichever of
+# the three raw routes (`qmu monitor`, `qmu qmp system_reset`,
+# `qmu qmp human-monitor-command`) reached it.
+_TCP_RESETTING_VERBS = frozenset({"system_reset", "loadvm"})
+
+
+def _before_mutation(inst: VMInstance, verb: str) -> int | None:
+    """Pre-mutation bookkeeping; returns the serial epoch to persist on success.
+
+    A qmu-issued `system_reset` used to leave `guest_epoch_serial_offset`
+    untouched, so `wait --pattern 'login:'` matched the previous boot in
+    0.00 s (snapshot audit D5) — the epoch only advanced on a RESET that
+    `wait` itself observed. Capturing the log size here, before the reset
+    lands, is exactly what `snapshot load` does.
+    """
+    if verb in _TCP_RESETTING_VERBS:
+        _drop_ssh_master(inst)
+        return serial_log_offset(inst.serial_log)
+    if verb == "savevm":
+        _drop_ssh_master(inst)
+    return None
+
+
+def _after_mutation(
+    inst: VMInstance, verb: str, output: str, epoch: int | None
+) -> VMInstance:
+    """Post-mutation bookkeeping plus the debugger coherence warning.
+
+    One switch for all three raw routes. The `human-monitor-command` one was
+    silent (dogfood F4): it reset the machine with an attached debugger, rc 0
+    and an empty stderr, which is precisely the wrong-answer-with-no-error
+    class debug.py exists to prevent. savevm/loadvm suppress on a failed op
+    (the same classifier the snapshot handlers use), since a failed op
+    mutated nothing.
+    """
+    failed = verb in ("savevm", "loadvm") and _snapshot_failed(output)
+    if verb in _TCP_RESETTING_VERBS and not failed:
+        if epoch is not None:
+            inst = save_guest_epoch_serial_offset(inst, epoch)
+        _drop_ssh_master(inst)
     if verb == "system_reset":
         if debug_session_present(inst):
             sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
     elif verb == "savevm":
-        if debug_stub_present(inst) and not _snapshot_failed(output):
+        if debug_stub_present(inst) and not failed:
             sys.stderr.write(savevm_breakpoint_warning(inst.vm_id) + "\n")
     elif verb == "loadvm":
-        if debug_session_present(inst) and not _snapshot_failed(output):
+        if debug_session_present(inst) and not failed:
             sys.stderr.write(loadvm_stale_session_warning(inst.vm_id) + "\n")
+    return inst
 
 
 def _handle_qmp(args: argparse.Namespace) -> int:
@@ -718,34 +912,34 @@ def _handle_qmp(args: argparse.Namespace) -> int:
             raise QMUError(f"Invalid --args JSON: {exc}") from exc
     method, qmp_args = _parse_qmp_command(args.command, args.args)
     inst = choose_instance(args.vm)
+    # Both raw paths reach a VM-reality mutation -- the QMP method itself
+    # (keyed on the NORMALIZED method, so the envelope form counts too) and
+    # `human-monitor-command`, whose HMP verb rides inside
+    # arguments['command-line'] and was unguarded (F4).
+    hmp_line: str | None = None
+    if method == "system_reset":
+        verb = "system_reset"
+    elif method == "human-monitor-command":
+        line = qmp_args.get("command-line") if isinstance(qmp_args, dict) else None
+        hmp_line = line if isinstance(line, str) else None
+        verb = _hmp_verb(hmp_line) if hmp_line is not None else ""
+    else:
+        verb = ""
+    epoch = _before_mutation(inst, verb)
     try:
         with _qmp_ctx(inst) as qmp:
             result = qmp.execute(method, qmp_args)
     except QMPCommandError as exc:
-        # A QEMU error REPLY, not a transport fault: the wire worked. Re-class
-        # the subset that proves caller input is at fault (exit 1); everything
-        # else keeps the QMPError -> exit 4 it has today.
-        caller_error = _qmp_caller_error(method, exc)
-        if caller_error is None:
-            raise
-        raise caller_error from exc
+        # A QEMU error REPLY, not a transport fault: the wire worked, so this
+        # is the exit-1 class whichever error class QEMU chose.
+        raise _qmp_caller_error(method, exc) from exc
+    if hmp_line is not None and isinstance(result, str) and hmp_failed(result):
+        raise _hmp_error(hmp_line, result)
     # Text mode passes the raw QMP return (any JSON type) straight to _output;
     # json mode wraps it so the universal {"ok": ...} contract holds, with the
     # original payload under "result".
     _emit(args, data={"ok": True, "result": result}, text=result, stem="qmp")
-    # #46: a machine reset silently drops the gdbstub breakpoint set. Both raw
-    # paths reach it -- the QMP method itself (keyed on the NORMALIZED method,
-    # so the envelope form warns too) and `human-monitor-command`, whose HMP
-    # verb rides inside arguments['command-line'] and was unguarded (F4).
-    if method == "system_reset":
-        _emit_mutation_coherence_warning(inst, "system_reset", "")
-    elif method == "human-monitor-command":
-        line = qmp_args.get("command-line") if isinstance(qmp_args, dict) else None
-        _emit_mutation_coherence_warning(
-            inst,
-            _hmp_verb(line) if isinstance(line, str) else "",
-            result if isinstance(result, str) else "",
-        )
+    _after_mutation(inst, verb, result if isinstance(result, str) else "", epoch)
     return 0
 
 
@@ -755,7 +949,18 @@ def _handle_qmp(args: argparse.Namespace) -> int:
 
 
 def _add_monitor(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("monitor", help="Send HMP monitor command")
+    p = sub.add_parser(
+        "monitor",
+        help="Send HMP monitor command",
+        description=(
+            "Send a raw HMP (human monitor) command and print its text. "
+            "HMP reports failures as text rather than a protocol error, so "
+            "output QEMU phrases as one (`unknown command: ...`, `Error: ...`, "
+            "`...: extraneous characters at the end of line`) exits 1 with "
+            "that text as the error; anything else exits 0 and is passed "
+            "through verbatim."
+        ),
+    )
     p.add_argument("command", nargs="+", help="HMP command")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_monitor)
@@ -764,18 +969,22 @@ def _add_monitor(sub: argparse._SubParsersAction) -> None:
 def _handle_monitor(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     command = " ".join(args.command)
+    # HMP is a raw escape hatch, so `qmu monitor {system_reset,savevm,loadvm}`
+    # reach the same VM-reality mutations as the dedicated handlers / `qmu qmp`
+    # but bypass their bookkeeping and coherence warnings. Route through the
+    # shared hooks, keyed on the HMP *verb* so e.g. `monitor help system_reset`
+    # -- which resets nothing -- is not caught.
+    verb = _hmp_verb(command)
+    epoch = _before_mutation(inst, verb)
     with _qmp_ctx(inst) as qmp:
         result = qmp.execute_hmp(command)
+    if hmp_failed(result):
+        raise _hmp_error(command, result)
     _emit(
         args,
         data={"ok": True, "output": result},
         text=result if result.strip() else "(no output)",
         stem="monitor",
     )
-    # HMP is a raw escape hatch, so `qmu monitor {system_reset,savevm,loadvm}`
-    # reach the same VM-reality mutations as the dedicated handlers / `qmu qmp`
-    # but bypass their coherence warnings. Re-emit through the shared switch,
-    # which is keyed on the HMP *verb* so e.g. `monitor help system_reset` --
-    # which resets nothing -- is not caught.
-    _emit_mutation_coherence_warning(inst, _hmp_verb(command), result)
+    _after_mutation(inst, verb, result, epoch)
     return 0

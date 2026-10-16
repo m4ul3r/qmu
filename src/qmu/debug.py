@@ -28,8 +28,15 @@ failure this subsystem exists to prevent.
 
 from __future__ import annotations
 
+import os
+import shutil
+import signal
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
+
+from .instance import instance_json_path, is_pid_alive, proc_pid_start, save_instance
 
 # TCP states from include/net/tcp_states.h as they appear (hex, upper-case) in
 # field 4 of /proc/net/tcp{,6}. An attached gdb client shows up as the gdbstub
@@ -129,6 +136,92 @@ def debug_session_present(inst: Any) -> bool:
     return gdb_client_attached(inst) is not False
 
 
+# --- pry bridge ownership (#40) ---------------------------------------------
+#
+# `qmu gdb` spawns a headless pry bridge and records its pid + /proc start-time
+# on the instance. That record is what lets `kill` reap the bridge instead of
+# stranding it against a dead stub, and lets a second `qmu gdb` name the
+# existing bridge instead of leaking another one.
+
+
+def bridge_alive(inst: Any) -> bool:
+    """Whether the recorded pry bridge is still the process it was at spawn.
+
+    Same discipline as `instance_alive`: a pid alone can be recycled, so when
+    a start-time was recorded it must match.
+    """
+    pid = getattr(inst, "gdb_bridge_pid", None)
+    if not isinstance(pid, int) or pid <= 0 or not is_pid_alive(pid):
+        return False
+    recorded = getattr(inst, "gdb_bridge_pid_start", None)
+    if recorded is None:
+        return True
+    return proc_pid_start(pid) == recorded
+
+
+def _exited(pid: int) -> bool:
+    """Gone, or a zombie (exited but not yet reaped by its parent)."""
+    if not is_pid_alive(pid):
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return True
+    rest = stat.rsplit(")", 1)[1].split()
+    return bool(rest) and rest[0] == "Z"
+
+
+def _wait_exit(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while not _exited(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def reap_bridge(inst: Any) -> bool:
+    """Terminate the pry bridge `qmu gdb` recorded for `inst`, if it is alive.
+
+    Prefers `pry kill --instance <pid>` (a clean gdb detach, which also lets
+    QEMU resume the vCPU) and falls back to SIGTERM. Clears the record on the
+    instance in place and rewrites its JSON when that still exists. Returns
+    True only when a live, identity-verified bridge was terminated; never
+    raises — this runs on the `kill` path, where a reaping failure must not
+    mask the VM teardown.
+    """
+    if not bridge_alive(inst):
+        return False
+    pid = inst.gdb_bridge_pid
+    killed = False
+    pry = shutil.which("pry")
+    if pry:
+        try:
+            result = subprocess.run(
+                [pry, "kill", "--instance", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            killed = result.returncode == 0 and _wait_exit(pid, 5.0)
+        except (subprocess.TimeoutExpired, OSError):
+            killed = False
+    if not killed and bridge_alive(inst):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        killed = _wait_exit(pid, 5.0)
+    inst.gdb_bridge_pid = None
+    inst.gdb_bridge_pid_start = None
+    try:
+        if instance_json_path(inst.vm_id).exists():
+            save_instance(inst)
+    except (OSError, TypeError, ValueError):
+        pass
+    return killed
+
+
 # --- Warning builders ------------------------------------------------------
 #
 # Each names the divergence event, what silently diverges, and the recovery
@@ -165,14 +258,26 @@ def savevm_breakpoint_warning(vm_id: str) -> str:
 
 
 def reset_dropped_breakpoints_warning(vm_id: str) -> str:
-    """#46 — a VM reset drops the gdbstub breakpoint set without telling anyone."""
+    """#46 — a VM reset drops the gdbstub breakpoint set without telling anyone.
+
+    Re-arming by symbol is not enough on its own: KASLR re-slides the kernel on
+    every boot, so the symbol file pry loaded against the old base now resolves
+    to addresses nothing executes, and the re-armed breakpoint sits at a stale
+    address with hits=0 and no error (debug audit R25–R26). The recovery must
+    re-derive the base first.
+    """
     return (
         f"[qmu] WARNING: VM '{vm_id}' has a GDB stub and was just reset. A "
         "machine reset drops the gdbstub's breakpoint/watchpoint set without "
         "notifying the client: an attached debugger will still list them as "
-        "[enabled] but they will not fire (hits stay 0). Re-set (re-arm) all "
-        "breakpoints after the guest comes back up; a canary breakpoint you can "
-        "prove is hit confirms trapping is live again."
+        "[enabled] but they will not fire (hits stay 0). KASLR also re-slides "
+        "the kernel on reboot, so symbols loaded against the old base now "
+        "resolve to stale addresses and a breakpoint re-set by symbol lands "
+        "where nothing runs. After the guest comes back up: re-derive the base "
+        f"with `eval \"$(qmu kbase --vm {vm_id} --symbols <vmlinux>)\"`, reload "
+        "symbols with `pry load <vmlinux> --base $KBASE`, THEN re-set (re-arm) "
+        "all breakpoints; a canary breakpoint you can prove is hit confirms "
+        "trapping is live again."
     )
 
 

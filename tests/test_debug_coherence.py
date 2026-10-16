@@ -26,8 +26,17 @@ import pytest
 from qmu import cli, debug
 from qmu.commands import qmp_cmds
 from qmu.config import ConfigError, QMUConfig, load_config_file
-from qmu.instance import VMInstance
+from qmu.instance import QMUError, VMInstance
+from qmu.snapshot import SnapshotResult
 from qmu.vm import build_qemu_command
+
+
+def _ok(message):
+    return SnapshotResult(True, message)
+
+
+def _failed(message):
+    return SnapshotResult(False, message)
 
 
 # --- /proc/net/tcp parsing + attach probe ----------------------------------
@@ -162,6 +171,7 @@ def _install_qmp_seams(monkeypatch, inst, *, present):
         qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(_FakeQMP())
     )
     monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: present)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
 
 
 def _snap_args():
@@ -171,7 +181,7 @@ def _snap_args():
 def test_snapshot_save_warns_int3_when_debugged(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
-    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: "Snapshot 'clean' saved.")
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: _ok("Snapshot 'clean' saved."))
     rc = qmp_cmds._handle_snapshot_save(_snap_args())
     err = capsys.readouterr().err
     assert rc == 0
@@ -183,7 +193,7 @@ def test_snapshot_save_warns_int3_when_debugged(monkeypatch, capsys):
 def test_snapshot_save_silent_when_not_debugged(monkeypatch, capsys):
     inst = _gdb_inst(None)
     _install_qmp_seams(monkeypatch, inst, present=False)
-    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: "Snapshot 'clean' saved.")
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: _ok("Snapshot 'clean' saved."))
     rc = qmp_cmds._handle_snapshot_save(_snap_args())
     err = capsys.readouterr().err
     assert rc == 0
@@ -199,7 +209,7 @@ def test_snapshot_save_warns_even_when_client_detached(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=False)
     monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: False)
-    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: "Snapshot 'clean' saved.")
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: _ok("Snapshot 'clean' saved."))
     rc = qmp_cmds._handle_snapshot_save(_snap_args())
     err = capsys.readouterr().err
     assert rc == 0
@@ -212,7 +222,8 @@ def test_snapshot_save_failure_does_not_add_int3_warning(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
     monkeypatch.setattr(
-        qmp_cmds, "save_snapshot", lambda qmp, name: "Error: Could not open 'savevm' section"
+        qmp_cmds, "save_snapshot",
+        lambda qmp, name: _failed("Error: Could not open 'savevm' section"),
     )
     rc = qmp_cmds._handle_snapshot_save(_snap_args())
     err = capsys.readouterr().err
@@ -224,7 +235,7 @@ def test_snapshot_save_failure_does_not_add_int3_warning(monkeypatch, capsys):
 def test_snapshot_load_warns_stale_session_when_debugged(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
-    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name: "Snapshot 'clean' loaded.")
+    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name: _ok("Snapshot 'clean' loaded."))
     # save_guest_epoch_serial_offset writes instance JSON; stub it to a no-op
     # that returns the instance so the handler proceeds offline.
     monkeypatch.setattr(qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst)
@@ -241,7 +252,7 @@ def test_snapshot_load_warns_stale_session_when_debugged(monkeypatch, capsys):
 def test_snapshot_load_silent_when_not_debugged(monkeypatch, capsys):
     inst = _gdb_inst(None)
     _install_qmp_seams(monkeypatch, inst, present=False)
-    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name: "Snapshot 'clean' loaded.")
+    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name: _ok("Snapshot 'clean' loaded."))
     monkeypatch.setattr(qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst)
     monkeypatch.setattr(qmp_cmds, "serial_log_offset", lambda path: 0)
     rc = qmp_cmds._handle_snapshot_load(_snap_args())
@@ -255,7 +266,8 @@ def test_snapshot_load_failure_does_not_warn_stale(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
     monkeypatch.setattr(
-        qmp_cmds, "load_snapshot", lambda qmp, name: "Error: Snapshot 'clean' does not exist"
+        qmp_cmds, "load_snapshot",
+        lambda qmp, name: _failed("Error: Snapshot 'clean' does not exist"),
     )
     monkeypatch.setattr(qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst)
     monkeypatch.setattr(qmp_cmds, "serial_log_offset", lambda path: 0)
@@ -350,18 +362,18 @@ def test_monitor_loadvm_warns_stale_when_debugged(monkeypatch, capsys):
     assert "does NOT re-sync" in err
 
 
-def test_monitor_savevm_failure_suppresses_warning(monkeypatch, capsys):
-    # A failed HMP savevm mutated nothing, so no int3 warning.
+def test_monitor_savevm_failure_is_an_error_without_warning(monkeypatch, capsys):
+    # A failed HMP savevm mutated nothing, so no int3 warning -- and HMP's own
+    # error text is a failure (exit 1), not an ok:true payload (audit D8).
     inst = _gdb_inst(1234)
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(
         qmp_cmds, "_qmp_ctx",
         lambda inst: contextlib.nullcontext(_HmpQMP("Error: Could not open 'savevm' section")),
     )
-    rc = qmp_cmds._handle_monitor(_monitor_args(["savevm", "clean"]))
-    err = capsys.readouterr().err
-    assert rc == 0
-    assert "int3" not in err
+    with pytest.raises(QMUError, match="Could not open 'savevm' section"):
+        qmp_cmds._handle_monitor(_monitor_args(["savevm", "clean"]))
+    assert "int3" not in capsys.readouterr().err
 
 
 # --- the third route: `qmu qmp human-monitor-command` (dogfood F4) ----------
@@ -451,18 +463,18 @@ def test_qmp_hmp_loadvm_warns_stale_when_debugged(monkeypatch, capsys):
     assert "does NOT re-sync" in err
 
 
-def test_qmp_hmp_savevm_failure_suppresses_warning(monkeypatch, capsys):
+def test_qmp_hmp_savevm_failure_is_an_error_without_warning(monkeypatch, capsys):
     # A failed HMP savevm mutated nothing, so no int3 warning — the suppression
-    # must reach this route too, which means reading the returned HMP text.
+    # must reach this route too, which means reading the returned HMP text;
+    # and that text is a failure, so the command exits 1 rather than ok:true.
     inst = _gdb_inst(1234)
     _install_hmp_via_qmp(
         monkeypatch, inst, present=True,
         result="Error: Could not open 'savevm' section",
     )
-    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("savevm clean"))
-    err = capsys.readouterr().err
-    assert rc == 0
-    assert "int3" not in err
+    with pytest.raises(QMUError, match="Could not open 'savevm' section"):
+        qmp_cmds._handle_qmp(_hmp_qmp_args("savevm clean"))
+    assert "int3" not in capsys.readouterr().err
 
 
 # --- gdb attach: KVM hardware-watchpoint warning (#39) ---------------------
@@ -486,6 +498,9 @@ def _install_gdb_seams(monkeypatch, inst):
         qmp_cmds.shutil, "which",
         lambda name: "/usr/bin/pry" if name == "pry" else None,
     )
+    # The attach gate reads the real /proc/net/tcp; on a shared host another
+    # VM's debugger may be attached to port 1234, so pin "no client".
+    monkeypatch.setattr(qmp_cmds, "gdb_client_attached", lambda inst: False)
 
     def run(argv, **kwargs):
         return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")

@@ -10,6 +10,14 @@ import pytest
 from qmu.commands import qmp_cmds
 from qmu.instance import VMInstance
 from qmu.qmp import QMPError
+from qmu.snapshot import SnapshotResult
+
+
+@pytest.fixture(autouse=True)
+def _no_ssh_master(monkeypatch):
+    """The handlers tear down the SSH ControlMaster around a load; that is a
+    real `ssh -O exit` subprocess and not what these tests are about."""
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
 
 
 def _inst(serial_log: str, offset: int = 3) -> VMInstance:
@@ -47,7 +55,7 @@ def test_snapshot_load_captures_before_load_and_saves_before_success_emit(
         calls.append("load")
         with log.open("ab") as stream:
             stream.write(b"restored guest output\n")
-        return "Snapshot 'clean' loaded."
+        return SnapshotResult(True, "Snapshot 'clean' loaded.")
 
     def save_epoch(record, offset):
         calls.append(("save", offset))
@@ -81,7 +89,9 @@ def test_snapshot_load_hmp_failure_preserves_epoch(message, tmp_path, monkeypatc
     saved = []
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(object()))
-    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name: message)
+    monkeypatch.setattr(
+        qmp_cmds, "load_snapshot", lambda qmp, name: SnapshotResult(False, message)
+    )
     monkeypatch.setattr(
         qmp_cmds, "save_guest_epoch_serial_offset",
         lambda record, offset: saved.append(offset),
@@ -122,7 +132,8 @@ def test_snapshot_load_metadata_failure_emits_no_success(tmp_path, monkeypatch):
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(object()))
     monkeypatch.setattr(
-        qmp_cmds, "load_snapshot", lambda qmp, name: "Snapshot 'clean' loaded."
+        qmp_cmds, "load_snapshot",
+        lambda qmp, name: SnapshotResult(True, "Snapshot 'clean' loaded."),
     )
     monkeypatch.setattr(
         qmp_cmds, "save_guest_epoch_serial_offset",
@@ -144,7 +155,8 @@ def test_snapshot_save_does_not_advance_epoch(tmp_path, monkeypatch):
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(object()))
     monkeypatch.setattr(
-        qmp_cmds, "save_snapshot", lambda qmp, name: "Snapshot 'clean' saved."
+        qmp_cmds, "save_snapshot",
+        lambda qmp, name: SnapshotResult(True, "Snapshot 'clean' saved."),
     )
     monkeypatch.setattr(
         qmp_cmds, "save_guest_epoch_serial_offset",
