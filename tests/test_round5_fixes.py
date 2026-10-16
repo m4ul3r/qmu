@@ -136,26 +136,35 @@ def test_age_gated_remnant_is_not_reported_as_missing(tmp_path, monkeypatch, cap
 
     rc = cli.main(["prune", "--vm", "orph4"])
 
-    err = capsys.readouterr().err
-    assert rc == 1
-    assert "No stopped VM named" not in err
-    assert "--older-than 0" in err
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "No stopped VM named" not in out
+    assert "orph4" in out
+    assert "--older-than 0" in out
 
 
-def test_the_suggested_command_actually_removes_it(tmp_path, monkeypatch):
+def test_the_suggested_command_actually_removes_it(tmp_path, monkeypatch, capsys):
     _log_only_remnant(tmp_path, monkeypatch)
 
+    assert cli.main(["--format", "json", "prune", "--vm", "orph4"]) == 0
+    assert json.loads(capsys.readouterr().out)["held_back"] == ["orph4"]
     assert cli.main(["prune", "--vm", "orph4", "--older-than", "0"]) == 0
-    assert cli.main(["--format", "json", "prune", "--vm", "orph4"]) == 1
+    capsys.readouterr()
+    assert cli.main(["--format", "json", "prune", "--vm", "orph4"]) == 0
+    assert json.loads(capsys.readouterr().out)["found"] is False
 
 
 def test_genuinely_absent_vm_still_says_so(tmp_path, monkeypatch, capsys):
+    """Absent is a clean no-op (issue #56: `kill && prune --vm` must not
+    fail), but it must still say that nothing was there."""
     _log_only_remnant(tmp_path, monkeypatch)
 
     rc = cli.main(["prune", "--vm", "never-existed"])
 
-    assert rc == 1
-    assert "No stopped VM named" in capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Nothing to prune for 'never-existed'" in out
+    assert "no state on disk" in out
 
 
 def test_log_only_entry_with_a_live_qemu_is_not_shown_as_stopped(

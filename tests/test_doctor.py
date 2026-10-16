@@ -86,6 +86,7 @@ def test_doctor_supported_configured_passt_is_healthy_and_uses_selected_arch(
         "check": "qemu-system-aarch64",
         "status": "ok",
         "detail": "/opt/qemu/qemu-system-aarch64",
+        "blocking": False,
     }
     assert native_check["status"] == "ok"
     assert native_check["detail"] == (
@@ -229,11 +230,13 @@ def test_doctor_user_backend_skips_native_passt_probe_and_external_requirement(
         "check": "QEMU native passt (-netdev passt)",
         "status": "info",
         "detail": "Not required for configured net_backend=user.",
+        "blocking": False,
     }
     assert external_check == {
         "check": "passt (net_backend=passt)",
         "status": "info",
         "detail": "Not found — not required for configured net_backend=user.",
+        "blocking": False,
     }
     probe.assert_not_called()
 
@@ -365,6 +368,7 @@ def test_doctor_reports_a_rejected_global_alongside_a_loaded_project(
         "check": "config",
         "status": "ok",
         "detail": "built-in defaults -> project: /work/qmu.toml",
+        "blocking": False,
     }
     assert broken in _check(payload, "global config")["detail"]
 
@@ -390,3 +394,115 @@ def test_doctor_text_shows_the_rejected_global_as_a_warn_row(
     assert rc == 1
     assert f"[~] global config: {broken} EXISTS but is invalid" in text
     assert "No qmu.toml or ~/.config/qmu/config.toml found" not in text
+
+
+# ---------------------------------------------------------------------------
+# The kernel row. doctor went green on a starter qmu.toml whose `kernel =`
+# line was still commented out, and the very next `launch` failed on it.
+# ---------------------------------------------------------------------------
+
+
+def _passt_ok(monkeypatch):
+    monkeypatch.setattr(
+        lifecycle, "probe_qemu_netdevs", Mock(return_value=_caps()), raising=False
+    )
+
+
+def test_doctor_warns_but_does_not_block_on_an_unconfigured_kernel(
+    doctor_env, monkeypatch, capsys
+):
+    _passt_ok(monkeypatch)
+
+    rc, payload = _run_json_doctor(capsys)
+
+    row = _check(payload, "kernel")
+    assert rc == 0 and payload["ok"] is True
+    assert row["status"] == "warn"
+    assert row["blocking"] is False
+    assert "not configured" in row["detail"]
+    assert "--harness" in row["detail"]
+
+    assert cli.main(["doctor"]) == 0
+    assert "[~] kernel: not configured" in capsys.readouterr().out
+
+
+def test_doctor_blocks_on_a_configured_kernel_that_is_missing(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    doctor_env.config.kernel = str(tmp_path / "nope" / "bzImage")
+
+    rc, payload = _run_json_doctor(capsys)
+
+    row = _check(payload, "kernel")
+    assert rc == 1 and payload["ok"] is False
+    assert row["status"] == "MISSING"
+    assert row["blocking"] is True
+    assert str(tmp_path / "nope" / "bzImage") in row["detail"]
+
+    assert cli.main(["doctor"]) == 1
+    assert "[!] kernel:" in capsys.readouterr().out
+
+
+def test_doctor_passes_a_configured_kernel_that_exists(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    kernel = tmp_path / "bzImage"
+    kernel.write_bytes(b"\x00")
+    doctor_env.config.kernel = str(kernel)
+
+    rc, payload = _run_json_doctor(capsys)
+
+    assert rc == 0
+    assert _check(payload, "kernel") == {
+        "check": "kernel", "status": "ok", "detail": str(kernel),
+        "blocking": False,
+    }
+    cli.main(["doctor"])
+    assert f"[+] kernel: {kernel}" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# libguestfs is optional tooling: its failure is a warning, never the reason
+# a host where launch/exec/crash all work is reported unhealthy.
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_stays_healthy_when_only_libguestfs_cannot_build(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    doctor_env.executables["guestfish"] = "/usr/bin/guestfish"
+    monkeypatch.setenv("SUPERMIN_KERNEL", str(tmp_path / "unreadable-vmlinuz"))
+
+    rc, payload = _run_json_doctor(capsys)
+
+    row = _check(payload, "libguestfs (rootfs inject / launch --inject)")
+    assert rc == 0 and payload["ok"] is True
+    assert row["status"] == "warn"
+    assert row["blocking"] is False
+    assert "NOT readable" in row["detail"]
+
+    cli.main(["doctor"])
+    assert "[~] libguestfs" in capsys.readouterr().out
+
+
+def test_every_doctor_check_carries_a_boolean_blocking_verdict(
+    doctor_env, monkeypatch, capsys
+):
+    _passt_ok(monkeypatch)
+    doctor_env.executables["qemu-system-aarch64"] = None
+    monkeypatch.setattr(
+        lifecycle, "probe_qemu_netdevs",
+        Mock(return_value=_caps(path=None, backends=frozenset())),
+        raising=False,
+    )
+
+    rc, payload = _run_json_doctor(capsys)
+
+    assert rc == 1
+    assert all(isinstance(c["blocking"], bool) for c in payload["checks"])
+    # `ok` is exactly "nothing blocks" — not a re-reading of status strings.
+    assert payload["ok"] is (not any(c["blocking"] for c in payload["checks"]))
+    assert _check(payload, "qemu-system-aarch64")["blocking"] is True

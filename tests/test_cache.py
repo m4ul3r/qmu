@@ -335,3 +335,10 @@ def test_cache_root_sanity_gate(cache_root, tmp_path):
     bare = tmp_path / "empty-elsewhere"
     bare.mkdir()
     assert not cache.cache_root_is_sane(bare)
+    assert not cache.cache_root_is_sane(tmp_path / "does-not-exist")
+    assert not cache.cache_root_is_sane(cache.Path("/"))
+
+
+def test_dead_instances_subtree_helper_is_gone():
+    """#49: it had no caller and no test; `paths.instances_dir` is the API."""
+    assert not hasattr(cache, "instances_subtree_path")

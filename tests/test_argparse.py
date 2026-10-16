@@ -168,19 +168,19 @@ class TestPruneVmPlacement:
         monkeypatch.setattr(lifecycle, "list_stopped_instances", lambda: [])
 
     def test_vm_before_subcommand_targets_name(self, capsys):
-        # Reaches the specific "No stopped VM named 'foo'." branch (target
+        # Reaches the specific "Nothing to prune for 'foo'" branch (target
         # lookup) — proof the top-level --vm reached _handle_prune.
         rc = cli.main(["--vm", "foo", "prune"])
-        assert rc == 1
-        err = capsys.readouterr().err
-        assert "No stopped VM named 'foo'." in err
-        assert "Specify either" not in err
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Nothing to prune for 'foo'" in out
+        assert "Specify either" not in out
 
     def test_vm_after_subcommand_targets_name(self, capsys):
         rc = cli.main(["prune", "--vm", "foo"])
-        assert rc == 1
-        err = capsys.readouterr().err
-        assert "No stopped VM named 'foo'." in err
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Nothing to prune for 'foo'" in out
 
     def test_no_selector_guidance_mentions_runtime(self, capsys):
         rc = cli.main(["prune"])
