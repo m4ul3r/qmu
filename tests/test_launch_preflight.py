@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from unittest.mock import Mock
 
 import pytest
@@ -232,3 +233,33 @@ def test_launch_probes_once_and_reuses_resolved_qemu_across_port_retry(
     probe.assert_called_once_with("qemu-system-x86_64")
     passt_lookup.assert_called_once_with("passt")
     assert [cmd[0] for cmd in commands] == [resolved, resolved]
+
+
+@pytest.mark.parametrize(
+    "invalid", ["kernel-directory", "empty-initrd", "fifo-initrd", "kernel-symlink-loop"]
+)
+def test_non_regular_boot_inputs_fail_before_launch_side_effects(
+    tmp_path, monkeypatch, invalid
+):
+    cfg, kernel = _launch_fixture(tmp_path, backend="user")
+    initrd = None
+    if invalid == "kernel-directory":
+        kernel = tmp_path
+    elif invalid == "empty-initrd":
+        initrd = ""
+    elif invalid == "kernel-symlink-loop":
+        # ELOOP is an OSError that is neither FileNotFoundError nor
+        # NotADirectoryError; it is still caller input and must stay in the
+        # operational class (QMUError -> exit 1), not the exit-4 catch-all.
+        kernel = tmp_path / "loop"
+        kernel.symlink_to(kernel)
+    else:
+        fifo = tmp_path / "initrd.fifo"
+        os.mkfifo(fifo)
+        initrd = str(fifo)
+    port_allocator, popen = _watch_launch_side_effects(monkeypatch)
+
+    with pytest.raises(QMUError):
+        vm.launch_vm(config=cfg, kernel=str(kernel), initrd=initrd)
+
+    _assert_no_launch_side_effects(port_allocator, popen)

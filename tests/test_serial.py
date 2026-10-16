@@ -156,6 +156,7 @@ TWO_DISTINCT_CRASHES_LOG = """\
 
 CLEAN_BOOT_LOG = """\
 [    0.000000] Linux version 6.6.75 (builder@host) #1 SMP
+[    0.044413] kasan: KernelAddressSanitizer initialized
 [    0.500000] Command line: console=ttyS0 root=/dev/sda
 [    1.200000] systemd[1]: Started Login Service.
 [    2.000000] Debian GNU/Linux 12 qmu ttyS0

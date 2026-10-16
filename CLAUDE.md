@@ -136,9 +136,12 @@ Never collapse them into one enum.
   guest as gone — instructing a destructive action on working state. The
   kernel's own boot banner is the log-local ground truth.
 
-  **Known, scoped separately:** `qmu crash` and `wait --pattern` still use the
-  raw epoch, so both can still be satisfied by pre-reboot content. Predates the
-  guest axis; not fixed here.
+  **Known, scoped separately:** `qmu crash` still uses the raw epoch, so it can
+  be satisfied by pre-reboot content. `wait --pattern` uses the same
+  `max(epoch, last banner)` boundary as the guest axis and reports it
+  (`scan_offset`/`scan_scope`); the one residual blind spot is a `dmesg`
+  replay echoed to the console, which reproduces the timestamped banner and
+  moves the boundary past any marker printed before it.
 
 The cross product is real — orphaned+panicked is the everyday outcome of a
 triggered crash on a VM whose metadata was lost — so adding `paused`/`panicked`

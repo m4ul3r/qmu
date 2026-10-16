@@ -62,6 +62,8 @@ def kbuild_env(tmp_path):
     cache = tmp_path / "cache"
     source = cache / "kernels/src/linux-7.0"
     source.mkdir(parents=True)
+    (source / "scripts/gdb/linux").mkdir(parents=True)
+    (source / "scripts/gdb/linux/constants.py.in").write_text("LX_CONFIG_HZ = 250\n")
     (source / "Makefile").write_text("VERSION = 7\nPATCHLEVEL = 0\n")
     (cache / "kernels/src/linux-7.0.tar.xz").write_bytes(b"")
 
@@ -74,6 +76,7 @@ def kbuild_env(tmp_path):
         """#!/usr/bin/env python3
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -100,6 +103,17 @@ for index, arg in enumerate(args):
 source = mounts["/src"]
 output = mounts["/output"]
 output.mkdir(parents=True, exist_ok=True)
+
+# Helper regressions execute the entire container command, not just its artifact
+# handoff. Only the fixed output mount is redirected; make runs real miniature
+# targets in the private source tree.
+if os.environ.get("KBUILD_EXECUTE_INNER") == "1":
+    inner = args[-1].replace("/output", '"$KBUILD_TEST_OUTPUT"')
+    env = dict(os.environ, KBUILD_TEST_OUTPUT=str(output))
+    command = args[args.index("bash"):-1] + [inner]
+    result = subprocess.run(command, cwd=source, env=env, check=False)
+    raise SystemExit(result.returncode)
+
 (output / ".config").write_text("CONFIG_DEBUG_INFO=y\\nCONFIG_GDB_SCRIPTS=y\\n")
 
 inner = args[-1]
@@ -167,6 +181,135 @@ source.mkdir(parents=True, exist_ok=True)
     return KbuildEnv(cache, env, docker_log)
 
 
+def _use_real_helper_targets(kbuild_env, mode):
+    """Run the real container shell against tiny, offline kernel make targets."""
+    source = kbuild_env.source_makefile.parent
+    helpers = source / "scripts/gdb"
+    constants_input = helpers / "linux/constants.py.in"
+    if mode == "early":
+        constants_input.unlink()
+    else:
+        constants_input.write_text("LX_CONFIG_HZ = @HZ@\n")
+    (helpers / "qmu_helper.py").write_text("VALUE = 'exported upstream layout'\n")
+    (helpers / "vmlinux-gdb.py").write_text(
+        "import os, sys\n"
+        "sys.path.insert(0, os.path.dirname(__file__) + '/scripts/gdb')\n"
+        "import qmu_helper\n"
+        "print(qmu_helper.VALUE)\n"
+    )
+    config = source / "scripts/config"
+    config.write_text("#!/bin/sh\nexit 0\n")
+    config.chmod(0o755)
+    helper_target = "scripts_gdb" if mode == "modern" else "prepare"
+    makefile = """
+.PHONY: mrproper defconfig kvm_guest.config olddefconfig bzImage prepare scripts_gdb
+mrproper:
+\trm -f .config vmlinux System.map vmlinux-gdb.py scripts/gdb/linux/constants.py
+defconfig:
+\tprintf 'CONFIG_DEBUG_INFO=y\\nCONFIG_GDB_SCRIPTS=y\\n' > .config
+kvm_guest.config olddefconfig:
+\t@:
+bzImage:
+\tmkdir -p arch/x86/boot
+\tprintf 'kernel image\\n' > arch/x86/boot/bzImage
+\tprintf 'ELF symbols\\n' > vmlinux
+\tprintf 'ffffffff81000000 T _text\\n' > System.map
+\tln -fsn "$(CURDIR)/scripts/gdb/vmlinux-gdb.py" vmlinux-gdb.py
+"""
+    # In legacy trees there must be no scripts_gdb rule, including a phony
+    # declaration: GNU make otherwise accepts the nonexistent target.
+    if mode != "modern":
+        makefile = makefile.replace("prepare scripts_gdb\n", "prepare\n")
+    else:
+        makefile += "prepare:\n\t@touch unexpected-fallback\n"
+    makefile += f"""
+{helper_target}:
+\t@touch helper-called
+\t@if test "$$KBUILD_TEST_FAIL_HELPER" = 1; then echo helper-generation-failed >&2; exit 23; fi
+"""
+    if mode != "early":
+        makefile += (
+            "\t@if test \"$$KBUILD_TEST_SKIP_CONSTANTS\" != 1; then "
+            "sed 's/@HZ@/250/' scripts/gdb/linux/constants.py.in "
+            "> scripts/gdb/linux/constants.py; fi\n"
+        )
+    kbuild_env.source_makefile.write_text(makefile)
+    kbuild_env.env["KBUILD_EXECUTE_INNER"] = "1"
+    return source
+
+
+@pytest.mark.parametrize("mode", ["modern", "legacy", "early"])
+def test_container_build_exports_helpers_for_upstream_capabilities(kbuild_env, mode):
+    source = _use_real_helper_targets(kbuild_env, mode)
+    result = kbuild_env.run()
+    assert result.returncode == 0, result.stderr
+    values = _parse_assignments(result.stdout)
+    assert list(values) == ["KERNEL", "VMLINUX", "CONFIG", "KERNEL_SRC", "VMLINUX_GDB"]
+    assert (source / "helper-called").is_file()
+    loader = Path(values["VMLINUX_GDB"])
+    # The copied loader must resolve its module relative to the exported build
+    # root, not depend on Docker's /src mount or a flattened helper directory.
+    imported = subprocess.run(
+        ["python3", str(loader)], cwd=loader.parent, text=True,
+        capture_output=True, check=False, timeout=5,
+    )
+    assert imported.returncode == 0, imported.stderr
+    assert imported.stdout == "exported upstream layout\n"
+    constants = loader.parent / "scripts/gdb/linux/constants.py"
+    if mode == "early":
+        assert not constants.exists()
+    else:
+        assert constants.read_text() == "LX_CONFIG_HZ = 250\n"
+
+    kbuild_env.clear_docker_log()
+    cached = kbuild_env.run(fail_if_docker_runs=True)
+    assert cached.returncode == 0, cached.stderr
+    assert cached.stdout == result.stdout
+    assert kbuild_env.docker_runs() == []
+    if mode != "early":
+        constants.unlink()
+        repaired = kbuild_env.run()
+        assert repaired.returncode == 0, repaired.stderr
+        assert constants.read_text() == "LX_CONFIG_HZ = 250\n"
+
+
+@pytest.mark.parametrize("mode", ["modern", "legacy"])
+def test_helper_target_failure_is_fatal_without_fallback(kbuild_env, mode):
+    source = _use_real_helper_targets(kbuild_env, mode)
+    kbuild_env.env["KBUILD_TEST_FAIL_HELPER"] = "1"
+    result = kbuild_env.run()
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "helper-generation-failed" in result.stderr
+    assert (source / "helper-called").is_file()
+    assert not (source / "unexpected-fallback").exists()
+    assert (source / "arch/x86/boot/bzImage").is_file()
+
+
+@pytest.mark.parametrize("mode", ["modern", "legacy"])
+def test_successful_helper_target_without_required_constants_is_rejected(
+    kbuild_env, mode
+):
+    _use_real_helper_targets(kbuild_env, mode)
+    kbuild_env.env["KBUILD_TEST_SKIP_CONSTANTS"] = "1"
+    result = kbuild_env.run()
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "constants.py" in result.stderr
+
+
+def test_container_config_only_does_not_build_image_or_helpers(kbuild_env):
+    source = _use_real_helper_targets(kbuild_env, "modern")
+    kbuild_env.env["KBUILD_TEST_FAIL_HELPER"] = "1"
+    result = kbuild_env.run("--config-only")
+    assert result.returncode == 0, result.stderr
+    values = _parse_assignments(result.stdout)
+    assert list(values) == ["CONFIG"]
+    assert "CONFIG_GDB_SCRIPTS=y" in Path(values["CONFIG"]).read_text()
+    assert not (source / "helper-called").exists()
+    assert not (source / "arch/x86/boot/bzImage").exists()
+
+
 def test_fresh_build_generates_gdb_helpers_and_exports_debug_paths(kbuild_env):
     result = kbuild_env.run()
     values = _parse_assignments(result.stdout)
@@ -181,18 +324,8 @@ def test_fresh_build_generates_gdb_helpers_and_exports_debug_paths(kbuild_env):
     loader = Path(values["VMLINUX_GDB"])
     assert loader == Path(values["VMLINUX"]).parent / "vmlinux-gdb.py"
     assert loader.is_file()
-    assert loader.is_symlink()
-    assert loader.readlink() == Path("scripts/gdb/vmlinux-gdb.py")
     assert (loader.parent / "scripts/gdb/vmlinux-gdb.py").is_file()
     assert (loader.parent / "scripts/gdb/linux/constants.py").is_file()
-    docker_argv = kbuild_env.last_docker_run()
-    inner = docker_argv[-1]
-    assert "scripts_gdb" in inner
-    assert "cp -a scripts/gdb /output/scripts/gdb" in inner
-    assert "-v" in docker_argv
-    assert any(arg.endswith(":/src:rw") for arg in docker_argv)
-    assert any(arg.endswith(":/output:rw") for arg in docker_argv)
-    assert docker_argv[docker_argv.index("-w") + 1] == "/src"
 
 
 def test_complete_cache_hit_matches_fresh_output_without_docker(kbuild_env):
@@ -268,7 +401,6 @@ def test_config_only_outputs_only_config_and_skips_scripts_gdb(kbuild_env, tmp_p
     assert result.stdout == f"CONFIG={cold}/.config\n"
     assert (cold / ".config").is_file()
     assert not (cold / "vmlinux-gdb.py").exists()
-    assert "scripts_gdb" not in kbuild_env.last_docker_run()[-1]
 
     warm_build = kbuild_env.run()
     warm_values = _parse_assignments(warm_build.stdout)
@@ -311,6 +443,8 @@ def _with_hostile_cache(kbuild_env, tmp_path):
     source = cache / "kernels/src/linux-7.0"
     source.mkdir(parents=True)
     (source / "Makefile").write_text("VERSION = 7\nPATCHLEVEL = 0\n")
+    (source / "scripts/gdb/linux").mkdir(parents=True)
+    (source / "scripts/gdb/linux/constants.py.in").write_text("LX_CONFIG_HZ = 250\n")
     (cache / "kernels/src/linux-7.0.tar.xz").write_bytes(b"")
     env = kbuild_env.env.copy()
     env["QMU_CACHE_DIR"] = str(cache)
@@ -449,11 +583,7 @@ def test_keep_residue_leaves_everything_in_place(kbuild_env):
 
 
 def test_cleaned_tree_is_still_a_cache_hit_with_no_docker_run(kbuild_env):
-    """The whole point: cleaning must not invalidate the build cache.
-
-    build_cache_complete() needs only $SRCDIR/Makefile from the source tree,
-    and the clean never touches it.
-    """
+    """Residue cleanup must not invalidate the complete build cache."""
     first = kbuild_env.run()
     assert first.returncode == 0, first.stderr
     kbuild_env.clear_docker_log()
@@ -468,6 +598,5 @@ def test_clean_is_scoped_to_the_source_tree_and_spares_arch_boot(kbuild_env):
     result = kbuild_env.run()
     assert result.returncode == 0, result.stderr
     src = kbuild_env.source_makefile.parent
-    # arch/*/boot is pruned wholesale: firmware-over-qmu recovers Image from there
-    # when kbuild's scripts_gdb step aborts the artifact copy on 4.x.
+    # The boot image remains available in the retained source tree.
     assert (src / "arch/x86/boot/bzImage").is_file()

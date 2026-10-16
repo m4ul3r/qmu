@@ -72,8 +72,8 @@ VMLINUX_GDB=/home/user/.cache/qmu/kernels/6.6.75/x86_64/vmlinux-gdb.py
 
 Use `eval "$(tools/kbuild.sh ...)"` to capture these into shell variables.
 
-**`--config-only`** prints only `CONFIG=...`. It does not build a kernel, does
-not run `scripts_gdb`, and cannot provide `VMLINUX_GDB` or `lx-*` helpers.
+**`--config-only`** prints only `CONFIG=...`. It does not build a kernel or
+run the helper-generation target, and cannot provide `VMLINUX_GDB` or `lx-*` helpers.
 
 Every invocation for a given kernel version — across **all architectures**,
 and regardless of whether it would otherwise have been a cache hit — takes
@@ -109,8 +109,17 @@ pry gdb "source $VMLINUX_GDB"
 `/src` is the fixed Docker source mount / build working directory recorded in
 DWARF, so `set substitute-path /src $KERNEL_SRC` maps those paths to the
 retained host sources under `KERNEL_SRC`. The loader must stay next to
-`scripts/gdb/` (never flattened); the relative imports and generated
-`scripts/gdb/linux/constants.py` depend on that layout.
+`scripts/gdb/` (never flattened); the relative imports, including generated
+`scripts/gdb/linux/constants.py` on kernels that use it, depend on that layout.
+
+Helper generation follows the source tree's capabilities, not a version cutoff:
+if its top-level Makefile defines `scripts_gdb`, kbuild runs that target.
+Otherwise it runs `prepare`; older helper trees generate their GDB
+constants through `prepare` → `Kbuild` → `build_constants_py`. Failures remain
+fatal in either path; a failed modern `scripts_gdb` is not retried through a
+fallback. Early 4.x trees without `scripts/gdb/linux/constants.py.in` use their
+shipped Python helpers without generated constants. kbuild exports those real
+helpers and does not manufacture a `constants.py` file.
 
 ## Version-to-container mapping
 
@@ -295,9 +304,11 @@ architectures; artifacts (including GDB helpers) are architecture-specific:
 
 Cache hits validate the complete helper/source contract (boot image, `vmlinux`,
 `.config`, `vmlinux-gdb.py`, `scripts/gdb/vmlinux-gdb.py`,
-`scripts/gdb/linux/constants.py`, and `KERNEL_SRC/Makefile`). Incomplete
-entries are rebuilt rather than reported as a successful cache. A boot image
-alone is never treated as complete.
+and `KERNEL_SRC/Makefile`). `scripts/gdb/linux/constants.py` is also required
+when the retained source contains `scripts/gdb/linux/constants.py.in`;
+early upstream helper trees without that input do not require constants.
+Incomplete entries are rebuilt rather than reported as a successful cache.
+A boot image alone is never treated as complete.
 
 Use `--no-cache` to force a rebuild. Use `--config-only` to generate and
 inspect `.config` before committing to a full build (emits only `CONFIG`; no

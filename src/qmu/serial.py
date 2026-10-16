@@ -14,7 +14,6 @@ CRASH_START_PATTERNS = [
         r"BUG: kernel NULL pointer dereference",
         r"BUG: unable to handle",
         r"BUG: soft lockup",
-        r"KASAN:",
         r"UBSAN:",
         r"WARNING: CPU:",
         r"Oops:",
@@ -147,7 +146,7 @@ class SerialTail:
         self.offset = max(0, offset)
         self._partial = ""
 
-    def read_lines(self) -> list[str]:
+    def read_lines(self, *, missing_ok: bool = True) -> list[str]:
         try:
             with self.path.open("rb") as stream:
                 size = os.fstat(stream.fileno()).st_size
@@ -158,8 +157,10 @@ class SerialTail:
                     self._partial = ""
                 stream.seek(self.offset)
                 chunk = stream.read()
-        except OSError:
-            return []
+        except FileNotFoundError:
+            if missing_ok:
+                return []
+            raise
 
         self.offset += len(chunk)
         if not chunk:
@@ -326,12 +327,13 @@ def extract_unknown_params(
 # offset is a true byte position (a decode with errors="replace" can change
 # lengths and desync it from the file).
 #
-# The leading printk timestamp is REQUIRED, and is the whole point: the real
-# banner is emitted by printk and carries one, while anything userspace echoes
-# to the console cannot. Without it a guest could write a banner-shaped line
-# after a survived crash — `dmesg` or `cat /proc/version` to the console does it
-# without trying — and hide that crash from the guest-state axis. Matching at
-# line start additionally stops a banner quoted mid-line from counting.
+# The leading printk timestamp is REQUIRED: the real banner is emitted by printk
+# and carries one, so a bare `echo` or `cat /proc/version` to the console cannot
+# forge it. It does NOT exclude a `dmesg` replay written to the console, which
+# reproduces the timestamped line verbatim — that residual case is accepted and
+# made visible instead: `wait --pattern` reports the boundary it scanned from
+# (`scan_offset`/`scan_scope`). Matching at line start additionally stops a
+# banner quoted mid-line from counting.
 _BOOT_BANNER = re.compile(rb"(?m)^\[\s*\d+\.\d+\] Linux version \S+ \(")
 
 
@@ -360,6 +362,11 @@ def last_boot_offset(log_path: str | Path, *, start_offset: int = 0) -> int:
     return offset + last.start() if last is not None else offset
 
 
+def is_terminal_panic_start(line: str) -> bool:
+    """Match a terminal panic start, not a prior report's end banner."""
+    return bool(_FATAL_PANIC_START.search(line)) and not _is_crash_end(line)
+
+
 def has_terminal_panic(log_path: str | Path, *, start_offset: int = 0) -> bool:
     """Whether the guest took a panic it cannot return from.
 
@@ -374,10 +381,12 @@ def has_terminal_panic(log_path: str | Path, *, start_offset: int = 0) -> bool:
             size = os.fstat(stream.fileno()).st_size
             offset = start_offset if 0 <= start_offset <= size else 0
             stream.seek(offset)
-            text = stream.read().decode("utf-8", errors="replace")
+            return any(
+                is_terminal_panic_start(line.decode("utf-8", errors="replace"))
+                for line in stream
+            )
     except OSError:
         return False
-    return bool(_FATAL_PANIC_START.search(text))
 
 
 def read_log(log_path: str | Path) -> str | None:

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -126,6 +127,224 @@ def test_held_back_is_distinct_from_stopped(cache, monkeypatch):
 
     assert classify_vm(VM, older_than_seconds=0.0)["state"] == VM_STOPPED
     assert classify_vm(VM, older_than_seconds=86400.0)["state"] == VM_HELD_BACK
+
+
+@pytest.mark.parametrize("failure", ["missing", "read"])
+def test_unavailable_stopped_serial_is_inconclusive_not_a_negative(
+    cache, monkeypatch, capsys, failure
+):
+    inst = _vm_with_log(cache, VM, "booting\n")
+    inst.pid = 0
+    instance_mod.save_instance(inst)
+    serial = Path(inst.serial_log)
+    if failure == "missing":
+        serial.unlink()
+    else:
+        import io
+
+        class Unreadable(io.FileIO):
+            def read(self, size=-1):
+                raise OSError("serial fixture I/O failure")
+
+        original_open = Path.open
+
+        def open_serial(path, *args, **kwargs):
+            if path == serial and args == ("rb",):
+                return Unreadable(path, "r")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", open_serial)
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
+    _decoy_running(monkeypatch)
+
+    rc = cli.main(["wait", "--vm", VM, "--pattern", "QMU-BOOT-DONE",
+                   "--timeout", "0", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["ok"] is False
+    assert "error" in payload
+    assert "matched" not in payload
+    assert instance_mod.load_instance(VM) is not None
+
+
+@pytest.mark.parametrize("with_metadata", [False, True])
+@pytest.mark.parametrize("output_format", ["text", "json", "ndjson"])
+def test_explicit_stopped_pattern_wait_agrees_with_retained_log(
+    cache, monkeypatch, capsys, with_metadata, output_format
+):
+    serial = _write_remnant(cache)
+    serial.write_text("booting\nQMU-BOOT-DONE")  # final fragment without newline
+    inst = _vm_with_log(cache, VM, serial.read_text())
+    inst.pid = 0
+    if with_metadata:
+        instance_mod.save_instance(inst)
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
+    _decoy_running(monkeypatch)
+
+    rc = cli.main(["wait", "--vm", VM, "--pattern", "QMU-BOOT-DONE",
+                   "--timeout", "0", "--format", output_format])
+    output = capsys.readouterr().out
+
+    assert rc == 0
+    if output_format == "text":
+        assert "QMU-BOOT-DONE" in output
+    else:
+        payload = json.loads(output)
+        assert payload["ok"] is True
+        assert payload["vm_id"] == VM
+        assert payload["matched_line"] == "QMU-BOOT-DONE"
+    assert serial.read_text() == "booting\nQMU-BOOT-DONE"
+    assert (instance_mod.load_instance(VM) is not None) == with_metadata
+
+
+def test_stopped_pattern_wait_without_match_is_not_a_timeout(
+    cache, monkeypatch, capsys
+):
+    serial = _write_remnant(cache)
+    content = (
+        "[    0.044413] kasan: KernelAddressSanitizer initialized\n"
+        "probe did not complete\n"
+    )
+    serial.write_text(content)
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
+    _decoy_running(monkeypatch)
+
+    rc = cli.main(["wait", "--vm", VM, "--pattern", "QMU-BOOT-DONE",
+                   "--timeout", "0", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["ok"] is False
+    assert payload["matched"] is False
+    assert payload["reason"] == "process_exited"
+    assert payload["crash"] is None
+    assert serial.read_text() == content
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_stopped_wait_requires_terminal_evidence_for_exit_three(
+    cache, monkeypatch, capsys, terminal
+):
+    report = (
+        "BUG: KASAN: slab-out-of-bounds in fixture_operation\n"
+        "Read of size 1 by task fixture/42\n"
+        "---[ end trace 0000000000000000 ]---\n"
+    )
+    if terminal:
+        report += (
+            "Kernel panic - not syncing: test panic\n"
+            "---[ end Kernel panic - not syncing: test panic ]---\n"
+        )
+    content = report + "reboot: Power down\n"
+    serial = _write_remnant(cache)
+    serial.write_text(content)
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
+    _decoy_running(monkeypatch)
+
+    args = ["wait", "--vm", VM, "--pattern", "QMU-BOOT-DONE",
+            "--timeout", "0", "--format", "json"]
+    if terminal:
+        # Ignore the early abort to exercise classification after process exit.
+        args.append("--ignore-crash")
+    rc = cli.main(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == (3 if terminal else 1)
+    assert payload["ok"] is False
+    assert payload["matched"] is False
+    assert payload["reason"] == "process_exited"
+    assert "BUG: KASAN:" in payload["crash"]
+    assert serial.read_text() == content
+
+
+@pytest.mark.parametrize(("content", "pattern", "ignore_crash", "expected"), [
+    ("Kernel panic - not syncing: test panic\nQMU-BOOT-DONE\n",
+     "QMU-BOOT-DONE", False, 3),
+    ("QMU-BOOT-DONE\nKernel panic - not syncing: test panic\n",
+     "QMU-BOOT-DONE", False, 0),
+    ("Kernel panic - not syncing: test panic\nQMU-BOOT-DONE\n",
+     "QMU-BOOT-DONE", True, 0),
+    ("Kernel panic - not syncing: test panic\n",
+     "Kernel panic - not syncing", False, 0),
+])
+def test_stopped_pattern_obeys_panic_marker_order(
+    cache, monkeypatch, capsys, content, pattern, ignore_crash, expected
+):
+    serial = _write_remnant(cache)
+    serial.write_text(content)
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
+    _decoy_running(monkeypatch)
+
+    args = ["wait", "--vm", VM, "--pattern", pattern,
+            "--timeout", "0", "--format", "json"]
+    if ignore_crash:
+        args.append("--ignore-crash")
+    rc = cli.main(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == expected
+    assert payload["ok"] == (expected == 0)
+    assert payload["matched"] == (expected == 0)
+    if expected == 3:
+        assert payload["reason"] == "crash"
+        assert "Kernel panic - not syncing" in payload["crash"]
+    assert serial.read_text() == content
+
+
+def test_stopped_pattern_ignores_pre_epoch_panic_tail(cache, monkeypatch, capsys):
+    previous = "Kernel panic - not syncing: old panic\n"
+    current = "---[ end Kernel panic - not syncing: old panic ]---\nQMU-BOOT-DONE\n"
+    inst = _vm_with_log(cache, VM, previous + current)
+    inst.pid = 0
+    inst.guest_epoch_serial_offset = len(previous)
+    instance_mod.save_instance(inst)
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
+    _decoy_running(monkeypatch)
+
+    rc = cli.main(["wait", "--vm", VM, "--pattern", "QMU-BOOT-DONE",
+                   "--timeout", "0", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["matched_line"] == "QMU-BOOT-DONE"
+    assert payload["crash"] is None
+
+
+@pytest.mark.parametrize("boundary", ["recorded-epoch", "kernel-banner"])
+def test_stopped_pattern_wait_does_not_reuse_previous_boot_evidence(
+    cache, monkeypatch, capsys, boundary
+):
+    old = "QMU-BOOT-DONE\n"
+    current = "[    0.000000] Linux version 6.6.75 (builder@host)\nbooting\n"
+    inst = _vm_with_log(cache, VM, old + current)
+    inst.pid = 0
+    inst.guest_epoch_serial_offset = len(old) if boundary == "recorded-epoch" else 0
+    instance_mod.save_instance(inst)
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
+    _decoy_running(monkeypatch)
+
+    rc = cli.main(["wait", "--vm", VM, "--pattern", "QMU-BOOT-DONE",
+                   "--timeout", "0", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["matched"] is False
+    assert payload["reason"] == "process_exited"
+    # The boundary that excluded the marker is reported, never implicit: an
+    # agent reading `reason` alone cannot tell "never printed" from "printed
+    # before the scanned range".
+    assert payload["scan_offset"] == len(old)
+    assert payload["scan_scope"] == (
+        "epoch" if boundary == "recorded-epoch" else "boot-banner"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -668,9 +887,11 @@ def test_a_forged_boot_banner_cannot_hide_a_crash(cache, monkeypatch):
     """The banner must be a printk, not anything the guest can echo.
 
     A guest that writes a banner-shaped line to the console after a survived
-    crash would otherwise scope that crash out of the label — reachable without
-    trying via `dmesg` or `cat /proc/version`. The real banner carries a printk
-    timestamp; a userspace echo cannot.
+    crash would otherwise scope that crash out of the label — `echo` or
+    `cat /proc/version` to the console does it without trying. The real banner
+    carries a printk timestamp; those userspace echoes cannot. (A `dmesg` replay
+    does reproduce the timestamp; that residual case is accepted and surfaced
+    through `wait --pattern`'s `scan_scope`, not hidden.)
     """
     inst = _vm_with_log(
         cache, "forged",

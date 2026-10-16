@@ -31,29 +31,14 @@ strictly worse than the three-command sequence it replaces.
 from __future__ import annotations
 
 import argparse
-import re
 import time
 from typing import Any
 
 # `extract_crash` deliberately also matches SURVIVED reports (a WARNING, a KASAN
 # splat), because those are worth showing. They are not evidence that the boot
 # failed, so the boot-failure classifier needs the stricter, terminal marker —
-# which is `serial.has_terminal_panic`, the single spelling shared with
+# `serial.has_terminal_panic`, using the same serial-text discriminator as
 # `lifecycle._guest_state` and `wait --pattern`.
-
-# This is the ONLY code path that scans a whole boot from byte 0, which exposes a
-# sharp edge in the shared patterns: `CRASH_START_PATTERNS` carries a bare,
-# case-insensitive `KASAN:` that also matches the ordinary boot banner
-# "kasan: KernelAddressSanitizer initialized". With no end marker after it, the
-# extract runs to the end of the log, so every KASAN kernel would report a
-# multi-thousand-token "warning" that is really just its boot. Require a genuine
-# report header before believing the extract. Narrowing the shared pattern would
-# change `qmu crash` for every caller, so the check lives at this call site.
-_REAL_REPORT_HEADER = re.compile(
-    r"(BUG:|WARNING: CPU:|Oops:|general protection fault|UBSAN:|"
-    r"Kernel panic|slab-use-after-free|slab-out-of-bounds|stack-out-of-bounds|"
-    r"use-after-free in|double-free or invalid-free)"
-)
 
 from ..instance import VMInstance, instance_alive
 from ..serial import extract_crash, has_terminal_panic
@@ -140,12 +125,7 @@ def _boot_failure_payload(
     ``start_offset=0`` is the whole log because the VM was launched by this
     command — every byte belongs to this boot.
     """
-    extracted = extract_crash(inst.serial_log, start_offset=0)
-    report = (
-        extracted
-        if extracted and _REAL_REPORT_HEADER.search(extracted)
-        else None
-    )
+    report = extract_crash(inst.serial_log, start_offset=0)
     crash = (
         report
         if report and has_terminal_panic(inst.serial_log, start_offset=0)

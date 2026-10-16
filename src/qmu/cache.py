@@ -3,9 +3,8 @@
 qmu owns the ``~/.cache/qmu`` namespace (:func:`qmu.paths.cache_home`), but three
 sibling shell tools write into it through the same ``QMU_CACHE_DIR``:
 ``tools/kbuild.sh`` (``kernels/``), ``tools/mkrootfs.sh`` (``rootfs/``) and
-``tools/mktarget.sh`` (``targets/``). Until this module existed no qmu command
-could *see* any of it — ``prune`` reaches ``instances/`` and ``runtime_root()``
-only, which on a real research box is ~0.01% of the bytes on disk.
+``tools/mktarget.sh`` (``targets/``). Runtime pruning reaches ``instances/`` and
+``runtime_root()`` only, so these build caches need a separate inventory.
 
 This is the single authority on "what is in the cache and what is reclaimable".
 It sits at the domain layer beside :mod:`qmu.instance` / :mod:`qmu.runtime` and
@@ -14,19 +13,14 @@ imports nothing from ``commands.*`` or ``cli``.
 Two invariants drive the whole design:
 
 **Allocated bytes, never apparent.** ``targets/`` and ``rootfs/`` hold sparse
-ext4 images: a single ``rootfs.img`` measures 4.29 GB by ``st_size`` and 0.65 GB
-by ``st_blocks * 512``. Summing ``st_size`` overstates a real cache by ~70%,
-concentrated in exactly the subtrees a reader would then wrongly delete. Both
-numbers are reported; ``bytes`` is always allocated.
+ext4 images, so ``st_size`` can substantially exceed ``st_blocks * 512``.
+Both numbers are reported; ``bytes`` is always allocated.
 
 **The residue classifier is an allowlist of build intermediates.** It never
 selects ``vmlinux``, ``vmlinux.unstripped``, ``System.map``, ``Makefile``,
-``.config``, anything under ``arch/*/boot/``, or any symlink. This is not
-defensive coding — those files are frequently the *only* copy. ``kbuild.sh``'s
-``make $GDB_TARGET`` step fails on 4.x kernels and, under ``pipefail``, aborts
-before the artifact copy, so the source tree keeps the only ``vmlinux`` /
-``System.map`` / ``Image`` for that build. ``skills/firmware-over-qmu/SKILL.md``
-documents recovering from exactly there.
+``.config``, anything under ``arch/*/boot/``, or any symlink. An interrupted
+build can leave those files as the only usable outputs. Preserve them even
+when artifact export did not finish; incomplete caches are not build residue.
 """
 
 from __future__ import annotations
@@ -65,9 +59,8 @@ _RESIDUE_TMP_VMLINUX = re.compile(r"^\.tmp_vmlinux")
 # NEVER classified as residue, at any depth, under any predicate.
 #
 # ``vmlinux.unstripped`` is listed explicitly rather than merely omitted from
-# the allowlist so a later suffix addition cannot pick it up. On linux-7.0.12 it
-# is 1109.5 MB against a copied-out ``vmlinux`` of 518.6 MB (2.14x) — it holds
-# strictly more debug information and is not derivable from what survives.
+# the allowlist so a later suffix addition cannot pick it up. It may retain
+# debug information that is unavailable in the copied-out ``vmlinux``.
 _NEVER_NAMES = frozenset({
     "vmlinux",
     "vmlinux.unstripped",

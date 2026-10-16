@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import os
 import stat
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from qmu.paths import (
-    SSH_CONTROL_PATH_MAX_BYTES,
     runtime_root,
     spill_root,
     ssh_control_dir,
@@ -74,13 +74,24 @@ def test_runtime_children_derive_from_override_and_are_private(tmp_path, monkeyp
     assert stat.S_IMODE(ssh_control_dir().stat().st_mode) == 0o700
 
 
-def test_control_path_expansion_stays_inside_portable_budget(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "root_name,safe",
+    [
+        pytest.param("x" * 35, True, id="temporary-path-at-100-byte-boundary"),
+        pytest.param("x" * 36, False, id="temporary-path-one-byte-over"),
+        pytest.param("x" * 51, False, id="99-byte-expanded-path"),
+        pytest.param("é" * 17 + "x", True, id="utf8-at-byte-boundary"),
+        pytest.param("é" * 18, False, id="utf8-bytes-exceed-character-count"),
+    ],
+)
+def test_control_path_budgets_openssh_temporary_name(
+    tmp_path, monkeypatch, root_name, safe
+):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("QMU_TEMP_DIR", "r")
-    path = ssh_control_path()
-    assert path is not None
-    expanded = os.fsencode(str(path).replace("%C", "0" * 40))
-    assert len(expanded) <= SSH_CONTROL_PATH_MAX_BYTES == 100
+    root = Path(root_name)
+    monkeypatch.setenv("QMU_TEMP_DIR", root_name)
+    expected = root / "ssh" / "cm-%C" if safe else None
+    assert ssh_control_path() == expected
 
 
 def test_overlong_explicit_root_disables_control_path(tmp_path, monkeypatch):

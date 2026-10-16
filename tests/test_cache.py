@@ -1,13 +1,8 @@
 """Domain tests for cache inventory and build-residue classification.
 
-The regression these guard against is not hypothetical. An earlier revision of
-this feature classified residue by filename glob and located built kernels by
-looking for an image directly under ``kernels/<version>/``. Both were wrong:
-``kbuild.sh`` writes the image to ``kernels/<version>/<arch>/``, and four source
-trees on the developer's own machine hold the ONLY copy of their ``vmlinux`` /
-``System.map`` / ``arch/*/boot/Image`` because kbuild's ``make scripts_gdb`` step
-fails on 4.x under ``pipefail`` and aborts before the artifact copy. The
-combination would have deleted every source tree in the cache.
+The inventory must follow the builder's ``kernels/<version>/<arch>/`` layout.
+An interrupted build can leave its only kernel and debug artifacts in the
+source tree; residue classification must never select those protected outputs.
 """
 
 from __future__ import annotations
@@ -79,11 +74,10 @@ def test_classifier_never_selects_a_protected_artifact(cache_root):
 
 
 def test_regression_source_tree_holding_the_only_kernel_copy_is_preserved(cache_root):
-    """kbuild's scripts_gdb failure on 4.x leaves the tree as the only copy.
+    """An interrupted build can leave its usable outputs only in the source tree.
 
     ``kernels/<ver>/<arch>/`` holds just a build.log; the built ``vmlinux``,
-    ``System.map`` and ``Image`` live only in the source tree. An earlier design
-    flagged exactly this shape for whole-tree deletion.
+    ``System.map`` and ``Image`` must survive residue cleanup.
     """
     src = _tree(cache_root, "linux-4.14.336")
     outdir = cache_root / "kernels" / "4.14.336" / "arm64"
@@ -186,9 +180,7 @@ def test_age_gate_holds_back_a_freshly_touched_tree(cache_root):
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory write bits")
 def test_unwritable_parent_refuses_per_file_not_per_tree(cache_root):
-    """Refusal is per-file. Whole-group refusal would forfeit a whole tree to
-    protect a handful of files -- on the developer's cache, 1.47 GB to protect
-    27 files."""
+    """Refuse only files whose parents prevent unlinking, not their whole tree."""
     src = _tree(cache_root, "linux-4.14.75")
     locked = src / "include" / "generated"
     (locked / "trapped.o").write_bytes(b"o" * 50)
