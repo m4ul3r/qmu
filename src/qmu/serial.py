@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import os
 import re
 from pathlib import Path
@@ -38,6 +39,15 @@ CRASH_END_PATTERNS = [
     ]
 ]
 
+# One alternation per list: the classifiers run on every line of a scan, and
+# `extract_crash` walks a whole boot (megabytes on a chatty guest) for every
+# `status`/`list`/`wait`. Searching 21 patterns per line cost 1.1 s on a 3 MB
+# log; one search each is linear in the log and nothing else.
+_CRASH_START_RE = re.compile(
+    "|".join(p.pattern for p in CRASH_START_PATTERNS), re.IGNORECASE
+)
+_CRASH_END_RE = re.compile("|".join(p.pattern for p in CRASH_END_PATTERNS))
+
 
 _SOFT_END_TRACE = re.compile(r"---\[ end trace")
 _FATAL_PANIC_START = re.compile(r"Kernel panic - not syncing", re.IGNORECASE)
@@ -49,11 +59,11 @@ def _is_crash_start(line: str) -> bool:
     # any end-marker line as END-only so it can never be mistaken for a start.
     if _is_crash_end(line):
         return False
-    return any(p.search(line) for p in CRASH_START_PATTERNS)
+    return _CRASH_START_RE.search(line) is not None
 
 
 def _is_crash_end(line: str) -> bool:
-    return any(p.search(line) for p in CRASH_END_PATTERNS)
+    return _CRASH_END_RE.search(line) is not None
 
 
 # How far past a soft "end trace" banner a fatal panic may appear and still
@@ -222,15 +232,21 @@ def extract_crash(
     if not tail:
         return None
 
+    # Classify every line with whole-text passes instead of two regex
+    # searches per line: on a 3 MB boot the per-line calls alone cost 0.5 s,
+    # and `status`/`list`/`wait` each pay this walk once.
+    end_lines = _lines_matching(CRASH_END_PATTERNS, text)
+    start_lines = _lines_matching(CRASH_START_PATTERNS, text) - end_lines
+
     # Walk backwards to find the first line of the last crash event. A soft
     # WARNING "end trace" remains part of the same event only when it leads
     # directly to a fatal panic continuation. Every other end marker is a hard
     # boundary between discrete events.
     crash_start = None
     for i in range(len(tail) - 1, -1, -1):
-        if _is_crash_start(tail[i]):
+        if i in start_lines:
             crash_start = i
-        elif crash_start is not None and _is_crash_end(tail[i]):
+        elif crash_start is not None and i in end_lines:
             if _SOFT_END_TRACE.search(tail[i]) and _soft_end_links_to_fatal_panic(tail, i):
                 continue
             break
@@ -243,11 +259,65 @@ def extract_crash(
     # progress (no end banner yet).
     end = len(tail)
     for i in range(len(tail) - 1, crash_start, -1):
-        if _is_crash_end(tail[i]):
+        if i in end_lines:
             end = i + 1
             break
 
     return "\n".join(tail[crash_start:end]) + "\n"
+
+
+_REGEX_META = frozenset("\\[](){}.*+?^$|")
+
+
+def _marker_positions(pattern: re.Pattern[str], text: str, lowered: str) -> list[int]:
+    """Start offsets of every hit of one marker pattern in `text`.
+
+    A marker is a literal (`BUG: KASAN:`) far more often than a regex; for
+    those `str.find` on a lowercased copy is the same case-insensitive test
+    at memchr speed, where a 17-way IGNORECASE alternation ran at ~10 MB/s.
+    """
+    if (
+        any(ch in _REGEX_META for ch in pattern.pattern)
+        # A lowercase form that changed length would desync the offsets.
+        or len(lowered) != len(text)
+    ):
+        return [m.start() for m in pattern.finditer(text)]
+    haystack = lowered if pattern.flags & re.IGNORECASE else text
+    needle = pattern.pattern.lower() if pattern.flags & re.IGNORECASE else pattern.pattern
+    positions: list[int] = []
+    pos = haystack.find(needle)
+    while pos >= 0:
+        positions.append(pos)
+        pos = haystack.find(needle, pos + 1)
+    return positions
+
+
+def _lines_matching(patterns: list[re.Pattern[str]], text: str) -> set[int]:
+    """Indices (in `text.splitlines()` numbering) of the lines any pattern hits."""
+    lowered = text.lower()
+    positions: list[int] = []
+    for pattern in patterns:
+        positions.extend(_marker_positions(pattern, text, lowered))
+    hits: set[int] = set()
+    if not positions:
+        return hits
+    starts = [0]
+    for line in text.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    for pos in positions:
+        hits.add(bisect.bisect_right(starts, pos) - 1)
+    return hits
+
+
+def _text_has_terminal_panic(text: str) -> bool:
+    """A `Kernel panic - not syncing` line that is not itself an end banner."""
+    for match in _FATAL_PANIC_START.finditer(text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        line = text[line_start:] if line_end < 0 else text[line_start:line_end]
+        if not _is_crash_end(line):
+            return True
+    return False
 
 
 _UNKNOWN_PARAMS = re.compile(
@@ -410,12 +480,57 @@ def has_terminal_panic(log_path: str | Path, *, start_offset: int = 0) -> bool:
             size = os.fstat(stream.fileno()).st_size
             offset = start_offset if 0 <= start_offset <= size else 0
             stream.seek(offset)
-            return any(
-                is_terminal_panic_start(line.decode("utf-8", errors="replace"))
-                for line in stream
-            )
+            text = stream.read().decode("utf-8", errors="replace")
     except OSError:
         return False
+    return _text_has_terminal_panic(text)
+
+
+def scan_console_growth(
+    log_path: str | Path, *, scanned: int, boot_offset: int
+) -> tuple[int, int, bool]:
+    """Examine only the bytes appended since `scanned`; return
+    `(scanned, boot_offset, terminal_panic)`.
+
+    The incremental form of `last_boot_offset` + `has_terminal_panic` for a
+    poll loop: both read from `boot_offset` to EOF on every call, so a wait
+    over a chatty guest cost O(log size) per tick (r2-shared measured 10 s of
+    CPU for a 20 s wait). `scanned` is line-aligned — the trailing fragment
+    without a newline is re-read next call, so a banner or panic split across
+    two reads is still seen whole. A newer banner moves `boot_offset`, and
+    only lines after it count toward the panic verdict: a panic before the
+    banner belongs to the boot that just ended. A log that shrank underneath
+    the loop (truncated, replaced) is rescanned from its start.
+    """
+    try:
+        with Path(log_path).open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            if scanned > size:
+                scanned = 0
+            if size <= scanned:
+                return scanned, boot_offset, False
+            stream.seek(scanned)
+            chunk = stream.read()
+    except OSError:
+        return scanned, boot_offset, False
+
+    last = None
+    for match in _BOOT_BANNER.finditer(chunk):
+        last = match
+    region_start = 0
+    if last is not None and scanned + last.start() > boot_offset:
+        boot_offset = scanned + last.start()
+        region_start = last.start()
+    elif scanned < boot_offset:
+        # Rescanning from 0 after a shrink: skip what precedes the boot.
+        region_start = min(len(chunk), boot_offset - scanned)
+
+    newline = chunk.rfind(b"\n")
+    complete = chunk[: newline + 1] if newline >= 0 else b""
+    panicked = _text_has_terminal_panic(
+        chunk[region_start:].decode("utf-8", errors="replace")
+    )
+    return scanned + len(complete), boot_offset, panicked
 
 
 def read_log(log_path: str | Path) -> str | None:

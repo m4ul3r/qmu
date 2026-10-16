@@ -117,38 +117,55 @@ The starter `qmu.toml` writes an **uncommented** `[ssh] key = "~/.ssh/qmu_id_rsa
 which overrides a global `~/.config/qmu/config.toml` key; comment it out if
 the per-user global is the one you mean.
 
-## `config show`
+## `config show` and `config path`
 
-Text: a `Layers:` line (`built-in defaults -> global <path> -> project
-<path>`), then one row per setting ending with its layer tag `[built-in |
-global <path> | project <path> | --config <path> | flag]`; path rows show
-`<as written> -> <resolved>` and `(not found)`; `Accel:`, `NIC model:`, `Net
-backend:`, `Extra args:` are always present; profiles one per line with their
-layer. JSON: `boot`, `machine` (`arch`, `memory`, `cpus`, `cpu`, `nic_model`,
-`net_backend`, `accel`, `extra_args`), `drive`, `ssh`, `gdb`, `profiles`,
-`sources` (`{dotted key: layer}`), `layers` (ordered list), `paths` (resolved
-`boot.kernel`, `boot.initrd`, `drive.rootfs`, `ssh.key`).
+`qmu config path` prints the global and project paths with `(not found)` /
+`(none found — searched up from CWD)`; JSON `global_config`,
+`global_config_exists`, `project_config` (null when none). It answers "which
+file is qmu reading?" before anything is launched.
+
+`config show` text: a `Layers:` line (`built-in defaults -> global <path> ->
+project <path>`), then one row per setting ending with its layer tag
+`[built-in | global <path> | project <path> | --config <path> | flag]`; path
+rows show `<as written> -> <resolved>` and `(not found)`; `Accel:`, `NIC
+model:`, `Net backend:`, `Extra args:` are always present; profiles one per
+line with their layer. JSON: `boot`, `machine` (`arch`, `memory`, `cpus`,
+`cpu`, `nic_model`, `net_backend`, `accel`, `extra_args`), `drive`, `ssh`,
+`gdb`, `profiles`, `sources` (`{dotted key: layer}`), `layers` (ordered list),
+`paths` (`boot.kernel`, `boot.initrd`, `drive.rootfs`, `ssh.key` → `{written,
+resolved, exists}` or null when unset). `config show` reports *resolution*,
+not health: it is `ok: true` with a missing kernel — branch on
+`paths.<key>.exists`, or run `doctor`, whose rows are the health verdict.
 
 ## Auto-selection, precisely
 
 Most commands (`status`, `exec`, `kill`, `gdb`, …) consider only **running** VMs,
 so stopped remnants never make them ambiguous. `log`, `crash` and `wait
 --pattern` also accept a **stopped** VM — that is how a dead VM's serial log
-stays readable — so they see more candidates. When they cannot narrow to one,
-they pick **the single running VM** and say so:
+stays readable — so they see more candidates. Whenever a command settles on
+the single running VM without `--vm`, it says so — never silently:
 
 ```
 $ qmu log
-[qmu] Auto-selected the only running VM 'poc' (8 other VM(s) exist; use --vm <id> to pick one).
+[qmu] Auto-selected the only running VM 'poc' (pass --vm to pin it).
 ```
 
-In JSON the same fact is `"vm": "poc"` plus `"autoselected": "..."`. Both
-commands always report which VM they read, auto-selected or not — never assume
-it from context. With **no** running VM and several stopped ones, they are
-genuinely ambiguous and error, naming the first few candidates and pointing at
-`qmu prune --all` — do not run that on a shared host. On a shared host there is
-never exactly one running VM, so auto-selection is never usable there: pass
-`--vm` on every command.
+(`log`/`crash` picking the only VM on disk when it is stopped say `the only
+VM (stopped) 'poc'` instead.)
+
+In JSON the same fact is `"autoselected": true` next to the VM name (`vm` for
+`log`/`crash`, `vm_id` elsewhere). Every command reports which VM it acted
+on, auto-selected or not — never assume it from context. `QMU_REQUIRE_VM=1`
+in the environment turns every
+auto-selection into exit 1 (`--vm is required: QMU_REQUIRE_VM is set`,
+`error_type: QMUError`); export it on a shared host so a forgotten `--vm`
+cannot kill or exec into a sibling's VM during the moments when theirs is the
+only one running. With **no** running VM and several stopped ones, `log`/
+`crash` are genuinely ambiguous and error, naming the first few candidates
+and pointing at `qmu prune --vm <id>` (and `qmu prune --all --dry-run` only
+as a preview); qmu never recommends a bare `prune --all`. With several
+running VMs the error is `Multiple VMs running. Specify one with --vm <id>:`
+plus the list.
 
 `--vm`, `--format`, and `--out` are accepted **both before and after** the
 subcommand — `qmu --vm <id> exec "..."` and `qmu exec --vm <id> "..."` are
@@ -177,11 +194,12 @@ heuristic for sizing only. Shapes: `output-contract.md`.
 
 Glyphs: `[+]` ok · `[!]` gating failure (drives exit 1) · `[~]` non-blocking
 warning · `[i]` informational. JSON rows are `{check, status: ok|fail|warn|
-info, detail, blocking: bool}` and `ok` ⇔ no `fail` row. `doctor` exits 1
-only when a `[!]` row is present; a missing config is `[~] config: No
-qmu.toml or <global path> found. Run: qmu config init` with exit 0 (the
-`Tip: run qmu config init` line appears only when no project/`--config`
-layer loaded).
+info, detail, blocking: bool, hint: str}` — `hint` is the fix as a runnable
+command or setting (`""` when there is nothing to fix) — and `ok` ⇔ no `fail`
+row. `doctor` exits 1 only when a `[!]` row is present; a missing config is
+`[~] config: No qmu.toml or <global path> found. Run: qmu config init` with
+exit 0 (the `Tip: run qmu config init` line appears only when no
+project/`--config` layer loaded). `doctor --config PATH` checks that file.
 
 | Row | Verdict |
 |---|---|
@@ -193,7 +211,9 @@ layer loaded).
 | `qemu-system-<arch>`, `KVM` | `[!]` binary missing / `accel=kvm` without `/dev/kvm`; `[i]` disabled by `accel=tcg` |
 | `cross compiler for <arch> (compile --host)`, `gdb-multiarch` | only when `[machine] arch` ≠ host arch; `[~]` when missing, naming `apt install gcc-<triple>` / `apt install gdb-multiarch` |
 | `libguestfs` | `[~]` with the appliance fix (above) |
-| `pry`, `passt`, `running VMs`, `cache`, `skills` | `[i]`/`[+]`, never gating |
+| `running VMs` | `[i] N running [+ M orphaned (no instance record)] under <instances dir>`; JSON `running`/`orphaned` ints, hint `qmu prune --orphans --dry-run` when orphans exist. A snapshot — other agents change it within seconds |
+| `skills` | text `[+] N skills × M roots installed` (or `…: N installed, M missing, K stale … (run: qmu skill install)`) — the JSON `summary`; JSON `detail` keeps the full path list and `detail_paths: {installed, missing, stale}` splits it |
+| `pry`, `passt`, `cache` | `[i]`/`[+]`, never gating |
 
 `doctor` does not check `[boot] initrd` existence or whether a cached
 mkrootfs image predates the key-only sshd policy (`guest-commands.md`).

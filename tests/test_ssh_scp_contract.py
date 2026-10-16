@@ -1,16 +1,33 @@
 from __future__ import annotations
 
-import subprocess
+import json
+import shlex
 
 import pytest
 
 from qmu.instance import QMUError
-from qmu.ssh import SCPFileError, SSHClient, SSHError, is_transport_failure
+from qmu.ssh import SCPFileError, SSHAborted, SSHClient, SSHError, is_transport_failure
 
 
 @pytest.fixture
 def client():
     return SSHClient(port=10022, key_path="/tmp/test-key")
+
+
+def _stub_scp(monkeypatch, client, tmp_path, *, rc=0, stderr="", sleep=0.0):
+    """Replace the scp argv with a shell stub that records its arguments,
+    prints `stderr`, optionally sleeps and exits `rc`. The transfer arguments
+    (`local`, `user@host:remote`) land in $1/$2 exactly as scp would see
+    them, so argument order is still observable."""
+    record = tmp_path / "argv.json"
+    script = (
+        f"printf '%s' {shlex.quote(stderr)} >&2; "
+        f"python3 -c 'import json,sys; json.dump(sys.argv[2:], open(sys.argv[1], \"w\"))' "
+        f"{shlex.quote(str(record))} \"$@\"; "
+        f"sleep {sleep}; exit {rc}"
+    )
+    monkeypatch.setattr(client, "_scp_base", lambda: ["sh", "-c", script, "scp-stub"])
+    return lambda: json.loads(record.read_text()) if record.exists() else None
 
 
 @pytest.mark.parametrize(
@@ -31,12 +48,7 @@ def test_scp_nonzero_maps_exit_code_to_error_class(
 ):
     source = tmp_path / "source.bin"
     source.write_bytes(b"data")
-    monkeypatch.setattr(
-        "qmu.ssh.subprocess.run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args=args[0], returncode=returncode, stdout="", stderr=stderr
-        ),
-    )
+    _stub_scp(monkeypatch, client, tmp_path, rc=returncode, stderr=stderr)
 
     with pytest.raises(error_class) as raised:
         if operation == "push":
@@ -63,7 +75,7 @@ def test_push_missing_local_source_does_not_spawn_scp(monkeypatch, tmp_path, cli
     def forbidden(*args, **kwargs):
         raise AssertionError("scp must not run for a missing local source")
 
-    monkeypatch.setattr("qmu.ssh.subprocess.run", forbidden)
+    monkeypatch.setattr("qmu.ssh.subprocess.Popen", forbidden)
     missing = tmp_path / "missing.bin"
 
     with pytest.raises(SCPFileError, match=f"Local file not found: {missing}") as raised:
@@ -77,7 +89,7 @@ def test_push_directory_is_refused_before_scp(monkeypatch, tmp_path, client):
     def forbidden(*args, **kwargs):
         raise AssertionError("scp must not run for a directory")
 
-    monkeypatch.setattr("qmu.ssh.subprocess.run", forbidden)
+    monkeypatch.setattr("qmu.ssh.subprocess.Popen", forbidden)
     directory = tmp_path / "adir"
     directory.mkdir()
 
@@ -93,19 +105,43 @@ def test_scp_timeout_has_no_positive_transport_evidence(
 ):
     source = tmp_path / "source.bin"
     source.write_bytes(b"data")
+    _stub_scp(monkeypatch, client, tmp_path, sleep=5)
+    monkeypatch.setattr(client, "scp_timeout", 0.3)
 
-    def timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(args[0], timeout=30)
-
-    monkeypatch.setattr("qmu.ssh.subprocess.run", timeout)
-    with pytest.raises(SSHError) as raised:
+    with pytest.raises(SSHError, match=f"SCP {operation} timed out after 0.3s") as raised:
         if operation == "push":
             client.push(str(source), "/root/source.bin")
         else:
             client.pull("/root/source.bin", str(tmp_path / "dest.bin"))
 
+    assert not isinstance(raised.value, SSHAborted)
     assert raised.value.returncode is None
     assert raised.value.stderr == ""
+
+
+@pytest.mark.parametrize("operation", ["push", "pull"])
+def test_scp_is_aborted_when_the_watcher_fires(monkeypatch, tmp_path, client, operation):
+    """A transfer is an ssh session: a breakpoint armed on a syscall sshd's
+    login path makes halts the vCPU under scp, and an unwatched transfer sat
+    out its whole budget before a bare timeout. `abort_when` is polled every
+    0.5 s like `run`'s and stops the child with the aborted class."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"data")
+    _stub_scp(monkeypatch, client, tmp_path, sleep=5)
+    monkeypatch.setattr(client, "scp_timeout", 10.0)
+    polls: list[int] = []
+
+    def halted() -> bool:
+        polls.append(1)
+        return True
+
+    with pytest.raises(SSHAborted, match=f"SCP {operation} aborted by qmu"):
+        if operation == "push":
+            client.push(str(source), "/root/source.bin", abort_when=halted)
+        else:
+            client.pull("/root/source.bin", str(tmp_path / "dest.bin"), abort_when=halted)
+
+    assert polls == [1]
 
 
 @pytest.mark.parametrize("operation", ["push", "pull"])
@@ -115,30 +151,13 @@ def test_scp_success_returns_none_and_keeps_argument_direction(
     source = tmp_path / "source.bin"
     source.write_bytes(b"data")
     dest = tmp_path / "dest.bin"
-    captured = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("qmu.ssh.subprocess.run", fake_run)
+    argv = _stub_scp(monkeypatch, client, tmp_path)
 
     if operation == "push":
         result = client.push(str(source), "/root/source.bin")
         assert result is None
-        assert str(source) in captured["cmd"]
-        local_idx = captured["cmd"].index(str(source))
-        remote_idx = next(
-            i for i, arg in enumerate(captured["cmd"]) if arg.endswith(":/root/source.bin")
-        )
-        assert local_idx < remote_idx
-        assert captured["cmd"][remote_idx].startswith("root@localhost:")
+        assert argv() == [str(source), "root@localhost:/root/source.bin"]
     else:
         result = client.pull("/root/source.bin", str(dest))
         assert result is None
-        remote_idx = next(
-            i for i, arg in enumerate(captured["cmd"]) if arg.endswith(":/root/source.bin")
-        )
-        local_idx = captured["cmd"].index(str(dest))
-        assert remote_idx < local_idx
-        assert captured["cmd"][remote_idx].startswith("root@localhost:")
+        assert argv() == ["root@localhost:/root/source.bin", str(dest)]

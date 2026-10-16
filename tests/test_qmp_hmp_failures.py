@@ -158,13 +158,16 @@ def test_snapshot_failure_text_goes_to_stderr_with_the_error_prefix(monkeypatch,
 
 def test_snapshot_load_failure_reports_the_resume(monkeypatch, capsys):
     err = "Error: Snapshot 'nope' does not exist in one or more devices"
-    _snapshot_seams(monkeypatch, "load", SnapshotResult(False, err, resumed=True))
+    _snapshot_seams(
+        monkeypatch, "load", SnapshotResult(False, err, resumed=True, reason="missing")
+    )
     rc = cli.main(["--format", "json", "snapshot", "load", "nope", "--vm", "dev"])
     payload = json.loads(capsys.readouterr().out)
     assert rc == 1
     assert payload["resumed"] is True
     assert payload["guest_paused"] is False
-    assert "hint" not in payload
+    # Every SnapshotError carries the fix; the resume is a note, not the hint.
+    assert "qmu snapshot list --vm dev" in payload["hint"]
 
     rc = cli.main(["snapshot", "load", "nope", "--vm", "dev"])
     assert rc == 1
@@ -173,17 +176,62 @@ def test_snapshot_load_failure_reports_the_resume(monkeypatch, capsys):
 
 def test_snapshot_load_failure_reports_a_stuck_pause_with_the_cont_hint(monkeypatch, capsys):
     err = "Error: Snapshot 'nope' does not exist in one or more devices"
-    _snapshot_seams(monkeypatch, "load", SnapshotResult(False, err, guest_paused=True))
+    _snapshot_seams(
+        monkeypatch, "load", SnapshotResult(False, err, guest_paused=True, reason="missing")
+    )
     rc = cli.main(["--format", "json", "snapshot", "load", "nope", "--vm", "dev"])
     payload = json.loads(capsys.readouterr().out)
     assert rc == 1
     assert payload["resumed"] is False
     assert payload["guest_paused"] is True
+    assert payload["hint"].startswith("loadvm left the guest paused")
     assert "qmu cont --vm dev" in payload["hint"]
 
     rc = cli.main(["snapshot", "load", "nope", "--vm", "dev"])
     assert rc == 1
     assert "qmu cont --vm dev" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("op", ["load", "delete"])
+def test_snapshot_missing_tag_hint_points_at_snapshot_list(monkeypatch, capsys, op):
+    err = "Error: Snapshot 'nope' does not exist in one or more devices"
+    _snapshot_seams(monkeypatch, op, SnapshotResult(False, err, reason="missing"))
+    rc = cli.main(["--format", "json", "snapshot", op, "nope", "--vm", "dev"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["error_type"] == "SnapshotError"
+    assert "qmu snapshot list --vm dev" in payload["hint"]
+
+    rc = cli.main(["snapshot", op, "nope", "--vm", "dev"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    error_line, hint_line = [
+        line for line in captured.err.splitlines() if line.startswith("[qmu]")
+    ][:2]
+    assert error_line.startswith(f"[qmu] Error: snapshot {op} failed:")
+    assert "qmu snapshot list --vm dev" in hint_line
+
+
+def test_snapshot_save_bad_name_hint_names_the_one_token_rule(monkeypatch, capsys):
+    err = "savevm: extraneous characters at the end of line"
+    _snapshot_seams(monkeypatch, "save", SnapshotResult(False, err, reason="bad_name"))
+    rc = cli.main(["--format", "json", "snapshot", "save", "has space", "--vm", "dev"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert "cannot contain whitespace" in payload["hint"]
+    assert "'has-space'" in payload["hint"]
+
+
+@pytest.mark.parametrize("op", ["save", "load", "delete"])
+def test_snapshot_other_hmp_failure_hint_points_at_info_snapshots(monkeypatch, capsys, op):
+    _snapshot_seams(monkeypatch, op, SnapshotResult(False, "Error: boom", reason="hmp"))
+    rc = cli.main(["--format", "json", "snapshot", op, "x", "--vm", "dev"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["hint"] == (
+        "Inspect the image's snapshot table with: qmu monitor 'info snapshots' --vm dev"
+    )
 
 
 def test_snapshot_success_envelope_is_unchanged(monkeypatch, capsys):

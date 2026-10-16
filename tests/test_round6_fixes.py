@@ -186,11 +186,12 @@ def test_kill_of_a_dead_remnant_describes_it(tmp_path, monkeypatch, capsys):
 
     rc = cli.main(["kill", "--vm", "dead"])
 
-    err = capsys.readouterr().err
-    assert rc == 1
-    assert "not found" not in err
-    assert "already stopped" in err
-    assert "qmu prune --vm dead" in err
+    captured = capsys.readouterr()
+    # Wave 3: already stopped is what the caller asked for — a no-op, exit 0.
+    assert rc == 0
+    assert "not found" not in captured.out + captured.err
+    assert "already stopped" in captured.out
+    assert "qmu prune --vm dead" in captured.out
 
 
 # ---------------------------------------------------------------------------

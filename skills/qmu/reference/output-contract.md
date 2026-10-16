@@ -74,6 +74,9 @@ spill root — `$QMU_TEMP_DIR/spills`, else `$XDG_RUNTIME_DIR/qmu/spills`, else
 
 Both also print `[qmu] Output spilled to <path>` on stderr. Always consume the
 printed path / `artifact_path`; never reconstruct spill names. `--out PATH`
-forces a file and prints the pointer envelope (as JSON, in every format).
+forces a file and prints the pointer envelope (as JSON, in every format); the
+file holds the result rendered in `--format`, so `qmu crash --vm X --format
+text --out report.txt` saves the plain report while `--format json --out`
+saves the `{"ok", "crash", …}` envelope with escaped newlines.
 `rootfs cat` spills binary content to a `.bin`. Aged automatic spills are
 reclaimed by `qmu prune --runtime` (`reference/cache.md`).

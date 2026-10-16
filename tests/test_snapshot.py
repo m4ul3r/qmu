@@ -159,6 +159,7 @@ def test_save_hmp_parse_error_is_a_failure_without_listing():
     result = save_snapshot(qmp, "has space")
     assert result.ok is False
     assert "extraneous characters" in result.message
+    assert result.reason == "bad_name"
     assert qmp.calls == ["savevm has space"]
 
 
@@ -167,6 +168,7 @@ def test_save_silent_but_unlisted_is_a_failure():
     result = save_snapshot(qmp, "clean")
     assert result.ok is False
     assert "not listed" in result.message
+    assert result.reason == "hmp"
 
 
 def test_load_empty_output_synthesizes_success_message():
@@ -194,7 +196,9 @@ def test_failed_load_resumes_a_guest_that_was_running():
     # before: running; after loadvm: stopped; after cont: running again
     qmp = FakeQMP(err, running=[True, False, True])
     result = load_snapshot(qmp, "nope")
-    assert result == SnapshotResult(False, err, resumed=True, guest_paused=False)
+    assert result == SnapshotResult(
+        False, err, resumed=True, guest_paused=False, reason="missing"
+    )
     assert qmp.qmp_calls == ["query-status", "query-status", "cont", "query-status"]
 
 
@@ -202,7 +206,9 @@ def test_failed_load_reports_guest_paused_when_cont_does_not_take():
     err = "Error: Snapshot 'nope' does not exist in one or more devices"
     qmp = FakeQMP(err, running=[True, False, False])
     result = load_snapshot(qmp, "nope")
-    assert result == SnapshotResult(False, err, resumed=False, guest_paused=True)
+    assert result == SnapshotResult(
+        False, err, resumed=False, guest_paused=True, reason="missing"
+    )
 
 
 def test_failed_load_leaves_an_already_paused_guest_alone():
@@ -211,7 +217,7 @@ def test_failed_load_leaves_an_already_paused_guest_alone():
     err = "Error: Snapshot 'nope' does not exist in one or more devices"
     qmp = FakeQMP(err, running=[False])
     result = load_snapshot(qmp, "nope")
-    assert result == SnapshotResult(False, err)
+    assert result == SnapshotResult(False, err, reason="missing")
     assert "cont" not in qmp.qmp_calls
 
 
@@ -228,4 +234,5 @@ def test_delete_missing_tag_is_a_failure_and_sends_no_delvm():
     result = delete_snapshot(qmp, "never-existed")
     assert result.ok is False
     assert "does not exist" in result.message
+    assert result.reason == "missing"
     assert qmp.calls == ["info snapshots"]

@@ -102,8 +102,90 @@ def is_transport_failure(rc: int, stderr: str) -> bool:
     return any(m in stderr for m in SSH_TRANSPORT_ERROR_MARKERS)
 
 
+def _watch_child(
+    proc: subprocess.Popen,
+    pipes: list,
+    *,
+    timeout: float,
+    abort_when: Callable[[], bool] | None,
+    poll_interval: float = 0.5,
+) -> tuple[list[str], bool, bool]:
+    """Drain `pipes` until the child exits, the budget expires or `abort_when`
+    fires. Returns (decoded output per pipe, completed, aborted); a child that
+    did not complete has been killed.
+
+    `abort_when` is polled every `poll_interval` seconds while the child runs.
+    The pipes are drained by a select loop rather than `communicate()`: under
+    ControlMaster the ssh child hands its stdout/stderr to the mux master,
+    which keeps them open until the remote command ends, so a `communicate()`
+    after `kill()` blocked for the rest of the remote command's lifetime (a
+    `--timeout 2` on `sleep 10` returned after 10 s). Output is collected as
+    bytes and decoded lossily at the end: guest output is arbitrary bytes (a
+    leak primitive dumping raw memory is the everyday case), and a strict
+    decode threw the whole result away as an internal error.
+    """
+    chunks: dict[int, list[bytes]] = {pipe.fileno(): [] for pipe in pipes}
+    sel = selectors.DefaultSelector()
+    for pipe in pipes:
+        os.set_blocking(pipe.fileno(), False)
+        sel.register(pipe, selectors.EVENT_READ)
+
+    def drain(wait: float) -> None:
+        for key, _ in sel.select(timeout=wait):
+            try:
+                data = os.read(key.fd, 65536)
+            except BlockingIOError:
+                continue
+            if data:
+                chunks[key.fd].append(data)
+            else:
+                sel.unregister(key.fileobj)
+
+    deadline = time.monotonic() + timeout
+    next_poll = time.monotonic() + poll_interval
+    aborted = False
+    try:
+        while sel.get_map():
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            if abort_when is not None and now >= next_poll:
+                if abort_when():
+                    aborted = True
+                    break
+                next_poll = now + poll_interval
+            wake = min(deadline, next_poll) if abort_when is not None else deadline
+            drain(max(wake - now, 0.0))
+        else:
+            # Every pipe hit EOF: the child is exiting; give it the rest of
+            # the budget to actually go.
+            try:
+                proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
+            except subprocess.TimeoutExpired:
+                pass
+        completed = proc.poll() is not None
+        if not completed:
+            proc.kill()
+            proc.wait()
+            # Whatever is already in the pipes is still the guest's output.
+            drain(0.0)
+    finally:
+        sel.close()
+        for pipe in pipes:
+            pipe.close()
+
+    # `chunks` preserves the order of `pipes`.
+    output = [
+        b"".join(parts).decode("utf-8", errors="replace") for parts in chunks.values()
+    ]
+    return output, completed, aborted
+
+
 class SSHClient:
     """Wraps system ssh/scp for guest communication."""
+
+    # Budget for one push/pull transfer.
+    scp_timeout: float = 30.0
 
     def __init__(
         self,
@@ -117,8 +199,8 @@ class SSHClient:
         self.host = host
         self.user = user
 
-    def _ssh_base(self) -> list[str]:
-        return [
+    def _ssh_base(self, *, multiplex: bool = True) -> list[str]:
+        base = [
             "ssh",
             "-i", self.key_path,
             "-p", str(self.port),
@@ -128,7 +210,10 @@ class SSHClient:
             "-o", "ServerAliveInterval=5",
             "-o", "ServerAliveCountMax=3",
             "-o", "LogLevel=ERROR",
-        ] + _control_opts()
+        ]
+        if multiplex:
+            return base + _control_opts()
+        return base + ["-o", "ControlMaster=no"]
 
     def _scp_base(self) -> list[str]:
         return [
@@ -145,8 +230,16 @@ class SSHClient:
         return f"{self.user}@{self.host}"
 
     def is_ready(self, timeout: int = 2) -> bool:
-        """Check if SSH is responding."""
-        cmd = self._ssh_base() + [
+        """Check if SSH is responding.
+
+        The probe is deliberately NOT multiplexed (`ControlMaster=no`, no
+        `ControlPath`): `list`/`status`/launch run it against every serving VM
+        on the host, and under `ControlMaster=auto` each probe spawned a
+        persistent `ssh [mux]` master (ControlPersist 60) for VMs the caller
+        never commands — including other users' — under the caller's
+        QMU_TEMP_DIR. `run`/`push`/`pull` keep the shared master.
+        """
+        cmd = self._ssh_base(multiplex=False) + [
             "-o", f"ConnectTimeout={timeout}",
             "-o", "BatchMode=yes",
             self._target(),
@@ -205,80 +298,25 @@ class SSHClient:
         `abort_when` is polled every `poll_interval` seconds while the child
         runs; when it returns True the child is killed and :class:`SSHAborted`
         is raised with the output collected so far. The caller watches the
-        serial log with it: a guest that panics mid-command drops the
+        serial log and QMP with it: a guest that panics mid-command drops the
         transport, but ssh only notices after the keepalive window
         (`ServerAliveInterval × ServerAliveCountMax` = 15 s) while the panic
-        is on disk within ~100 ms. A `--timeout` overrun raises
-        :class:`SSHError` carrying the partial output the same way.
-
-        The pipes are drained by a select loop rather than `communicate()`:
-        under ControlMaster the ssh child hands its stdout/stderr to the mux
-        master, which keeps them open until the remote command ends, so a
-        `communicate()` after `kill()` blocked for the rest of the remote
-        command's lifetime (a `--timeout 2` on `sleep 10` returned after
-        10 s). Output is collected as bytes and decoded lossily at the end:
-        guest output is arbitrary bytes (a leak primitive dumping raw memory
-        is the everyday case), and a strict decode threw the whole result
-        away as an internal error.
+        is on disk within ~100 ms; a halted vCPU never drops it at all. A
+        `--timeout` overrun raises :class:`SSHError` carrying the partial
+        output the same way. See :func:`_watch_child` for the drain.
         """
         cmd = self._ssh_base() + [self._target(), command]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
-        chunks: dict[int, list[bytes]] = {out_fd: [], err_fd: []}
-        sel = selectors.DefaultSelector()
-        for pipe in (proc.stdout, proc.stderr):
-            os.set_blocking(pipe.fileno(), False)
-            sel.register(pipe, selectors.EVENT_READ)
-
-        def drain(wait: float) -> None:
-            for key, _ in sel.select(timeout=wait):
-                try:
-                    data = os.read(key.fd, 65536)
-                except BlockingIOError:
-                    continue
-                if data:
-                    chunks[key.fd].append(data)
-                else:
-                    sel.unregister(key.fileobj)
-
-        deadline = time.monotonic() + timeout
-        next_poll = time.monotonic() + poll_interval
-        aborted = False
-        try:
-            while sel.get_map():
-                now = time.monotonic()
-                if now >= deadline:
-                    break
-                if abort_when is not None and now >= next_poll:
-                    if abort_when():
-                        aborted = True
-                        break
-                    next_poll = now + poll_interval
-                wake = min(deadline, next_poll) if abort_when is not None else deadline
-                drain(max(wake - now, 0.0))
-            else:
-                # Both pipes hit EOF: the child is exiting; give it the rest
-                # of the budget to actually go.
-                try:
-                    proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
-                except subprocess.TimeoutExpired:
-                    pass
-            completed = proc.poll() is not None
-            if not completed:
-                proc.kill()
-                proc.wait()
-                # Whatever is already in the pipes is still the guest's output.
-                drain(0.0)
-        finally:
-            sel.close()
-            proc.stdout.close()
-            proc.stderr.close()
-
-        stdout = b"".join(chunks[out_fd]).decode("utf-8", errors="replace")
-        stderr = b"".join(chunks[err_fd]).decode("utf-8", errors="replace")
+        (stdout, stderr), completed, aborted = _watch_child(
+            proc,
+            [proc.stdout, proc.stderr],
+            timeout=timeout,
+            abort_when=abort_when,
+            poll_interval=poll_interval,
+        )
         if aborted:
             raise SSHAborted(
-                f"SSH command aborted (guest kernel panicked): {command}",
+                f"SSH command aborted by qmu (guest panicked or halted): {command}",
                 stdout=stdout,
                 stderr=stderr,
             )
@@ -295,8 +333,14 @@ class SSHClient:
             )
         return proc.returncode, stdout, stderr
 
-    def push(self, local_path: str, remote_path: str = "/root/") -> None:
-        """Copy a file to the guest."""
+    def push(
+        self,
+        local_path: str,
+        remote_path: str = "/root/",
+        *,
+        abort_when: Callable[[], bool] | None = None,
+    ) -> None:
+        """Copy a file to the guest. `abort_when` as in :meth:`run`."""
         local = Path(local_path)
         if not local.exists():
             raise SCPFileError(f"Local file not found: {local_path}")
@@ -309,31 +353,60 @@ class SSHClient:
             str(local),
             f"{self._target()}:{remote_path}",
         ]
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, errors="replace", timeout=30
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise SSHError(
-                f"SCP push timed out after 30s: {local_path} -> {remote_path}"
-            ) from exc
+        result = self._scp(
+            cmd,
+            operation="push",
+            direction=f"{local_path} -> {remote_path}",
+            abort_when=abort_when,
+        )
         _raise_scp_failure("push", result)
 
-    def pull(self, remote_path: str, local_path: str = ".") -> None:
-        """Copy a file from the guest."""
+    def pull(
+        self,
+        remote_path: str,
+        local_path: str = ".",
+        *,
+        abort_when: Callable[[], bool] | None = None,
+    ) -> None:
+        """Copy a file from the guest. `abort_when` as in :meth:`run`."""
         cmd = self._scp_base() + [
             f"{self._target()}:{remote_path}",
             local_path,
         ]
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, errors="replace", timeout=30
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise SSHError(
-                f"SCP pull timed out after 30s: {remote_path} -> {local_path}"
-            ) from exc
+        result = self._scp(
+            cmd,
+            operation="pull",
+            direction=f"{remote_path} -> {local_path}",
+            abort_when=abort_when,
+        )
         _raise_scp_failure("pull", result)
+
+    def _scp(
+        self,
+        cmd: list[str],
+        *,
+        operation: str,
+        direction: str,
+        abort_when: Callable[[], bool] | None,
+    ) -> subprocess.CompletedProcess:
+        """Run scp under `scp_timeout`, polling `abort_when` like :meth:`run`.
+
+        A transfer is an ssh session too: sshd's login path makes the same
+        syscalls a shell does, so a breakpoint armed for `exec` fires under
+        scp as well, and an unwatched transfer sat out the whole budget before
+        a bare timeout said nothing about the debugger. scp's stdout carries
+        nothing and is not read.
+        """
+        timeout = self.scp_timeout
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        (stderr,), completed, aborted = _watch_child(
+            proc, [proc.stderr], timeout=timeout, abort_when=abort_when
+        )
+        if aborted:
+            raise SSHAborted(f"SCP {operation} aborted by qmu: {direction}", stderr=stderr)
+        if not completed:
+            raise SSHError(f"SCP {operation} timed out after {timeout:g}s: {direction}")
+        return subprocess.CompletedProcess(cmd, proc.returncode, "", stderr)
 
 
 def _raise_scp_failure(operation: str, result: subprocess.CompletedProcess) -> None:

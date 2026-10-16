@@ -34,6 +34,7 @@ from qmu.serial import (
     _is_crash_end,
     _is_crash_start,
     extract_crash,
+    scan_console_growth,
     serial_log_offset,
     tail_log,
 )
@@ -535,3 +536,80 @@ def test_tail_log_missing_file_returns_none(tmp_path):
 def test_tail_log_zero_byte_file_returns_empty_string(tmp_path):
     log = _write(tmp_path, "empty-tail.serial.log", "")
     assert tail_log(log, lines=50) == ""
+
+
+# ---------------------------------------------------------------------------
+# scan_console_growth: the incremental banner/panic scanner the bare `wait`
+# loop polls with. r2-shared measured 10 s of CPU for a 20 s wait when every
+# tick rescanned the whole boot; each tick must now touch only new bytes.
+# ---------------------------------------------------------------------------
+
+BANNER = "[    0.000000] Linux version 7.0.0 (builder@host) (gcc 13.3.0) #1 SMP\n"
+PANIC = "[    2.0] Kernel panic - not syncing: sysrq triggered crash\n"
+
+
+def test_scan_growth_reads_only_appended_bytes(tmp_path):
+    log = _write(tmp_path, "g.serial.log", BANNER + "line one\n")
+    scanned, boot, panicked = scan_console_growth(log, scanned=0, boot_offset=0)
+    assert (scanned, boot, panicked) == (len(BANNER + "line one\n"), 0, False)
+
+    # Nothing new: no read, same high-water mark.
+    assert scan_console_growth(log, scanned=scanned, boot_offset=boot) == (
+        scanned, boot, False,
+    )
+
+    with log.open("a") as f:
+        f.write("line two\n")
+    scanned2, boot2, panicked2 = scan_console_growth(log, scanned=scanned, boot_offset=boot)
+    assert scanned2 == scanned + len("line two\n")
+    assert boot2 == 0 and panicked2 is False
+
+
+def test_scan_growth_withholds_a_partial_line_until_it_completes(tmp_path):
+    log = _write(tmp_path, "p.serial.log", BANNER + "[    2.0] Kernel pan")
+    scanned, _, panicked = scan_console_growth(log, scanned=0, boot_offset=0)
+    assert scanned == len(BANNER), "the fragment must be re-read next tick"
+    assert panicked is False
+
+    with log.open("a") as f:
+        f.write("ic - not syncing: Fatal exception\n")
+    scanned, _, panicked = scan_console_growth(log, scanned=scanned, boot_offset=0)
+    assert panicked is True
+    assert scanned == serial_log_offset(log)
+
+
+def test_scan_growth_moves_the_boot_past_a_new_banner(tmp_path):
+    first = BANNER + PANIC
+    log = _write(tmp_path, "r.serial.log", first)
+    scanned, boot, panicked = scan_console_growth(log, scanned=0, boot_offset=0)
+    assert panicked is True and boot == 0
+
+    # panic=1 reboot: a second banner starts a new guest; the old panic must
+    # not be re-reported against it, and the boot offset is the banner's.
+    with log.open("a") as f:
+        f.write(BANNER + "fresh boot\n")
+    scanned, boot, panicked = scan_console_growth(log, scanned=scanned, boot_offset=boot)
+    assert boot == len(first)
+    assert panicked is False
+
+
+def test_scan_growth_panic_before_a_banner_in_the_same_chunk_does_not_count(tmp_path):
+    log = _write(tmp_path, "s.serial.log", "")
+    with log.open("a") as f:
+        f.write(BANNER + PANIC + BANNER + "fresh\n")
+    scanned, boot, panicked = scan_console_growth(log, scanned=0, boot_offset=0)
+    assert boot == len(BANNER + PANIC)
+    assert panicked is False
+
+
+def test_scan_growth_rescans_a_log_that_shrank(tmp_path):
+    log = _write(tmp_path, "t.serial.log", BANNER + "a\nb\nc\n")
+    scanned, boot, _ = scan_console_growth(log, scanned=0, boot_offset=0)
+    log.write_text(BANNER + PANIC)
+    scanned, boot, panicked = scan_console_growth(log, scanned=scanned, boot_offset=boot)
+    assert panicked is True
+    assert scanned == serial_log_offset(log)
+
+
+def test_scan_growth_missing_log_is_inert(tmp_path):
+    assert scan_console_growth(tmp_path / "nope.log", scanned=7, boot_offset=3) == (7, 3, False)

@@ -12,7 +12,17 @@ overlay. That overlay **is a qcow2** (QEMU creates it under `/var/tmp/vl.*`), so
 HMP `savevm`/`loadvm` checkpoints work with the default `raw` base and the
 default user/slirp NIC — verified on QEMU 8.2.2: `snapshot save` ≈2.5 s,
 `load` 1–4 s, state rewound, no slirp warning. The base image is never
-modified, and the checkpoints disappear when the QEMU process exits.
+modified. The overlay is discarded when the QEMU process exits, taking the
+checkpoints **and every guest disk write of the session** with it: after
+`kill` + relaunch the guest starts from the pristine image (a file written
+before the kill is gone). Rewind (`load` + first `exec`, ≈1.6 s) versus
+relaunch (`kill` + `launch` + first `exec`, ≈7 s) is the comparison that
+matters; both discard disk state, only the rewind keeps the checkpoint.
+
+`snapshot list` JSON is `snapshots: [{id, tag, vm_size, date, time,
+vm_clock}]` straight from HMP `info snapshots`; `vm_size` (e.g. `820 MiB`
+for a 4 G guest) is the RAM image each checkpoint stores in the overlay
+under `/var/tmp` — the cost of a `save` on a shared host.
 
 ## Durable internal snapshots
 
@@ -55,8 +65,10 @@ A `load` whose HMP `loadvm` fails (typo'd name, incompatible device state)
 **resumes the guest** instead of leaving it silently paused (`resumed: true`
 in JSON; `guest_paused: true` with a `qmu cont` hint if the resume itself
 failed). HMP error replies on `save`/`load`/`delete` are failures — exit 1,
-`ok:false` with `error`/`error_type: "SnapshotError"` — and `save` confirms
-the tag in `info snapshots` before reporting success.
+`ok:false` with `error`, `error_type: "SnapshotError"` and `hint` (`qmu
+snapshot list --vm X`) — and `save` confirms the tag in `info snapshots`
+before reporting success. The success envelope of `load` is `{ok, message,
+name}`; it carries no `resumed`/`ssh` key.
 
 ## Debugger interaction
 

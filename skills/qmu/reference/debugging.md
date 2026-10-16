@@ -11,17 +11,17 @@ Explicit attach → continue → discover base → manual rebase → arm → res
 trigger → wait. qmu never resumes, re-halts, or rebases for you.
 
 ```bash
-eval "$(tools/kbuild.sh --version 7.0 --arch x86_64)"
+KERNEL=./bzImage VMLINUX=./vmlinux                # the paired kernel + unstripped ELF (kbuild outputs)
 qmu launch --kernel "$KERNEL" --gdb --name debug-vm --no-replace
 qmu gdb --vm debug-vm --symbols "$VMLINUX"      # spawns a pry bridge; vCPU is now HALTED
 qmu cont --vm debug-vm                          # resume so SSH (and kbase) work
-eval "$(qmu kbase --vm debug-vm --symbols "$VMLINUX")"   # KBASE, LINK_BASE, SLIDE
-pry load "$VMLINUX" --base "$KBASE"             # first pry touch after qmu cont: HALTS again
-pry break set __x64_sys_newuname                # trigger-specific canary (see below)
-pry continue --background                       # REQUIRED before any qmu exec
-qmu exec --vm debug-vm "uname -r"               # trigger
-pry wait --timeout 10                           # blocks until the stop; the reliable primitive
-pry backtrace
+eval "$(qmu kbase --vm debug-vm --symbols "$VMLINUX")"   # KBASE, LINK_BASE, SLIDE — SSH + kallsyms only
+pry --instance qmu-debug-vm load "$VMLINUX" --base "$KBASE"   # first pry touch after qmu cont: HALTS again
+pry --instance qmu-debug-vm break set __x64_sys_newuname      # trigger-specific canary (see below)
+pry --instance qmu-debug-vm continue --background             # REQUIRED before any qmu exec
+qmu exec --vm debug-vm "uname -r"               # trigger; returns in ~1 s with guest_state: paused once the bp fires
+pry --instance qmu-debug-vm wait --timeout 10   # blocks until the stop; the reliable primitive
+pry --instance qmu-debug-vm backtrace
 ```
 
 `qmu kbase`'s stdout is eval-safe: it prints `KEY=value` lines or nothing, and
@@ -39,17 +39,18 @@ never discovers a runtime base during `gdb` and never passes `--base` to pry.
 The payload also carries `kvm` (recorded at launch) and, under KVM, a
 `kvm_watchpoint_warning` (see the watchpoint row below), plus the spawned
 bridge as `bridge_pid`. `qmu gdb` against a VM that already has an attached
-client fails fast with exit 1 naming that client (`pry kill --instance <pid>`
-to detach it) and spawns nothing.
+client fails fast with exit 1 naming that client (`pry kill --instance
+qmu-<vm>` or `<pid>` to detach it) and spawns nothing.
 
 **`qmu kbase --vm NAME --symbols VMLINUX`** reads local ELF `_text` (via
 `nm`/`llvm-nm`) and runtime `_text` (via guest `/proc/kallsyms`), then prints
 eval-able `KBASE`, `LINK_BASE`, and `SLIDE` (JSON/NDJSON use the same values as
-hex-string fields). It requires normal guest SSH. It **does not** issue QMP
-`cont`, resume/re-halt the guest, invoke pry, or apply a symbol base.
-Operational errors (exit 1) include: harness/no-SSH instances, unsupported or
-legacy (`arch=None`) architecture metadata, restricted kallsyms
-(`kptr_restrict`), missing symbols/tools, missing `_text`, and a
+hex-string fields). It needs **only** normal guest SSH and readable kallsyms —
+not `--gdb`, not a stub, not a pry bridge; it works on a plain VM. It **does
+not** issue QMP `cont`, resume/re-halt the guest, invoke pry, or apply a
+symbol base. Operational errors (exit 1) include: harness/no-SSH instances,
+unsupported or legacy (`arch=None`) architecture metadata, restricted
+kallsyms (`kptr_restrict`), missing symbols/tools, missing `_text`, and a
 paused/debugger-stopped guest (returned immediately with `qmu cont`/`pry
 continue` guidance). On arm64 pass `KBASE` as-is: pry keys the slide to
 `_text`, so `KBASE` is the right base there too (details and the `_stext`
@@ -76,12 +77,22 @@ anti-pattern in `skill://qmu/reference/cross-arch.md`).
   `running:false` state (`paused`, `debug`, `restore-vm`, `prelaunch`, …)
   fails in ~0.1 s with exit 1, `guest_state:"paused"`, `qemu_status`,
   `ssh_error:false`, `crash_detected:false` and a `qmu cont` / `pry continue`
-  hint; text mode prints `[qmu] Error: VM 'X' is paused (vCPU halted).` on
-  stderr. A breakpoint that fires **during** a command drops the SSH
-  transport; qmu re-probes QMP and reports the same paused envelope (exit 1,
+  hint; text mode prints `[qmu] Error: VM 'X' is debug (vCPU halted).` on
+  stderr (the word is QEMU's status name: `debug` for a breakpoint stop,
+  `paused` after `qmu gdb`/`stop`). A breakpoint that fires **during**
+  `exec`/`compile --run`/`dmesg` is caught by the same QMP watch within ~1 s:
+  the command aborts and reports the identical paused envelope (exit 1,
   `exit_code:null`, text `SSH connection lost while running: <cmd>` plus the
-  paused lines), never exit 4 "VM may be unreachable". `pry wait` then shows
-  the stop.
+  paused lines), never exit 4 "VM may be unreachable" and never after the SSH
+  keepalive. `pry wait` then shows the stop.
+- **qmu's own SSH probe runs `uname`.** `status`/`list`/`launch` readiness
+  probes execute `uname` in the guest, so a `__x64_sys_newuname` breakpoint
+  fires on a `qmu status` with no trigger of yours. `status`/`list` therefore
+  skip the probe while a gdb client is attached (`ssh: "skipped (debugger
+  attached)"`); with no client attached (bridge torn down, breakpoints baked
+  into a snapshot) the
+  probe runs and can trip the canary — read `pry status`, not `guest_detail`,
+  when a `uname` stop appears that you did not send.
 - **Choose a trigger-specific canary.** `commit_creds` fires on every `execve`
   in the guest, so it is hit by unrelated guest activity before your trigger
   connects and your own `qmu exec` is then refused with `is debug`. Use the
@@ -104,6 +115,9 @@ anti-pattern in `skill://qmu/reference/cross-arch.md`).
 - `pry interrupt` answers `not interrupted (inferior is stopped)` when the
   target is already at a stop; that reply is trustworthy where `pry status`
   may not be.
+- pry cannot see a kernel panic: the bridge reports `running` while the guest
+  sits in the panic loop. `qmu status --vm X` (`guest: "panicked"`) is the
+  authority.
 
 ## Bridge lifecycle on a shared host
 
@@ -112,27 +126,32 @@ Each `qmu gdb` spawns a pry bridge (a gdb process) that outlives the VM.
 bare `pry` command with more than one alive errors with `Multiple bridge
 instances running (pids: A, B). Use --instance <pid>`.
 
+- **Address your bridge by name.** `qmu gdb`'s payload carries
+  `bridge_instance_id: "qmu-<vm>"` next to `bridge_pid`; `pry --instance
+  qmu-<vm> …` is stable across a kill/relaunch cycle where the pid is not.
+  Another agent's `pry launch` mid-flow otherwise turns every bare `pry`
+  command of yours into the multiple-instances error. `pry doctor` does not
+  show which port a bridge is on, so with several unnamed bridges `ss -tnp |
+  grep :<gdb_port>` is the fallback.
 - **After `qmu kill` + relaunch**, `qmu kill` reaps the bridge that `qmu gdb`
-  spawned for that VM (recorded as `bridge_pid`; `bridge_reaped` in kill's
-  JSON). A bridge you started by hand still points at the dead stub; qmu
-  prints a stderr note at `kill` time when such a client was attached.
-  Recovery: `pry doctor` → `pry --instance <pid> status` (the stale one reports
-  `exited (code 0)`, the live one `stopped`/`running`) → `pry kill --instance
+  spawned for that VM (`bridge_reaped: true` in kill's JSON; `false` when
+  there was nothing to reap or the bridge was hand-started). A bridge you
+  started by hand (`pry launch --connect`) still points at the dead stub;
+  qmu prints a stderr note at `kill` time when such a client was attached.
+  Recovery: `pry doctor` → `pry --instance <id> status` (the stale one fails
+  with `RuntimeError: Remote target disappeared without an exit code or
+  termination signal; reconnect before inspecting or resuming the target`,
+  exit 1; the live one reports `stopped`/`running`) → `pry kill --instance
   <stale>`.
-- **On a shared host always address your bridge explicitly** with
-  `pry --instance <pid> …` — another agent's `pry launch` mid-flow otherwise
-  turns every bare `pry` command of yours into the multiple-instances error.
-  Take the pid from `qmu gdb`'s payload (`bridge_pid`) or from
-  `pry doctor`; `pry doctor` does not show which port a bridge is on, so with
-  several bridges `ss -tnp | grep :<gdb_port>` is the fallback.
 - **`pry kill` (clean) detaches and QEMU resumes the vCPU** — the VM is left
   `serving`, not paused. An **unclean** bridge death (`kill -9`, a crash)
   does not detach, and the vCPU stays halted: `qmu status` then shows
   `Guest: paused` with no reason and `pry doctor` lists nothing. `qmu cont
   --vm <id>` resumes it.
 - **Reconnect after a bridge death** with `pry launch --connect
-  localhost:<gdb_port>` (the port is in `qmu status`); that attach halts the
-  guest again, so finish with `pry continue`.
+  localhost:<gdb_port> --symbols "$VMLINUX" --instance-id <name>` (the port
+  is in `qmu status`); that attach halts the guest again, so finish with
+  `pry continue`.
 
 ## Hardware watchpoints
 
@@ -158,7 +177,7 @@ breakpoint.**
 
 | You run | What silently breaks | Recover |
 |---|---|---|
-| `qmu snapshot load` | Idle register/memory reads keep the **pre-load** view; breakpoint/memory bookkeeping is stale. (Stop *events* still arrive: a breakpoint armed before the load fires again after it and `pry wait` reports the fresh stop.) The bridge survives the rewind. | Do not trust a read taken before the load; `pry interrupt` then re-inspect, and re-arm anything you deleted. If you tear the bridge down, reconnect with `pry launch --connect` rather than a second `qmu gdb`. |
+| `qmu snapshot load` | The bridge's connection survives the rewind but its view is the **pre-load** vCPU state (stale `$rip`/stop reason) and stale breakpoint/memory bookkeeping, presented as current. The stderr warning says exactly this. | Do what the warning says: tear the stale bridge down first (`pry kill --instance qmu-<vm>`), then reconnect with `pry launch --connect localhost:<gdb_port> --symbols "$VMLINUX" --instance-id qmu-<vm>` — **not** a second `qmu gdb`, which would spawn a second bridge against the same stub — and re-arm every breakpoint before trusting a register or memory read. |
 | `qmu snapshot save` (breakpoints armed) | Software breakpoints are `int3` (`0xCC`) bytes; the save **bakes them into the image**. A later `load` + run traps at that address with no live breakpoint → `Oops: int3` at the breakpointed symbol, `Kernel panic - not syncing: Fatal exception in interrupt` — mimicking your PoC crashing the kernel (reproduced live). | Clear breakpoints before saving a clean image; treat a post-load `int3` crash at a breakpointed function as a debugger artifact, not an exploit result. |
 | `qmu qmp system_reset` / `qmu monitor system_reset` (or a guest reboot) | The gdbstub's breakpoint/watchpoint set is **dropped**; the client still lists them `[enabled]` but they never fire again (`hits=0`). **KASLR re-slides on the reboot**, so the symbols loaded in pry are wrong too — re-arming by symbol name without reloading lands on the old address, silently (`hits=0`, no error). | `qmu kbase` again → `pry load "$VMLINUX" --base "$KBASE"` again → then re-set every breakpoint; confirm with a canary you can prove is hit. |
 | A **hardware watchpoint** doesn't fire on a write you can prove happened | Wrong virtual address (alias), see above. | Watch the VA the write goes through; `--no-kvm` only to rule out a KVM guest-debug limitation. |

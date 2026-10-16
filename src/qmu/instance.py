@@ -4,6 +4,7 @@ import json
 import math
 import os
 import stat
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, fields, replace
@@ -446,7 +447,57 @@ def remove_instance(vm_id: str, *, keep_logs: bool = False) -> None:
         qemu_log_path(vm_id).unlink(missing_ok=True)
 
 
+# The auto-selection a running command made, consumed by the output layer so
+# the JSON envelope can carry `autoselected: true` without every handler
+# plumbing it. Per-dispatch state: `cli.main` resets it through
+# `reset_autoselection()` before each command.
+_autoselected_vm: str | None = None
+
+
+def reset_autoselection() -> None:
+    global _autoselected_vm
+    _autoselected_vm = None
+
+
+def autoselected_vm() -> str | None:
+    """The vm_id this dispatch auto-selected, or None when `--vm` named one."""
+    return _autoselected_vm
+
+
+def _require_vm_env_set() -> bool:
+    return os.environ.get("QMU_REQUIRE_VM", "") not in ("", "0")
+
+
+def _autoselect(inst: VMInstance, *, running: bool) -> VMInstance:
+    """Record and disclose a pick the caller did not make.
+
+    Never silent: on a shared host a vm-less `qmu exec`/`kill`/`log` acting
+    on "the only running VM" acts on whatever VM happens to be alive, which
+    may be a peer's. The note goes to stderr so stdout stays the command's
+    own payload; JSON readers get `autoselected: true` from the output layer.
+    """
+    global _autoselected_vm
+    _autoselected_vm = inst.vm_id
+    which = "only running VM" if running else "only VM (stopped)"
+    sys.stderr.write(
+        f"[qmu] Auto-selected the {which} '{inst.vm_id}' (pass --vm to pin it).\n"
+    )
+    return inst
+
+
+def _refuse_autoselect_if_required() -> None:
+    """`QMU_REQUIRE_VM=1` turns auto-selection into an error (exit 1).
+
+    For agents sharing a host: the opt-out that makes a forgotten `--vm` a
+    refusal instead of an action on a VM that may belong to someone else.
+    """
+    if _require_vm_env_set():
+        raise QMUError("--vm is required: QMU_REQUIRE_VM is set")
+
+
 def choose_instance(vm_id: str | None = None) -> VMInstance:
+    if vm_id is None:
+        _refuse_autoselect_if_required()
     instances = list_instances()
     if not instances:
         raise QMUError("No running VMs. Start one with: qmu launch --kernel <bzImage>")
@@ -468,7 +519,7 @@ def choose_instance(vm_id: str | None = None) -> VMInstance:
         )
 
     if len(instances) == 1:
-        return instances[0]
+        return _autoselect(instances[0], running=True)
 
     lines = [f"Multiple VMs running. Specify one with --vm <id>:"]
     for inst in instances:
@@ -481,6 +532,8 @@ def choose_instance(vm_id: str | None = None) -> VMInstance:
 
 def find_instance(vm_id: str | None = None) -> VMInstance:
     """Locate a VM whether it's running or stopped. Used by read-only commands."""
+    if vm_id is None:
+        _refuse_autoselect_if_required()
     running = list_instances()
     stopped = list_stopped_instances()
 
@@ -498,7 +551,7 @@ def find_instance(vm_id: str | None = None) -> VMInstance:
     if not candidates:
         raise QMUError("No VMs found. Start one with: qmu launch --kernel <bzImage>")
     if len(candidates) == 1:
-        return candidates[0]
+        return _autoselect(candidates[0], running=bool(running))
 
     # Exactly one VM is running: that is the obvious intent, and it is what
     # `choose_instance` (status/exec/kill) already does. Without this tie-break
@@ -508,11 +561,8 @@ def find_instance(vm_id: str | None = None) -> VMInstance:
     # commands auto-select it", and for these two that was false as soon as a
     # single stopped remnant existed. Reading a stopped VM's log still works
     # via an explicit --vm, so nothing that f792840 fixed is regressed.
-    #
-    # The caller is expected to disclose the pick (see autoselect_note): a
-    # SILENT auto-select is how an agent reads the wrong VM's log after a kill.
     if len(running) == 1:
-        return running[0]
+        return _autoselect(running[0], running=True)
 
     raise QMUError(ambiguous_vm_message(running, stopped))
 
@@ -538,28 +588,15 @@ def ambiguous_vm_message(
             f"  ... and {withheld} more stopped VM(s) — see `qmu list`."
         )
     if stopped:
+        # Never recommend `prune --all`: on a shared host the stopped VMs
+        # listed here include other people's, and the hint was followed.
+        example = shown[0].vm_id
         lines.append(
             "Stopped VMs count as candidates so their logs stay readable. "
-            "Clear them with `qmu prune --all` (preview: `--dry-run`)."
+            "Remove a stopped VM's state with `qmu prune --vm <id>`, e.g. "
+            f"`qmu prune --vm {example}`."
         )
     return "\n".join(lines)
-
-
-def autoselect_note(inst: VMInstance, vm_id: str | None) -> str | None:
-    """Describe an auto-selection, when one actually happened and was ambiguous.
-
-    Returned so handlers can disclose it. None when the caller named a VM, or
-    when there was only ever one candidate (nothing to disclose).
-    """
-    if vm_id is not None:
-        return None
-    others = len(list_instances()) + len(list_stopped_instances()) - 1
-    if others <= 0:
-        return None
-    return (
-        f"Auto-selected the only running VM '{inst.vm_id}' "
-        f"({others} other VM(s) exist; use --vm <id> to pick one)."
-    )
 
 
 def find_orphan_qemus() -> list[dict[str, Any]]:

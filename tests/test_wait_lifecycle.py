@@ -197,9 +197,13 @@ def test_wait_returns_when_the_recorded_process_exits(
     assert payload["ok"] is True
     assert payload["stopped"] is True
     assert payload["reason"] == "process_exited"
-    assert payload["guest"] == "unknown"
+    # No process, no guest axis: `unknown` read as a probe that failed.
+    assert payload["guest"] is None
     assert payload["crash"] is None
     assert payload["cleaned"] is True
+    # The run's own evidence rides along, because the auto-clean just
+    # removed the log it came from (r2-harness finding 1).
+    assert payload["console_tail"] == BOOT.rstrip("\n").splitlines()[-20:]
     assert remove_calls == ["wait-vm"]
     assert qmp.connects >= 1
 
@@ -215,8 +219,9 @@ def test_wait_reports_the_crash_of_a_process_that_exited(
 
     assert rc == 0
     assert payload["stopped"] is True
-    assert payload["guest"] == "panicked"
+    assert payload["guest"] is None
     assert "sysrq triggered crash" in payload["crash"]
+    assert payload["console_tail"][-1] == TERMINAL_PANIC.rstrip("\n").splitlines()[-1]
 
 
 def test_wait_non_harness_exit_does_not_auto_clean(monkeypatch, capsys, tmp_path):
@@ -284,9 +289,27 @@ def test_wait_process_exit_text_is_terminal(monkeypatch, capsys, tmp_path):
 
     assert rc == 0
     assert "VM 'wait-vm' stopped (process_exited" in captured.out
-    assert "Guest: panicked" in captured.out
+    assert "Guest:" not in captured.out
     assert "Crash from serial log:\n" in captured.out
+    # The crash IS the evidence; the tail would only repeat it.
+    assert "Console tail:" not in captured.out
     assert "still running" not in captured.out
+
+
+def test_wait_process_exit_text_shows_the_console_tail(
+    monkeypatch, capsys, tmp_path
+):
+    """A harness that printed its marker and powered off: the marker is the
+    result, and text mode must show it without a second `qmu log`."""
+    rc, _, captured, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        alive=[False], fmt="text", serial=BOOT + "=== HARNESS DONE ===\n",
+    )
+
+    assert rc == 0
+    assert "Console tail:" in captured.out
+    assert "  === HARNESS DONE ===" in captured.out
+    assert "Instance metadata cleaned up" in captured.out
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +463,9 @@ def test_wait_busy_timeout_reports_the_unobserved_status(
     )
 
     assert rc == 124
-    assert "QMP: busy (held by another client)" in captured.out
+    assert "QMP: busy (held by another client" in captured.out
+    # Names the likely holder, as the `status` busy classification does.
+    assert "another qmu command such as `wait`/`status`, or a debugger bridge" in captured.out
     assert "still running" in captured.out
 
 
@@ -687,7 +712,7 @@ def test_wait_reboot_scopes_the_exit_crash_to_the_new_boot(
     assert payload["reason"] == "process_exited"
     assert payload["last_event"] == "RESET"
     assert payload["crash"] is None
-    assert payload["guest"] == "unknown"
+    assert payload["guest"] is None
 
 
 def test_wait_reset_persistence_failure_prevents_live_result(
@@ -768,10 +793,11 @@ def test_wait_on_an_already_stopped_vm_is_a_finished_wait(
     assert payload["ok"] is True
     assert payload["stopped"] is True
     assert payload["reason"] == "already_stopped"
-    assert payload["guest"] == "unknown"
+    assert payload["guest"] is None
     assert payload["crash"] is None
     assert payload["cleaned"] is False
     assert payload["elapsed"] == 0.0
+    assert payload["console_tail"][-1] == "done"
 
 
 def test_wait_on_an_already_stopped_vm_reports_its_last_boot_crash(
@@ -785,9 +811,11 @@ def test_wait_on_an_already_stopped_vm_reports_its_last_boot_crash(
 
     assert rc == 0
     assert payload["reason"] == "already_stopped"
-    assert payload["guest"] == "panicked"
+    assert payload["guest"] is None
     assert "sysrq triggered crash" in payload["crash"]
     assert "old_warning" not in payload["crash"]
+    # The tail is scoped to the last boot like the crash is.
+    assert not any("old_warning" in line for line in payload["console_tail"])
 
 
 @pytest.mark.parametrize("no_clean", [False, True])

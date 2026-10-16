@@ -529,7 +529,7 @@ def test_valid_project_config_keeps_status_working(
         '[machine]\nmemory = "2G"\n[boot]\nkernel = "bzImage"\n'
     )
 
-    rc = cli.main(["--format", "json", "status"])
+    rc = cli.main(["--format", "json", "status", "--vm", "live"])
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 

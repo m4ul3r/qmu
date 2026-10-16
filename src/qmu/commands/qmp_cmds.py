@@ -113,6 +113,30 @@ def _drop_ssh_master(inst: VMInstance) -> None:
 _SNAPSHOT_ERROR_TYPE = "SnapshotError"
 
 
+def _snapshot_failure_hint(name: str, vm_id: str, reason: str | None) -> str:
+    """The machine-readable fix for a failed snapshot op (envelope `hint`).
+
+    The skill's exit-code table tells agents to "read the `hint`" on exit 1,
+    and `SnapshotError` was the one error envelope without one: a typo'd tag
+    said only `does not exist in one or more devices` (HMP wording) and left
+    the reader to guess that `qmu snapshot list` is the next command.
+    """
+    if reason == "missing":
+        return (
+            f"Snapshot '{name}' is not in the image of VM '{vm_id}'. "
+            f"List what exists: qmu snapshot list --vm {vm_id}"
+        )
+    if reason == "bad_name":
+        return (
+            "HMP parses the snapshot name as one token: it cannot contain "
+            f"whitespace. Use e.g. '{'-'.join(name.split())}'."
+        )
+    return (
+        f"Inspect the image's snapshot table with: qmu monitor "
+        f"'info snapshots' --vm {vm_id}"
+    )
+
+
 def _emit_snapshot_result(
     args: argparse.Namespace,
     op: str,
@@ -120,9 +144,10 @@ def _emit_snapshot_result(
     result: SnapshotResult,
 ) -> int:
     """Render one snapshot outcome. A failure carries `error` + `error_type`
-    like every other error envelope (not a bare `message`), and in text mode
-    goes to stderr under the `[qmu] Error:` prefix the skill promises, so an
-    `eval "$(...)"`-style consumer never executes prose."""
+    like every other error envelope (not a bare `message`) plus a `hint`
+    naming the fix, and in text mode goes to stderr under the `[qmu] Error:`
+    prefix the skill promises, so an `eval "$(...)"`-style consumer never
+    executes prose."""
     stem = f"snapshot-{op}"
     if result.ok:
         _emit(
@@ -133,32 +158,35 @@ def _emit_snapshot_result(
         )
         return 0
     error = f"snapshot {op} failed: {result.message}"
-    data: dict[str, object] = {
-        "ok": False,
-        "error": error,
-        "error_type": _SNAPSHOT_ERROR_TYPE,
-        "name": args.name,
-    }
+    hint = _snapshot_failure_hint(args.name, inst.vm_id, result.reason)
     notes: list[str] = []
     if op == "load":
-        data["resumed"] = result.resumed
-        data["guest_paused"] = result.guest_paused
         if result.resumed:
             notes.append(
                 "loadvm paused the guest before failing; qmu resumed it "
                 "(resumed: true)."
             )
         elif result.guest_paused:
+            # The stuck pause is the more urgent fix; it leads the hint.
             hint = (
                 "loadvm left the guest paused and qmu could not resume it. "
-                f"Resume with: qmu cont --vm {inst.vm_id}"
+                f"Resume with: qmu cont --vm {inst.vm_id}. Then: {hint}"
             )
-            data["hint"] = hint
-            notes.append(hint)
+    data: dict[str, object] = {
+        "ok": False,
+        "error": error,
+        "error_type": _SNAPSHOT_ERROR_TYPE,
+        "name": args.name,
+        "hint": hint,
+    }
+    if op == "load":
+        data["resumed"] = result.resumed
+        data["guest_paused"] = result.guest_paused
     if getattr(args, "format", "text") == "text":
         sys.stderr.write(f"[qmu] Error: {error}\n")
         for note in notes:
             sys.stderr.write(f"[qmu] {note}\n")
+        sys.stderr.write(f"[qmu] {hint}\n")
     else:
         _emit(args, data=data, text=error, stem=stem)
     return 1
@@ -174,13 +202,7 @@ def _handle_snapshot_save(args: argparse.Namespace) -> int:
         result = save_snapshot(qmp, args.name)
     rc = _emit_snapshot_result(args, "save", inst, result)
     if rc != 0:
-        if "extraneous characters" in result.message:
-            sys.stderr.write(
-                "[qmu] HMP parses the snapshot name as one token: it cannot "
-                "contain whitespace. Use e.g. "
-                f"'{'-'.join(args.name.split())}'.\n"
-            )
-        else:
+        if result.reason != "bad_name":
             sys.stderr.write(
                 "[qmu] qmu's implicit rootfs uses a temporary snapshot=on overlay; "
                 "that overlay can hold in-session checkpoints with a raw or qcow2 base, "

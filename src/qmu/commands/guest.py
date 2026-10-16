@@ -29,7 +29,6 @@ from ..hostcc import host_compile, resolve_host_cc
 from ..instance import (
     QMUError,
     VMInstance,
-    autoselect_note,
     choose_instance,
     find_instance,
 )
@@ -137,6 +136,33 @@ def _emit_transfer_transport_lost(
     return status
 
 
+def _emit_transfer_halted(
+    args: argparse.Namespace,
+    inst: VMInstance,
+    start_offset: int,
+    *,
+    operation: str,
+    stem: str,
+) -> int | None:
+    """Emit the paused envelope when a lost transfer is explained by a halted
+    vCPU (the watcher aborted it, or ssh gave up on a stopped guest). Returns
+    the exit status (1), or None when the vCPU runs and the transport
+    classification applies.
+    """
+    qemu_status = _halted_not_panicked(inst, start_offset=start_offset)
+    if qemu_status is None:
+        return None
+    data, text = _stopped_guest_payload(inst, qemu_status)
+    data["operation"] = operation
+    _emit(
+        args,
+        data=data,
+        text=[f"SSH connection lost during {operation}.", *text],
+        stem=stem,
+    )
+    return 1
+
+
 class _DeliveryTransportLost(SSHError):
     """A confirmed transport loss while delivering a host-built binary.
 
@@ -175,8 +201,17 @@ def _handle_push(args: argparse.Namespace) -> int:
     ssh = _make_ssh(inst)
     start_offset = serial_log_offset(inst.serial_log)
     try:
-        ssh.push(args.local, args.remote)
+        ssh.push(
+            args.local,
+            args.remote,
+            abort_when=_guest_abort_watcher(inst, start_offset=start_offset),
+        )
     except SSHError as exc:
+        halted = _emit_transfer_halted(
+            args, inst, start_offset, operation="push", stem="push"
+        )
+        if halted is not None:
+            return halted
         if exc.returncode is None or not is_transport_failure(
             exc.returncode, exc.stderr
         ):
@@ -214,8 +249,17 @@ def _handle_pull(args: argparse.Namespace) -> int:
     ssh = _make_ssh(inst)
     start_offset = serial_log_offset(inst.serial_log)
     try:
-        ssh.pull(args.remote, args.local)
+        ssh.pull(
+            args.remote,
+            args.local,
+            abort_when=_guest_abort_watcher(inst, start_offset=start_offset),
+        )
     except SSHError as exc:
+        halted = _emit_transfer_halted(
+            args, inst, start_offset, operation="pull", stem="pull"
+        )
+        if halted is not None:
+            return halted
         if exc.returncode is None or not is_transport_failure(
             exc.returncode, exc.stderr
         ):
@@ -398,6 +442,49 @@ def _explain_lost_transport(
     return None
 
 
+def _guest_abort_watcher(
+    inst: VMInstance, *, start_offset: int, qmp_interval: float = 1.0
+):
+    """The `abort_when` predicate for a guest command: panic OR halted vCPU.
+
+    Every poll reads the serial log for a terminal panic appended since
+    `start_offset` (cheap, ~100 ms behind reality). About once per
+    `qmp_interval` it also asks QMP `query-status`: a breakpoint that fires
+    mid-command halts the vCPU without a byte of serial output, and ssh only
+    notices after its keepalive window plus the liveness re-probes (measured
+    20 s for `exec uname -r` against an armed `__x64_sys_newuname`). QMP is
+    best-effort — a busy or missing socket is treated as "still running" so
+    the watcher can never turn a working guest command into an outage — and
+    the stop it detects is re-read by :func:`_explain_lost_transport`, which
+    renders the same paused envelope the preflight uses.
+    """
+    next_qmp = time.monotonic() + qmp_interval
+
+    def aborted() -> bool:
+        nonlocal next_qmp
+        if has_terminal_panic(inst.serial_log, start_offset=start_offset):
+            return True
+        now = time.monotonic()
+        if now < next_qmp:
+            return False
+        next_qmp = now + qmp_interval
+        return _qmp_stopped_status(inst) is not None
+
+    return aborted
+
+
+def _halted_not_panicked(inst: VMInstance, *, start_offset: int) -> str | None:
+    """QEMU's status when a lost command is explained by a halted vCPU.
+
+    None when the serial log holds a terminal panic since `start_offset`
+    (QEMU reports a panicked guest as running, and the panic is the better
+    explanation when both show) or when QMP says the guest runs.
+    """
+    if has_terminal_panic(inst.serial_log, start_offset=start_offset):
+        return None
+    return _qmp_stopped_status(inst)
+
+
 def _emit_ssh_lost(
     args: argparse.Namespace,
     command: str,
@@ -504,19 +591,17 @@ def _run_guest_command(
     `[exit code: N]` trailer, a survived kernel report) — see
     :func:`_emit_guest_result`.
 
-    The ssh child is watched against the serial log: a terminal panic
-    appended after the command started kills it immediately instead of
-    waiting the keepalive window (15 s) plus the liveness re-probes for ssh to
-    report the loss itself (measured 20–50 s for a sysrq crash the serial log
-    showed within 100 ms).
+    The ssh child is watched by :func:`_guest_abort_watcher`: a terminal
+    panic appended after the command started, or a vCPU QMP reports halted,
+    kills it immediately instead of waiting the keepalive window (15 s) plus
+    the liveness re-probes for ssh to report the loss itself (measured 20–50 s
+    for a sysrq crash the serial log showed within 100 ms).
     """
     command_start_offset = serial_log_offset(inst.serial_log)
-
-    def panicked() -> bool:
-        return has_terminal_panic(inst.serial_log, start_offset=command_start_offset)
+    watcher = _guest_abort_watcher(inst, start_offset=command_start_offset)
 
     try:
-        rc, stdout, stderr = ssh.run(command, timeout=timeout, abort_when=panicked)
+        rc, stdout, stderr = ssh.run(command, timeout=timeout, abort_when=watcher)
     except SSHError as exc:
         # qmu stopped the child: the watcher saw a panic, or --timeout expired.
         # The latter is NOT by itself a crash: a guest that still answers SSH
@@ -673,6 +758,8 @@ def _compile_on_host(
     happened; ``compiled_on`` records which path ran.
     """
     cc = resolve_host_cc(inst.arch, args.cc)
+    # Delivery is watched like every other guest session (panic or halted vCPU).
+    watcher = _guest_abort_watcher(inst, start_offset=serial_log_offset(inst.serial_log))
     with tempfile.TemporaryDirectory(prefix="qmu-compile-") as tmpdir:
         local_bin = Path(tmpdir) / source.stem
         rc, stdout, stderr, argv = host_compile(
@@ -697,13 +784,15 @@ def _compile_on_host(
         if rc != 0:
             return rc, result
 
-        ssh.push(str(local_bin), remote_bin)
+        ssh.push(str(local_bin), remote_bin, abort_when=watcher)
 
     # scp does not preserve the mode (no -p in SSHClient._scp_base), so the
     # pushed binary lands non-executable and --run would fail with a bare
     # "Permission denied" that reads like a guest problem. chmod is part of
     # delivering a *runnable* artifact, so its failure is a compile failure.
-    chmod_rc, _, chmod_err = ssh.run(f"chmod +x {shlex.quote(remote_bin)}", timeout=15)
+    chmod_rc, _, chmod_err = ssh.run(
+        f"chmod +x {shlex.quote(remote_bin)}", timeout=15, abort_when=watcher
+    )
     # ...unless the guest vanished under it. rc=255 is both a legal exit code and
     # what ssh returns when a panic drops the transport, so confirm with the same
     # liveness probe exec uses and hand the caller the transport-loss path:
@@ -742,6 +831,12 @@ def _handle_compile(args: argparse.Namespace) -> int:
         try:
             rc, result = _compile_on_host(args, inst, ssh, source, remote_bin)
         except SSHError as exc:
+            # A halted vCPU (breakpoint under scp/chmod) is the paused envelope.
+            halted = _emit_transfer_halted(
+                args, inst, delivery_offset, operation="push", stem="compile"
+            )
+            if halted is not None:
+                return halted
             # Delivering the host-built binary lost the transport. Classify it
             # exactly as push/pull do — a fresh crash report is the only thing
             # that justifies the kernel-crash class (3); otherwise the guest is
@@ -769,8 +864,21 @@ def _handle_compile(args: argparse.Namespace) -> int:
                 stem="compile",
             )
     else:
-        # Push source
-        ssh.push(str(source), remote_src)
+        # Push source (watched: a halted vCPU under scp is the paused envelope).
+        push_offset = serial_log_offset(inst.serial_log)
+        try:
+            ssh.push(
+                str(source),
+                remote_src,
+                abort_when=_guest_abort_watcher(inst, start_offset=push_offset),
+            )
+        except SSHError:
+            halted = _emit_transfer_halted(
+                args, inst, push_offset, operation="push", stem="compile"
+            )
+            if halted is None:
+                raise
+            return halted
 
         # Compile. The remote paths are quoted (a source name with a space or shell
         # metacharacter must not detonate the root shell); --cflags and --cc are
@@ -779,7 +887,29 @@ def _handle_compile(args: argparse.Namespace) -> int:
             f"{args.cc or 'gcc'} {args.cflags} -o {shlex.quote(remote_bin)} "
             f"{shlex.quote(remote_src)}"
         )
-        rc, stdout, stderr = ssh.run(compile_cmd, timeout=30)
+        # Watched like the run: a breakpoint armed on a syscall the login shell
+        # makes (`uname`) halts the vCPU under gcc, and an unwatched 30 s
+        # budget then expired into a bare infra error.
+        compile_start_offset = serial_log_offset(inst.serial_log)
+        try:
+            rc, stdout, stderr = ssh.run(
+                compile_cmd,
+                timeout=30,
+                abort_when=_guest_abort_watcher(inst, start_offset=compile_start_offset),
+            )
+        except SSHError:
+            qemu_status = _halted_not_panicked(inst, start_offset=compile_start_offset)
+            if qemu_status is None:
+                raise
+            data, text = _stopped_guest_payload(inst, qemu_status)
+            data["command"] = compile_cmd
+            _emit(
+                args,
+                data=data,
+                text=[f"SSH connection lost while running: {compile_cmd}", *text],
+                stem="compile",
+            )
+            return 1
 
         result = {
             "source": str(source),
@@ -815,25 +945,36 @@ def _handle_compile(args: argparse.Namespace) -> int:
         built_by = (
             f" (host {result['compiler']})" if args.host_build else ""
         )
-        _emit(
+        # Text mode: the banner is a note (stderr), never stdout — stdout is
+        # reserved for program output on every compile path, so a redirect
+        # of `compile` with or without --run collects the same thing.
+        _emit_guest_result(
             args,
             data=result,
-            text=f"Compiled {source.name} -> {remote_bin}{built_by}",
+            text="",
+            notes=[f"Compiled {source.name} -> {remote_bin}{built_by}"],
             stem="compile",
         )
         return 0
 
     # Run (quoted: the binary path is interpolated into a root shell command)
     run_start_offset = serial_log_offset(inst.serial_log)
-
-    def panicked() -> bool:
-        return has_terminal_panic(inst.serial_log, start_offset=run_start_offset)
+    watcher = _guest_abort_watcher(inst, start_offset=run_start_offset)
+    text_mode = getattr(args, "format", "text") == "text"
+    if text_mode:
+        # The banner precedes the program's output on a terminal, and lives on
+        # stderr so `compile --run ... > out.txt` holds only what the program
+        # printed. It used to be a trailing stderr note, so it landed AFTER
+        # the output and read as a footer of the wrong stream.
+        sys.stderr.write(f"Compiled and ran {source.name}:\n")
+        sys.stderr.flush()
 
     try:
-        # Watched like `exec`: a terminal panic in the serial log stops the
-        # ssh child at once instead of after the keepalive window.
+        # Watched like `exec`: a terminal panic in the serial log, or a vCPU
+        # QMP reports halted (a breakpoint fired), stops the ssh child at once
+        # instead of after the keepalive window.
         rc, stdout, stderr = ssh.run(
-            shlex.quote(remote_bin), timeout=args.timeout, abort_when=panicked
+            shlex.quote(remote_bin), timeout=args.timeout, abort_when=watcher
         )
         # A kernel panic during the run drops the connection and ssh exits 255
         # (often with empty stderr). rc=255 is also a legal guest exit code, so
@@ -843,7 +984,11 @@ def _handle_compile(args: argparse.Namespace) -> int:
         # avoid a false positive on a busy live guest): if SSH still does not
         # answer the guest vanished — raise SSHError so the crash-extraction
         # except-block below handles it uniformly with the timeout case.
-        if rc == 255 and (panicked() or _transport_lost(ssh)):
+        if rc == 255 and (
+            has_terminal_panic(inst.serial_log, start_offset=run_start_offset)
+            or _qmp_stopped_status(inst) is not None
+            or _transport_lost(ssh)
+        ):
             raise SSHError(
                 "SSH transport lost (rc=255) — guest likely crashed",
                 stdout=stdout,
@@ -855,10 +1000,10 @@ def _handle_compile(args: argparse.Namespace) -> int:
             "run_stdout": stdout,
             "run_stderr": stderr,
         })
-        # Text mode: the program's stdout is the stdout, byte for byte; the
-        # banner, its stderr and a non-zero exit code are stderr notes — the
-        # same rule as `exec`, so `compile --run ... > out.txt` composes.
-        notes = [f"Compiled and ran {source.name}:"]
+        # Text mode: the program's stdout is the stdout, byte for byte; its
+        # stderr and a non-zero exit code are stderr notes — the same rule as
+        # `exec`.
+        notes = []
         if stderr:
             notes.append(stderr)
         if rc != 0:
@@ -867,6 +1012,26 @@ def _handle_compile(args: argparse.Namespace) -> int:
         return 0 if rc == 0 else 1
 
     except SSHError as exc:
+        # A halted vCPU (breakpoint, `qmu gdb`) explains the loss exactly and is
+        # the same paused envelope the preflight refuses with — exit 1, not the
+        # crash/transport class. A terminal panic in the serial log outranks it
+        # (QEMU reports a panicked guest as running).
+        qemu_status = _halted_not_panicked(inst, start_offset=run_start_offset)
+        if qemu_status is not None:
+            paused, text = _stopped_guest_payload(inst, qemu_status)
+            result.update(paused)
+            result.update({
+                "run_exit": None,
+                "run_stdout": exc.stdout,
+                "run_stderr": exc.stderr,
+            })
+            status, data, lines, notes = _with_guest_output(
+                (1, result, [f"SSH connection lost while running {name}.", *text]),
+                exc.stdout,
+                exc.stderr,
+            )
+            _emit_guest_result(args, data=data, text=lines, notes=notes, stem="compile")
+            return status
         crash = extract_crash(inst.serial_log, start_offset=run_start_offset)
         result.update({
             "ok": False,
@@ -934,12 +1099,10 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
         # count would otherwise be misparsed as a tail option).
         cmd = f"dmesg | tail -n {max(args.tail, 0)}"
     command_start_offset = serial_log_offset(inst.serial_log)
-
-    def panicked() -> bool:
-        return has_terminal_panic(inst.serial_log, start_offset=command_start_offset)
+    watcher = _guest_abort_watcher(inst, start_offset=command_start_offset)
 
     try:
-        rc, stdout, stderr = ssh.run(cmd, timeout=15, abort_when=panicked)
+        rc, stdout, stderr = ssh.run(cmd, timeout=15, abort_when=watcher)
     except SSHError as exc:
         # qmu stopped the child: the serial watcher saw a panic, or the 15 s
         # budget expired. The serial log / QMP explain it first (a panic
@@ -1028,7 +1191,6 @@ def _handle_crash(args: argparse.Namespace) -> int:
     # Already gated: cli.main validates the project/explicit config for every
     # non-exempt verb before dispatching (#37).
     inst = find_instance(args.vm)
-    crash_autoselect_note = autoselect_note(inst, args.vm)
     history = args.full_history
     scope = "history" if history else "current"
     # The current scope is the current BOOT — the later of the recorded epoch
@@ -1071,9 +1233,6 @@ def _handle_crash(args: argparse.Namespace) -> int:
         "serial_log": inst.serial_log,
         "crash": crash,
     }
-    if crash_autoselect_note:
-        crash_data["autoselected"] = crash_autoselect_note
-        text = f"[qmu] {crash_autoselect_note}\n{text}"
     _emit(args, data=crash_data, text=text, stem="crash")
     return 0 if detected else 1
 
@@ -1134,7 +1293,6 @@ def _handle_log(args: argparse.Namespace) -> int:
     # Already gated: cli.main validates the project/explicit config for every
     # non-exempt verb before dispatching (#37).
     inst = find_instance(args.vm)
-    note = autoselect_note(inst, args.vm)
 
     # A filtered read defaults to the WHOLE log. Applying the 50-line tail
     # first would silently scope the search to the end of the boot and report
@@ -1161,10 +1319,6 @@ def _handle_log(args: argparse.Namespace) -> int:
         "available": available,
         "empty": not available,
     }
-    # Disclose an auto-selection rather than making it silently: with several
-    # VMs on disk, "which log am I reading" is not obvious from the content.
-    if note:
-        data["autoselected"] = note
     if args.grep is not None:
         data["grep"] = args.grep
         data["matches"] = matches or 0
@@ -1180,7 +1334,5 @@ def _handle_log(args: argparse.Namespace) -> int:
     else:
         text = "Serial log is empty or missing."
 
-    if note:
-        text = f"[qmu] {note}\n{text}"
     _emit(args, data=data, text=text, stem="log")
     return 0

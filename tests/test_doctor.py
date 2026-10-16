@@ -30,6 +30,7 @@ def doctor_env(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(lifecycle, "resolve_config", lambda **kwargs: config)
     monkeypatch.setattr(lifecycle, "list_instances", lambda: [])
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
 
     skill_source = tmp_path / "skill-source" / "qmu"
     skill_source.mkdir(parents=True)
@@ -88,6 +89,7 @@ def test_doctor_supported_configured_passt_is_healthy_and_uses_selected_arch(
         "status": "ok",
         "detail": "/opt/qemu/qemu-system-aarch64",
         "blocking": False,
+        "hint": "",
     }
     assert native_check["status"] == "ok"
     assert native_check["detail"] == (
@@ -232,12 +234,14 @@ def test_doctor_user_backend_skips_native_passt_probe_and_external_requirement(
         "status": "info",
         "detail": "Not required for configured net_backend=user.",
         "blocking": False,
+        "hint": "",
     }
     assert external_check == {
         "check": "passt (net_backend=passt)",
         "status": "info",
         "detail": "Not found — not required for configured net_backend=user.",
         "blocking": False,
+        "hint": "",
     }
     probe.assert_not_called()
 
@@ -379,6 +383,7 @@ def test_doctor_reports_a_rejected_global_alongside_a_loaded_project(
         "status": "ok",
         "detail": "built-in defaults -> project: /work/qmu.toml",
         "blocking": False,
+        "hint": "",
     }
     assert broken in _check(payload, "global config")["detail"]
 
@@ -467,7 +472,7 @@ def test_doctor_passes_a_configured_kernel_that_exists(
     assert rc == 0
     assert _check(payload, "kernel") == {
         "check": "kernel", "status": "ok", "detail": str(kernel),
-        "blocking": False,
+        "blocking": False, "hint": "",
     }
     cli.main(["doctor"])
     assert f"[+] kernel: {kernel}" in capsys.readouterr().out
@@ -583,6 +588,140 @@ def test_doctor_missing_skills_are_informational_not_gating(
     assert "qmu skill install" in row["detail"]
 
 
+def test_every_doctor_row_carries_a_machine_readable_hint(
+    doctor_env, monkeypatch, capsys
+):
+    """The fix lives in `hint`, not only inside the prose `detail`."""
+    _passt_ok(monkeypatch)
+    doctor_env.config.kernel = "./bzImage"  # not found -> fail
+    doctor_env.executables["pry"] = None
+    monkeypatch.setattr(lifecycle, "skill_install_roots", lambda: [Path("/nonexistent")])
+
+    rc, payload = _run_json_doctor(capsys)
+
+    assert rc == 1
+    for row in payload["checks"]:
+        assert isinstance(row["hint"], str), row["check"]
+        if row["status"] == "ok":
+            assert row["hint"] == "", row["check"]
+        if row["status"] == "fail":
+            assert row["hint"], row["check"]
+    assert _check(payload, "kernel")["hint"] == "set [boot] kernel in qmu.toml or pass --kernel"
+    assert _check(payload, "skills")["hint"] == "qmu skill install"
+    assert _check(payload, "pry (GDB integration)")["hint"]
+
+
+def test_doctor_skills_row_is_a_count_with_paths_in_json(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    """Fifteen absolute paths on one line dominated every doctor run."""
+    _passt_ok(monkeypatch)
+    sources = []
+    roots = [tmp_path / r for r in ("claude", "codex", "agents")]
+    for name in ("qmu", "qmu-linux-kbuild", "qmu-linux-rootfs", "qmu-ubuntu-target", "firmware-over-qmu"):
+        src = tmp_path / "repo-skills" / name
+        src.mkdir(parents=True)
+        sources.append(src)
+        for root in roots:
+            root.mkdir(exist_ok=True)
+            (root / name).symlink_to(src)
+    monkeypatch.setattr(lifecycle, "all_skill_source_dirs", lambda: sources)
+    monkeypatch.setattr(lifecycle, "skill_install_roots", lambda: roots)
+
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "skills")
+    assert row["status"] == "ok"
+    assert row["summary"] == "5 skills × 3 roots installed"
+    assert row["detail"] == ", ".join(row["detail_paths"]["installed"])
+    assert len(row["detail_paths"]["installed"]) == 15
+    assert row["detail_paths"]["missing"] == []
+    assert row["detail_paths"]["stale"] == []
+
+    cli.main(["doctor"])
+    text = capsys.readouterr().out
+    skills_line = next(l for l in text.splitlines() if "] skills:" in l)
+    assert len(skills_line) <= 120
+    assert str(tmp_path) not in skills_line
+
+
+def test_doctor_skills_row_counts_missing_and_stale_links(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    src = tmp_path / "repo-skills" / "qmu"
+    src.mkdir(parents=True)
+    other = tmp_path / "old-checkout" / "qmu"
+    other.mkdir(parents=True)
+    roots = [tmp_path / "claude", tmp_path / "codex", tmp_path / "agents"]
+    for root in roots:
+        root.mkdir()
+    (roots[0] / "qmu").symlink_to(src)
+    (roots[1] / "qmu").symlink_to(other)
+    monkeypatch.setattr(lifecycle, "all_skill_source_dirs", lambda: [src])
+    monkeypatch.setattr(lifecycle, "skill_install_roots", lambda: roots)
+
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "skills")
+    assert row["status"] == "warn"
+    assert row["detail"] == (
+        "partial: 2 installed, 1 missing, 1 stale (linked to another checkout) "
+        "(run: qmu skill install)"
+    )
+    assert row["summary"] == (
+        "1 skills × 3 roots: 2 installed, 1 missing, 1 stale (linked to "
+        "another checkout) (run: qmu skill install)"
+    )
+    assert row["hint"] == "qmu skill install"
+    assert row["detail_paths"]["missing"] == [str(roots[2] / "qmu")]
+    assert row["detail_paths"]["stale"] == [str(roots[1] / "qmu")]
+
+
+def test_doctor_running_vms_counts_records_and_orphans_like_list(
+    doctor_env, monkeypatch, capsys
+):
+    """`doctor` said 0 while `list` showed a VM: orphaned QEMUs are running too."""
+    _passt_ok(monkeypatch)
+    monkeypatch.setattr(lifecycle, "list_instances", lambda: [object()])
+    monkeypatch.setattr(
+        lifecycle, "find_orphan_qemus", lambda: [{"pid": 4242, "serial_log": "/x"}],
+    )
+
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "running VMs")
+    assert row["running"] == 1 and row["orphaned"] == 1
+    assert row["detail"].startswith("1 running + 1 orphaned (no instance record) under ")
+    assert row["hint"] == "qmu prune --orphans --dry-run"
+
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "running VMs")
+    assert row["detail"].startswith("1 running under ")
+    assert row["hint"] == ""
+
+
+def test_doctor_libguestfs_honours_a_readable_supermin_kernel(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    doctor_env.executables["guestfish"] = "/usr/bin/guestfish"
+    kernel = tmp_path / "vmlinuz"
+    kernel.write_bytes(b"")
+    monkeypatch.setenv("SUPERMIN_KERNEL", str(kernel))
+
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "libguestfs (rootfs inject / launch --inject)")
+    assert row["status"] == "ok"
+    assert row["detail"] == f"/usr/bin/guestfish; SUPERMIN_KERNEL={kernel}"
+    assert row["hint"] == ""
+
+    monkeypatch.setenv("SUPERMIN_KERNEL", str(tmp_path / "absent"))
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "libguestfs (rootfs inject / launch --inject)")
+    assert row["status"] == "warn"
+    assert "is NOT readable" in row["detail"]
+    assert row["hint"] == "export SUPERMIN_KERNEL=<readable kernel image>"
+
+
 def test_doctor_key_permissions_warning_does_not_fail_the_check(
     doctor_env, monkeypatch, capsys, tmp_path
 ):
@@ -643,7 +782,7 @@ def test_doctor_adds_cross_toolchain_rows_for_a_foreign_arch(
     assert _check(payload, "cross compiler for aarch64 (compile --host)") == {
         "check": "cross compiler for aarch64 (compile --host)",
         "status": "ok", "detail": "/usr/bin/aarch64-linux-gnu-gcc",
-        "blocking": False,
+        "blocking": False, "hint": "",
     }
     assert _check(payload, "gdb-multiarch (qmu gdb / pry on a foreign arch)")["status"] == "ok"
 

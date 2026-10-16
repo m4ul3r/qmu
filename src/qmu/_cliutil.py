@@ -24,6 +24,7 @@ from .config import QMUConfig, resolve_config
 from .instance import (
     QMUError,
     VMInstance,
+    autoselected_vm,
     is_pid_alive,
     remove_instance,
 )
@@ -110,7 +111,14 @@ def _output(
     *,
     source_ok: bool | None = None,
 ) -> None:
-    """Render output with optional spilling."""
+    """Render output with optional spilling.
+
+    A dict payload emitted after an auto-selection carries `autoselected:
+    true`, so the JSON reader learns which VM the command acted on without
+    every handler plumbing the fact (the stderr note covers text mode).
+    """
+    if isinstance(value, dict) and autoselected_vm() is not None:
+        value = {**value, "autoselected": True}
     fmt = getattr(args, "format", "text")
     out = getattr(args, "out", None)
     out_path = Path(out) if out else None

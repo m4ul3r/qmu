@@ -22,7 +22,7 @@ import sys
 from typing import NoReturn
 
 from .config import reset_global_config_warnings
-from .instance import QMUError
+from .instance import QMUError, reset_autoselection
 from .output import render_value
 from .qmp import QMPError
 from .ssh import SSHError
@@ -263,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
     # warn on a broken global config; only resolve_config() calls WITHIN this
     # one dispatch (the gate below plus a handler that resolves again) dedupe.
     reset_global_config_warnings()
+    reset_autoselection()
     parser = build_parser()
     if argv is None:
         argv = sys.argv[1:]

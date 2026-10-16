@@ -65,6 +65,7 @@ from ..paths import (
     all_skill_source_dirs,
     global_config_path,
     cache_home,
+    instances_dir,
     qemu_log_path,
     qmp_socket_path,
     skill_install_roots,
@@ -79,6 +80,7 @@ from ..serial import (
     has_terminal_panic,
     extract_unknown_params,
     last_boot_offset,
+    scan_console_growth,
     serial_log_offset,
 )
 from ..vm import launch_vm, suspect_dotted_params
@@ -362,17 +364,15 @@ def _profile_params(inst: Any) -> set[str]:
     return {token for token in profile_cmdline.split()}
 
 
-def _warn_unknown_kernel_params(
-    inst: Any, *, note_profile: bool = True
-) -> dict[str, list[str]]:
+def _warn_unknown_kernel_params(inst: Any) -> dict[str, list[str]]:
     """Report boot params the kernel did not claim, ranked by who supplied them.
 
-    Params that came from qmu's own profile are reported separately and more
-    quietly. They are not actionable by the reader — `apparmor=0` is unclaimed
-    precisely because AppArmor is not compiled in, which is the state the param
-    was asking for — and mixing them in with a genuine typo renders both
-    identically. A warning that is always present is a warning nobody reads,
-    which is how a dead `panic_on_oops=1` survived in the first place.
+    Params that came from qmu's own profile are never printed. They are not
+    actionable by the reader — `apparmor=0` is unclaimed precisely because
+    AppArmor is not compiled in, which is the state the param was asking for —
+    and a note that appears on every launch is a note nobody reads, which is
+    how a dead `panic_on_oops=1` survived in the first place. They stay in the
+    returned `profile` bucket so the JSON envelope keeps the split.
     """
     unknown = extract_unknown_params(
         inst.serial_log,
@@ -394,11 +394,7 @@ def _warn_unknown_kernel_params(
             "(many are sysctl-only — e.g. the boot form of panic_on_oops is "
             "'oops=panic').\n"
         )
-    if inherited and note_profile:
-        sys.stderr.write(
-            f"[qmu] Note: unclaimed by this kernel, from profile "
-            f"'{inst.profile}': {' '.join(inherited)}\n"
-        )
+    # The profile bucket is deliberately silent on stderr; see the docstring.
     # Machine-readable output keeps the same split the text output makes. A
     # script gating on "did I pass a bogus param" must not trip forever on a
     # profile param it cannot fix — that is the alarm fatigue this split exists
@@ -676,8 +672,13 @@ def _handle_launch(args: argparse.Namespace) -> int:
         ssh_status = "skipped"
 
     if inst.harness and getattr(inst, "rootfs", None):
+        # Name the layer that actually supplied the disk: an explicit --rootfs
+        # used to be reported as "from config", sending the reader to edit a
+        # qmu.toml key the flag had just overridden.
+        layer = config.source_layer("rootfs")
+        source = "--rootfs" if layer == "flag" else f"[drive] rootfs in {layer}"
         note = (
-            f"Harness mode: attached rootfs {inst.rootfs} (from config; pass "
+            f"Harness mode: attached rootfs {inst.rootfs} (from {source}; pass "
             "--drive to choose the disk)"
         )
         sys.stderr.write(f"[qmu] {note}\n")
@@ -839,11 +840,24 @@ class _GuestObservation:
     has_endpoint: bool = False
     ssh_ready: bool | None = None
     ssh_probed: bool = False
+    # The SSH probe was withheld because a gdb client is attached: its login
+    # runs `uname`, which fires a user breakpoint on `__x64_sys_newuname`.
+    debugger_attached: bool = False
 
     @property
     def qmp_state(self) -> str | None:
         """`connected`/`busy`/`unreachable`, or None when QMP was not asked."""
         return self.qmp.state if self.qmp is not None else None
+
+    def ssh_state(self) -> str:
+        """The one SSH word `status` and `list` both report for this VM."""
+        if not self.has_endpoint:
+            return "none"
+        if self.ssh_probed:
+            return "ready" if self.ssh_ready else "down"
+        if self.debugger_attached:
+            return "skipped (debugger attached)"
+        return "skipped"
 
     def detail(self) -> str | None:
         """Why the axis says `unknown`, for the reader who has to act on it."""
@@ -856,6 +870,8 @@ class _GuestObservation:
             reasons.append("QMP unreachable")
         if self.ssh_probed:
             reasons.append("SSH ready" if self.ssh_ready else "SSH down")
+        elif self.has_endpoint and self.debugger_attached:
+            reasons.append("SSH not probed: debugger attached")
         elif self.has_endpoint:
             reasons.append("SSH not probed")
         else:
@@ -916,9 +932,18 @@ def _observe_guest(
             ssh_ready=False if has_endpoint else None,
         )
 
+    # #39-adjacent: the readiness probe logs in, and a login runs `uname`.
+    # With a client on the gdb stub that is a breakpoint on
+    # `__x64_sys_newuname` fired by qmu itself, and a `status` that halts the
+    # guest it was asked to describe. Console bytes stand in as the positive
+    # evidence, exactly as for a guest with no endpoint.
+    attached = (
+        probe_ssh and has_endpoint and inst.gdb_port is not None
+        and debug_session_present(inst)
+    )
     ssh_ready: bool | None = None
     ssh_probed = False
-    if probe_ssh and has_endpoint:
+    if probe_ssh and has_endpoint and not attached:
         ssh_ready = bool(_make_ssh(inst).is_ready())
         ssh_probed = True
 
@@ -932,7 +957,7 @@ def _observe_guest(
         guest = GUEST_UNKNOWN
     return _GuestObservation(
         guest, start, console_bytes, qmp, has_endpoint,
-        ssh_ready=ssh_ready, ssh_probed=ssh_probed,
+        ssh_ready=ssh_ready, ssh_probed=ssh_probed, debugger_attached=attached,
     )
 
 
@@ -965,6 +990,27 @@ def _classify(vm_id: str, older_than: float = 86400.0) -> dict[str, Any]:
     else:
         info["guest"] = GUEST_UNKNOWN
     return info
+
+
+def _retained_logs(inst: Any) -> dict[str, Any]:
+    """What a stopped VM left behind, in the words `status`/`kill`/`list` share.
+
+    `crash_detected` is scoped to the last boot like every other reader, so
+    a kill that preserved a report and a `list` that marks it agree.
+    """
+    serial = inst.serial_log if inst.serial_log and os.path.exists(inst.serial_log) else None
+    qemu = qemu_log_path(inst.vm_id)
+    qemu_log = str(qemu) if qemu.exists() else None
+    crash_detected = False
+    if serial is not None:
+        scope = current_boot_offset(serial, inst.guest_epoch_serial_offset)
+        crash_detected = extract_crash(serial, start_offset=scope) is not None
+    return {
+        "serial_log": serial,
+        "qemu_log": qemu_log,
+        "logs_retained": serial is not None,
+        "crash_detected": crash_detected,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1041,6 +1087,19 @@ def _kill_orphan_if_named(args: argparse.Namespace) -> int | None:
     return None
 
 
+def _close_ssh_master(inst: Any) -> bool:
+    """Tear down the VM's multiplexed ssh master before QEMU goes away.
+
+    `exec`/`push`/`pull` leave a `ControlPersist=60` master behind; after the
+    guest is gone it lingers for its full minute as an `ssh [mux]` process
+    under the runtime dir, which `prune --runtime` then reports as live.
+    False when the VM never had an endpoint or no master was open.
+    """
+    if inst.harness or inst.ssh_port is None or not inst.ssh_key:
+        return False
+    return bool(_make_ssh(inst).close_control_master())
+
+
 def _handle_kill(args: argparse.Namespace) -> int:
     orphan_result = _kill_orphan_if_named(args)
     if orphan_result is not None:
@@ -1048,12 +1107,29 @@ def _handle_kill(args: argparse.Namespace) -> int:
     if args.vm:
         info = _classify(args.vm)
         if info["state"] in (VM_STOPPED, VM_HELD_BACK):
-            raise QMUError(
-                f"VM '{args.vm}' is already stopped; there is no process to "
-                f"kill. Its logs remain — read them with `qmu log --vm "
-                f"{args.vm}`, or remove them with `qmu prune --vm {args.vm} "
-                f"--older-than 0`."
+            # Already what the caller asked for. An error here made every
+            # "kill then kill again" cleanup script branch on exit codes for
+            # a state it was happy with.
+            retained = _retained_logs(info["instance"])
+            _emit(
+                args,
+                data={
+                    "ok": True,
+                    "vm_id": args.vm,
+                    "already_stopped": True,
+                    "logs_retained": retained["logs_retained"],
+                    "serial_log": retained["serial_log"],
+                },
+                text=(
+                    f"VM '{args.vm}' is already stopped; state retained "
+                    f"(remove with: qmu prune --vm {args.vm})"
+                    if retained["logs_retained"]
+                    else f"VM '{args.vm}' is already stopped; no logs retained "
+                    f"(remove its record with: qmu prune --vm {args.vm})"
+                ),
+                stem="kill",
             )
+            return 0
     inst = choose_instance(args.vm)
     # A panicked or crashed guest has a report in its serial log that `status`
     # just told the reader to pull. The default clean deleted it without a
@@ -1069,6 +1145,7 @@ def _handle_kill(args: argparse.Namespace) -> int:
     # connection, and if one is present, say so on stderr so cleanup is not a
     # later surprise. qmu still does not manage the pry lifecycle.
     had_bridge = debug_session_present(inst) if inst.gdb_port is not None else False
+    _close_ssh_master(inst)
     _kill_vm(inst, force=args.force, clean=clean)
     bridge_reaped = _reap_recorded_bridge(inst)
     if preserve_crash:
@@ -1843,6 +1920,11 @@ def _handle_wait(args: argparse.Namespace) -> int:
     last_event: str | None = None
     event_data: Any = None
     boot_offset = current_boot_offset(inst.serial_log, inst.guest_epoch_serial_offset)
+    # Line-aligned high-water mark of the console bytes already examined.
+    # Rescanning from `boot_offset` every tick made a 20 s wait on a chatty
+    # guest burn half a core (r2-shared: 10 s user CPU); each tick now reads
+    # only what QEMU appended since the last one.
+    scanned = boot_offset
     warned_reset_debug = False
 
     while True:
@@ -1857,7 +1939,9 @@ def _handle_wait(args: argparse.Namespace) -> int:
         # harness calling reboot). Persist it as the guest epoch exactly as an
         # observed RESET used to be, BEFORE the next liveness check, so a VM
         # that exits right after rebooting is scoped to its last boot.
-        banner = last_boot_offset(inst.serial_log, start_offset=boot_offset)
+        scanned, banner, panicked = scan_console_growth(
+            inst.serial_log, scanned=scanned, boot_offset=boot_offset
+        )
         if banner > boot_offset:
             boot_offset = banner
             last_event = "RESET"
@@ -1872,7 +1956,7 @@ def _handle_wait(args: argparse.Namespace) -> int:
         # #27: a terminal panic ends the guest even though QEMU keeps running
         # (no -no-reboot, panic=0). Reporting "still running" here contradicted
         # `status` on the same VM and sent the reader back to wait again.
-        if has_terminal_panic(inst.serial_log, start_offset=boot_offset):
+        if panicked:
             reason = _WAIT_REASON_TERMINAL_PANIC
             guest = GUEST_PANICKED
             crash = _settled_crash(inst, boot_offset) or extract_crash(
@@ -1924,11 +2008,9 @@ def _handle_wait(args: argparse.Namespace) -> int:
         # The guest may have rebooted between the last scan and its exit.
         boot_offset = last_boot_offset(inst.serial_log, start_offset=boot_offset)
         crash = extract_crash(inst.serial_log, start_offset=boot_offset)
-        guest = (
-            GUEST_PANICKED
-            if has_terminal_panic(inst.serial_log, start_offset=boot_offset)
-            else GUEST_UNKNOWN
-        )
+        # No process, no guest axis: `unknown` here read as "qmu could not
+        # tell", when the honest answer is that there is nothing to classify.
+        guest = None
     guest_detail: str | None = None
     if not stopped and guest is None:
         observation = _observe_guest(inst, qmp=probe)
@@ -1942,7 +2024,31 @@ def _handle_wait(args: argparse.Namespace) -> int:
         crash=crash, qmp_state=probe.state if probe is not None else None,
         qemu_status=qemu_status,
         last_event=last_event, event_data=event_data,
+        console_tail=_console_tail(inst.serial_log, boot_offset),
     )
+
+
+# How many console lines a bare `wait` hands back with its verdict. A harness
+# prints its marker and powers off; without this the only evidence of a
+# successful run was a log that the harness auto-clean had already removed.
+_CONSOLE_TAIL_LINES = 20
+
+
+def _console_tail(log_path: str | None, start: int) -> list[str]:
+    """The last `_CONSOLE_TAIL_LINES` lines of the current boot's console."""
+    if not log_path:
+        return []
+    try:
+        with Path(log_path).open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            stream.seek(start if 0 <= start <= size else 0)
+            text = stream.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = [line.rstrip("\r") for line in text.splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines[-_CONSOLE_TAIL_LINES:]
 
 
 def _wait_already_stopped(args: argparse.Namespace, inst: Any) -> int:
@@ -1955,16 +2061,12 @@ def _wait_already_stopped(args: argparse.Namespace, inst: Any) -> int:
     """
     scope = current_boot_offset(inst.serial_log, inst.guest_epoch_serial_offset)
     crash = extract_crash(inst.serial_log, start_offset=scope)
-    guest = (
-        GUEST_PANICKED
-        if has_terminal_panic(inst.serial_log, start_offset=scope)
-        else GUEST_UNKNOWN
-    )
     return _finish_wait(
         args, inst,
         stopped=True, reason=_WAIT_REASON_ALREADY_STOPPED, elapsed=0.0,
-        guest=guest, guest_detail=None, crash=crash, qmp_state=None,
+        guest=None, guest_detail=None, crash=crash, qmp_state=None,
         qemu_status="unknown", last_event=None, event_data=None,
+        console_tail=_console_tail(inst.serial_log, scope),
     )
 
 
@@ -1975,13 +2077,14 @@ def _finish_wait(
     stopped: bool,
     reason: str,
     elapsed: float,
-    guest: str,
+    guest: str | None,
     guest_detail: str | None,
     crash: str | None,
     qmp_state: str | None,
     qemu_status: str,
     last_event: str | None,
     event_data: Any,
+    console_tail: list[str],
 ) -> int:
     """Render one bare-`wait` outcome and map it to the exit code.
 
@@ -1989,10 +2092,9 @@ def _finish_wait(
     3 — the guest took a terminal panic while its QEMU process lives on.
     124 — the deadline passed with the process alive and the guest not gone.
     """
-    # The profile note (`apparmor=0` unclaimed) belongs to `launch`; repeating
-    # it on every wait is the alarm fatigue the operator/profile split exists
-    # to end. Operator typos are still worth a line here.
-    _unknown_params = _warn_unknown_kernel_params(inst, note_profile=False)
+    # Operator typos are still worth a line here; the profile bucket is never
+    # printed by any command.
+    _unknown_params = _warn_unknown_kernel_params(inst)
 
     cleaned = False
     if stopped and inst.harness and not args.no_clean and not instance_alive(inst):
@@ -2006,6 +2108,8 @@ def _finish_wait(
         "vm_id": inst.vm_id,
         "stopped": stopped,
         "reason": reason,
+        # None once QEMU has exited: there is no guest to classify, and
+        # `unknown` read as a probe that failed.
         "guest": guest,
         "guest_detail": guest_detail,
         "elapsed": round(elapsed, 3),
@@ -2014,6 +2118,7 @@ def _finish_wait(
         "last_event": last_event,
         "event_data": event_data,
         "crash": crash,
+        "console_tail": console_tail,
         "cleaned": cleaned,
         "unknown_kernel_params": _unknown_params["all"],
         "unknown_kernel_params_by_source": {
@@ -2039,11 +2144,14 @@ def _finish_wait(
             f"VM '{inst.vm_id}' {'stopped' if stopped else 'still running'} "
             f"({reason}, elapsed={elapsed:.2f}s)"
         ]
-    lines.append(f"Guest: {guest}" + (f" ({guest_detail})" if guest_detail else ""))
+    if guest is not None:
+        lines.append(f"Guest: {guest}" + (f" ({guest_detail})" if guest_detail else ""))
     observation_suffix = "" if stopped else " (QEMU process still running)"
     if qmp_state == QMP_BUSY and not stopped:
         lines.append(
-            "QMP: busy (held by another client), so QEMU's status was not observed."
+            "QMP: busy (held by another client — another qmu command such as "
+            "`wait`/`status`, or a debugger bridge), so QEMU's status was not "
+            "observed."
         )
     if last_event is not None:
         lines.append(f"Observed QMP event {last_event}{observation_suffix}.")
@@ -2051,6 +2159,11 @@ def _finish_wait(
         lines.append(f"Observed QEMU status {qemu_status}{observation_suffix}.")
     if crash:
         lines.append("\nCrash from serial log:\n" + crash)
+    elif stopped and console_tail:
+        # The run's own evidence. A harness prints its marker and powers off;
+        # the auto-clean below may remove the log this came from.
+        lines.append("Console tail:")
+        lines.extend(f"  {line}" for line in console_tail)
     if cleaned:
         lines.append("[qmu] Instance metadata cleaned up.")
     _emit(args, data=result, text=lines, stem="wait")
@@ -2226,7 +2339,7 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
 
     elapsed = time.monotonic() - start
     matched = matched_line is not None
-    _unknown_params = _warn_unknown_kernel_params(inst, note_profile=False)
+    _unknown_params = _warn_unknown_kernel_params(inst)
     result = {
         "ok": matched,
         "vm_id": inst.vm_id,
@@ -2366,10 +2479,14 @@ def _handle_list(args: argparse.Namespace) -> int:
                 "status": "running",
                 "guest": obs.guest,
                 "guest_detail": obs.detail(),
-                "qmp": obs.qmp_state,
+                # "skipped" when the guest axis was decided without asking
+                # QEMU (a terminal panic needs no second opinion): a null
+                # read as "probe failed" and contradicted `status`.
+                "qmp": obs.qmp_state or "skipped",
                 "pid": inst.pid,
                 "harness": inst.harness,
                 "ssh_port": inst.ssh_port,
+                "ssh": "n/a (harness)" if inst.harness else obs.ssh_state(),
                 "ssh_ready": obs.ssh_ready,
                 "gdb_port": inst.gdb_port,
                 "kernel": inst.kernel,
@@ -2378,20 +2495,24 @@ def _handle_list(args: argparse.Namespace) -> int:
                 "arch": inst.arch,
                 "kvm": inst.kvm,
                 "serial_log": inst.serial_log,
+                "logs_retained": True,
+                "crash_detected": obs.guest in (GUEST_PANICKED, GUEST_CRASHED),
             })
         for inst in stopped:
             orphan_pid = orphan_logs.get(inst.serial_log)
+            retained = _retained_logs(inst)
             data.append({
                 "vm_id": inst.vm_id,
                 "status": "orphaned" if orphan_pid else "stopped",
-                "guest": _guest_state(inst) if orphan_pid else GUEST_UNKNOWN,
+                "guest": _guest_state(inst) if orphan_pid else None,
                 "guest_detail": None,
-                "qmp": None,
+                "qmp": "skipped",
                 # A stopped record's pid is the dead process's; never present
                 # it as if it were live.
                 "pid": orphan_pid or None,
                 "harness": inst.harness,
                 "ssh_port": inst.ssh_port,
+                "ssh": "n/a (harness)" if inst.harness else "skipped",
                 "ssh_ready": None,
                 "gdb_port": inst.gdb_port,
                 "kernel": inst.kernel or None,
@@ -2399,7 +2520,9 @@ def _handle_list(args: argparse.Namespace) -> int:
                 "profile_applied": not inst.cmdline_override,
                 "arch": inst.arch,
                 "kvm": inst.kvm,
-                "serial_log": inst.serial_log,
+                "serial_log": retained["serial_log"],
+                "logs_retained": retained["logs_retained"],
+                "crash_detected": retained["crash_detected"],
             })
         _output({"ok": True, "vms": data}, args, stem="list")
         return 0
@@ -2410,6 +2533,8 @@ def _handle_list(args: argparse.Namespace) -> int:
             ssh_str = "harness"
         elif inst.ssh_port is None:
             ssh_str = "ssh=none"
+        elif obs.debugger_attached:
+            ssh_str = f"ssh={inst.ssh_port}(not probed: debugger attached)"
         else:
             ssh_str = f"ssh={inst.ssh_port}({'ok' if obs.ssh_ready else 'down'})"
         gdb_str = f" gdb={inst.gdb_port}" if inst.gdb_port else ""
@@ -2435,6 +2560,10 @@ def _handle_list(args: argparse.Namespace) -> int:
                 GUEST_CRASHED: ", crash report waiting, run `qmu crash`",
             }.get(_guest_state(inst), "")
             state = f"[ORPHANED — process alive{suffix}]"
+        elif _retained_logs(inst)["crash_detected"]:
+            # `kill` kept this report on purpose and said so; a bare
+            # [stopped] here hid that from the one command that lists it.
+            state = "[stopped — crash report retained]"
         else:
             state = "[stopped]"
         lines.append(f"  {inst.vm_id}  {profile_str}  {kernel_str}  {state}")
@@ -2485,16 +2614,22 @@ def _crash_warning(guest: str | None, vm_id: str) -> str:
 
 
 def describe_non_running(
-    vm_id: str, older_than: float = 86400.0, *, command: str | None = None
+    vm_id: str,
+    older_than: float = 86400.0,
+    *,
+    command: str | None = None,
+    info: dict[str, Any] | None = None,
 ) -> str | None:
     """Explain a vm_id that `list` displays but a running-only lookup misses.
 
     `status` is the natural next command after spotting something odd in
     `list`, so answering "not found" — while helpfully listing what IS running,
     implying the entry is bogus — is the worst possible response. Shared with
-    `prune` so the two cannot drift apart again.
+    `prune` so the two cannot drift apart again. `info` lets a caller that
+    already classified the VM skip the second `/proc` walk.
     """
-    info = _classify(vm_id, older_than)
+    if info is None:
+        info = _classify(vm_id, older_than)
     state = info["state"]
     if state == VM_ORPHANED:
         lead = (
@@ -2518,19 +2653,66 @@ def describe_non_running(
             f"VM '{vm_id}' is stopped; only its logs remain, so {verb}. "
             f"Read them with `qmu log --vm {vm_id}` or "
             f"`qmu crash --vm {vm_id}`, and remove them with "
-            f"`qmu prune --vm {vm_id} --older-than 0`. "
+            f"`qmu prune --vm {vm_id}`. "
             f"Serial log: {info['serial_log']}"
         )
     return None
+
+
+def _status_non_running(args: argparse.Namespace, info: dict[str, Any]) -> int:
+    """`status` on a VM `list` shows but no process serves: a description, not an error.
+
+    A kill that kept its logs is the normal end of every exploit run, and
+    the next command is `status`. Exit 1 there made the stopped state look
+    like a failed lookup, so callers branched on it as "gone" — while `list`
+    still showed the VM and `crash` could still read its report.
+    """
+    vm_id = args.vm
+    state = info["state"]
+    inst = info["instance"]
+    retained = _retained_logs(inst)
+    orphan_pid = info["pid"] if state == VM_ORPHANED else None
+    data = {
+        "ok": True,
+        "vm_id": vm_id,
+        "status": state,
+        # The guest axis exists only while a process serves it; for an orphan
+        # that process is alive, so `list` and `status` must carry the same word.
+        "guest": info["guest"] if state == VM_ORPHANED else None,
+        "pid": orphan_pid if orphan_pid is not None else (inst.pid or None),
+        "pid_alive": orphan_pid is not None,
+        "harness": inst.harness,
+        "serial_log": retained["serial_log"],
+        "qemu_log": retained["qemu_log"],
+        "logs_retained": retained["logs_retained"],
+        "crash_detected": retained["crash_detected"],
+    }
+    if state == VM_ORPHANED:
+        text = describe_non_running(vm_id, info=info) or f"VM '{vm_id}' is orphaned."
+    elif not retained["logs_retained"]:
+        text = f"VM '{vm_id}' is stopped (no logs retained)"
+    elif retained["crash_detected"]:
+        text = (
+            f"VM '{vm_id}' is stopped (logs retained; crash report waiting: "
+            f"qmu crash --vm {vm_id})"
+        )
+    else:
+        text = (
+            f"VM '{vm_id}' is stopped (logs retained: qmu log --vm {vm_id}; "
+            f"remove with: qmu prune --vm {vm_id})"
+        )
+    _emit(args, data=data, text=text, stem="status")
+    return 0
 
 
 def _handle_status(args: argparse.Namespace) -> int:
     # Validation of the project/explicit config happens once, at the cli.main
     # dispatch gate (#37), so every sibling verb gives one answer about whether
     # the project is valid. status reads no boot settings from qmu.toml.
-    explanation = describe_non_running(args.vm) if args.vm else None
-    if explanation is not None:
-        raise QMUError(explanation)
+    if args.vm:
+        info = _classify(args.vm)
+        if info["state"] in (VM_STOPPED, VM_HELD_BACK, VM_ORPHANED):
+            return _status_non_running(args, info)
     inst = choose_instance(args.vm)
 
     # One QMP round trip, shared with the guest axis: `status` used to connect
@@ -2543,14 +2725,10 @@ def _handle_status(args: argparse.Namespace) -> int:
 
     if inst.harness:
         ssh_state = "n/a (harness)"
-    elif inst.ssh_port is None:
-        # Non-harness VM launched with --no-net and no --ssh-port: there is no
-        # endpoint to probe, which is a different fact from "down".
-        ssh_state = "none"
-    elif obs.ssh_probed:
-        ssh_state = "ready" if obs.ssh_ready else "down"
     else:
-        ssh_state = "skipped"
+        # "none" (--no-net, no --ssh-port) is a different fact from "down";
+        # "skipped (debugger attached)" names why no probe was sent.
+        ssh_state = obs.ssh_state()
 
     accel = {True: "kvm", False: "tcg"}.get(inst.kvm, "unknown")
     result = {
@@ -2600,6 +2778,11 @@ def _handle_status(args: argparse.Namespace) -> int:
         lines.append(f"  SSH:       none (--no-net, no --ssh-port)")
     elif obs.ssh_probed:
         lines.append(f"  SSH:       port {inst.ssh_port} ({ssh_state})")
+    elif obs.debugger_attached:
+        lines.append(
+            f"  SSH:       port {inst.ssh_port} (not probed: debugger attached; "
+            "a login would trip breakpoints)"
+        )
     else:
         lines.append(
             f"  SSH:       port {inst.ssh_port} (not probed: guest {guest})"
@@ -2649,13 +2832,21 @@ def _add_doctor(sub: argparse._SubParsersAction) -> None:
 _DOCTOR_GLYPHS = {"ok": "+", "fail": "!", "warn": "~", "info": "i"}
 
 
-def _doctor_row(check: str, status: str, detail: str) -> dict[str, Any]:
+def _doctor_row(
+    check: str, status: str, detail: str, hint: str = "", **extra: Any
+) -> dict[str, Any]:
+    """One doctor check. `hint` is the fix as a command or config edit, kept
+    out of the prose so a script can act on it without parsing `detail`; it is
+    empty when there is nothing to fix. `extra` adds machine-readable
+    companions to a row (e.g. the paths a summarised `detail` elides)."""
     assert status in _DOCTOR_GLYPHS, status
     return {
         "check": check,
         "status": status,
         "detail": detail,
         "blocking": status == "fail",
+        "hint": hint,
+        **extra,
     }
 
 
@@ -2674,6 +2865,7 @@ def _check_libguestfs() -> dict[str, Any]:
             "guestfish not found in PATH — required only for "
             "`qmu rootfs *` and `qmu launch --inject`. "
             "Install libguestfs-tools.",
+            hint="apt install libguestfs-tools",
         )
 
     # An explicit supermin kernel overrides the /boot lookup entirely.
@@ -2684,6 +2876,7 @@ def _check_libguestfs() -> dict[str, Any]:
             check, "ok" if readable else "warn",
             f"{fish}; SUPERMIN_KERNEL={override}"
             + ("" if readable else " is NOT readable"),
+            hint="" if readable else "export SUPERMIN_KERNEL=<readable kernel image>",
         )
 
     kernels = sorted(Path("/boot").glob("vmlinuz-*")) if Path("/boot").is_dir() else []
@@ -2692,6 +2885,7 @@ def _check_libguestfs() -> dict[str, Any]:
             check, "warn",
             f"{fish}; no /boot/vmlinuz-* found for the supermin "
             f"appliance. Set SUPERMIN_KERNEL to a readable kernel.",
+            hint="export SUPERMIN_KERNEL=<readable kernel image>",
         )
     if any(os.access(k, os.R_OK) for k in kernels):
         return _doctor_row(check, "ok", fish)
@@ -2704,6 +2898,9 @@ def _check_libguestfs() -> dict[str, Any]:
         f"— or leave system perms alone and export SUPERMIN_KERNEL / "
         f"SUPERMIN_KERNEL_VERSION / SUPERMIN_MODULES pointing at a "
         f"readable copy.",
+        hint="sudo chmod 0644 /boot/vmlinuz-*  (or: export SUPERMIN_KERNEL="
+             "<readable copy> SUPERMIN_KERNEL_VERSION=<ver> SUPERMIN_MODULES="
+             "/lib/modules/<ver>)",
     )
 
 
@@ -2728,6 +2925,7 @@ def _check_cross_toolchain(arch: str) -> list[dict[str, Any]]:
             f"will fail — compile in the guest, or install it"
             + (f": apt install {pkg}" if pkg else "")
             + ". Override with --cc <compiler>.",
+            hint=f"apt install {pkg}" if pkg else "qmu compile --cc <cross compiler>",
         ))
     gdb = shutil.which("gdb-multiarch")
     rows.append(_doctor_row(
@@ -2735,6 +2933,7 @@ def _check_cross_toolchain(arch: str) -> list[dict[str, Any]]:
         "ok" if gdb else "warn",
         gdb or f"not found in PATH; the host `gdb` cannot debug {target} "
                f"guests. Install it: apt install gdb-multiarch",
+        hint="" if gdb else "apt install gdb-multiarch",
     ))
     return rows
 
@@ -2744,6 +2943,11 @@ def _unconfigured_detail(key: str, flag: str, status: str) -> str:
     if status == "fail":
         return text + " (a flagless launch will fail without one)"
     return text + "; not needed for --harness boots"
+
+
+def _path_hint(key: str, flag: str) -> str:
+    """The fix for a missing or unconfigured path field, as a config edit."""
+    return f"set {key} in qmu.toml or pass {flag}"
 
 
 # The starter file's `# CHANGE ME` values, as written. A configured path that
@@ -2797,11 +3001,13 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             "config", "warn",
             "Running on built-in defaults only: every config file "
             "found was rejected (see below).",
+            hint="fix or delete the rejected file(s) named below",
         ))
     else:
         checks.append(_doctor_row(
             "config", "warn",
             f"No qmu.toml or {global_config_path()} found. Run: qmu config init",
+            hint="qmu config init",
         ))
     for skipped in skipped_sources:
         checks.append(_doctor_row(
@@ -2810,6 +3016,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             f"{skipped['problem']}. Fix or delete that file — "
             f"`qmu config init` writes a project qmu.toml and will not "
             f"clear this.",
+            hint=f"fix or delete {skipped['path']}",
         ))
 
     # Cache subtrees no qmu command fully reclaims. Informational, never a
@@ -2834,6 +3041,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
     checks.append(_doctor_row(
         binary, "ok" if qemu else "fail",
         qemu or f"Not found in PATH (install the QEMU system emulator for {config.arch})",
+        hint="" if qemu else f"install {binary} (the QEMU system emulator for {config.arch})",
     ))
 
     if not passt_required:
@@ -2850,6 +3058,8 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             f"{qemu_caps.path} advertises native '-netdev passt'"
             if passt_problem is None
             else passt_problem,
+            hint="" if passt_problem is None else
+                 "set [machine] net_backend = \"user\" or install a QEMU built with -netdev passt",
         ))
 
     # Cross toolchain: only meaningful when the configured guest arch is not
@@ -2873,12 +3083,14 @@ def _handle_doctor(args: argparse.Namespace) -> int:
                 _missing_path_detail(config, "kernel")
                 + "; set [boot] kernel in qmu.toml or pass --kernel — launch "
                   "will fail with `Kernel not found`.",
+                hint=_path_hint("[boot] kernel", "--kernel"),
             ))
     else:
         checks.append(_doctor_row(
             "kernel", "warn",
             "not configured (set [boot] kernel or pass --kernel; "
             "--harness/launch flags still work)",
+            hint=_path_hint("[boot] kernel", "--kernel"),
         ))
 
     # Rootfs and SSH key. "Not configured" gates only when a flagless
@@ -2890,19 +3102,23 @@ def _handle_doctor(args: argparse.Namespace) -> int:
     # these are hints, not failures.
     harness_shaped = config.initrd is not None and config.rootfs is None
     unconfigured = "fail" if kernel_configured and not harness_shaped else "warn"
+    rootfs_hint = _path_hint("[drive] rootfs", "--rootfs")
     if config.rootfs:
         if Path(config.rootfs).expanduser().exists():
             checks.append(_doctor_row("rootfs image", "ok", config.rootfs))
         else:
             checks.append(_doctor_row(
                 "rootfs image", "fail", _missing_path_detail(config, "rootfs"),
+                hint=rootfs_hint,
             ))
     else:
         checks.append(_doctor_row(
             "rootfs image", unconfigured,
             _unconfigured_detail("[drive] rootfs", "--rootfs", unconfigured),
+            hint=rootfs_hint,
         ))
 
+    key_hint = _path_hint("[ssh] key", "--ssh-key")
     if config.ssh_key:
         key_path = Path(config.ssh_key).expanduser()
         if key_path.exists():
@@ -2914,15 +3130,18 @@ def _handle_doctor(args: argparse.Namespace) -> int:
                 checks.append(_doctor_row(
                     "SSH key permissions", "warn",
                     f"mode={mode} (should be 600 — `chmod 600 {config.ssh_key}`)",
+                    hint=f"chmod 600 {config.ssh_key}",
                 ))
         else:
             checks.append(_doctor_row(
                 "SSH key", "fail", _missing_path_detail(config, "ssh_key"),
+                hint=key_hint,
             ))
     else:
         checks.append(_doctor_row(
             "SSH key", unconfigured,
             _unconfigured_detail("[ssh] key", "--ssh-key", unconfigured),
+            hint=key_hint,
         ))
 
     # KVM. Distinguish "explicitly disabled" (accel=tcg / --no-kvm) from
@@ -2937,6 +3156,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
                 "KVM", "fail",
                 "accel=kvm forces -enable-kvm but /dev/kvm is missing; "
                 "launch will fail. Use accel=auto/tcg or --no-kvm.",
+                hint="set [machine] accel = \"auto\" (or \"tcg\") in qmu.toml, or pass --no-kvm",
             ))
         else:
             checks.append(_doctor_row(
@@ -2968,6 +3188,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
         "pry (GDB integration)", "ok" if pry else "info",
         pry or "Not found in PATH — required only for `qmu gdb`. "
                "Install pry and ensure it is on PATH.",
+        hint="" if pry else "install pry and put it on PATH",
     ))
 
     # External passt executable (required only when net_backend = "passt")
@@ -2981,39 +3202,80 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             if passt_required else
             "Not found — not required for configured net_backend=user."
         ),
+        hint="apt install passt" if passt_required and not passt else "",
     ))
 
-    # Running instances
+    # Running VMs: the same enumeration `list` makes — live records plus
+    # qmu-launched QEMUs no live record claims — so the two never disagree
+    # about how many VMs are up. Counting records alone reported 0 while
+    # `list` was showing an orphaned VM as running. The cache dir is named
+    # so a QMU_CACHE_DIR mismatch between shells is visible in the row.
     instances = list_instances()
-    checks.append(_doctor_row("running VMs", "info", f"{len(instances)} instance(s)"))
+    orphans = find_orphan_qemus()
+    vm_detail = f"{len(instances)} running"
+    if orphans:
+        vm_detail += f" + {len(orphans)} orphaned (no instance record)"
+    vm_detail += f" under {instances_dir()}"
+    checks.append(_doctor_row(
+        "running VMs", "info", vm_detail,
+        hint="qmu prune --orphans --dry-run" if orphans else "",
+        running=len(instances), orphaned=len(orphans),
+    ))
 
     # Skills installed — informational: a missing skill symlink changes what
-    # an agent knows, not whether a VM boots.
-    skill_names = [d.name for d in all_skill_source_dirs()]
-    if not skill_names:
-        skill_names = ["qmu"]
+    # an agent knows, not whether a VM boots. JSON `detail` keeps the full
+    # path list (consumers do not pay for length) and `detail_paths` the
+    # structured form; the TEXT row renders `summary` instead, because
+    # 5 skills × 3 roots ≈ 900 chars dominated every doctor run.
+    sources = {d.name: d for d in all_skill_source_dirs()}
+    skill_names = list(sources) or ["qmu"]
     roots = skill_install_roots()
     installed: list[Path] = []
     missing: list[Path] = []
+    stale: list[Path] = []
     for name in skill_names:
         for root in roots:
             p = root / name
-            (installed if p.exists() else missing).append(p)
-    if not missing:
-        checks.append(_doctor_row("skills", "ok", ", ".join(str(p) for p in installed)))
-    elif installed:
+            if not p.exists():
+                missing.append(p)
+                continue
+            installed.append(p)
+            src = sources.get(name)
+            if src is not None and p.is_symlink() and p.resolve() != src.resolve():
+                stale.append(p)
+    paths = {
+        "installed": [str(p) for p in installed],
+        "missing": [str(p) for p in missing],
+        "stale": [str(p) for p in stale],
+    }
+    summary = f"{len(skill_names)} skills × {len(roots)} roots"
+    if not installed:
         checks.append(_doctor_row(
-            "skills", "warn",
-            f"partial: {len(installed)} installed, {len(missing)} missing "
-            f"(run: qmu skill install)",
+            "skills", "info", "not installed. Run: qmu skill install",
+            hint="qmu skill install", detail_paths=paths,
+            summary=f"{summary}: not installed. Run: qmu skill install",
+        ))
+    elif missing or stale:
+        problems = [f"{len(missing)} missing"] if missing else []
+        if stale:
+            problems.append(f"{len(stale)} stale (linked to another checkout)")
+        counts = f"{len(installed)} installed, {', '.join(problems)}"
+        checks.append(_doctor_row(
+            "skills", "warn", f"partial: {counts} (run: qmu skill install)",
+            hint="qmu skill install", detail_paths=paths,
+            summary=f"{summary}: {counts} (run: qmu skill install)",
         ))
     else:
-        checks.append(_doctor_row("skills", "info", "not installed. Run: qmu skill install"))
+        checks.append(_doctor_row(
+            "skills", "ok", ", ".join(paths["installed"]),
+            detail_paths=paths, summary=f"{summary} installed",
+        ))
 
     all_ok = not any(c["blocking"] for c in checks)
     lines = ["qmu doctor:"]
     for c in checks:
-        lines.append(f"  [{_DOCTOR_GLYPHS[c['status']]}] {c['check']}: {c['detail']}")
+        shown = c.get("summary", c["detail"])
+        lines.append(f"  [{_DOCTOR_GLYPHS[c['status']]}] {c['check']}: {shown}")
     # The starter-file tip only when no project/--config layer applied: with
     # one loaded, `config init` would just refuse to overwrite it.
     if not project_sources:

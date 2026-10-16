@@ -26,29 +26,36 @@ and `du`.
 
 ## Instance prunes (`--vm`, `--all`)
 
-`qmu prune --vm <name>` removes a stopped VM's state files; `--keep-logs`
-drops `.json` + `.qmp.sock` but preserves `.serial.log` and `.qemu.log`.
-`qmu prune --all` does the same for every stopped VM.
+`qmu prune --vm <name>` removes a stopped VM's state files — including the
+`.json` + `.serial.log` + `.qemu.log` that `kill` preserves when a crash
+report is waiting, at any age; `--keep-logs` drops `.json` + `.qmp.sock` but
+preserves `.serial.log` and `.qemu.log`. `qmu prune --all` does the same for
+every stopped VM; qmu never recommends it, and on a shared host only
+`--all --dry-run` is ever appropriate.
 
 `prune --vm <name>` for a VM that no longer has any state (the normal case
 right after a plain `qmu kill`, which already removed everything) is a clean
 no-op: exit 0, `pruned: []`, `found: false`, and a note that there was
 nothing to remove — so `kill && prune` cleanup scripts never see a spurious
-failure. A typo'd name gets the same answer; check `qmu list` if you expected
-state to exist.
+failure (after `cleaned: true` there is nothing to prune; prune only after
+`logs_preserved: true` or `--no-clean`). A typo'd name gets the same answer;
+check `qmu list` if you expected state to exist.
 
-**Log-only remnants and the age gate.** If a VM's `.json` is gone but its logs
-remain, `qmu list` still synthesizes an entry for it. Those remnants are
-age-gated: `qmu prune --vm <id>` leaves one younger than `--older-than`
-(default 24h) alone and tells you so — re-run with `--older-than 0` to clear it
-now. `qmu list` also distinguishes a remnant whose QEMU is still alive
-(`[ORPHANED — process alive]`, `status: "orphaned"` in JSON) from a genuinely
-stopped one, so a live orphan holding your rootfs can never present as
-"nothing running". Reap it with `qmu prune --orphans` (use `--dry-run` first on
-a shared machine), or with `qmu kill --vm <id>` — kill handles an orphaned
-remnant by signalling its process and preserving the serial log.
-`qmu prune --all` names any remnant the age gate held back rather than
-reporting "No stopped VMs to prune" while `qmu list` still shows one.
+**Remnants and the age gate.** If a VM's `.json` is gone but its logs remain,
+`qmu list` still synthesizes an entry for it. A serial-log-only remnant
+prunes at any age. Only a metadata-free remnant that still has a `.qemu.log`
+or `.qmp.sock` is age-gated: `qmu prune --vm <id>` leaves one younger than
+`--older-than` (default 24 h) alone, reports it under `held_back`
+(`status: "held_back"` in `list`/`status`), and `--older-than 0` clears it
+now — the same flag looks like a no-op on an ordinary stopped VM. `qmu list`
+also distinguishes a remnant whose QEMU is still alive (`[ORPHANED — process
+alive]`, `status: "orphaned"` in JSON) from a genuinely stopped one, so a
+live orphan holding your rootfs can never present as "nothing running". Reap
+it with `qmu prune --orphans` (use `--dry-run` first on a shared machine), or
+with `qmu kill --vm <id>` — kill handles an orphaned remnant by signalling
+its process and preserving the serial log. `qmu prune --all` names any
+remnant the age gate held back rather than reporting "No stopped VMs to
+prune" while `qmu list` still shows one.
 
 ## `--dry-run`
 
@@ -64,8 +71,9 @@ prune reports `dry_run: false`.
 
 Kills qmu-launched QEMUs that no instance record claims. It matches only QEMUs
 launched by qmu, via the QMP socket path in their argv, so it can never touch an
-unrelated QEMU — but on a shared host it *can* touch another agent's VM whose
-record was lost. Always `--dry-run` first there.
+unrelated QEMU — but on a shared host it **does** touch another agent's VM
+whose record was lost (an `orphaned` entry in `qmu list` with a foreign name
+is exactly that). Always `--dry-run` first there and read `would_kill[].vm_id`.
 
 ## `--runtime`
 

@@ -118,10 +118,10 @@ class WatchedSSH:
     def is_ready(self, timeout=2):
         return self._ready
 
-    def push(self, local, remote):
+    def push(self, local, remote, **kwargs):
         self.pushes.append((local, remote))
 
-    def pull(self, remote, local):
+    def pull(self, remote, local, **kwargs):
         self.pulls.append((remote, local))
 
 
@@ -367,6 +367,127 @@ def test_compile_run_and_dmesg_are_watched_too(wired, tmp_path, capsys, command)
     payload = json.loads(capsys.readouterr().out)
     assert payload["crash_detected"] is True
     assert payload["vm_id"] == "exec-vm"
+
+
+# --- the watcher also sees a halted vCPU -----------------------------------
+
+
+def _halt_qmp(monkeypatch, running_polls: int = 0):
+    """QMP reports a halted vCPU (`debug`) — a breakpoint fired mid-command —
+    after answering "running" to the first `running_polls` queries. The clock
+    jumps past the 1 s QMP cadence on every read so the predicate consults
+    QMP on its first poll."""
+    calls: list[str] = []
+
+    def stopped(inst):
+        calls.append(inst.vm_id)
+        return None if len(calls) <= running_polls else "debug"
+
+    monkeypatch.setattr(guest, "_qmp_stopped_status", stopped)
+    clock = [1000.0]
+
+    def monotonic():
+        clock[0] += 2.0
+        return clock[0]
+
+    monkeypatch.setattr(guest.time, "monotonic", monotonic)
+    return calls
+
+
+def test_a_breakpoint_halting_the_vcpu_aborts_exec_into_the_paused_envelope(
+    wired, monkeypatch, capsys
+):
+    """No serial output accompanies a halted vCPU, so the serial-only watcher
+    let ssh run to its keepalive window: `exec uname -r` against an armed
+    `__x64_sys_newuname` took 20 s to report `is debug`. QMP is polled too,
+    and the abort renders the preflight's paused envelope (exit 1, never the
+    crash/transport class)."""
+    fake = wired(stdout="partial\n")
+    _halt_qmp(monkeypatch)
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "uname -r"])
+
+    assert rc == 1
+    assert fake.predicate_answers == [True]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["guest_state"] == "paused"
+    assert payload["qemu_status"] == "debug"
+    assert payload["crash_detected"] is False
+    assert payload["ssh_error"] is False
+    assert payload["exit_code"] is None
+    assert payload["stdout"] == "partial\n"
+    assert "qmu cont --vm exec-vm" in payload["hint"]
+
+
+def test_the_watcher_does_not_ask_qmp_before_its_cadence(wired, monkeypatch):
+    """QMP is best-effort and rate-limited: a predicate poll inside the first
+    second reads the serial log only, so a busy socket never slows the
+    common path."""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        guest, "_qmp_stopped_status", lambda inst: calls.append(inst.vm_id) or "debug"
+    )
+    fake = wired(stdout="ok\n")
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "true"])
+
+    assert rc == 0
+    assert fake.predicate_answers == [False]
+    assert calls == []
+
+
+@pytest.mark.parametrize("command", ["compile", "dmesg"])
+def test_compile_run_and_dmesg_abort_on_a_halted_vcpu_too(
+    wired, monkeypatch, tmp_path, capsys, command
+):
+    fake = wired(stdout="partial\n")
+    # The guest compile step is watched too; halt only once the binary runs.
+    _halt_qmp(monkeypatch, running_polls=1 if command == "compile" else 0)
+    if command == "compile":
+        source = tmp_path / "x.c"
+        source.write_text("int main(void){return 0;}\n")
+        argv = ["--format", "json", "compile", "--vm", "exec-vm", str(source), "--run"]
+    else:
+        argv = ["--format", "json", "dmesg", "--vm", "exec-vm"]
+
+    rc = cli.main(argv)
+
+    assert rc == 1
+    assert fake.predicate_answers[-1] is True
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["guest_state"] == "paused"
+    assert payload["qemu_status"] == "debug"
+    assert payload["crash_detected"] is False
+    assert "qmu cont --vm exec-vm" in payload["hint"]
+    assert payload["vm_id"] == "exec-vm"
+    if command == "compile":
+        assert payload["compiled"] is True
+        assert payload["run_exit"] is None
+        assert payload["run_stdout"] == "partial\n"
+
+
+def test_the_guest_compile_step_is_watched_too(wired, monkeypatch, tmp_path, capsys):
+    """A breakpoint on a syscall the login shell makes (`uname`) halts the
+    vCPU under gcc; the unwatched 30 s compile budget then expired into a bare
+    infra error (exit 4) with no mention of the debugger."""
+    fake = wired()
+    calls = _halt_qmp(monkeypatch)
+    source = tmp_path / "x.c"
+    source.write_text("int main(void){return 0;}\n")
+
+    rc = cli.main(["--format", "json", "compile", "--vm", "exec-vm", str(source), "--run"])
+
+    assert rc == 1
+    assert fake.predicate_answers == [True]
+    assert [cmd.startswith("gcc") for cmd in fake.runs] == [True]
+    assert calls  # QMP was consulted
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["guest_state"] == "paused"
+    assert payload["qemu_status"] == "debug"
+    assert payload["command"].startswith("gcc")
+    assert "compiled" not in payload
 
 
 # --- --timeout keeps partial output -----------------------------------------

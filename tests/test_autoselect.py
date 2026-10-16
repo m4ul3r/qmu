@@ -66,20 +66,32 @@ def test_one_running_many_stopped_auto_selects(cmd, cache, capsys):
     assert data.get("vm", "live") == "live"
 
 
-@pytest.mark.parametrize("cmd", ["log", "crash"])
+NOTE = "[qmu] Auto-selected the only running VM 'live' (pass --vm to pin it)."
+
+
+@pytest.mark.parametrize("cmd", ["log", "crash", "status", "wait", "exec"])
 def test_auto_selection_is_disclosed_not_silent(cmd, cache, capsys):
-    """A silent pick is how an agent reads the wrong VM's log after a kill."""
+    """A silent pick is how an agent reads the wrong VM's log after a kill.
+
+    Every command that picks the single running VM says so on stderr — the
+    disclosure lives in the lookup, not in each handler, so a new command
+    cannot forget it — and the JSON envelope carries `autoselected: true`.
+    """
     _mk("live", alive=True)
     _mk("dead", alive=False)
 
-    cli.main(["--format", "json", cmd])
-    data = json.loads(capsys.readouterr().out)
-    assert data["vm"] == "live"
-    assert "autoselected" in data
-    assert "live" in data["autoselected"]
+    extra = {"wait": ["--timeout", "0"], "exec": ["true"]}.get(cmd, [])
+    cli.main(["--format", "json", cmd, *extra])
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data.get("vm", data.get("vm_id", "live")) == "live"
+    assert data["autoselected"] is True
+    assert NOTE in captured.err
 
-    cli.main([cmd])
-    assert "Auto-selected" in capsys.readouterr().out
+    cli.main([cmd, *extra])
+    captured = capsys.readouterr()
+    assert NOTE in captured.err
+    assert "Auto-selected" not in captured.out, "the note must not pollute stdout"
 
 
 @pytest.mark.parametrize("cmd", ["log", "crash"])
@@ -89,19 +101,53 @@ def test_explicit_vm_wins_and_is_not_annotated(cmd, cache, capsys):
     _mk("dead", alive=False)
 
     rc = cli.main(["--format", "json", cmd, "--vm", "dead"])
-    data = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
     assert data["vm"] == "dead"
     assert "autoselected" not in data
+    assert "Auto-selected" not in captured.err
     if cmd == "log":
         assert "serial-of-dead" in data["log"]
 
 
-def test_single_candidate_is_not_annotated(cache, capsys):
+def test_single_candidate_is_still_disclosed(cache, capsys):
+    """One VM on disk is still a pick the caller did not make: on a shared
+    host that one VM may be someone else's."""
     _mk("solo", alive=False)
     cli.main(["--format", "json", "log"])
-    data = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
     assert data["vm"] == "solo"
+    assert data["autoselected"] is True
+    assert "Auto-selected the only VM (stopped) 'solo'" in captured.err
+
+
+@pytest.mark.parametrize("cmd", ["log", "status", "kill", "exec"])
+def test_require_vm_env_refuses_auto_selection(cmd, cache, monkeypatch, capsys):
+    """`QMU_REQUIRE_VM=1`: a forgotten --vm is a refusal, never an action on
+    whatever VM happens to be alive."""
+    _mk("live", alive=True)
+    monkeypatch.setenv("QMU_REQUIRE_VM", "1")
+
+    extra = ["true"] if cmd == "exec" else []
+    rc = cli.main(["--format", "json", cmd, *extra])
+    data = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert data["ok"] is False
+    assert data["error"] == "--vm is required: QMU_REQUIRE_VM is set"
     assert "autoselected" not in data
+
+    if cmd != "kill":  # an explicit --vm is never refused
+        cli.main(["--format", "json", cmd, "--vm", "live", *extra])
+        assert "QMU_REQUIRE_VM" not in capsys.readouterr().out
+
+
+def test_require_vm_env_zero_is_unset(cache, monkeypatch, capsys):
+    _mk("live", alive=True)
+    monkeypatch.setenv("QMU_REQUIRE_VM", "0")
+    cli.main(["--format", "json", "status"])
+    assert json.loads(capsys.readouterr().out)["autoselected"] is True
 
 
 def test_genuine_ambiguity_is_bounded_and_names_the_remedy(cache, capsys):
@@ -121,7 +167,10 @@ def test_genuine_ambiguity_is_bounded_and_names_the_remedy(cache, capsys):
     assert len(listed) == _AMBIGUITY_LIST_LIMIT
     assert "and 35 more" in text
     assert "qmu list" in text
-    assert "qmu prune --all" in text
+    # On a shared host the stopped VMs listed are other people's too; the
+    # remedy names one VM, never the cache-wide sweep (r2-shared P1).
+    assert "qmu prune --vm dead" in text
+    assert "prune --all" not in text
     assert len(text.strip().splitlines()) <= 10
 
 

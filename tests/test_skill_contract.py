@@ -157,7 +157,7 @@ def test_documented_command_parses(path, lineno, command):
     )
 
 
-MAX_SKILL_LINES = 650
+MAX_SKILL_LINES = 400
 
 
 def test_main_skill_stays_short():
@@ -167,6 +167,66 @@ def test_main_skill_stays_short():
     assert lines <= MAX_SKILL_LINES, (
         f"SKILL.md is {lines} lines (> {MAX_SKILL_LINES}); move detail to reference/"
     )
+
+
+# Claims a second round of fresh-agent dogfooding proved wrong against the
+# tool. Each regex is the wording that misled; the reason says what is true.
+RETIRED_CLAIMS = [
+    (r"--older-than 0\s+# finally drop the retained logs",
+     "kill-preserved logs prune at any age; only metadata-free .qemu.log/.qmp.sock remnants are gated"),
+    (r"stale one reports\s+`exited \(code 0\)`",
+     "a stale hand-started bridge fails with RuntimeError: Remote target disappeared"),
+    (r"wait` ends in `124` with `crash: null` instead of reporting the panic",
+     "bare wait returns 3 at the panic line whether or not --no-reboot is set"),
+    (r"15-60 s on a busy host", "list takes a few seconds; the estimate was wrong"),
+    (r"the `profile` bucket is noise\)",
+     "profile-sourced unknown params are JSON-only, never printed"),
+    (r"pointing at\s+`qmu prune --all` — do not run",
+     "qmu never recommends prune --all; its hints name prune --vm <id>"),
+    (r"auto-selection needs exactly one running VM\)\.",
+     "auto-selection is announced on stderr + autoselected: true; QMU_REQUIRE_VM=1 forbids it"),
+]
+
+
+@pytest.mark.parametrize("pattern,reason", RETIRED_CLAIMS, ids=[r for _, r in RETIRED_CLAIMS])
+def test_retired_claims_stay_retired(pattern, reason):
+    rx = re.compile(pattern)
+    hits = [
+        f"{p.name}:{n}" for p in SKILL_FILES
+        for n, line in enumerate(p.read_text().splitlines(), 1) if rx.search(line)
+    ]
+    assert not hits, f"retired claim back in {hits}: {reason}"
+
+
+# Contracts the skill must carry so an agent branches on the tool, not on a
+# guess. (file, phrase) — every phrase is a literal the tool emits or a key.
+REQUIRED_CLAIMS = [
+    (SKILL, "QMU_REQUIRE_VM"),
+    (SKILL, "autoselected: true"),
+    (SKILL, "console_tail"),
+    (SKILL, "already_stopped: true"),
+    (SKILL, "[stopped — crash report retained]"),
+    (SKILL, "skipped (debugger attached)"),
+    (SKILL, "--format text --out report.txt"),
+    (SKILL, "--partition 0"),
+    (SKILL, "10.0.2.15"),
+    (SKILL, "pry --instance qmu-"),
+    (REFERENCE_DIR / "wait.md", "console_tail"),
+    (REFERENCE_DIR / "launch.md", "logs_retained"),
+    (REFERENCE_DIR / "debugging.md", "Remote target disappeared"),
+    (REFERENCE_DIR / "debugging.md", "bridge_instance_id"),
+    (REFERENCE_DIR / "snapshots.md", "vm_clock"),
+    (REFERENCE_DIR / "troubleshooting.md", "paths.<key>.exists"),
+    (REFERENCE_DIR / "troubleshooting.md", "qmu config path"),
+    (REFERENCE_DIR / "cross-arch.md", "[boot]"),
+]
+
+
+@pytest.mark.parametrize(
+    "path,phrase", REQUIRED_CLAIMS, ids=[f"{p.name}:{s}" for p, s in REQUIRED_CLAIMS]
+)
+def test_required_claims_present(path, phrase):
+    assert phrase in path.read_text(), f"{path.name} no longer states {phrase!r}"
 
 
 def _table_commands(path: Path) -> list[tuple[int, str]]:

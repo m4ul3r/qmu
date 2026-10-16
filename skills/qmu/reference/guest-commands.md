@@ -38,7 +38,9 @@ JSON: `vm_id`, `command`, `exit_code` (null when the command did not finish),
 - Against a `panicked` or `paused` guest (any QMP `running: false` state) the
   command refuses in under a second: exit 1, `guest_state: "panicked" |
   "paused"`, `hint` naming `qmu crash --vm X` / `qmu kill --vm X` or `qmu cont
-  --vm X`. A debugger stop that fires mid-command gives the same `paused`.
+  --vm X`. A debugger stop that fires mid-command (`exec`, `compile --run`,
+  `dmesg`) aborts the SSH session within ~1 s and gives the same `paused`
+  envelope — never the 15–20 s keepalive wait.
 - Text mode: `reference/output-contract.md` → *Guest-command text mode*.
 
 ## `run`
