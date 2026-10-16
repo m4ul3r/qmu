@@ -89,9 +89,11 @@ class MkrootfsEnv:
                     # arrives on stdin (-f -), the context dir is the last arg.
                     cat >"$STATE/dockerfile"
                     ctx="${{@: -1}}"
-                    if [[ -f "$ctx/qmu-guest-setup.sh" ]]; then
-                      cp "$ctx/qmu-guest-setup.sh" "$STATE/context-qmu-guest-setup.sh"
-                    fi
+                    for f in qmu-guest-setup.sh qmu-export-fixup.sh; do
+                      if [[ -f "$ctx/$f" ]]; then
+                        cp "$ctx/$f" "$STATE/context-$f"
+                      fi
+                    done
                     # Real `docker build -q` writes the image id to stdout.
                     echo "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
                     exit 0
@@ -824,6 +826,7 @@ def _run_guest_setup(
         "ROOT_DEV": "/dev/vda",
         "QMU_RELEASE": "bookworm",
         "QMU_ARCH": "arm64",
+        "QMU_HOSTNAME": "qmu-rootfs",
     })
     return subprocess.run(
         ["sh", str(setup)], env=env, text=True, capture_output=True, check=False
@@ -883,7 +886,10 @@ def test_guest_setup_keeps_console_autologin_and_records_policy(mkrootfs_env: Mk
 
     autologin = (root / "etc/systemd/system/serial-getty@.service.d/autologin.conf").read_text()
     assert "--autologin root" in autologin
-    assert (root / "etc/hostname").read_text() == "qmu-rootfs\n"
+    # /etc/hostname is bind-mounted during RUN and so cannot be written here;
+    # the export fixup owns it (see test_export_fixup_*). The stamp records
+    # the value the fixup will write.
+    assert not (root / "etc/hostname").exists()
     assert (root / "etc/fstab").read_text() == "/dev/vda / ext4 defaults 0 1\n"
     # A fresh sshd_config is created when the package has none, Include first.
     assert (root / "etc/ssh/sshd_config").read_text().startswith("Include /etc/ssh/sshd_config.d/")
@@ -896,6 +902,8 @@ def test_guest_setup_keeps_console_autologin_and_records_policy(mkrootfs_env: Mk
     assert record["ssh_pubkey_sha256"] == hashlib.sha256(
         b"ssh-ed25519 AAAA test@qmu\n"
     ).hexdigest()
+    assert record["hostname"] == "qmu-rootfs"
+    assert record["console"] == "serial-autologin-root"
 
 
 def test_guest_setup_refuses_to_run_without_a_key(mkrootfs_env: MkrootfsEnv):
@@ -933,6 +941,80 @@ def test_dockerfile_runs_the_generated_guest_setup_and_nothing_permissive(
     emitted = _emit_guest_setup(mkrootfs_env).read_text()
     assert shipped == emitted
     assert "PermitEmptyPasswords no" in shipped
+
+
+def test_export_fixup_strips_container_markers_and_sets_hostname(
+    mkrootfs_env: MkrootfsEnv,
+):
+    """`docker export` ships /.dockerenv (bind-mounted during RUN, so no
+    Dockerfile step can remove it). On the booted VM systemd-detect-virt then
+    says "docker", the getty generator takes the container branch, ttyS0 goes
+    to console-getty.service and serial-getty@ttyS0 -- the unit the autologin
+    drop-in targets -- never exists: the serial console shows `login:` against
+    a locked root password. /etc/hostname exports as the 0-byte bind file, so
+    the guest is `localhost`. Both are fixed on the extracted tree, before
+    mke2fs; this runs the script the build consumed against a scratch tree."""
+    result = mkrootfs_env.run_args()
+    assert result.returncode == 0, result.stderr
+    state = mkrootfs_env.tmp_path / "docker-state"
+    fixup = state / "context-qmu-export-fixup.sh"
+    assert fixup.is_file(), "the export fixup must be shipped in the build context"
+
+    root = mkrootfs_env.tmp_path / "exported-root"
+    (root / "etc").mkdir(parents=True)
+    (root / "run").mkdir()
+    (root / ".dockerenv").write_bytes(b"")
+    (root / "run/.containerenv").write_bytes(b"")
+    (root / "etc/hostname").write_bytes(b"")  # what docker export ships
+    (root / "etc/hosts").write_bytes(b"")
+    run = subprocess.run(["sh", str(fixup), str(root)], text=True, capture_output=True)
+    assert run.returncode == 0, run.stderr
+    assert not (root / ".dockerenv").exists()
+    assert not (root / "run/.containerenv").exists()
+    assert (root / "etc/hostname").read_text() == "qmu-rootfs\n"
+    hosts = (root / "etc/hosts").read_text()
+    assert "127.0.1.1 qmu-rootfs\n" in hosts
+    assert "127.0.0.1 localhost\n" in hosts
+
+    # A tree that is not an extracted rootfs is refused, not "fixed".
+    bogus = mkrootfs_env.tmp_path / "not-a-rootfs"
+    bogus.mkdir()
+    run = subprocess.run(["sh", str(fixup), str(bogus)], text=True, capture_output=True)
+    assert run.returncode != 0
+
+
+def test_export_fixup_runs_before_mke2fs_on_both_image_paths(mkrootfs_env: MkrootfsEnv):
+    """The helper-container path and the sudo fallback each extract the tarball
+    themselves, so each must run the fixup, between tar -x and mke2fs. The
+    shim's helper `docker run` always fails, so one run exercises both."""
+    result, _scratch, calls = mkrootfs_env.run()
+    assert result.returncode == 0, result.stderr
+    log = calls.read_text()
+
+    # `docker $*` logs the bash -c script with its newlines, so the helper
+    # invocation spans from "docker run " to the next "docker " line.
+    helper = re.search(r"^docker run .*?(?=^docker |\Z)", log, re.M | re.S).group(0)
+    assert re.search(r"-v \S+:/qmu-ctx:ro", helper), helper
+    tar_i = helper.index("tar -x -C /rootfs")
+    fixup_i = helper.index("sh /qmu-ctx/qmu-export-fixup.sh /rootfs")
+    mke2fs_i = helper.index("mke2fs ")
+    assert tar_i < fixup_i < mke2fs_i, helper
+
+    lines = log.splitlines()
+    sudo_tar = next(i for i, l in enumerate(lines) if l.startswith("sudo tar "))
+    sudo_fixup = next(i for i, l in enumerate(lines) if re.match(r"sudo sh \S+/qmu-export-fixup\.sh ", l))
+    sudo_mke2fs = next(i for i, l in enumerate(lines) if l.startswith("sudo mke2fs "))
+    assert sudo_tar < sudo_fixup < sudo_mke2fs, lines
+
+    # And console-login readiness is part of the build digest, so an image
+    # exported before it existed (shipping /.dockerenv, no console login) is
+    # rebuilt.
+    source = MKROOTFS.read_text()
+    assert re.search(r'^CONSOLE_LOGIN_REV="\S+"$', source, re.M)
+    assert 'echo "console_login=$CONSOLE_LOGIN_REV"' in source
+    # serial-getty@ttyS0 BindsTo=dev-ttyS0.device, which only udev activates.
+    dockerfile = (mkrootfs_env.tmp_path / "docker-state" / "dockerfile").read_text()
+    assert re.search(r"apt-get install .*\budev\b", dockerfile, re.S), dockerfile
 
 
 def test_stamp_records_sshd_policy_and_pre_policy_images_are_rebuilt(

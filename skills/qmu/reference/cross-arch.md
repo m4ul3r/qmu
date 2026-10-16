@@ -176,8 +176,9 @@ If nothing is found, the error names what was tried, the package to install, and
 guest arch, so an unmodelled toolchain (musl cross, clang, a wrapper script) works;
 without `--host` it names the compiler run *in the guest* (default `gcc`). A VM whose instance record has **no**
 recorded arch (written before qmu recorded it) is refused rather than guessed —
-relaunch it, or pass `--cc`. `qmu doctor` does not check for the cross
-toolchain or for `gdb-multiarch`; the first `compile --host` tells you.
+relaunch it, or pass `--cc`. `qmu doctor` adds `cross compiler for <arch>
+(compile --host)` and `gdb-multiarch` rows when `[machine] arch` ≠ host arch
+(`[~]` when missing, naming the `apt install` package).
 
 Keep `-static` in `--cflags` (it is the default): a host-built dynamic binary must
 match the guest's libc, and a static one sidesteps that entirely. The pushed

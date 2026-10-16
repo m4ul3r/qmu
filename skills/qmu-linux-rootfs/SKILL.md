@@ -1,235 +1,203 @@
 ---
 name: qmu-linux-rootfs
-description: Build Debian rootfs images for QEMU exploit development via Docker buildx. Multi-arch (x86_64, i386, arm64, arm32), auto-generates SSH keys, produces raw ext4 images ready for qmu launch.
+description: Build Debian rootfs images for QEMU exploit development via Docker (x86_64, i386, arm64, arm32). Produces a raw ext4 image plus a generated SSH key; root SSH is key-only. Use when `qmu launch` needs a rootfs, or a cross-arch rootfs, that pairs with a kbuild kernel.
 ---
 
 # qmu-linux-rootfs
 
-Use this skill when the user needs a rootfs image for `qmu launch` and does not have one, needs a cross-architecture rootfs, or is setting up a fresh exploit-dev project. The script builds a Debian-based rootfs via Docker with systemd + SSH + networking pre-configured for qmu.
+`tools/mkrootfs.sh` builds a Debian rootfs (systemd + sshd + gcc, static IP
+for QEMU user-net) as a raw ext4 image and prints eval-able `ROOTFS=`/`SSH_KEY=`
+assignments. It pairs with a kernel you built (`qmu-linux-kbuild`). For a
+result that must be a statement about Ubuntu itself, use `qmu-ubuntu-target`
+(`tools/mktarget.sh`) instead: this image boots under qmu's `exploit-dev`
+profile, which disables the LSM stack.
 
-> **Testing a PoC against a real distro instead?** Use `qmu-ubuntu-target`
-> (`tools/mktarget.sh`), which builds Ubuntu's own kernel at a pinned ABI plus a
-> matching Ubuntu userland with its real hardening — AppArmor enforcing, KASLR on,
-> distro sysctl defaults. This skill's Debian rootfs pairs with a kernel *you*
-> built (`qmu-linux-kbuild`) and its default profile disables the LSM stack, so
-> results from it are statements about your kernel, not about a distro.
+The script is not on `PATH`: from a qmu checkout it is `tools/mkrootfs.sh` (the
+form used below); from this skill's directory, `../../tools/mkrootfs.sh`.
 
-The script ships in the qmu project's `tools/` directory. It is not on `PATH`; resolve it relative to the install location — from this skill's directory that is `../../tools/mkrootfs.sh`, or from a checkout of the qmu repo just `tools/mkrootfs.sh` (the form used in the examples below).
+## Decision table
 
-## Quick reference
+| Need | Run |
+|---|---|
+| A rootfs for an x86_64 kernel (default: bookworm, 2G) | `eval "$(tools/mkrootfs.sh)"` |
+| Build + boot in one go | `eval "$(tools/kbuild.sh --version 6.6.75)"; eval "$(tools/mkrootfs.sh)"; qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY"` |
+| arm64 / arm32 / i386 rootfs | `eval "$(tools/mkrootfs.sh --arch arm64)"` (also `arm32`, `i386`; needs binfmt, see Prerequisites) |
+| Extra packages / bigger image | `tools/mkrootfs.sh --packages "gdb,strace" --size 4G` (gets its own cache directory) |
+| Use a key you already have | `tools/mkrootfs.sh --ssh-key ~/.ssh/qmu_ed25519` (`PATH.pub` must exist and be readable) |
+| Older/newer Debian | `tools/mkrootfs.sh --release bullseye` (`bullseye`, `bookworm`, `trixie`, `sid`) |
+| Force a rebuild (e.g. a legacy image whose sshd accepts any key) | `tools/mkrootfs.sh --no-cache` |
+| Put the image somewhere specific | `tools/mkrootfs.sh --outdir /data/rootfs/bookworm` |
+| Inspect the in-guest setup (sshd policy, keys) without Docker | `tools/mkrootfs.sh --emit-guest-setup ./setup.sh` |
+| Put files into the image offline (no boot) | `qmu rootfs inject "$ROOTFS" ./exploit:/root --partition 0` or `qmu launch --inject ./exploit:/root --partition 0` |
+| Check whether a cached image is key-only | `qmu rootfs cat "$ROOTFS" /etc/qmu-rootfs.json --partition 0` (missing file ⇒ legacy, any key works) |
 
-```bash
-# Build default x86_64 rootfs
-tools/mkrootfs.sh
+## Output contract
 
-# Build and wire up with qmu
-eval $(tools/mkrootfs.sh)
-qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY"
-
-# Cross-arch rootfs for arm64
-tools/mkrootfs.sh --arch arm64
-
-# Use an older Debian release
-tools/mkrootfs.sh --release bullseye
-
-# Add extra packages
-tools/mkrootfs.sh --packages "gdb,strace,ltrace"
-
-# Use an existing SSH key
-tools/mkrootfs.sh --ssh-key ~/.ssh/qmu_id_rsa
-
-# Force rebuild
-tools/mkrootfs.sh --no-cache
-```
-
-## Output format
-
-The script prints eval-able shell variables to stdout (all logs go to stderr):
+Stdout carries only `printf %q`-quoted assignments; every log line, note and
+build-tool chatter goes to stderr, on a cache hit and on a full build alike, so
+`eval "$(tools/mkrootfs.sh …)"` is safe.
 
 ```
 ROOTFS=/home/user/.cache/qmu/rootfs/bookworm/x86_64/rootfs.img
 SSH_KEY=/home/user/.cache/qmu/rootfs/bookworm/x86_64/id_ed25519
 ```
 
-Stdout carries nothing but those assignments, on a cache hit and on a full
-build alike: every log line, every note, and every build command's own output
-(`docker build -q`'s image id, mke2fs's `Creating regular file …`) goes to
-stderr. The paths are shell-quoted with `printf %q`, matching
-`tools/kbuild.sh`, so an `--outdir` containing a space still survives the
-`eval`.
+`SSH_KEY` is the private key that is authorized in the image (the generated
+one, or the `--ssh-key` path). `--emit-guest-setup` prints nothing on stdout.
 
-## What's in the rootfs
+| Exit | Meaning | Next |
+|---|---|---|
+| `0` | image built or served from cache; assignments on stdout | `qmu launch --rootfs "$ROOTFS" --ssh-key "$SSH_KEY" …` |
+| `2` | usage: `--help`, unknown flag, unsupported `--arch`/`--release`, missing/unreadable `--ssh-key` or `PATH.pub`, missing `id_ed25519.pub` next to a cached private key, `docker` not on PATH, binfmt missing for a cross-arch build. Message is `mkrootfs: error: …` on stderr | fix the named input; the error names the file or the `docker run … binfmt` command |
+| other non-zero | a build step failed under `set -e` (`docker build`, both `mke2fs` paths, `docker export`); the status is the failing tool's | rerun with `--verbose` and read stderr; `docker build` apt errors are usually mirror hiccups — retry |
 
-A qmu-ready Debian base with everything needed for `qmu exec`, `qmu push`, and `qmu compile`:
+A failed build never leaves a half-written `rootfs.img`: the image is built as
+`rootfs.img.part` and renamed only after `mke2fs` succeeds.
 
-- **Init:** systemd (boots to multi-user target)
-- **SSH:** openssh-server, root login enabled, ed25519 key-based auth
-- **Build tools:** gcc, libc6-dev, make (for `qmu compile`)
-- **Networking:** iproute2, ethtool, kmod
-- **qmu-net.service:** systemd oneshot that configures static IP 10.0.2.15/24 for QEMU user-net, disables NIC offload (e1000+slirp workaround), and prints "QMU-NET-READY" to serial console
-- **Extra packages:** anything passed via `--packages`
+## Guest SSH policy: key-only root
 
-Image is raw ext4, 2G by default (configurable with `--size`).
+- sshd authorizes **only** the key in `SSH_KEY`: `/root/.ssh/authorized_keys`
+  (0600) holds that one public key, and `/etc/ssh/sshd_config.d/60-qmu.conf`
+  sets `PermitRootLogin prohibit-password`, `PubkeyAuthentication yes`,
+  `PasswordAuthentication no`, `KbdInteractiveAuthentication no`,
+  `PermitEmptyPasswords no` (sshd takes the first value it sees, and the
+  drop-in is included from line 1). Root's password is locked (`passwd -l`).
+  A wrong key gets `Permission denied (publickey)`, which is what makes a port
+  mix-up between two VMs fail instead of silently running on the wrong guest.
+- The serial console autologs in as root (a `serial-getty@.service.d/autologin.conf`
+  drop-in, so it covers `ttyS0` and `ttyAMA0`; `udev` is installed so
+  `dev-ttyS0.device` becomes active); the guest hostname is `qmu-rootfs`.
+  qmu's serial is log-only, so nothing in a qmu workflow depends on console
+  login. An image whose serial log shows `localhost login:` predates the
+  export fix (it still carries `/.dockerenv`, so systemd's getty generator
+  takes the container branch) — rebuild it.
+- Provenance: `/etc/qmu-rootfs.json` inside the image
+  (`{"schema": 1, "sshd_policy": "key-only", "root_password": "locked",
+  "console": "serial-autologin-root", "hostname": "qmu-rootfs", "release",
+  "arch", "ssh_pubkey_sha256"}`), and `sshd_policy=key-only` in
+  `<outdir>/.mkrootfs-stamp` (the console-login revision is folded into the
+  stamp's `build_key=` digest, not a separate line). Read it from the host
+  with `qmu rootfs cat "$ROOTFS" /etc/qmu-rootfs.json --partition 0` or in
+  the guest with `qmu exec 'cat /etc/qmu-rootfs.json'`.
 
-## Architecture details
+**Images built before this policy accept root with ANY key** (they ran
+`passwd -d root` + `PermitEmptyPasswords yes`) and have neither the JSON file
+nor an `sshd_policy=` stamp line. The sshd policy and the console-login
+revision are both part of the build key, so:
 
-| Arch | Docker platform | Root device | QEMU machine type |
+| Cached image | What a rerun does | Command |
+|---|---|---|
+| stamped, no `sshd_policy=` line (built with non-default options) | prints `note: cached image at … predates the key-only sshd policy (its sshd accepted root with ANY key …); rebuilding so only the qmu key is authorized`, then rebuilds in place | rerun the same `tools/mkrootfs.sh …` invocation |
+| stamped `sshd_policy=key-only` but built before the export fix (key-only, yet `localhost login:` on serial) | prints `note: … was built with different options than requested (requested: … sshd-policy=key-only)` and rebuilds in place | rerun the same invocation |
+| unstamped (legacy default build) | serves it with `note: … has no completion stamp, so its --packages/--size/--ssh-key are UNVERIFIED and its sshd most likely accepts root with ANY key …` | `tools/mkrootfs.sh --no-cache` (add `--arch`/`--release` as used) |
+| stamped by the current script | cache hit, no note | nothing |
+
+## Flags and environment
+
+| Flag | Effect |
+|---|---|
+| `--arch ARCH` | `x86_64` (default), `i386`, `arm64`, `arm32` |
+| `--release REL` | `bookworm` (default), `bullseye`, `trixie`, `sid` |
+| `--ssh-key PATH` | authorize this ed25519 private key instead of generating one; needs readable `PATH.pub` |
+| `--packages PKGS` | comma-separated extra apt packages (order-insensitive in the cache key) |
+| `--size SIZE` | image size (default `2G`) |
+| `--outdir DIR` | write `rootfs.img`, key and stamp here instead of the cache path |
+| `--no-cache` | rebuild even if a matching cached image exists |
+| `--verbose` | show `docker build` output |
+| `--emit-guest-setup PATH` | write the in-guest setup script to PATH and exit 0; no Docker |
+| `-h`, `--help` | usage on stderr, exit 2 |
+
+`QMU_CACHE_DIR` overrides `~/.cache/qmu` (shared with kbuild/mktarget);
+`QMU_ROOTFS_SIZE` sets the default size (`--size` wins, and a non-`2G` value
+routes to a keyed cache directory like any other non-default option).
+
+## What is in the image
+
+Debian `<release>-slim` + `systemd-sysv udev openssh-server gcc libc6-dev make
+iproute2 ethtool kmod` + `--packages`. `qmu-net.service` (oneshot, before
+`ssh.service`) disables NIC offload on `eth0`, sets `10.0.2.15/24` with gateway
+`10.0.2.10`, and prints `QMU-NET-READY …` on the console. `/etc/fstab` mounts
+the arch's root device. Raw ext4, label `qmu-root`, no partition table — every
+offline `qmu rootfs …`/`qmu launch --inject` call needs `--partition 0`.
+
+| Arch | Docker platform | Root device | Boot it with |
 |---|---|---|---|
-| `x86_64` | `linux/amd64` | `/dev/sda` | default (PC/q35) |
-| `i386` | `linux/386` | `/dev/sda` | default (PC) |
-| `arm64` | `linux/arm64` | `/dev/vda` | virt (`-M virt -cpu cortex-a57`) |
-| `arm32` | `linux/arm/v7` | `/dev/vda` | virt (`-M virt -cpu cortex-a15`) |
-
-The fstab inside the rootfs is automatically set to the correct root device for the target arch.
-
-Cross-arch builds require binfmt_misc QEMU user-mode emulators registered on the host. If missing, the script tells you how to register them.
-
-## SSH key handling
-
-- **Default (no `--ssh-key`):** Auto-generates an ed25519 keypair into the output directory alongside rootfs.img. Reused on subsequent cached runs — but the generated key's public half is recorded in the completion stamp and re-checked on every hit, so *replacing* `id_ed25519`/`id_ed25519.pub` in a cache directory busts the hit and rebuilds the image rather than handing back one the new key cannot log into. If the private half is present and the `.pub` is missing or unreadable, the run stops with an error naming that file (restore it with `ssh-keygen -y -f DIR/id_ed25519 > DIR/id_ed25519.pub`) instead of claiming the key changed.
-- **With `--ssh-key PATH`:** Uses the provided private key; expects a readable `PATH.pub` alongside it.
-
-Wire the key into qmu.toml:
-```toml
-[ssh]
-key = "/home/user/.cache/qmu/rootfs/bookworm/x86_64/id_ed25519"
-```
-
-Or use CLI: `qmu launch --ssh-key "$SSH_KEY" ...`
-
-## Full workflow (kernel + rootfs + qmu)
+| `x86_64` | `linux/amd64` | `/dev/sda` | default profile (`root=/dev/sda`) |
+| `i386` | `linux/386` | `/dev/sda` | `qmu launch --arch i386 …` |
+| `arm64` | `linux/arm64` | `/dev/vda` | `--arch aarch64 --cmdline "console=ttyAMA0 root=/dev/vda rw" -- -M virt -cpu cortex-a57` |
+| `arm32` | `linux/arm/v7` | `/dev/vda` | virt + virtio-MMIO drive; recipe in `skill://qmu/reference/cross-arch.md` |
 
 ```bash
-# 1. Build a kernel
-eval $(tools/kbuild.sh --version 6.6.75)
-
-# 2. Build a rootfs
-eval $(tools/mkrootfs.sh)
-
-# 3. Launch
-qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY"
-
-# 4. Use
-qmu exec "uname -r"
-qmu compile exploit.c --run
-```
-
-For arm64 (extra QEMU args go after `--`; there is no `--extra-args` flag, and the ARM
-console/root cmdline must be set since the default profile is x86-only):
-```bash
-eval $(tools/kbuild.sh --version 6.6.75 --arch arm64)
-eval $(tools/mkrootfs.sh --arch arm64)
+eval "$(tools/kbuild.sh --version 6.6.75 --arch arm64)"
+eval "$(tools/mkrootfs.sh --arch arm64)"
 qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY" \
   --arch aarch64 --cmdline "console=ttyAMA0 root=/dev/vda rw" \
   -- -M virt -cpu cortex-a57
 ```
 
-See the qmu skill's **Cross-arch quickstarts (aarch64 / arm32)** section for the complete
-recipe, including the arm32 virtio-MMIO drive form and pry rebasing.
+## Cache rules
 
-## Cache layout
+Layout: `~/.cache/qmu/rootfs/<release>/<arch>/` for a build with exactly the
+default options; `<release>/<arch>-<key8>/` for any build that differs
+(`--packages`, `--size`, `--ssh-key`, a non-`2G` `QMU_ROOTFS_SIZE`). Each holds
+`rootfs.img`, `id_ed25519`, `id_ed25519.pub` and `.mkrootfs-stamp`.
 
+- The build key hashes `arch`, `release`, `size`, the sorted package list, the
+  `--ssh-key` public half (if given), `sshd_policy` and the console-login
+  revision (`console_login=…`, bumped when the script's console setup changes). A hit needs
+  `rootfs.img` **and** a stamp whose `build_key=` equals this run's. A
+  generated key's public half is also re-checked against the stamp's
+  `ssh_pubkey_sha256=`; replacing `id_ed25519*` in a cache directory rebuilds
+  instead of handing back an image the new key cannot log into.
+- A stamped mismatch is never served silently: stderr names the requested
+  options (`requested: size=… packages=… ssh-key=… sshd-policy=key-only`) or
+  the pre-policy/publish-in-progress reason, then the run rebuilds and replaces
+  the image.
+- Only a default-shape run may serve an **unstamped** directory, and it says
+  so (UNVERIFIED note above). Non-default runs never see one.
+- Publish is atomic: stamp poisoned with `build_key=publishing-<pid>`, image
+  renamed into place, real stamp written. A `publishing-` stamp means a build
+  died mid-publish; the next run rebuilds.
+- Private key present but `id_ed25519.pub` missing ⇒ exit 2 with the repair
+  command (`ssh-keygen -y -f DIR/id_ed25519 > DIR/id_ed25519.pub`).
+
+Wire the key into a project config instead of passing `--ssh-key` every time:
+
+```toml
+[drive]
+rootfs = "/home/user/.cache/qmu/rootfs/bookworm/x86_64/rootfs.img"
+[ssh]
+key = "/home/user/.cache/qmu/rootfs/bookworm/x86_64/id_ed25519"
 ```
-~/.cache/qmu/rootfs/
-  bookworm/
-    x86_64/                       # default-argument builds (legacy path)
-      rootfs.img        # raw ext4 image
-      id_ed25519        # SSH private key (auto-generated)
-      id_ed25519.pub    # SSH public key
-      .mkrootfs-stamp   # records the build key + options
-    x86_64-<key8>/                # builds that differ from the defaults
-      rootfs.img                  # (--packages / --size / --ssh-key each
-      id_ed25519                  #  select a variant keyed by those options)
-      id_ed25519.pub
-      .mkrootfs-stamp
-    arm64/
-      rootfs.img
-      id_ed25519
-      id_ed25519.pub
-  bullseye/
-    ...
-```
-
-A stamped cache hit requires an image plus a completion stamp whose recorded
-build key matches the requested options. Default-argument runs may still serve
-an *unstamped* directory — without any stamp check — but print a note that the
-image's `--packages` / `--size` / `--ssh-key` are UNVERIFIED, naming the
-possibilities rather than asserting one (a directory written before stamps
-existed, or one whose stamp was removed) — pass `--no-cache` to force a
-rebuild. An image built with different options is never silently returned:
-non-default requests get their own keyed variant, and a stamped hit whose
-recorded key differs names the mismatched options (image path rendered
-shell-quoted) before rebuilding with the requested ones.
-
-Partial builds can never be served as hits: the image is created under
-`rootfs.img.part` and renamed into place only after mke2fs succeeds (the same
-atomicity rule as the stamp), so an interrupted run leaves nothing at the
-final path. Package lists are order-insensitive in the build key (`strace,htop`
-and `htop,strace` share one cache entry), matching mktarget's normalization.
-
-The image and its stamp are published as a *window*, not two independent
-writes: the stamp is first replaced with a `build_key=publishing-<pid>` poison,
-then the image is renamed into place, then the real stamp is written — each
-write temp-file-then-rename. A run killed inside that window therefore leaves a
-stamp that matches no request at all, so the next invocation reports that the
-image was left by a build that died while publishing it and rebuilds, instead
-of serving an image the surviving stamp only claimed to describe. A
-`publishing-` build key in a cache directory means exactly that; a completed
-build never leaves one.
-
-The default shape is compared against the literal defaults (`2G`, no
-`--packages`, no `--ssh-key`), so an env-overridden `QMU_ROOTFS_SIZE` also
-routes to a keyed variant rather than the legacy path.
-
-Use `--no-cache` to force a rebuild. Use `--outdir` to place output elsewhere.
 
 ## Prerequisites
 
-- **Docker** with buildx support (Docker 19.03+)
-- **binfmt_misc** for cross-arch builds:
-  ```bash
-  docker run --rm --privileged tonistiigi/binfmt:latest --install all
-  ```
-  Only needed once per host boot. Native-arch builds (x86_64 on x86_64) need no binfmt.
-- **libguestfs with a readable appliance kernel** — only for *offline* edits of
-  the built image (`qmu rootfs inject|ls|cat|rm`, `qmu launch --inject`), which
-  is how files get into a harness rootfs with no SSH. Debian/Ubuntu ship
-  `/boot/vmlinuz-*` as mode `0600`, so the supermin appliance fails with an
-  opaque "appliance closed the connection unexpectedly". `qmu doctor` diagnoses
-  it; fix with `sudo chmod 0644 /boot/vmlinuz-*`, or leave system permissions
-  alone and point supermin at a copy:
-  ```bash
-  sudo install -m 0644 /boot/vmlinuz-$(uname -r) /var/tmp/vmlinuz
-  export SUPERMIN_KERNEL=/var/tmp/vmlinuz SUPERMIN_KERNEL_VERSION=$(uname -r) \
-         SUPERMIN_MODULES=/lib/modules/$(uname -r)
-  ```
-  Building the image itself does not need libguestfs.
+- **Docker** (the build and the `mke2fs` helper both run in containers; if the
+  helper fails the script falls back to `sudo mke2fs -d`).
+- **binfmt_misc** for any arch the host cannot run natively (`arm32` always;
+  `arm64` on x86 hosts): `docker run --rm --privileged tonistiigi/binfmt:latest --install all`
+  once per host boot. Missing ⇒ exit 2 naming that command.
+- **libguestfs with a readable appliance kernel** only for offline edits
+  (`qmu rootfs inject|ls|cat|rm`, `qmu launch --inject`). Debian/Ubuntu ship
+  `/boot/vmlinuz-*` as `0600`, which fails with "appliance closed the
+  connection unexpectedly"; `qmu doctor` reports it. Fix: `sudo chmod 0644
+  /boot/vmlinuz-*`, or point supermin at a copy:
+  `sudo install -m 0644 /boot/vmlinuz-$(uname -r) /var/tmp/vmlinuz && export
+  SUPERMIN_KERNEL=/var/tmp/vmlinuz SUPERMIN_KERNEL_VERSION=$(uname -r)
+  SUPERMIN_MODULES=/lib/modules/$(uname -r)`. Building the image needs none
+  of this.
 
-## Troubleshooting
+## Recovery
 
-**"cannot run linux/arm64 containers":**
-binfmt_misc QEMU emulators not registered. Run:
-```bash
-docker run --rm --privileged tonistiigi/binfmt:latest --install all
-```
-
-**ext4 image creation fails:**
-The script tries to create the ext4 image inside a helper Docker container (no sudo needed). If that fails, it falls back to `sudo mke2fs -d`. Ensure either Docker works or you have sudo access. The temporary extracted root used by the sudo fallback is removed whether the fallback succeeds or fails.
-
-**SSH connection refused after boot:**
-- Wait for "QMU-NET-READY" in serial log (`qmu log --tail 20`)
-- Verify the SSH key in qmu.toml matches what was baked into the rootfs
-- Check `qmu doctor` for SSH key issues
-
-**Wrong root device (kernel panic: VFS unable to mount):**
-- x86 kernels expect `root=/dev/sda` (default qmu profile)
-- arm64/arm32 with virtio-blk need `root=/dev/vda` — override cmdline:
-  ```bash
-  qmu launch --cmdline "console=ttyAMA0 root=/dev/vda rw" ...
-  ```
-
-**Image too small (no space for packages):**
-Increase with `--size`:
-```bash
-tools/mkrootfs.sh --size 4G --packages "gdb,valgrind,python3"
-```
+| Symptom | Cause | Fix |
+|---|---|---|
+| `qmu exec` → `Permission denied (publickey)` / launch `ssh_status` not `ready` | key passed to qmu is not the one baked into this image | use the `SSH_KEY` printed with this `ROOTFS`; `qmu rootfs cat "$ROOTFS" /etc/qmu-rootfs.json --partition 0` shows `ssh_pubkey_sha256` to compare with `sha256sum "$SSH_KEY.pub"` |
+| a foreign key logs in as root | legacy image (no `/etc/qmu-rootfs.json`) | `tools/mkrootfs.sh --no-cache` (same `--arch`/`--release`) |
+| `mkrootfs: error: cannot run linux/arm64 containers` (exit 2) | binfmt not registered | `docker run --rm --privileged tonistiigi/binfmt:latest --install all` |
+| `mkrootfs: error: SSH public key missing: …/id_ed25519.pub` (exit 2) | `.pub` deleted beside a cached private key | `ssh-keygen -y -f DIR/id_ed25519 > DIR/id_ed25519.pub` |
+| `note: … was built with different options than requested` then a rebuild | stamp exists but options differ (e.g. a `--outdir` reused across option sets) | expected; use a separate `--outdir` per variant or let it rebuild |
+| `Kernel panic … VFS: Unable to mount root fs` | wrong `root=` for the arch | x86: `root=/dev/sda`; arm64/arm32 virtio: `root=/dev/vda` in `--cmdline` |
+| SSH never ready but `QMU-NET-READY` absent from `qmu log` | guest networking did not come up (wrong kernel NIC config or `--no-net`) | kernel needs `E1000`/`VIRTIO_NET` built in (kbuild does this); don't pair `--no-net` with SSH use |
+| apt `No space left on device` in the build / packages missing | image too small | `tools/mkrootfs.sh --size 4G --packages …` |
+| `qmu rootfs inject` → "appliance closed the connection unexpectedly" | libguestfs cannot read `/boot/vmlinuz-*` | see Prerequisites; `qmu doctor` |
+| `qmu rootfs …` → image/partition errors on a mkrootfs image | default `--partition 1` on a partitionless image | add `--partition 0` |

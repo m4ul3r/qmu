@@ -11,6 +11,39 @@ boot/access lane, not board emulation: a vendor kernel targeting absent SoC
 devices generally cannot boot on QEMU `virt`. Do not promise an unavailable
 board model or silently replace a convergence request with shell access.
 
+## Decision table
+
+| Need | Run / read |
+|---|---|
+| Identify arch, libc, kernel, init chain | phase 1 (`file <mnt>/sbin/init`, `readlink <mnt>/lib*/ld-*.so*`, …) |
+| A generic kernel for `virt`/`q35` | `tools/kbuild.sh --version <maj.min.patch> --arch <arm64|x86_64>` (`qmu-linux-kbuild`), then check the required `=y` options |
+| Repack the rootfs without loop mounts | `sudo mke2fs -q -t ext4 -L fwroot -d <mnt> -O ^has_journal -F fw-root.img 4G` |
+| SSH/gdbserver helpers for the guest | `skills/firmware-over-qmu/fetch-hosttools.sh --arch <arm64|amd64|arm/v7|386> --release <bionic|focal|jammy|noble> --out ./fw-tools` |
+| Inject helpers/keys/init offline | `sudo debugfs -w -f inject.cmds fw-root.img`, then verify every injected file (phase 4) |
+| Dependency probe, serial only | `qmu launch --harness --cmdline '… init=/qmu-probe-init.sh' --name fw-probe --no-replace`, then `qmu wait --vm fw-probe --pattern QMU-BOOT-DONE --timeout 30` |
+| Interactive access over SSH | `qmu launch --cmdline '… init=/qmu-net-init.sh net.ifnames=0' --ssh-timeout 240 --name fw-access --no-replace`, then `qmu --vm fw-access exec -- '…'` |
+| Run / debug original binaries | phase 6: `exec`/`push`/`pull`, gdbserver over the SSH pipe |
+| Decide what counts as evidence, handoff | `skill://qmu/reference/evidence-contract.md` — read before promoting any marker, SSH connection or green run into a claim |
+
+Exit codes you will branch on (full contract: `qmu --help`, `skill://qmu/reference/wait.md`):
+
+| Command | Exit | Meaning | JSON key |
+|---|---|---|---|
+| `qmu launch` (SSH wait) | `0` | QEMU started and sshd answered | `ssh_status: "ready"` |
+| | `4` | SSH never answered within `--ssh-timeout`; VM **retained** for `qmu log`/`status` | `ok: false`, `ssh_status` (`no-console-output` = wrong `console=`/machine within ~10 s) |
+| `qmu launch --harness` / `--no-wait-ssh` | `0` | QEMU started; no SSH claim at all | `ssh_status` |
+| `qmu wait --vm X --pattern P` | `0` | a complete serial line matched P in the current boot | `matched_line`, `scan_scope` (`boot-banner`\|`epoch`), `scan_offset` |
+| | `3` | terminal kernel panic before a match | `reason: "crash"`, `crash` |
+| | `1` | QEMU exited before a match | `reason: "process_exited"` |
+| | `124` | `--timeout` elapsed | `reason: "timeout"` |
+| | `4` | serial log unreadable — inconclusive, not negative | `inconclusive: true`, `error` |
+| `qmu wait --vm X` (bare) | `0` | QEMU exited — now, or before the wait began | `reason` (`already_stopped` when it was already gone), `guest` |
+| | `3` | terminal panic while QEMU still runs; `qmu kill --vm X` keeps the report | `reason: "terminal_panic"`, `crash` |
+| | `124` / `4` | timeout / QMP unreachable with the pid alive | `reason`, `qmp` |
+| `qmu exec` | `0`/`N` | guest command's status | `exit_code` |
+| | `4` | SSH transport lost or refused, no fresh crash report | `error_type` |
+| | `3` | SSH dropped **and** a fresh serial crash report exists | `crash` |
+
 ## Goal and fidelity boundary
 
 Agree the goal and benign completion operation at intake:
@@ -47,24 +80,14 @@ may join the main baseline only after explicit approval; approval authorizes an
 adaptation, not a claim that it matches unobserved hardware. Keep a blocked main
 goal separate from a passed isolated experiment.
 
-Apply qmu's **Evidence and handoff contract** (`read
-skill://qmu/reference/evidence-contract.md`): identify artifacts by revision or
-digest, keep writable worker state private, use unique VM names with
-`--no-replace` and explicit `--vm`, and preserve a discoverable same-host recipe
-and linked receipts. Report milestone/state/strongest observation/substitutions
-and limits/receipt/next distinguishing check or blocker. Routine repairs are
-autonomous; interrupt only for changes to the proof question, relevant original
-behavior, destructive/shared state, or user-only prerequisites. Another attempt
-must name its hypothesis, changed variable, and distinguishing observation;
-stop the blocked lane when no such observation is available.
-
-Before an emulation milestone or handoff is complete, a fresh independent agent
-must review its exact scope/evidence and reproduce the benign operation from a
-clean VM. A warm-only result is scoped evidence, not reproducible completion.
-Missing exercise markers, failed observation channels, collisions, or stale
-artifact identity make a run invalid/inconclusive, not negative. Changed scope
-or bound evidence invalidates approval and requires renewed review/reproduction;
-preserve limitations and corrections through handoff.
+This skill applies qmu's **Evidence and handoff contract** —
+`skill://qmu/reference/evidence-contract.md` — in full: artifact identity by
+revision/digest, private worker state, unique VM names with `--no-replace` and
+explicit `--vm`, a discoverable same-host recipe with linked receipts, the
+milestone report row, and the independent clean-VM reproduction gate before a
+milestone or handoff is complete. The lanes above decide *which* benign
+operation that contract is applied to; the contract decides when an
+observation may be promoted to a claim. Nothing in this skill relaxes it.
 
 ## The method (six phases)
 
@@ -144,11 +167,13 @@ Ubuntu releases are candidate sources (bionic 2.27, focal 2.31, jammy 2.35,
 noble 2.39); verify the fetched artifacts, not just the release name.
 
 The fetcher requires Docker and target-architecture execution support (binfmt
-for cross-architecture containers). Use an **absolute output path**, because it
-is passed directly as a Docker bind source:
+for cross-architecture containers). `--out` may be relative or absolute; the
+script resolves it to an absolute path before using it as a Docker bind source
+and creates it if missing. Fetched files are owned by root on the host
+(written by the container); `--help` exits 0, a missing `--out` exits 1.
 ```bash
-skills/firmware-over-qmu/fetch-hosttools.sh --arch <arm64|amd64|arm/v7> \
-   --release <bionic|focal|jammy|noble> --out "$PWD/fw-tools"
+skills/firmware-over-qmu/fetch-hosttools.sh --arch <arm64|amd64|arm/v7|386> \
+   --release <bionic|focal|jammy|noble> --out ./fw-tools
 ```
 It fetches `dropbear`, `dropbearkey`, `gdbserver`, `sftp-server` and selected
 non-glibc libraries, **not shells or application utilities**; its library filter
@@ -275,24 +300,32 @@ address or route reported as an error is failure, not silently repaired.
 Network configuration can succeed before `dropbear-exec` fails; the earlier
 configuration observation remains true but does not prove SSH access.
 SSH readiness is qmu's actual **host-side connection check**, not a serial
-marker. When requested SSH readiness times out, launch returns `4` (SSH/
-infrastructure failure) and `ok:false`, retaining the VM, logs and SSH
-status/detail for diagnosis; `124` remains a wait/run timeout outcome.
-`--no-wait-ssh` and `--harness` skip that check; successful launch then makes no
-SSH-readiness claim. After readiness, perform a benign `qmu --vm fw-access exec
--- 'printf "%s\n" QMU-ACCESS-CHECK'` and, if transfers are required, push/pull a
-known harmless file and compare its bytes. Record outcomes, not just connection.
+marker. When it times out, `launch` exits `4` with `ok: false` and
+`ssh_status: "timeout (VM may still be booting)"`, retaining the VM, logs and SSH status for diagnosis
+(`ssh_status: "no-console-output"` after ~10 s of empty serial means the
+`console=`/machine type is wrong for this arch); `124` remains a `wait`/`run`
+timeout outcome. `--no-wait-ssh` and `--harness` skip that check; a successful
+launch then makes no SSH-readiness claim. After readiness, perform a benign
+`qmu --vm fw-access exec -- 'printf "%s\n" QMU-ACCESS-CHECK'` and, if transfers
+are required, push/pull a known harmless file and compare its bytes. Record
+outcomes, not just connection.
 
 Template failure parks PID1 to preserve diagnostics: inspect serial output and
 stop the failed lane rather than waiting indefinitely. `qmu wait --vm fw-probe
---pattern QMU-BOOT-DONE --timeout 30` can inspect retained stopped logs, so a
-fast successful probe need not still be running. Preserve its metadata/logs;
-matching uses the recorded epoch/latest-boot scope. Exit `0` proves only a
-pattern match; inspect accompanying dependency/failure evidence and bind the
-receipt to that VM and boot. No match follows normal panic/death/timeout
-outcomes, not an assumed negative experiment. Bare wait remains running-only
-and establishes QEMU process termination, not exercise evidence. Follow the
-qmu skill's marker/boot-epoch limits.
+--pattern QMU-BOOT-DONE --timeout 30` also reads a retained stopped log when
+`--vm` is explicit, so a fast successful probe need not still be running.
+Matching is scoped to the current boot — `scan_scope` is `boot-banner` (latest
+kernel banner in the log) or `epoch` (recorded guest epoch), `scan_offset` is
+the byte it scanned from; earlier output is out of scope. Exit `0` proves only
+a pattern match: inspect the accompanying dependency/failure lines and bind the
+receipt to that VM and boot. Exit `3` (`reason: "crash"`) is a terminal panic
+before the marker, `1` (`process_exited`) QEMU gone without a match, `124`
+timeout, `4` (`inconclusive: true`) an unreadable log — none of them is a
+negative experiment. Bare `qmu wait --vm X` establishes QEMU process
+termination (exit `0`, `reason: "already_stopped"` if it had already exited)
+or a terminal panic while QEMU still runs (exit `3`,
+`reason: "terminal_panic"`); neither is exercise evidence. Full contract:
+`skill://qmu/reference/wait.md`.
 Dependency inspection and shell-only init remain intermediate for convergence:
 activate the relevant original services, observe readiness, and perform the
 agreed benign operation, then apply the independent clean-VM handoff gate.
@@ -349,22 +382,23 @@ The process stops at the ld.so entry (libs not yet mapped); `continue` to a brea
 rtld to see `info sharedlibrary`. (qmu's `--gdb`/`gdb` is the QEMU stub for the *kernel*, not
 userspace.) Stripped binaries: load symbols from your BNDB/IDA analysis or a `.symtab` sidecar.
 
-## Gotchas
-- **`--vm` vs `--name`:** `--name` names the instance at `launch`; every other verb selects it
-  with the global `--vm` flag (`qmu --vm fw exec ...`).
-- **SSH key/host-key algorithm follows the sourced dropbear.** Old dropbear (bionic 2017.75)
-  predates ed25519 → "No matching algo hostkey" and client-key rejection. Use **ecdsa-nistp256**
-  for BOTH host keys (`dropbear -R` makes rsa+ecdsa) and the client key
-  (`ssh-keygen -t ecdsa`). Newer dropbear (≥2018.76) can use ed25519.
-- **`qmu push`/`pull` need `sftp-server`** at dropbear's compiled path (often `/usr/lib/sftp-server`).
-  A “No such file” error can also mean a missing interpreter/loader or dangling symlink; inspect these before assuming only the server file is absent.
-- **Dangling `/tmp`.** Firmware `/tmp` is often a symlink to a tmpfs systemd would mount
-  (`/var/volatile/tmp`, `/run`, ...). Under bare init it doesn't exist → push to `/tmp` fails
-  with "No such file or directory". The init template recreates it.
-- **Kernel networking must be built-in.** `VIRTIO_NET`/`VIRTIO_PCI`/`PCI_HOST_GENERIC` `=m`
-  won't load (your modules aren't in the image). Rebuild `=y` if defconfig didn't set them.
-- **Cross-emulation is TCG** (no KVM unless guest arch == host arch). Allow for
-  slower boot with an appropriate `--ssh-timeout`; elapsed time is not readiness evidence.
-- **musl / non-glibc firmware:** use a compatible target toolchain/sysroot or
-  verified static helpers. Static linking removes runtime shared-libc lookup,
-  not kernel ABI, shell, account configuration, utility or runtime-file requirements.
+## Recovery
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `qmu exec`/`log` says no such VM, but `launch --name fw` worked | `--name` names the instance at `launch`; every other verb selects with the global `--vm` | `qmu --vm fw exec -- '…'` (or `qmu exec --vm fw …`) |
+| `launch` exit 4, `ssh_status: "no-console-output"` | wrong `console=` or machine type for the arch; the guest never wrote to serial | arm64: `console=ttyAMA0` + `extra_args = ["-M", "virt"]`; x86: `console=ttyS0`, no `-M virt` |
+| `launch` exit 4, `ssh_status: "timeout (VM may still be booting)"`, serial shows `QMU-NET-CONFIGURED` | dropbear did not start or rejected the key: missing loader/library, bad `authorized_keys` perms, key algorithm | `qmu log --vm fw-access --grep 'QMU-NET|dropbear'`; see the key and permission rows below |
+| same, serial shows `QMU-NET-FAILED: <stage>` | `ip` link/address/route step failed, or the address already existed (strict one-shot `add`) | fix the template for this firmware's `ip`/interface; check `VIRTIO_NET`/`VIRTIO_PCI`/`PCI_HOST_GENERIC` are `=y` in `$CONFIG` |
+| same, serial empty after the kernel banner | kernel reached init but init could not exec (`/bin/bash` missing, wrong ELF interpreter) | phase 4 inventory; the templates require Bash |
+| `No matching algo hostkey` / client key rejected | sourced dropbear predates ed25519 (bionic 2017.75) | ecdsa-nistp256 for both host keys (`dropbear -R` makes rsa+ecdsa) and the client key (`ssh-keygen -t ecdsa`); ≥2018.76 can use ed25519 |
+| SSH connects then closes; `Authentication refused: bad ownership or modes` in daemon output | home/`.ssh`/`authorized_keys` writable by group/other, or wrong owner | home `0700`/`0755`, `.ssh` `0700`, key file `0600`, owned by the account or root — in the private image only |
+| `qmu push`/`pull` → `No such file` | `sftp-server` absent at dropbear's compiled path (often `/usr/lib/sftp-server`), or its loader/library missing, or a dangling symlink | inject it at the compiled path and verify its dependency closure |
+| `push` to `/tmp` → `No such file or directory` | firmware `/tmp` is a symlink to a tmpfs systemd would mount | the net template recreates `/var/volatile/tmp`; adjust to this firmware's layout (`readlink /tmp`) |
+| guest boots but no network device | `VIRTIO_NET`/`VIRTIO_PCI`/`PCI_HOST_GENERIC` are `=m` (modules not in the image) | rebuild with them `=y` |
+| slow boot, SSH wait expires | cross-emulation is TCG (no KVM unless guest arch == host arch) | raise `--ssh-timeout`; elapsed time is not readiness evidence |
+| `qmu wait --pattern` exit 1 right after launch | QEMU exited before the marker (init crashed, PID1 parked then powered off) | `qmu log --vm fw-probe`; `reason: "process_exited"` + `crash` in JSON |
+| `qmu wait --pattern` exit 4 | serial log missing/unreadable — inconclusive | `inconclusive: true`; check `serial_log` path, rerun |
+| helper binary `Exec format error` / `not found` with the file present | ELF machine/ABI/interpreter mismatch; musl vs glibc | phase 4 checks (machine, class, interpreter path, symbol versions); use a compatible sysroot or verified static helpers — static linking removes shared-libc lookup, not kernel ABI, shell, account or runtime-file requirements |
+| `fetch-hosttools.sh` fails to run the container | no binfmt for a cross-arch container, or EOL release | `docker run --rm --privileged tonistiigi/binfmt:latest --install all`; the script already falls back to `old-releases.ubuntu.com` |
+| injected files are root-owned/unexpected on the host | the fetcher writes through a container | `sudo chown` or copy; ownership inside the image is set by your `debugfs` commands, not by the host files |

@@ -20,10 +20,12 @@ from pathlib import Path
 
 import pytest
 
-from qmu.cli import build_parser
+from qmu.cli import _UsageError, build_parser
 
 SKILL = Path(__file__).resolve().parents[1] / "skills" / "qmu" / "SKILL.md"
 REFERENCE_DIR = SKILL.parent / "reference"
+# #42 split moved the config schema and `config init` enumeration here.
+TROUBLESHOOTING = REFERENCE_DIR / "troubleshooting.md"
 # #42 split: every companion file is scanned for `qmu …` lines too, so moving a
 # section out of SKILL.md never moves it out of the contract.
 SKILL_FILES = [SKILL, *sorted(REFERENCE_DIR.glob("*.md"))]
@@ -136,17 +138,66 @@ def test_documented_command_parses(path, lineno, command):
     try:
         with redirect_stdout(out), redirect_stderr(err):
             parser.parse_args(argv)
+    except _UsageError as exc:
+        # build_parser() raises instead of exiting so `main` can render the
+        # UsageError envelope; the message is what argparse would have printed.
+        reason = exc.message
     except SystemExit as exc:
         if exc.code in (0, None):
             return  # --help
         reason = (err.getvalue().strip().splitlines() or ["exit"])[-1]
-        unknown = "unrecognized arguments" in reason or "invalid choice" in reason
-        if PLACEHOLDER.search(command) and not unknown:
-            pytest.skip(f"template line: {command}")
-        pytest.fail(
-            f"{path.name}:{lineno} documents a command the CLI rejects:\n"
-            f"  $ {command}\n  -> {reason}"
-        )
+    else:
+        return
+    unknown = "unrecognized arguments" in reason or "invalid choice" in reason
+    if PLACEHOLDER.search(command) and not unknown:
+        pytest.skip(f"template line: {command}")
+    pytest.fail(
+        f"{path.name}:{lineno} documents a command the CLI rejects:\n"
+        f"  $ {command}\n  -> {reason}"
+    )
+
+
+MAX_SKILL_LINES = 650
+
+
+def test_main_skill_stays_short():
+    """#42: the main skill is the hot path an agent reads on every task; detail
+    belongs in reference/. The cap is a regression guard, not a target."""
+    lines = len(SKILL.read_text().splitlines())
+    assert lines <= MAX_SKILL_LINES, (
+        f"SKILL.md is {lines} lines (> {MAX_SKILL_LINES}); move detail to reference/"
+    )
+
+
+def _table_commands(path: Path) -> list[tuple[int, str]]:
+    """Every inline-code `qmu …` span inside a markdown table row of PATH.
+
+    The decision and recovery tables in the main skill are what an agent
+    copies first, so a flag the CLI rejects there costs more than one in
+    prose. Spans joined by `→` or `…` are separate spans, checked separately.
+    """
+    found: list[tuple[int, str]] = []
+    for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+        if not raw.lstrip().startswith("|"):
+            continue
+        for span in re.findall(r"`([^`]*)`", raw):
+            if span.startswith("qmu "):
+                found.append((lineno, _cut_at_unquoted(span)))
+    return found
+
+
+TABLE_DOCUMENTED = [
+    (SKILL, lineno, command) for lineno, command in _table_commands(SKILL)
+]
+
+
+@pytest.mark.parametrize(
+    "path,lineno,command",
+    TABLE_DOCUMENTED,
+    ids=[f"{p.name}:L{n}:table" for p, n, _ in TABLE_DOCUMENTED],
+)
+def test_table_command_parses(path, lineno, command):
+    test_documented_command_parses(path, lineno, command)
 
 
 def test_reference_files_exist_and_are_pointed_at():
@@ -212,7 +263,7 @@ def test_skill_schema_section_matches_validator():
 
     documented: dict[str, set[str]] = {}
     duplicate_tables: list[str] = []
-    for line in SKILL.read_text().splitlines():
+    for line in TROUBLESHOOTING.read_text().splitlines():
         m = bullet_re.match(line.strip())
         if m:
             table = m.group(1)
@@ -220,7 +271,7 @@ def test_skill_schema_section_matches_validator():
                 duplicate_tables.append(table)
             documented[table] = leading_key_run(m.group(2))
 
-    assert documented, "schema bullets not found in SKILL.md"
+    assert documented, "schema bullets not found in troubleshooting.md"
     assert not duplicate_tables, (
         f"duplicate schema bullet(s) for table(s) {duplicate_tables}: a second "
         "bullet for the same table silently masks the first"
@@ -247,7 +298,7 @@ def test_config_init_table_enumeration_matches_the_generator():
     ]
 
     sentence = next(
-        line for line in SKILL.read_text().splitlines()
+        line for line in TROUBLESHOOTING.read_text().splitlines()
         if line.startswith("`qmu config init` writes ")
     )
     documented = re.findall(r"`\[([\w.<>*-]+)\]`", sentence)

@@ -8,7 +8,9 @@
 # required nor sufficient. Never overwrite vendor libc to make a helper run.
 # This fetches SSH/debugger tools and selected libraries, not shells/app utilities.
 # Requires: docker + target-arch execution support (binfmt for cross-architecture
-# containers). Use an absolute --out directory; it becomes a Docker bind source.
+# containers). --out may be relative or absolute: it is created if missing and
+# resolved to an absolute path before becoming the Docker bind source. Fetched
+# files are written by the container and are root-owned on the host.
 #
 # Candidate Ubuntu release / glibc cheat sheet (verify actual fetched artifacts):
 #   2.23 xenial(16.04) · 2.27 bionic(18.04) · 2.31 focal(20.04)
