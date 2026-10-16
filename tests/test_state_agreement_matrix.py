@@ -32,7 +32,7 @@ from qmu.instance import (
     VMInstance,
     classify_vm,
 )
-from qmu.ssh import SSHError
+from qmu.ssh import SSHAborted, SSHError
 
 
 VM = "subject"
@@ -393,16 +393,46 @@ def test_no_command_calls_a_listed_vm_nonexistent(
 
 @pytest.mark.parametrize("state", [VM_ORPHANED, VM_HELD_BACK])
 def test_status_explains_rather_than_denying(state, cache, monkeypatch, capsys):
+    """A non-running VM `list` shows is a successful description (exit 0),
+    not a failed lookup: after `kill` kept the logs, `status` is the very
+    next command, and exit 1 there read as "gone" (r2-exploit finding 3)."""
     _make_state(state, cache, monkeypatch)
 
     rc = cli.main(["status", "--vm", VM])
-    err = capsys.readouterr().err
+    out = capsys.readouterr().out
 
-    assert rc == 1
-    assert VM in err
+    assert rc == 0
+    assert VM in out
     # It must say what the thing IS, and name a command that acts on it.
-    assert ("orphaned remnant" in err) or ("is stopped" in err)
-    assert "qmu " in err
+    assert ("orphaned remnant" in out) or ("is stopped" in out)
+    assert "qmu " in out
+
+
+@pytest.mark.parametrize("state", [VM_ORPHANED, VM_HELD_BACK, VM_STOPPED])
+def test_status_non_running_json_is_structured(state, cache, monkeypatch, capsys):
+    pid = _make_state(state, cache, monkeypatch)
+
+    rc = cli.main(["--format", "json", "status", "--vm", VM])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["ok"] is True
+    assert payload["vm_id"] == VM
+    # `stopped` is held back from `prune --all` by the default age gate,
+    # which is the only difference between the two; `status` reports the
+    # same state word `prune` would.
+    expected = VM_HELD_BACK if state == VM_STOPPED else state
+    assert payload["status"] == expected
+    assert payload["pid"] == pid
+    assert payload["pid_alive"] is (state == VM_ORPHANED)
+    assert payload["logs_retained"] is True
+    assert payload["serial_log"].endswith(f"{VM}.serial.log")
+    assert payload["qemu_log"].endswith(f"{VM}.qemu.log")
+    assert payload["crash_detected"] is False
+    if state == VM_ORPHANED:
+        assert payload["guest"] in {"unknown", "serving", "panicked", "crashed", "paused"}
+    else:
+        assert payload["guest"] is None
 
 
 def test_status_names_the_live_pid_for_an_orphan(cache, monkeypatch, capsys):
@@ -411,7 +441,107 @@ def test_status_names_the_live_pid_for_an_orphan(cache, monkeypatch, capsys):
 
     cli.main(["status", "--vm", VM])
 
-    assert str(pid) in capsys.readouterr().err
+    assert str(pid) in capsys.readouterr().out
+
+
+def _stopped_with_report(cache, monkeypatch, vm_id=VM):
+    """A VM `kill` stopped with its crash report kept, as every triggered
+    exploit run ends."""
+    idir = cache / "instances"
+    idir.mkdir(parents=True, exist_ok=True)
+    serial = idir / f"{vm_id}.serial.log"
+    serial.write_text(
+        "[ 0.0] Linux version 6.12.0 (b@h) (gcc) #1\n"
+        "[ 1.6] Oops: general protection fault [#1] SMP\n"
+        "[ 1.6] ---[ end trace 0000000000000000 ]---\n"
+        "[ 1.6] Kernel panic - not syncing: Fatal exception\n"
+    )
+    (idir / f"{vm_id}.qemu.log").write_text("qemu\n")
+    inst = VMInstance(
+        vm_id=vm_id, pid=999_999, qmp_socket=str(idir / f"{vm_id}.qmp.sock"),
+        ssh_port=None, ssh_key=None, gdb_port=None, serial_log=str(serial),
+        kernel="/boot/bzImage", rootfs=None, memory="4G", cpus=2,
+        cmdline="console=ttyS0", profile="exploit-dev",
+        started_at="2026-08-17T00:00:00Z", harness=False, pid_start="0",
+    )
+    instance_mod.save_instance(inst)
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
+    return inst
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_stopped_vm_with_a_report_is_marked_everywhere(
+    output_format, cache, monkeypatch, capsys
+):
+    """`kill` said "crash report preserved"; `list` then showed a bare
+    [stopped] and `status` exit 1 — three answers about one fact."""
+    _stopped_with_report(cache, monkeypatch)
+
+    rc = cli.main(["--format", output_format, "list"])
+    listing = capsys.readouterr().out
+    assert rc == 0
+    rc = cli.main(["--format", output_format, "status", "--vm", VM])
+    detail = capsys.readouterr().out
+    assert rc == 0
+
+    if output_format == "json":
+        row = json.loads(listing)["vms"][0]
+        assert row["status"] == "stopped"
+        assert row["crash_detected"] is True
+        assert row["logs_retained"] is True
+        assert row["guest"] is None
+        # Never null: a null read as "probe failed".
+        assert row["qmp"] == "skipped"
+        payload = json.loads(detail)
+        assert payload["status"] == "stopped"
+        assert payload["crash_detected"] is True
+        assert payload["logs_retained"] is True
+    else:
+        assert f"{VM}  profile=exploit-dev  kernel=bzImage  [stopped — crash report retained]" in listing
+        assert f"VM '{VM}' is stopped (logs retained; crash report waiting: qmu crash --vm {VM})" in detail
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_kill_of_a_stopped_vm_is_a_clean_no_op(
+    output_format, cache, monkeypatch, capsys
+):
+    """`kill` then `kill` again: the second is already what was asked for."""
+    inst = _stopped_with_report(cache, monkeypatch)
+    calls = _fake_kill(monkeypatch)
+
+    rc = cli.main(["--format", output_format, "kill", "--vm", VM])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert calls == []
+    assert Path(inst.serial_log).exists()
+    if output_format == "json":
+        payload = json.loads(out)
+        assert payload["ok"] is True
+        assert payload["already_stopped"] is True
+        assert payload["vm_id"] == VM
+        assert payload["logs_retained"] is True
+    else:
+        assert out.strip() == (
+            f"VM '{VM}' is already stopped; state retained "
+            f"(remove with: qmu prune --vm {VM})"
+        )
+        assert "--older-than 0" not in out
+
+
+def test_kill_of_an_absent_vm_still_says_not_found(cache, monkeypatch, capsys):
+    """The no-op is for a VM `list` shows; a typo must stay a typo."""
+    _stopped_with_report(cache, monkeypatch)
+    _decoy_running(monkeypatch)
+    _fake_kill(monkeypatch)
+
+    rc = cli.main(["--format", "json", "kill", "--vm", "subjct"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert "not found" in payload["error"]
+    assert VM in payload["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -725,7 +855,7 @@ def test_orphaned_and_panicked_reports_both_facts(cache, monkeypatch, capsys):
     listing = capsys.readouterr().out
 
     cli.main(["status", "--vm", "op"])
-    described = capsys.readouterr().err
+    described = capsys.readouterr().out
 
     # Neither fact may be dropped: reaping without pulling the crash first
     # loses the evidence the run existed to produce.
@@ -1170,6 +1300,119 @@ def test_list_probes_running_vms_concurrently_and_keeps_their_order(
     assert "ssh=10030(ok)" in text and "ssh=10031(down)" in text
 
 
+# ---------------------------------------------------------------------------
+# Axis 4, list vs status on a held QMP slot. Another client (a `wait`, a
+# debugger bridge) owns the one QMP connection: `status` called that `busy`
+# while `list` called the same socket `unreachable`, which reads as a dead
+# VM. Both must classify the same exception the same way.
+# ---------------------------------------------------------------------------
+
+
+def _held_qmp(monkeypatch):
+    class HeldCtx:
+        def __enter__(self):
+            raise __import__("qmu.qmp", fromlist=["QMPBusyError"]).QMPBusyError(
+                "accepted the connection but sent no greeting"
+            )
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda inst: HeldCtx())
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_list_and_status_agree_a_held_qmp_slot_is_busy(
+    output_format, cache, monkeypatch, capsys
+):
+    inst = _ssh_capable(_vm_with_log(cache, "held", "[ 0.0] Linux version 6.12.0\n"), 10022)
+    _held_qmp(monkeypatch)
+    _register_running(monkeypatch, inst)
+    monkeypatch.setattr(
+        lifecycle, "_make_ssh",
+        lambda i: type("S", (), {"is_ready": lambda self, timeout=2: True})(),
+    )
+
+    cli.main(["--format", output_format, "list"])
+    listing = capsys.readouterr().out
+    cli.main(["--format", output_format, "status", "--vm", "held"])
+    detail = capsys.readouterr().out
+
+    if output_format == "json":
+        row = json.loads(listing)["vms"][0]
+        payload = json.loads(detail)
+        assert row["qmp"] == payload["qmp"] == "busy"
+        assert row["guest"] == payload["guest"] == "serving"
+    else:
+        assert "qmp=busy" in listing
+        assert "unreachable" not in listing
+        assert "QMP:       busy" in detail
+
+
+# ---------------------------------------------------------------------------
+# The SSH readiness probe logs in, and a login runs `uname`. With a gdb
+# client attached that is a breakpoint on `__x64_sys_newuname` fired by qmu's
+# own `status` — which then halted the guest it was asked to describe
+# (r2-debug P1). `status` and `list` both withhold the probe and both say so.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_status_and_list_skip_the_ssh_probe_while_a_debugger_is_attached(
+    output_format, cache, monkeypatch, capsys
+):
+    inst = __import__("dataclasses").replace(
+        _ssh_capable(_vm_with_log(cache, "dbg", "[ 0.0] Linux version 6.12.0\n"), 10022),
+        gdb_port=1234,
+    )
+    _qmp(monkeypatch, True)
+    _register_running(monkeypatch, inst)
+    monkeypatch.setattr(lifecycle, "debug_session_present", lambda i: True)
+    monkeypatch.setattr(
+        lifecycle, "_make_ssh",
+        lambda i: pytest.fail("probed sshd with a debugger attached"),
+    )
+
+    cli.main(["--format", output_format, "status", "--vm", "dbg"])
+    detail = capsys.readouterr().out
+    cli.main(["--format", output_format, "list"])
+    listing = capsys.readouterr().out
+
+    if output_format == "json":
+        payload = json.loads(detail)
+        row = json.loads(listing)["vms"][0]
+        assert payload["ssh"] == row["ssh"] == "skipped (debugger attached)"
+        assert row["ssh_ready"] is None
+        # Console bytes are the positive evidence, as for a guest with no endpoint.
+        assert payload["guest"] == row["guest"] == "serving"
+    else:
+        assert "not probed: debugger attached" in detail
+        assert "ssh=10022(not probed: debugger attached)" in listing
+
+
+def test_ssh_probe_runs_when_no_debugger_is_attached(cache, monkeypatch, capsys):
+    """The skip is keyed on an attached client, not on the gdb port existing:
+    every `--gdb` launch has a port, and most of the time nobody is on it."""
+    inst = __import__("dataclasses").replace(
+        _ssh_capable(_vm_with_log(cache, "nodbg", "[ 0.0] Linux version 6.12.0\n"), 10022),
+        gdb_port=1234,
+    )
+    _qmp(monkeypatch, True)
+    _register_running(monkeypatch, inst)
+    monkeypatch.setattr(lifecycle, "debug_session_present", lambda i: False)
+    probed = []
+    monkeypatch.setattr(
+        lifecycle, "_make_ssh",
+        lambda i: type("S", (), {"is_ready": lambda self, timeout=2: probed.append(1) or True})(),
+    )
+
+    cli.main(["--format", "json", "status", "--vm", "nodbg"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert probed == [1]
+    assert payload["ssh"] == "ready"
+
+
 def test_list_never_presents_a_dead_pid_as_live(cache, monkeypatch, capsys):
     """A stopped record keeps the pid its process had; `list` showed it as
     if it were still a process to signal."""
@@ -1557,7 +1800,7 @@ class _TransportLostSSH:
         self._drop()
         return 255, "", "Connection timed out during banner exchange"
 
-    def push(self, local, remote):
+    def push(self, local, remote, **kwargs):
         self._drop()
         raise SSHError(
             "SCP push failed: mux failed: Broken pipe",
@@ -1565,7 +1808,7 @@ class _TransportLostSSH:
             stderr="mux failed: Broken pipe",
         )
 
-    def pull(self, remote, local):
+    def pull(self, remote, local, **kwargs):
         self.push(local, remote)
 
     def is_ready(self, timeout=2):
@@ -1657,6 +1900,84 @@ def test_every_ssh_command_agrees_on_a_lost_transport(
         assert view == expected, f"`qmu {command}` disagrees: {view}"
 
 
+class _HaltedMidCommandSSH:
+    """A session the watcher aborts: `abort_when` is honoured like the real
+    client (one poll, then :class:`SSHAborted`) for commands and transfers."""
+
+    def _abort(self, kwargs, what):
+        abort_when = kwargs.get("abort_when")
+        assert abort_when is not None, f"{what} is not watched"
+        assert abort_when() is True
+        raise SSHAborted(f"{what} aborted by qmu", stdout="", stderr="")
+
+    def run(self, command, timeout=30.0, check=False, **kwargs):
+        self._abort(kwargs, "SSH command")
+
+    def push(self, local, remote, **kwargs):
+        self._abort(kwargs, "SCP push")
+
+    def pull(self, remote, local, **kwargs):
+        self._abort(kwargs, "SCP pull")
+
+    def is_ready(self, timeout=2):
+        raise AssertionError("SSH probed against a halted vCPU")
+
+
+_HALTED_ARGV = {
+    **_LOST_ARGV,
+    "compile": ["compile", "--vm", VM, "--run", "/tmp/x.c"],
+}
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_every_ssh_command_agrees_on_a_vcpu_halted_mid_command(
+    output_format, cache, monkeypatch, capsys, tmp_path
+):
+    """A breakpoint fires while exec / dmesg / push / pull / compile run: no
+    serial output, no transport drop — only QMP knows. Every command aborts
+    on the watcher's QMP poll and reports the preflight's paused envelope
+    (exit 1, `guest_state: paused`, the `qmu cont` hint), never the 20 s
+    keepalive stall into the crash/transport class, in both renderings."""
+    inst = _ssh_capable_instance(cache)
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+    monkeypatch.setattr(guest_mod, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(guest_mod, "_preflight_ssh_guest", lambda *a, **kw: None)
+    monkeypatch.setattr(guest_mod, "_make_ssh", lambda selected: _HaltedMidCommandSSH())
+    monkeypatch.setattr(guest_mod, "_qmp_stopped_status", lambda i: "debug")
+    clock = [0.0]
+
+    def monotonic():
+        clock[0] += 2.0
+        return clock[0]
+
+    monkeypatch.setattr(guest_mod.time, "monotonic", monotonic)
+    (tmp_path / "x.c").write_text("int main(void){return 0;}\n")
+    argvs = {**_HALTED_ARGV, "compile": ["compile", "--vm", VM, "--run", str(tmp_path / "x.c")]}
+
+    for command, argv in argvs.items():
+        with open(inst.serial_log, "w") as stream:
+            stream.write("boot ok\n")
+        rc = cli.main(["--format", output_format, *argv])
+        captured = capsys.readouterr()
+        assert rc == 1, f"`qmu {command}`: rc {rc}"
+        if output_format == "json":
+            payload = json.loads(captured.out)
+            assert payload["ok"] is False, command
+            assert payload["guest_state"] == "paused", command
+            assert payload["qemu_status"] == "debug", command
+            assert payload["crash_detected"] is False, command
+            assert payload["ssh_error"] is False, command
+            assert payload["vm_id"] == VM, command
+            assert f"qmu cont --vm {VM}" in payload["hint"], command
+        else:
+            out = captured.out + captured.err
+            assert f"VM '{VM}' is debug (vCPU halted)." in out, command
+            assert f"Resume with: qmu cont --vm {VM}" in out, command
+            assert "crash" not in out.lower(), command
+
+
 class _ServingSSH:
     """A guest that answers: fixed exec result, transfers succeed."""
 
@@ -1666,10 +1987,10 @@ class _ServingSSH:
     def run(self, command, timeout=30.0, check=False, **kwargs):
         return self._result
 
-    def push(self, local, remote):
+    def push(self, local, remote, **kwargs):
         pass
 
-    def pull(self, remote, local):
+    def pull(self, remote, local, **kwargs):
         pass
 
     def is_ready(self, timeout=2):

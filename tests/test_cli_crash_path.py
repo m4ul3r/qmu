@@ -480,7 +480,7 @@ class FakeCompileSSH:
         self._run_count = 0
         self.is_ready_calls = 0
 
-    def push(self, local, remote):
+    def push(self, local, remote, **kwargs):
         pass
 
     def run(self, command, timeout=30.0, check=False, **kwargs):

@@ -58,10 +58,10 @@ class FakeTransferSSH:
         if self.failure is not None:
             raise self.failure
 
-    def push(self, local, remote):
+    def push(self, local, remote, **kwargs):
         self._perform("push", local, remote)
 
-    def pull(self, remote, local):
+    def pull(self, remote, local, **kwargs):
         self._perform("pull", remote, local)
 
 

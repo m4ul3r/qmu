@@ -114,6 +114,20 @@ class QMPClient:
         except (ConnectionRefusedError, FileNotFoundError) as exc:
             self.close()
             raise QMPError(f"Cannot connect to QMP socket {self.socket_path}: {exc}") from exc
+        except (BlockingIOError, InterruptedError, socket.timeout, TimeoutError) as exc:
+            # EAGAIN on a unix-socket connect() means the listen backlog is
+            # full: QEMU has not accepted the connections queued behind the
+            # client it is serving. That is the same contention as a silent
+            # greeting, and it used to be reported as `unreachable` by one
+            # command and `busy` by the next, depending on how many probes
+            # were already queued.
+            self.close()
+            raise QMPBusyError(
+                f"QMP socket {self.socket_path} is not accepting connections "
+                f"({exc}). QEMU serves one QMP client at a time, so it is most "
+                "likely held by another qmu command such as `wait`, or by a "
+                "debugger bridge."
+            ) from exc
 
         try:
             greeting = self._recv_json()

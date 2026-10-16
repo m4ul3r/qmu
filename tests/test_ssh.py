@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import time
 from pathlib import Path
 
@@ -78,33 +79,53 @@ def test_ssh_and_scp_builders_share_current_bounded_control_options(
             assert not any(option.startswith("Control") for option in options)
 
 
+def test_is_ready_probe_never_spawns_a_control_master(tmp_path, monkeypatch):
+    """`list`/`status`/launch probe every serving VM on the host; a multiplexed
+    probe left a persistent `ssh [mux]` master (ControlPersist 60) per VM —
+    including other users' — under the prober's QMU_TEMP_DIR."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QMU_TEMP_DIR", str(Path("rt")))
+    client = ssh.SSHClient(port=2222, key_path="test-key")
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    monkeypatch.setattr(ssh.subprocess, "run", fake_run)
+    assert client.is_ready() is True
+    options = _options(seen["cmd"])
+    assert "ControlMaster=no" in options
+    assert not any(o.startswith(("ControlPath=", "ControlPersist=")) for o in options)
+    # Commands keep the shared master.
+    assert "ControlMaster=auto" in _options(client._ssh_base())
+
+
 @pytest.mark.parametrize("method", ["push", "pull"])
-def test_scp_streams_are_decoded_lossily_never_raised(monkeypatch, tmp_path, method):
+def test_scp_stderr_is_decoded_lossily_never_raised(monkeypatch, tmp_path, method):
     """Guest output is arbitrary bytes (a leak primitive dumping raw memory).
 
     `text=True` without `errors=` made `exec 'head -c 100 /dev/urandom'` exit
-    4 `UnicodeDecodeError` with the output discarded. Every subprocess call
-    that decodes guest-originated bytes must do so lossily (`run` reads raw
-    bytes and decodes them itself; see the real-subprocess tests below).
+    4 `UnicodeDecodeError` with the output discarded. scp's stderr (the one
+    stream it carries) goes through the same byte drain as `run` and is
+    decoded lossily.
     """
-    seen: dict[str, object] = {}
-
-    def fake_run(cmd, **kwargs):
-        seen.update(kwargs)
-        import subprocess
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(ssh.subprocess, "run", fake_run)
     client = ssh.SSHClient(port=10022, key_path="/tmp/test-key")
+    monkeypatch.setattr(
+        client,
+        "_scp_base",
+        lambda: ["sh", "-c", "printf 'bad \\377 byte' >&2; exit 255", "scp-stub"],
+    )
     source = tmp_path / "payload.bin"
     source.write_bytes(b"data")
-    if method == "push":
-        client.push(str(source), "/root/")
-    else:
-        client.pull("/root/payload.bin", str(tmp_path / "out.bin"))
+    with pytest.raises(ssh.SSHError) as raised:
+        if method == "push":
+            client.push(str(source), "/root/")
+        else:
+            client.pull("/root/payload.bin", str(tmp_path / "out.bin"))
 
-    assert seen["text"] is True
-    assert seen["errors"] == "replace"
+    assert raised.value.returncode == 255
+    assert raised.value.stderr == "bad \ufffd byte"
 
 
 def _fake_ssh_on_path(tmp_path, monkeypatch, script: str) -> ssh.SSHClient:

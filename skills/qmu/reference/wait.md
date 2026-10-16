@@ -48,30 +48,46 @@ line/scope rules that decide whether `--pattern` can ever match.
 
 `--harness` implies `--no-wait-ssh` and `--no-net` and skips the rootfs/SSH-key
 requirement. It does **not** boot without a disk: a config `[drive] rootfs` is
-still attached unless you pass `--drive`/`--rootfs`. Prefer `--harness --rootfs
-./rootfs.img` when the image is a plain rootfs — it stays tracked (holder
-checks for `rootfs inject`, `status.rootfs`); an explicit `--drive` image is
-not recorded as the VM's rootfs. SSH commands (`push`/`pull`/`exec`/`compile`/
-`dmesg`/`kbase`) error immediately on a harness VM; serial/QMP commands
-(`log`/`crash`/`wait`/`qmp`/`monitor`/`kill`) work.
+still attached unless you pass `--drive`/`--rootfs`, and the launch note
+names which (`Harness mode: attached rootfs <p> (from --rootfs; …)` / `(from
+[drive] rootfs in project <qmu.toml>; …)`). Prefer `--harness --rootfs ./rootfs.img` when the image is a plain
+rootfs — it stays tracked (holder checks for `rootfs inject`, `status.rootfs`);
+an explicit `--drive` image is not recorded as the VM's rootfs. The implicit/
+`--rootfs` disk is `/dev/sda` on x86_64 and `/dev/vda` on aarch64/arm; a
+whole-disk image (mkrootfs, cloud) takes no partition suffix, so the cmdline
+is `root=/dev/sda ro init=/run.sh`. SSH commands (`push`/`pull`/`exec`/
+`compile`/`dmesg`/`kbase`) error immediately on a harness VM; serial/QMP
+commands (`log`/`crash`/`wait`/`qmp`/`monitor`/`kill`) work.
 
-Pass `--no-reboot` for a kernel whose panic would otherwise reboot-loop
-(`panic=N` on the cmdline): without it a panicking harness guest comes back up
-and `wait` ends in `124` with `crash: null` instead of reporting the panic.
+`--no-reboot` does not change how a panic is reported: bare `wait` returns 3
+(`terminal_panic`, `crash` populated) at the panic line with or without it,
+and before any `panic=N` timer fires. It decides what happens *next*: with
+`--no-reboot` QEMU exits once the timer expires (a second `wait` reports
+`already_stopped` with the same `crash`); without it the guest reboots into
+a fresh boot whose banner moves the scan scope past the report, so a `wait`
+started *after* the reboot sees a healthy boot and ends in `124` with `crash:
+null`. Pass it for every `panic=N` kernel. After exit 3 the VM is still
+running: `qmu kill --vm X` (report kept) then `qmu prune --vm X`; a
+`--no-clean` remnant is also removed by `qmu prune --vm X`.
 
 ## `qmu wait` without `--pattern`
 
 Bare `wait` holds no QMP connection: it polls every 0.5 s with one
 short-lived `query-status` plus a PID-liveness check, so it never occupies
 QEMU's single QMP slot. Every result carries `vm_id`, `reason`, `stopped`,
-`crash`, `guest`, `guest_detail`, `qmp` (`connected` · `busy` ·
+`crash`, `console_tail` (the last 20 lines of the scanned scope, on every
+outcome), `guest`, `guest_detail`, `qmp` (`connected` · `busy` ·
 `unreachable` · null once stopped), `qemu_status`, `last_event`,
-`event_data`, `elapsed`, `cleaned`.
+`event_data`, `elapsed`, `cleaned`. `guest` is `serving` while a running
+harness guest has console output in this boot and `null` once QEMU has
+exited (never `"unknown"` for an exited VM). Text mode prints the tail under
+`Console tail:` when QEMU exited without a crash — that, or `matched_line`
+from a `--pattern` wait, is the receipt for a successful harness run.
 
 | Exit | `reason` | Meaning |
 |---|---|---|
-| `0` | `process_exited` | the recorded QEMU process identity exited during the wait; `crash` carries the terminal crash (null if none; text prints `Crash from serial log:`) |
-| `0` | `already_stopped` | QEMU had exited before the wait began (explicit `--vm`); `crash` is read from the retained log scoped to its last boot; harness auto-clean still honoured |
+| `0` | `process_exited` | the recorded QEMU process identity exited during the wait; `crash` carries the terminal crash (null if none; text prints `Crash from serial log:`, otherwise `Console tail:`); `guest: null` |
+| `0` | `already_stopped` | QEMU had exited before the wait began (explicit `--vm`); `crash` and `console_tail` are read from the retained log scoped to its last boot; `guest: null`; harness auto-clean still honoured |
 | `3` | `terminal_panic` | `Kernel panic - not syncing` while QEMU still runs: `stopped: false`, `guest: "panicked"`, `crash` populated. `qmu kill --vm X` preserves the report for `qmu crash --vm X` |
 | `124` | `timeout` | `--timeout` elapsed with the process alive; `ok: false`, `stopped: false` |
 | `4` | — | `QMPError`: QMP unreachable for more than 1 s with the pid alive (EOF alone is never success; a persistent failure never cleans the live VM) |
@@ -84,19 +100,22 @@ QEMU's single QMP slot. Every result carries `vm_id`, `reason`, `stopped`,
   "offset": N}`. Non-running states (`paused`, `postmigrate`,
   `guest-panicked`) are observations, not proof that QEMU exited.
 - Under QMP contention the wait continues with `qmp: "busy"`, `qemu_status:
-  "unknown"`; each busy poll costs the 2 s greeting timeout, so `--timeout`
-  can overshoot by up to 2 s (and `--timeout 0` may surface as exit 4).
+  "unknown"` (text: `QMP: busy (held by another client — another qmu command
+  such as wait/status, or a debugger bridge), so QEMU's status was not
+  observed.`); each busy poll costs the 2 s greeting timeout, so `--timeout`
+  can overshoot by up to 2 s, and `--timeout 0` under a held slot is 124.
 - A VM stopped by `qmu kill` while it was being waited on reports the loss as
   exit 1/4 rather than a clean exit 0; treat that as "someone killed it".
-- `wait` does not print the `[qmu] Note: unclaimed by this kernel, from
-  profile …` line (only `launch` does); operator-param warnings still appear.
+- No command prints the profile-sourced unknown-parameter note; `launch`
+  keeps it in JSON only. Operator-param warnings still appear on `launch`.
 
 **`wait` auto-cleans harness VMs only after confirming that the recorded QEMU
-process identity exited** (removes metadata + `.serial.log`) unless you pass
+process identity exited** (removes `.json` + `.serial.log`) unless you pass
 `--no-clean`. A live-PID timeout or a terminal panic never auto-cleans. Read
-the terminal crash from `wait`'s own output rather than a later `qmu crash` —
-after a confirmed exit, the log may already be gone. Non-harness VMs are never
-auto-cleaned by `wait`.
+the terminal crash and `console_tail` from `wait`'s own output rather than a
+later `qmu crash`/`qmu log` — after a confirmed exit, the log may already be
+gone. Non-harness VMs are never auto-cleaned by `wait`. `wait --help` documents
+only the `--pattern` codes; the bare-wait table above is the contract.
 
 ## `--pattern` outcomes
 

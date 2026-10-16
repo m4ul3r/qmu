@@ -25,6 +25,9 @@ class SnapshotResult:
     message: str
     resumed: bool = False
     guest_paused: bool = False
+    # Why a FAILED operation failed, for the CLI's `hint`: `missing` (no such
+    # tag), `bad_name` (HMP parse error), `hmp` (any other QEMU refusal).
+    reason: str | None = None
 
 
 def guest_running(qmp: QMPClient) -> bool | None:
@@ -52,6 +55,20 @@ def snapshot_tags(qmp: QMPClient) -> set[str]:
     return {snap["tag"] for snap in list_snapshots(qmp)}
 
 
+def _classify_hmp_failure(message: str) -> str:
+    """Bucket an HMP savevm/loadvm/delvm error so the CLI can name the fix.
+
+    `missing` — the tag is not in the image (`loadvm` says "does not exist in
+    one or more devices"); `bad_name` — HMP could not parse the name as one
+    token (whitespace); `hmp` — anything else QEMU refused.
+    """
+    if "does not exist" in message:
+        return "missing"
+    if "extraneous characters" in message:
+        return "bad_name"
+    return "hmp"
+
+
 def save_snapshot(qmp: QMPClient, name: str, timeout: float = 60.0) -> SnapshotResult:
     """Save a VM snapshot and confirm it is listed afterwards.
 
@@ -62,11 +79,12 @@ def save_snapshot(qmp: QMPClient, name: str, timeout: float = 60.0) -> SnapshotR
     """
     result = qmp.execute_hmp(f"savevm {name}", timeout=timeout).strip()
     if hmp_failed(result):
-        return SnapshotResult(False, result)
+        return SnapshotResult(False, result, reason=_classify_hmp_failure(result))
     if name not in snapshot_tags(qmp):
         return SnapshotResult(
             False,
             result or f"Snapshot '{name}' is not listed by 'info snapshots' after savevm",
+            reason=_classify_hmp_failure(result) if result else "hmp",
         )
     return SnapshotResult(True, result or f"Snapshot '{name}' saved.")
 
@@ -81,17 +99,23 @@ def load_snapshot(qmp: QMPClient, name: str, timeout: float = 60.0) -> SnapshotR
     if was_running and guest_running(qmp) is False:
         resumed = resume_guest(qmp)
         guest_paused = not resumed
-    return SnapshotResult(False, result, resumed=resumed, guest_paused=guest_paused)
+    return SnapshotResult(
+        False,
+        result,
+        resumed=resumed,
+        guest_paused=guest_paused,
+        reason=_classify_hmp_failure(result),
+    )
 
 
 def delete_snapshot(qmp: QMPClient, name: str, timeout: float = 30.0) -> SnapshotResult:
     """Delete a VM snapshot. HMP `delvm` is silent for a missing tag, so the
     tag is checked against `info snapshots` first."""
     if name not in snapshot_tags(qmp):
-        return SnapshotResult(False, f"Snapshot '{name}' does not exist")
+        return SnapshotResult(False, f"Snapshot '{name}' does not exist", reason="missing")
     result = qmp.execute_hmp(f"delvm {name}", timeout=timeout).strip()
     if hmp_failed(result):
-        return SnapshotResult(False, result)
+        return SnapshotResult(False, result, reason="hmp")
     return SnapshotResult(True, result or f"Snapshot '{name}' deleted.")
 
 

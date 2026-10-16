@@ -466,16 +466,21 @@ def test_operator_params_and_profile_params_are_reported_separately(
     # apparmor=0 ships in qmu's own exploit-dev profile; totally_bogus=7 does not.
     monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
 
-    lifecycle._warn_unknown_kernel_params(inst)
+    split = lifecycle._warn_unknown_kernel_params(inst)
     err = capsys.readouterr().err
 
-    warning, note = err.split("[qmu] Note:")
-    assert "totally_bogus=7" in warning
-    assert "apparmor=0" not in warning
-    assert "apparmor=0" in note
+    assert "totally_bogus=7" in err
+    assert "apparmor=0" not in err
+    assert "from profile" not in err
+    assert split == {
+        "all": ["apparmor=0", "totally_bogus=7"],
+        "operator": ["totally_bogus=7"],
+        "profile": ["apparmor=0"],
+    }
 
 
-def test_no_operator_params_means_no_loud_warning(monkeypatch, tmp_path, capsys):
+def test_profile_only_params_print_nothing(monkeypatch, tmp_path, capsys):
+    """The profile bucket is JSON-only: a note on every launch is noise."""
     serial = tmp_path / "vm.serial.log"
     serial.write_text(
         '[    0.1] Unknown kernel command line parameters "apparmor=0", '
@@ -483,11 +488,11 @@ def test_no_operator_params_means_no_loud_warning(monkeypatch, tmp_path, capsys)
     )
     inst = _instance(str(serial))
 
-    lifecycle._warn_unknown_kernel_params(inst)
+    split = lifecycle._warn_unknown_kernel_params(inst)
     err = capsys.readouterr().err
 
-    assert "Warning" not in err
-    assert "apparmor=0" in err
+    assert err == ""
+    assert split["profile"] == ["apparmor=0"]
 
 
 # ---------------------------------------------------------------------------

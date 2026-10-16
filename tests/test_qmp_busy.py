@@ -54,6 +54,40 @@ def test_busy_default_is_two_seconds():
     assert QMPClient("/nonexistent").greeting_timeout == pytest.approx(2.0)
 
 
+def test_a_full_backlog_is_busy_not_unreachable(tmp_path):
+    """Probes queued behind the held slot fill the listen backlog; the next
+    connect() gets EAGAIN at once. `list` reported that `unreachable` while
+    `status`, one probe earlier, said `busy` — same socket, same holder."""
+    path = tmp_path / "full.qmp.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    server.listen(0)
+    queued = []
+    try:
+        # Fill the backlog with connections the "server" never accepts.
+        for _ in range(8):
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(0.2)
+            try:
+                s.connect(str(path))
+            except OSError:
+                s.close()
+                break
+            queued.append(s)
+
+        client = QMPClient(path)
+        client.greeting_timeout = 0.2
+        started = time.monotonic()
+        with pytest.raises(QMPBusyError) as excinfo:
+            client.connect()
+        assert time.monotonic() - started < 1.0
+        assert "another qmu command" in str(excinfo.value)
+    finally:
+        for s in queued:
+            s.close()
+        server.close()
+
+
 def test_missing_socket_is_unreachable_not_busy(tmp_path):
     with pytest.raises(QMPError) as excinfo:
         QMPClient(tmp_path / "absent.sock").connect()

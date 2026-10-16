@@ -290,17 +290,38 @@ def test_launch_json_reports_the_replaced_vm(launch_env, capsys, monkeypatch):
     assert "Replacing existing VM 'readiness' (pid=777)" in output.err
 
 
-def test_harness_attached_rootfs_note_is_mirrored_in_json(launch_env, capsys):
+def test_harness_attached_rootfs_note_is_mirrored_in_json(launch_env, capsys, tmp_path):
     inst, _, _ = launch_env
     inst.rootfs = "/var/rootfs.img"
+    (tmp_path / "qmu.toml").write_text(
+        '[boot]\nkernel = "Image"\n[drive]\nrootfs = "/var/rootfs.img"\n'
+    )
 
     rc = cli.main(["launch", "--harness", "--format", "json"])
     output = capsys.readouterr()
     payload = json.loads(output.out)
 
     assert rc == 0
-    assert any("attached rootfs /var/rootfs.img" in w for w in payload["warnings"])
-    assert "attached rootfs /var/rootfs.img" in output.err
+    expected = (
+        "attached rootfs /var/rootfs.img (from [drive] rootfs in project "
+        f"{(tmp_path / 'qmu.toml').resolve()};"
+    )
+    assert any(expected in w for w in payload["warnings"])
+    assert expected in output.err
+
+
+def test_harness_attached_rootfs_note_names_the_flag(launch_env, capsys):
+    """`--rootfs` on the command line is not "from config"."""
+    inst, _, _ = launch_env
+    inst.rootfs = "/var/flag.img"
+
+    rc = cli.main(["launch", "--harness", "--rootfs", "/var/flag.img", "--format", "json"])
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+
+    assert rc == 0
+    assert any("attached rootfs /var/flag.img (from --rootfs;" in w for w in payload["warnings"])
+    assert "from config" not in output.err
 
 
 def test_broken_global_config_warning_is_mirrored_in_json(

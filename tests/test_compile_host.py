@@ -76,7 +76,7 @@ class FakeSSH:
     def is_ready(self, timeout=2):
         return self.ready
 
-    def push(self, local, remote):
+    def push(self, local, remote, **kwargs):
         self.pushes.append((local, remote))
         if self.push_raises is not None:
             self._panic()
@@ -400,6 +400,50 @@ def test_host_build_then_run_executes_the_pushed_binary(wired, source, capsys):
     assert rc == 0
     assert ssh.runs == ["chmod +x /root/exploit", "/root/exploit"]
     assert "pwned" in capsys.readouterr().out
+
+
+def test_run_text_mode_stdout_is_the_program_output_only(wired, source, capsys):
+    """`compile --run ... > out.txt` must hold only what the program printed:
+    the banner, the program's stderr and the `[exit code]` trailer are stderr,
+    with the banner FIRST (it used to trail the output as a stderr note, so a
+    terminal showed the header after the body)."""
+    install, _state = wired
+    install(run_results=[(0, "", ""), (3, "sizeof(void*)=8\n", "warn\n")])
+
+    rc = cli.main(["compile", "--host", "--run", str(source)])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == "sizeof(void*)=8\n"
+    assert captured.err == "Compiled and ran exploit.c:\nwarn\n[exit code: 3]\n"
+
+
+def test_compile_without_run_keeps_stdout_empty_in_text_mode(wired, source, capsys):
+    """Same split without --run: the `Compiled ...` banner is a stderr note, so a
+    redirect of `compile` collects nothing but program output on every path."""
+    install, _state = wired
+    install(run_results=[(0, "", "")])
+
+    rc = cli.main(["compile", "--host", str(source)])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out == ""
+    assert captured.err.startswith("Compiled exploit.c -> /root/exploit")
+
+
+def test_compile_json_envelope_is_unchanged_by_the_stream_split(wired, source, capsys):
+    install, _state = wired
+    install(run_results=[(0, "", ""), (0, "pwned\n", "")])
+
+    rc = cli.main(["--format", "json", "compile", "--host", "--run", str(source)])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["run_stdout"] == "pwned\n"
+    assert payload["run_exit"] == 0
 
 
 def test_host_build_then_run_propagates_a_non_zero_guest_exit(wired, source):

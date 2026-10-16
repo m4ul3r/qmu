@@ -674,6 +674,10 @@ def _wire_wait_reset(monkeypatch, inst, *, debugged):
         lambda sel: alive.pop(0) if len(alive) > 1 else alive[0],
     )
     # The log is empty when the wait starts; the first poll finds a banner.
+    monkeypatch.setattr(
+        lifecycle, "scan_console_growth",
+        lambda p, *, scanned, boot_offset: (100, 100, False),
+    )
     monkeypatch.setattr(lifecycle, "last_boot_offset", lambda p, start_offset=0: 100)
     monkeypatch.setattr(lifecycle, "serial_log_offset", lambda p: 100)
     monkeypatch.setattr(lifecycle, "has_terminal_panic", lambda *a, **k: False)

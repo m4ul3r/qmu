@@ -7,21 +7,23 @@ the `kill`/`prune`/`list` rules.
 ## Launch flags
 
 ```bash
-qmu launch --name X --no-replace --kernel ./bzImage --initrd ./ramdisk.img \
-  --drive 'file=./rootfs.img,if=virtio,readonly,format=raw' \
-  --cmdline 'console=ttyS0 root=/dev/vda1 ro init=/run.sh'
+qmu launch --name X --no-replace --harness --kernel ./bzImage --initrd ./ramdisk.img \
+  --rootfs ./rootfs.img --cmdline 'console=ttyS0 root=/dev/sda ro init=/run.sh'
+qmu launch --name X --no-replace --drive 'file=./disk.qcow2,format=qcow2'   # take over the block topology
 qmu launch --name X --no-replace --no-net                  # -nic none; no SSH endpoint recorded
 qmu launch --name X --no-replace --nic-model e1000         # default virtio-net-pci
-qmu launch --name X --no-replace --no-kvm                  # force TCG ([machine] accel=tcg)
+qmu launch --name X --no-replace --no-kvm                  # force TCG ([machine] accel=tcg); boot 20–60 s
 qmu launch --name X --no-replace --ssh-timeout 120         # default 60 s
 qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only after --
 ```
 
 - `--kernel`/`--initrd`/`--cmdline`/`--profile` have `[boot]` config keys;
   every other flag has its `[machine]`/`[drive]`/`[ssh]` key. CLI beats config.
-- `--drive SPEC` (repeatable) suppresses the implicit rootfs drive and is not
-  recorded as the VM's rootfs (holder checks, `status.rootfs`); prefer
-  `--rootfs` for a plain image.
+- `--rootfs IMG` is the implicit disk: `/dev/sda` on x86_64, `/dev/vda`
+  (virtio) on aarch64/arm; a whole-disk image takes no partition suffix. It
+  is recorded as the VM's rootfs (holder checks, `status.rootfs`). `--drive
+  SPEC` (repeatable) suppresses the implicit drive and is not recorded;
+  prefer `--rootfs` for a plain image.
 - `--no-net` without `--ssh-port` records **no** SSH endpoint (`ssh:
   "none"`); SSH commands refuse naming the reason. With a manual NIC pass
   `--ssh-port N` and forward `N` yourself.
@@ -29,8 +31,9 @@ qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only 
   and `/dev/kvm` exists, recorded as `kvm` in `launch`/`status`/`list` JSON.
   KVM does **not** disable hardware watchpoints (`debugging.md`).
 - `--no-reboot` passes `-no-reboot`: a panic under `panic=N` exits QEMU
-  instead of rebooting into a fresh boot that buries the report. CLI only
-  (no config key).
+  instead of rebooting into a fresh boot that buries the report. It changes
+  what happens *after* the panic only — bare `wait` returns 3 at the panic
+  line either way. CLI only (no config key).
 - `--inject LOCAL:/guest/dir` (repeatable; `--partition`, `--mkdir`) runs the
   offline injection before boot. Every target — image, local file, guest
   directory — is validated read-only **before** a same-named running VM is
@@ -40,7 +43,9 @@ qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only 
   earlier with `ssh_status: "no-console-output"` (exit 4, VM retained), naming
   the expected `console=` for the arch.
 - `--harness` implies `--no-wait-ssh --no-net`, skips the rootfs/SSH-key
-  requirement, allocates no SSH port (`wait.md`).
+  requirement, allocates no SSH port (`wait.md`). A config `[drive] rootfs`
+  is still attached; the launch note names the source: `Harness mode:
+  attached rootfs <p> (from --rootfs; …)` or `(from [drive] rootfs in project <qmu.toml>; …)`.
 
 ## Launch result
 
@@ -54,7 +59,9 @@ booting)` · `n/a (harness)` · `none (--no-net, no --ssh-port)`), `kvm`,
 
 `warnings[]` mirrors every stderr warning: profile-override casualty list,
 dotted-param typo, `--cmdline` without `root=`, ignored broken global config,
-harness attached-rootfs note, replace note, and the arch-cmdline lint:
+harness attached-rootfs note, replace note, and the arch-cmdline lint. The
+profile-sourced unknown-parameter note (`apparmor=0`, `selinux=0`) is JSON-only
+(`unknown_kernel_params_by_source.profile`), never printed:
 
 - `'console=ttyS0' names an x86 serial port; on <arch> QEMU's virt console is ttyAMA0 …`
 - `'root=/dev/sda' names a SCSI/SATA disk; qmu attaches the rootfs as virtio on <arch>, where it is /dev/vda …` (aarch64/arm; skipped with `--drive`)
@@ -84,11 +91,14 @@ running pid — it never launches alongside, which would strand the first QEMU.
 
 ## Multiple VMs and auto-selection
 
-Each VM gets its own SSH port (from 10021), QMP socket and serial log. With
-exactly one VM running most commands auto-select it; `log`/`crash`/`wait
---pattern` also consider stopped VMs and report `autoselected`. On a shared
-host always pass `--vm`. On `launch`/`run`, `--vm` is an alias for `--name`.
-Precisely: `troubleshooting.md` → *Auto-selection*.
+Each VM gets its own SSH port (from 10021; ports are recycled across agents
+as soon as a VM dies), QMP socket and serial log. With exactly one VM running
+most commands auto-select it, print `[qmu] Auto-selected the only running VM
+'X' (pass --vm to pin it).` on stderr and set `autoselected: true`; `log`/
+`crash`/`wait --pattern` also consider stopped VMs. `QMU_REQUIRE_VM=1` makes
+every auto-selection exit 1 instead. On a shared host always pass `--vm`. On
+`launch`/`run`, `--vm` is an alias for `--name`. Precisely:
+`troubleshooting.md` → *Auto-selection*.
 
 ## The two state axes
 
@@ -97,15 +107,28 @@ Precisely: `troubleshooting.md` → *Auto-selection*.
 metadata was lost).
 
 **Existence** (`status`): `running` · `orphaned` (no metadata, process
-alive) · `stopped` · `absent`. Every command that answers about a VM agrees
-with `list` — `status`, `log`, `crash`, `prune`, `kill`, `wait`, `exec` all
-describe a stopped or orphaned VM rather than reporting it missing.
+alive) · `stopped` · `held_back` (metadata-free remnant the prune age gate
+withheld) · `absent`. Every command that answers about a VM agrees with
+`list` — `status`, `log`, `crash`, `prune`, `kill`, `wait`, `exec` all
+describe a stopped or orphaned VM rather than reporting it missing. `status
+--vm X` on a non-running VM is exit 0: `{ok: true, vm_id, status, guest,
+pid, pid_alive, serial_log, qemu_log, logs_retained, crash_detected,
+harness}` — `guest` is `null` for `stopped`/`held_back` and the live
+classification for `orphaned` (its QEMU still runs; text keeps the
+"orphaned remnant … pid N" prose). Text: `VM 'X' is stopped (logs retained;
+crash report waiting: qmu crash --vm X)` / `(logs retained: qmu log --vm X;
+remove with: qmu prune --vm X)` / `(no logs retained)`. Only an absent name
+is exit 1. `list` JSON rows carry the same `ssh` words as `status` (`ready`
+· `down` · `none` · `skipped` · `skipped (debugger attached)` · `n/a
+(harness)`), `logs_retained`, `crash_detected`; a stopped row's `guest` is
+null.
 
 **Guest usability** (`guest`), in precedence order:
 
 - `panicked` — `Kernel panic - not syncing` in the current boot; the guest is
   gone and reaping is correct. `status` does not probe SSH (`ssh:
-  "skipped"`, text `SSH: port N (not probed: guest panicked)`).
+  "skipped"`, text `SSH: port N (not probed: guest panicked)`). `sysrq-c` is
+  a direct `panic()` under every profile — it never demonstrates `crashed`.
 - `paused` — QMP `running: false`: `qmu gdb` until `qmu cont`, a debugger
   stop, an unclean bridge death, `restore-vm`.
 - `crashed` — a report is retrievable AND the guest still serves. Under
@@ -113,7 +136,8 @@ describe a stopped or orphaned VM rather than reporting it missing.
   in an uninstrumented path) kills only the faulting task. Pull the report; do
   not reap.
 - `serving` — positive evidence: sshd answered, or (no SSH endpoint / not
-  probed) console output in the current boot.
+  probed, e.g. harness) console output in the current boot. Bare `wait`
+  reports it the same way while QEMU runs, and `guest: null` once it exited.
 - `unknown` — otherwise, with `guest_detail`: `SSH down, 0 bytes of console
   output`, `no SSH, 0 bytes of console output`, `QMP busy, SSH not probed,
   1234 bytes of console output`. A wrong-arch cmdline (empty serial, no SSH)
@@ -124,12 +148,17 @@ Both crash reads are scoped to the latest kernel boot banner, so a previous
 boot's panic never labels a healthy rebooted guest as gone.
 
 **QMP** (`qmp`): `connected` · `busy` (another client holds QEMU's single QMP
-slot — a bare `wait` from an older qmu, a debugger bridge, a wedged `savevm`)
-· `unreachable` · null (stopped). When not `connected`, `qemu_status` is
+slot — a debugger bridge, a wedged `savevm`; bare `wait` never holds it) ·
+`unreachable` · `"skipped"` (`list` did not consult QMP, e.g. a stopped VM) ·
+null (stopped, in `status`/`wait`). When not `connected`, `qemu_status` is
 `unknown` and nothing QMP-derived is claimed. `kill` under a held socket
 skips the graceful `quit` after 1 s and signals (≈1 s, not 14 s). `list`'s
 concurrent probe may report a held slot as `unreachable` rather than `busy`;
-`status --vm X` is the precise read.
+`status --vm X` is the precise read. With a gdb client attached, `status`/
+`list` skip the SSH probe (`ssh: "skipped (debugger attached)"`; text `port N
+(not probed: debugger attached; a login would trip breakpoints)`, list
+`ssh=PORT(not probed: debugger attached)`) because the probe's `uname` would
+trip user breakpoints.
 
 KASAN-detected bugs are terminal under every profile (`kasan.fault=panic`);
 `--append kasan.fault=report` survives them; `--profile exploit-test`
@@ -138,29 +167,34 @@ KASAN-detected bugs are terminal under every profile (`kasan.fault=panic`);
 ## `list`, `kill`, `prune`
 
 ```bash
-qmu list                                 # existence + guest state; probes SSH, 15-60 s on a busy host
-qmu status --vm X                        # < 1 s
-qmu kill --vm X                          # QMP quit → SIGTERM; `bridge_reaped`, `logs_preserved`
+qmu list                                 # existence + guest state; probes SSH (ControlMaster=no), a few seconds on a busy host
+qmu status --vm X                        # < 1 s; exit 0 on a stopped VM (status: "stopped")
+qmu kill --vm X                          # QMP quit → SIGTERM; `bridge_reaped`, `logs_preserved`; closes the ControlMaster
 qmu kill --vm X --force                  # SIGKILL
-qmu kill --vm X --no-clean               # keep .serial.log + .json
-qmu prune --vm X                         # stopped VM's state files; no-op after a plain kill
+qmu kill --vm X --no-clean               # keep .json + .serial.log
+qmu prune --vm X                         # stopped VM's state files (kill-preserved logs included); no-op after a plain kill
 qmu prune --vm X --keep-logs             # drop .json + .qmp.sock, keep logs
-qmu prune --vm X --older-than 0          # clear a log-only remnant now (default gate 24 h)
-qmu prune --orphans --dry-run            # would_kill[] with vm_id; drop --dry-run to kill
-qmu prune --all                          # NOT on a shared host
+qmu prune --vm X --older-than 0          # clear a metadata-free .qemu.log/.qmp.sock remnant now (default gate 24 h)
+qmu prune --orphans --dry-run            # would_kill[] with vm_id; drop --dry-run to kill (reaps other agents' lost VMs too)
 ```
 
-`kill` removes metadata and logs by default but keeps `.serial.log`/
-`.qemu.log` when the guest is `crashed` or `panicked` (`logs_preserved:
+`kill` removes metadata and logs by default but keeps `.json`, `.serial.log`
+and `.qemu.log` when the guest is `crashed` or `panicked` (`logs_preserved:
 true`, pointing at `qmu crash --vm X`); it also reaps the pry bridge `qmu gdb`
-spawned. Log-only remnants are age-gated against `prune --vm` and named under
-`held_back`. Every prune mode, `--dry-run`, `cache du/ls`: `cache.md`.
+spawned. `kill --vm X` on an already-stopped VM is a clean no-op: exit 0,
+`already_stopped: true`, `logs_retained`, text `VM 'X' is already stopped;
+state retained (remove with: qmu prune --vm X)`. `prune --vm X` removes a
+stopped VM with its record, or a serial-log-only remnant, at any age; only a
+metadata-free `.qemu.log`/`.qmp.sock` remnant is age-gated (`held_back`,
+`--older-than 0`). `list` text marks a stopped VM whose report is still on
+disk `[stopped — crash report retained]`. qmu never recommends `prune --all`.
+Every prune mode, `--dry-run`, `cache du/ls`: `cache.md`.
 
 ## Files on disk
 
 | File | Purpose | Removed by |
 |---|---|---|
-| `<name>.json` | metadata (pid, ports, kernel, arch, kvm, bridge pid) | `kill`, `prune`, `prune --keep-logs`, `wait` harness auto-clean |
+| `<name>.json` | metadata (pid, ports, kernel, arch, kvm, bridge pid) | `kill` (unless logs are preserved), `prune`, `prune --keep-logs`, `wait` harness auto-clean |
 | `<name>.serial.log` | serial console (`qmu log`) | `kill` (only when the guest is neither `crashed` nor `panicked`), `prune`, `wait` harness auto-clean — kept by `kill --no-clean`, `prune --keep-logs`, `wait --no-clean` |
 | `<name>.qmp.sock` | QMP control socket | `kill`, `prune`, `prune --keep-logs`, `wait` harness auto-clean |
 | `<name>.qemu.log` | QEMU stdout/stderr | same rule as `.serial.log` |

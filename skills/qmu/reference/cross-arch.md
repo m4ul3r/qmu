@@ -35,17 +35,23 @@ export PATH=/tmp/gdb-multiarch-bin:$PATH
 ## aarch64 (arm64)
 
 ```bash
-eval "$(tools/kbuild.sh --version 7.0 --arch arm64)"     # KERNEL=Image, VMLINUX, KERNEL_SRC
-eval "$(tools/mkrootfs.sh --arch arm64)"                 # ROOTFS, SSH_KEY
+# Outputs of the qmu-linux-kbuild / qmu-linux-rootfs skills, under ~/.cache/qmu:
+KERNEL=~/.cache/qmu/kernels/7.0/arm64/Image      VMLINUX=~/.cache/qmu/kernels/7.0/arm64/vmlinux
+ROOTFS=~/.cache/qmu/rootfs/bookworm/arm64/rootfs.img  SSH_KEY=~/.cache/qmu/rootfs/bookworm/arm64/id_ed25519
+KERNEL_SRC=~/.cache/qmu/kernels/src/linux-7.0       # unpacked source tree, for `pry load --src`
 
 qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY" \
-  --arch aarch64 --gdb --name arm70 --no-replace \
+  --arch aarch64 --name arm70 --no-replace \
   --cmdline "console=ttyAMA0 root=/dev/vda rw net.ifnames=0" \
-  -- -M virt -cpu cortex-a57
+  -- -M virt -cpu cortex-a57                  # TCG: boot-to-SSH 20–60 s (measured 20–30 s), not ~7 s
 
 qmu exec --vm arm70 "uname -a"          # … 7.0.0 … aarch64
-qmu compile hello.c --run --vm arm70    # machine=aarch64, sizeof(void*)=8
+qmu compile hello.c --run --vm arm70    # machine=aarch64, sizeof(void*)=8 (banner on stderr)
 ```
+
+`qmu kbase` needs only SSH and readable `/proc/kallsyms` — no `--gdb`, no
+stub, no pry bridge — so the rebase check below works on this plain VM; add
+`--gdb` to the launch only when you intend to attach pry.
 
 **KASLR rebase on arm64 — use `qmu kbase`'s `KBASE` (`_text`), nothing else.**
 pry (0.1.0 and later) keys the slide to the `_text` symbol, which is exactly
@@ -57,13 +63,16 @@ missed. Older copies of this skill recommended `_stext` as a workaround for a
 pry bug that is now fixed — do not follow them.
 
 ```bash
+qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY" --arch aarch64 --gdb \
+  --name arm70 --no-replace --cmdline "console=ttyAMA0 root=/dev/vda rw net.ifnames=0" -- -M virt -cpu cortex-a57
+qmu gdb --vm arm70 --symbols "$VMLINUX"                   # bridge qmu-arm70; vCPU halted
 qmu cont --vm arm70                                       # attach halted the vCPU
 eval "$(qmu kbase --vm arm70 --symbols "$VMLINUX")"       # KBASE, LINK_BASE, SLIDE
-pry load "$VMLINUX" --base "$KBASE" --src "$KERNEL_SRC"
-pry break set __arm64_sys_newuname                        # arm64 syscall wrapper prefix
-pry continue --background
-qmu exec --vm arm70 "uname -r"                            # hits the breakpoint
-pry wait --timeout 10                                     # the reliable stop primitive
+pry --instance qmu-arm70 load "$VMLINUX" --base "$KBASE" --src "$KERNEL_SRC"
+pry --instance qmu-arm70 break set __arm64_sys_newuname   # arm64 syscall wrapper prefix
+pry --instance qmu-arm70 continue --background
+qmu exec --vm arm70 "uname -r"                            # hits the breakpoint; exec returns in ~1 s, guest_state: paused
+pry --instance qmu-arm70 wait --timeout 10                # the reliable stop primitive
 ```
 
 For `lx-*` scripts and `$lx_current()`, the arm64 kernel must be built with **full**
@@ -81,8 +90,9 @@ needs `--no-net` plus a manual `-netdev`/`virtio-net-device` pair. Pick the SSH 
 yourself with `--ssh-port N` and use the same `N` in the `hostfwd`:
 
 ```bash
-eval "$(tools/kbuild.sh --version 7.0 --arch arm32)"     # KERNEL=zImage (multi_v7)
-eval "$(tools/mkrootfs.sh --arch arm32)"                 # ROOTFS, SSH_KEY
+KERNEL=~/.cache/qmu/kernels/7.0/arm32/zImage     VMLINUX=~/.cache/qmu/kernels/7.0/arm32/vmlinux   # multi_v7
+ROOTFS=~/.cache/qmu/rootfs/bookworm/arm32/rootfs.img  SSH_KEY=~/.cache/qmu/rootfs/bookworm/arm32/id_ed25519
+KERNEL_SRC=~/.cache/qmu/kernels/src/linux-7.0
 
 qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY" \
   --arch arm --gdb --name arm32-70 --no-replace --no-net --ssh-port 10131 \
@@ -129,10 +139,14 @@ KASLR at all — it really does nothing there.
 ## Arch-aware qmu.toml (skip the per-launch flags)
 
 Baking the machine args, arch, and ARM cmdline into `qmu.toml` lets you launch with just
-`qmu launch --kernel "$KERNEL"`. Example for aarch64 (swap `cortex-a15`/`arm` for arm32,
+`qmu launch --name X --no-replace --kernel "$KERNEL"` — or flagless with the optional
+`[boot] kernel`. Example for aarch64 (swap `cortex-a15`/`arm` for arm32,
 and add the `--no-net --ssh-port N` + MMIO NIC args from the arm32 recipe):
 
 ```toml
+[boot]
+kernel = "/…/kernels/7.0/arm64/Image"   # optional: then plain `qmu launch --name X --no-replace` works
+
 [machine]
 arch = "aarch64"
 extra_args = ["-M", "virt", "-cpu", "cortex-a57"]
@@ -147,6 +161,12 @@ key = "/…/rootfs/bookworm/arm64/id_ed25519"
 [profiles.exploit-dev]
 cmdline = "console=ttyAMA0 root=/dev/vda rw net.ifnames=0 selinux=0 apparmor=0 kasan.fault=panic"
 ```
+
+The kbuild arm64 config has no LSMs, so `selinux=0 apparmor=0` are unclaimed
+by that kernel; being profile-sourced they appear only in launch JSON
+(`unknown_kernel_params_by_source.profile`), never on stderr. Without
+`[boot] kernel`, `doctor` shows `[~] kernel: not configured` — `--kernel`
+launches still work.
 
 ## Building on the host for a foreign guest (`compile --host`)
 

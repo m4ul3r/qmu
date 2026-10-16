@@ -139,6 +139,17 @@ Never collapse them into one enum.
   - `unknown` — nothing positive; `guest_detail` names what was checked
     (`SSH down, 0 bytes of console output`).
 
+  The guest axis is defined for a running QEMU only: once the process has
+  exited (`status` on a stopped VM, bare `wait` after `process_exited`/
+  `already_stopped`) the key is `null`, never `"unknown"`. A running harness
+  guest with console bytes is `serving` — bare `wait` reports it the same way
+  `status` does. The SSH probe is also skipped when
+  `debug.debug_session_present(inst)` (`ssh: "skipped (debugger attached)"`):
+  the probe runs `uname` in the guest, which trips a `__x64_sys_newuname`
+  breakpoint with no trigger from the operator. Readiness probes run with
+  `ControlMaster=no` so `list`/`status`/`launch` never leave a mux master
+  behind; `kill` closes the VM's master before signalling QEMU.
+
   Both crash reads are scoped to `max(recorded epoch,
   serial.last_boot_offset())`. `guest_epoch_serial_offset` only advances on an
   **observed** QMP RESET, so a guest-initiated reboot between two commands is
@@ -159,6 +170,23 @@ triggered crash on a VM whose metadata was lost — so adding `paused`/`panicked
 as existence-enum values would force `orphaned+panicked`, `stopped+…` and grow
 combinatorially. `list` must report both; it used to consult neither QMP nor
 crash detection and presented a panicked VM identically to a healthy one.
+`list` marks a stopped VM whose report is still on disk `[stopped — crash
+report retained]` and reports `qmp: "skipped"` (never null) when it did not
+consult QMP.
+
+**A non-running VM is described, not refused.** `status --vm X` on a
+stopped/orphaned-remnant/held-back VM is exit 0 with `status`, `guest: null`,
+`pid_alive`, `logs_retained`, `crash_detected`; `kill --vm X` on a stopped VM
+is exit 0 with `already_stopped: true`. Only an absent name goes through
+`describe_non_running()` → exit 1.
+
+**Auto-selection is never silent.** Every command that falls back to the
+single running VM prints `[qmu] Auto-selected the only running VM 'X' (pass
+--vm to pin it).` on stderr and sets JSON `autoselected: true`; with
+`QMU_REQUIRE_VM=1` in the environment it is exit 1 instead (`--vm is
+required: QMU_REQUIRE_VM is set`). No message anywhere recommends `prune
+--all`; the no-running-VM hints for `log`/`crash` name `qmu prune --vm <id>`
+(and `--all --dry-run` only as a preview).
 
 ### Crash vs. transport-loss disambiguation (`guest.py`, `ssh.py`, `serial.py`)
 
@@ -259,8 +287,14 @@ toolchains, key permissions); `info` for cache/pry/skills.
 commands (`push`/`pull`/`exec`/`compile`/`dmesg`) then error via `_require_ssh`;
 serial/QMP commands (`log`/`crash`/`wait`/`qmp`/`monitor`/`kill`) work. `qmu wait`
 polls `query-status` + PID liveness (see *Bare `wait`* above) and auto-cleans a
-harness VM only after the recorded pid is positively gone; `--no-reboot` keeps a
-`panic=N` kernel from rebooting over its own report.
+harness VM only after the recorded pid is positively gone. Every bare-`wait`
+result carries `console_tail` (last 20 lines of the scanned scope) so a
+successful run whose log is about to be auto-cleaned still has a receipt;
+text prints it under `Console tail:` when QEMU exited without a crash. A
+panic is exit 3 at the panic line regardless of `--no-reboot`; the flag only
+keeps a `panic=N` kernel from rebooting over its own report afterwards. The
+launch note names the disk's source (`from --rootfs` vs `from [drive] rootfs
+in project <qmu.toml>`).
 
 ### Debugger↔VM coherence (`debug.py`)
 
@@ -296,6 +330,9 @@ that common case while still warning whenever a client is (or might be) present.
 Guest-*initiated* reboots are invisible to a one-shot command, so those stay
 doc-only (skill: *Debugger↔VM coherence*). This is the qmu-side stopgap layer of
 umbrella #48; auto re-sync/re-arm and true pry-bridge reap need pry-side work.
+`exec`/`compile --run`/`dmesg` watch QMP while the SSH command runs and abort
+within ~1 s of `running:false` (a breakpoint stop), emitting the same paused
+envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
 
 ## Gotchas
 
@@ -328,7 +365,20 @@ umbrella #48; auto re-sync/re-arm and true pry-bridge reap need pry-side work.
 - **Never report "not found" for something another command displays.** This
   class recurred across `prune --vm`, `prune --all`, `kill`, `status`, `wait`,
   and `exec`, each time sending the reader to `rm` in the cache directory for a
-  VM `qmu list` was showing them. Use `lifecycle.describe_non_running()`.
+  VM `qmu list` was showing them. `status`/`kill` describe a non-running VM
+  with exit 0; only an absent name uses `lifecycle.describe_non_running()`.
+- **`prune --vm` is not age-gated for anything `kill` preserved.** A stopped
+  VM with its record, and a serial-log-only remnant, prune at any age; only a
+  metadata-free `.qemu.log`/`.qmp.sock` remnant is `held_back` by
+  `--older-than`. Docs that say `--older-than 0` for kill-preserved logs are
+  wrong, not the tool.
+- **stderr is for the operator, JSON is for scripts.** The profile-sourced
+  unknown-kernel-param note (`apparmor=0` from `exploit-dev`) lives only in
+  `unknown_kernel_params_by_source.profile`; `compile --run`'s `Compiled and
+  ran …` banner goes to stderr so stdout is the program's stdout (as `exec`).
+  `SnapshotError` and every `doctor` row carry a machine-readable `hint`; the
+  `doctor` skills row prints a one-line `summary` (JSON `detail` keeps the
+  paths; `detail_paths` splits installed/missing/stale).
 - **`tests/test_state_agreement_matrix.py` is the guard for that whole class.**
   Seven rounds of dogfooding produced the same defect shape — a fix improves one
   path's message and leaves its siblings contradicting it — always on one of

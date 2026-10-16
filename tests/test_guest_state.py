@@ -98,10 +98,10 @@ class FakeSSH:
     def __init__(self, trace):
         self.trace = trace
 
-    def push(self, local, remote):
+    def push(self, local, remote, **kwargs):
         self.trace.append(("ssh", "push", local, remote))
 
-    def pull(self, remote, local):
+    def pull(self, remote, local, **kwargs):
         self.trace.append(("ssh", "pull", remote, local))
 
     def run(self, command, timeout=30.0, check=False, **kwargs):
@@ -674,7 +674,7 @@ def test_compile_run_transport_loss_names_the_same_follow_up_as_exec(
             super().__init__(serial, append=DMESG_PANIC if panicked else "")
             self._compiled = False
 
-        def push(self, local, remote):
+        def push(self, local, remote, **kwargs):
             pass
 
         def run(self, command, timeout=30.0, check=False, **kwargs):
