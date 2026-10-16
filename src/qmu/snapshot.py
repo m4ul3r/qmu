@@ -135,7 +135,8 @@ def parse_snapshot_list(raw: str) -> list[dict[str, Any]]:
     """
     # Regex: ID  TAG  SIZE UNIT  DATE  TIME  VM_CLOCK  [ICOUNT]
     snap_re = re.compile(
-        r"^\s*(\S+)\s+(\S+)\s+(\d+\s*\S+)\s+"  # id, tag, vm_size (e.g. "913 MiB")
+        r"^\s*(\S+)\s+(\S+)\s+"
+        r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*\S+)\s+"  # QEMU's %g size + unit
         r"(\d{4}-\d{2}-\d{2})\s+"                # date
         r"(\d{2}:\d{2}:\d{2})\s+"                # time
         r"(\S+)"                                   # vm_clock

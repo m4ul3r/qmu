@@ -138,6 +138,16 @@ class FakeQMP:
         return {}
 
 
+@pytest.mark.parametrize("vm_size", ["1.36 GiB", "1e+03 GiB"])
+def test_large_snapshots_remain_visible_and_operable(vm_size):
+    listing = _LISTED_CLEAN.replace("486 MiB", vm_size)
+
+    rows = parse_snapshot_list(listing)
+    assert [(row["tag"], row["vm_size"]) for row in rows] == [("clean", vm_size)]
+    assert save_snapshot(FakeQMP("", listing=listing), "clean").ok is True
+    assert delete_snapshot(FakeQMP("", listing=listing), "clean").ok is True
+
+
 def test_save_empty_output_synthesizes_success_when_listed():
     qmp = FakeQMP("", listing=_LISTED_CLEAN)
     assert save_snapshot(qmp, "clean") == SnapshotResult(True, "Snapshot 'clean' saved.")

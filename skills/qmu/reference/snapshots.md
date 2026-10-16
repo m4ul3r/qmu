@@ -20,9 +20,11 @@ relaunch (`kill` + `launch` + first `exec`, ≈7 s) is the comparison that
 matters; both discard disk state, only the rewind keeps the checkpoint.
 
 `snapshot list` JSON is `snapshots: [{id, tag, vm_size, date, time,
-vm_clock}]` straight from HMP `info snapshots`; `vm_size` (e.g. `820 MiB`
-for a 4 G guest) is the RAM image each checkpoint stores in the overlay
-under `/var/tmp` — the cost of a `save` on a shared host.
+vm_clock}]` straight from HMP `info snapshots`; `vm_size` is QEMU's
+human-readable RAM-image size (for example `820 MiB` or `1.36 GiB`), not
+an integer byte count. Fractional sizes remain visible to `list` and usable
+by `save`/`delete`. Each checkpoint stores that image in the overlay under
+`/var/tmp` — the cost of a `save` on a shared host.
 
 ## Durable internal snapshots
 
