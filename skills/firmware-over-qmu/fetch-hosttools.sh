@@ -29,6 +29,9 @@ while [[ $# -gt 0 ]]; do case "$1" in
 esac; done
 [[ -n "$OUT" ]] || { echo "ERROR: --out required" >&2; usage 1; }
 mkdir -p "$OUT"
+# A relative -v source is a Docker *named volume*, not a bind mount: the host
+# dir would stay empty while the in-container listing reports success.
+OUT=$(cd "$OUT" && pwd -P)
 
 echo ">> fetching dropbear/gdbserver/sftp-server for ubuntu:$RELEASE ($ARCH) into $OUT" >&2
 docker run --rm --platform "linux/$ARCH" -v "$OUT:/output:rw" "ubuntu:$RELEASE" bash -c '
