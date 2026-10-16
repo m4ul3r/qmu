@@ -13,7 +13,7 @@ import pytest
 from qmu import cli
 from qmu.commands import guest
 from qmu.instance import VMInstance
-from qmu.ssh import SSHError
+from qmu.ssh import SCPFileError, SSHError
 
 
 PANIC_LOG = (
@@ -127,12 +127,17 @@ def test_transfer_success_preserves_paths_and_status(
         assert payload == {"ok": True, "local": local, "remote": remote}
 
 
-@pytest.mark.parametrize("fmt", ["json", "ndjson"])
-def test_transfer_local_validation_is_exit4_without_crash_claim(
+@pytest.mark.parametrize("fmt", ["text", "json", "ndjson"])
+def test_transfer_local_validation_is_exit1_without_crash_claim(
     monkeypatch, tmp_path, capsys, fmt
 ):
+    """A missing local file is the caller's error (1), never transport (4).
+
+    Measured live: `push nonexistent.bin` exited 4 `SSHError` — the class an
+    agent reads as "guest unreachable, retry/relaunch", looping on a typo.
+    """
     missing = tmp_path / "missing.bin"
-    failure = SSHError(f"Local file not found: {missing}")
+    failure = SCPFileError(f"Local file not found: {missing}")
     _install_transfer(
         monkeypatch,
         tmp_path,
@@ -142,14 +147,18 @@ def test_transfer_local_validation_is_exit4_without_crash_claim(
     )
 
     rc = cli.main(["--format", fmt, "push", str(missing), "/root/"])
-    out = capsys.readouterr().out
-    if fmt == "ndjson":
-        assert len(out.splitlines()) == 1
-    payload = json.loads(out)
+    captured = capsys.readouterr()
 
-    assert rc == 4
+    assert rc == 1
+    if fmt == "text":
+        assert captured.out == ""
+        assert captured.err == f"[qmu] Error: Local file not found: {missing}\n"
+        return
+    if fmt == "ndjson":
+        assert len(captured.out.splitlines()) == 1
+    payload = json.loads(captured.out)
     assert payload["ok"] is False
-    assert payload["error_type"] == "SSHError"
+    assert payload["error_type"] == "SCPFileError"
     assert payload["error"] == f"Local file not found: {missing}"
     assert "crash" not in payload
     assert "crash_detected" not in payload
@@ -162,16 +171,17 @@ def test_transfer_local_validation_is_exit4_without_crash_claim(
     ["No such file or directory", "Permission denied"],
 )
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
-def test_transfer_remote_filesystem_failure_is_ordinary_exit4(
+def test_transfer_remote_filesystem_failure_is_operational_exit1(
     monkeypatch, tmp_path, capsys, operation, stderr, fmt
 ):
+    """scp's file-level refusal on a working connection keeps its wording."""
     local = str(tmp_path / "payload.bin")
     remote = "/root/payload.bin"
     (tmp_path / "payload.bin").write_bytes(b"data")
     message = (
         f"SCP {operation} failed: {stderr}"
     )
-    failure = SSHError(message, returncode=1, stderr=stderr)
+    failure = SCPFileError(message, returncode=1, stderr=stderr)
     _install_transfer(
         monkeypatch,
         tmp_path,
@@ -185,11 +195,11 @@ def test_transfer_remote_filesystem_failure_is_ordinary_exit4(
     out = capsys.readouterr().out
     payload = json.loads(out)
 
-    assert rc == 4
+    assert rc == 1
     assert payload == {
         "ok": False,
         "error": message,
-        "error_type": "SSHError",
+        "error_type": "SCPFileError",
     }
 
 

@@ -203,3 +203,35 @@ def test_crash_current_excludes_resumed_warning_before_sysrq_panic(
     assert "old_warning" not in payload["crash"]
     assert "old_root_cause" not in payload["crash"]
     assert "end trace 111" not in payload["crash"]
+
+
+REBOOTED_PAST_PANIC = (
+    "[ 2.0] Kernel panic - not syncing: rebooted_bug panic\n"
+    "[ 2.1] ---[ end Kernel panic - not syncing: rebooted_bug panic ]---\n"
+    "[ 2.2] Rebooting in 3 seconds..\n"
+    "[    0.000000] Linux version 7.0.0 (qmu@kbuild) (gcc 13) #1 SMP\n"
+    + "".join(f"[    0.{i:06d}] boot line {i}\n" for i in range(700))
+    + "localhost login: \n"
+)
+
+
+def test_crash_current_scope_is_the_current_boot(monkeypatch, tmp_path, capsys):
+    """`panic=N` guest: the epoch never moved (no QMP RESET observed), but the
+    log holds a new boot banner. `status` calls that guest serving; `crash`
+    must not call its pre-reboot panic current. `--full-history` keeps it —
+    and must find it under 700 lines of boot output (the old 500-line window
+    reported "no crash markers")."""
+    _patch_crash_instance(monkeypatch, tmp_path, REBOOTED_PAST_PANIC)
+
+    rc = cli.main(["crash", "--vm", "crash-vm", "--format", "json"])
+    current = json.loads(capsys.readouterr().out)
+    rc_history = cli.main(["crash", "--vm", "crash-vm", "--full-history", "--format", "json"])
+    history = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert current["crash_detected"] is False
+    assert current["reason"] == "no crash markers found in current guest epoch"
+    assert rc_history == 0
+    assert history["crash_detected"] is True
+    assert "rebooted_bug" in history["crash"]
+    assert "boot line" not in history["crash"]

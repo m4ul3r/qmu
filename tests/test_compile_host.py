@@ -220,6 +220,21 @@ def test_cc_flag_reaches_the_resolver(monkeypatch, wired, source):
     assert seen["override"] == "clang -target x"
 
 
+def test_cc_flag_is_honored_by_the_guest_compile_too(wired, source, capsys):
+    """`--cc` without `--host` was accepted and silently ignored (measured:
+    `compile_cmd` showed plain `gcc`). It now names the guest compiler."""
+    install, _state = wired
+    ssh = install()
+
+    rc = cli.main(["compile", "--format", "json", "--cc", "gcc -O2", str(source)])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["compiled_on"] == "guest"
+    assert payload["compile_cmd"].startswith("gcc -O2 -static -lpthread -o ")
+    assert ssh.runs == [payload["compile_cmd"]]
+
+
 # --- failure paths ---------------------------------------------------------
 
 def test_host_compile_failure_is_exit_1_with_the_ordinary_envelope(

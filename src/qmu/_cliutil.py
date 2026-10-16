@@ -29,6 +29,7 @@ from .instance import (
 )
 from .output import write_output_result
 from .qmp import QMPClient, QMPError
+from .serial import current_boot_offset, has_terminal_panic
 from .ssh import SSHClient
 
 
@@ -37,10 +38,23 @@ def _make_ssh(inst: VMInstance) -> SSHClient:
 
 
 def _require_ssh(inst: VMInstance) -> None:
-    """Raise QMUError if `inst` has no SSH (harness mode or unconfigured)."""
-    if inst.harness or inst.ssh_port is None or inst.ssh_key is None:
+    """Raise QMUError if `inst` has no SSH (harness mode, --no-net, unconfigured)."""
+    if inst.harness:
         raise QMUError(
             f"VM '{inst.vm_id}' is harness-mode (no SSH). "
+            f"Use 'qmu log', 'qmu crash', 'qmu qmp', or 'qmu wait' instead."
+        )
+    if inst.ssh_port is None:
+        # A non-harness VM with no port was launched with --no-net and no
+        # --ssh-port: qmu never bound a port, so there is no SSH endpoint.
+        raise QMUError(
+            f"VM '{inst.vm_id}' was launched with --no-net and no --ssh-port; "
+            "it has no SSH endpoint. Relaunch with --ssh-port N and a matching "
+            "hostfwd, or without --no-net."
+        )
+    if inst.ssh_key is None:
+        raise QMUError(
+            f"VM '{inst.vm_id}' has no SSH key recorded (no SSH). "
             f"Use 'qmu log', 'qmu crash', 'qmu qmp', or 'qmu wait' instead."
         )
 
@@ -155,7 +169,117 @@ def _emit(
         _output(data, args, stem=stem, source_ok=source_ok)
 
 
-_SSH_BLOCKED_QEMU_STATUSES = frozenset({"paused", "debug"})
+def _emit_refusal(
+    args: argparse.Namespace,
+    *,
+    data: dict[str, Any],
+    text: list[str],
+    stem: str,
+) -> None:
+    """Emit an operational refusal: JSON envelope on stdout, text on stderr.
+
+    A refusal is prose about why nothing ran, not a result. In text mode it
+    must not land on stdout: `eval "$(qmu kbase ...)"` executed the refusal
+    as shell commands (`VM: command not found`), destroying the message and
+    leaving `KBASE` unset. The skill's text contract — errors print
+    `[qmu] Error: ...` to stderr — applies to every refusal path, so the
+    stdout of a text-mode command stays eval-/pipe-safe.
+    """
+    if getattr(args, "format", "text") == "text":
+        first, *rest = text
+        sys.stderr.write(f"[qmu] Error: {first}\n")
+        for line in rest:
+            sys.stderr.write(f"[qmu] {line}\n")
+        return
+    _emit(args, data=data, text=text, stem=stem)
+
+
+def _qmp_stopped_status(inst: VMInstance) -> str | None:
+    """QEMU's status string when QMP positively says the vCPUs are not running.
+
+    Keyed on `running: false`, not on a list of status names: `paused` and
+    `debug` are the common ones, but a failed `loadvm` leaves `restore-vm`,
+    and `prelaunch`/`inmigrate`/`postmigrate` are just as unreachable over
+    SSH. Every one of them is what `qmu status` calls `paused`, and a gate
+    that recognised two of them sent the rest down a 15–30 s SSH failure in
+    the transport class. Returns None when QMP cannot be asked or says the
+    guest runs — introspection is best-effort and must never become a new
+    outage for a working guest.
+    """
+    try:
+        with _qmp_ctx(inst) as qmp:
+            status_result = qmp.execute("query-status")
+    except (QMPError, OSError):
+        return None
+    if not isinstance(status_result, dict):
+        return None
+    running = status_result.get("running")
+    qemu_status = status_result.get("status")
+    if running is True:
+        return None
+    if running is False:
+        return qemu_status if isinstance(qemu_status, str) else "paused"
+    # No `running` boolean: fall back to the status name. QEMU's only running
+    # RunState is "running"; every other name is a stopped vCPU.
+    if isinstance(qemu_status, str) and qemu_status != "running":
+        return qemu_status
+    return None
+
+
+def _stopped_guest_payload(
+    inst: VMInstance, qemu_status: str
+) -> tuple[dict[str, Any], list[str]]:
+    """The (data, text) pair for a vCPU-halted guest, shared by every reporter.
+
+    Used before an SSH command starts (preflight) and after one lost its
+    transport mid-flight (a breakpoint fired while `exec` was running), so
+    both tell the same story and name the same recovery.
+    """
+    hint = (
+        f"VM '{inst.vm_id}' is {qemu_status}. "
+        f"Resume with: qmu cont --vm {inst.vm_id}. "
+        "If a debugger halted the vCPU, use: pry continue."
+    )
+    data: dict[str, Any] = {
+        "ok": False,
+        "vm_id": inst.vm_id,
+        "guest_state": "paused",
+        "qemu_status": qemu_status,
+        "ssh_error": False,
+        "crash_detected": False,
+        "hint": hint,
+    }
+    text = [
+        f"VM '{inst.vm_id}' is {qemu_status} (vCPU halted).",
+        f"Resume with: qmu cont --vm {inst.vm_id}",
+        "Debugger alternative: pry continue",
+    ]
+    return data, text
+
+
+def _panicked_guest_payload(inst: VMInstance) -> tuple[dict[str, Any], list[str]]:
+    """The (data, text) pair for a guest whose current boot took a terminal panic."""
+    hint = (
+        f"VM '{inst.vm_id}' guest is PANICKED: a terminal kernel panic predates "
+        f"this command, so nothing can run until relaunch. "
+        f"Read it with: qmu crash --vm {inst.vm_id}; then reap with: "
+        f"qmu kill --vm {inst.vm_id}"
+    )
+    data: dict[str, Any] = {
+        "ok": False,
+        "vm_id": inst.vm_id,
+        "guest_state": "panicked",
+        "ssh_error": False,
+        "crash_detected": False,
+        "hint": hint,
+    }
+    text = [
+        f"VM '{inst.vm_id}' guest is PANICKED (terminal kernel panic before "
+        "this command); SSH operation was not started.",
+        f"Read the report: qmu crash --vm {inst.vm_id}",
+        f"Then reap it:    qmu kill --vm {inst.vm_id}",
+    ]
+    return data, text
 
 
 def _preflight_ssh_guest(
@@ -164,48 +288,35 @@ def _preflight_ssh_guest(
     *,
     stem: str,
 ) -> int | None:
-    """Fail fast when QMP positively identifies a manual/debugger stop.
+    """Fail fast when the guest demonstrably cannot answer SSH.
+
+    Two positive signals, checked in the order `_guest_state` uses:
+
+    - a terminal panic in the current boot scope (the serial log is the
+      ground truth; a reboot banner after the panic means a new guest, which
+      is NOT refused). Exit 1, not 3: the panic is not fresh for this command,
+      and the guest is known gone rather than merely unreachable (4). Without
+      this, `exec` on a VM `status` already called PANICKED spent 15–45 s in
+      ssh keepalive and reported "no fresh crash" — contradicting `status`.
+    - QMP reports the vCPUs are not running (`qmu gdb` halt, a failed
+      `loadvm`, a breakpoint): exit 1 with the resume hint.
 
     QMP introspection is best-effort. An unavailable QMP socket must not turn an
     otherwise working guest command into a new outage, so transport failures
-    return None and preserve the existing SSH path.
+    preserve the existing SSH path. Returns the exit status when it refused,
+    else None.
     """
-    try:
-        with _qmp_ctx(inst) as qmp:
-            status_result = qmp.execute("query-status")
-    except (QMPError, OSError):
-        return None
+    boot_start = current_boot_offset(inst.serial_log, inst.guest_epoch_serial_offset)
+    if has_terminal_panic(inst.serial_log, start_offset=boot_start):
+        data, text = _panicked_guest_payload(inst)
+        _emit_refusal(args, data=data, text=text, stem=stem)
+        return 1
 
-    if not isinstance(status_result, dict):
+    qemu_status = _qmp_stopped_status(inst)
+    if qemu_status is None:
         return None
-    qemu_status = status_result.get("status")
-    if not isinstance(qemu_status, str):
-        return None
-    if qemu_status not in _SSH_BLOCKED_QEMU_STATUSES:
-        return None
-
-    hint = (
-        f"VM '{inst.vm_id}' is {qemu_status}. "
-        f"Resume with: qmu cont --vm {inst.vm_id}. "
-        "If a debugger halted the vCPU, use: pry continue."
-    )
-    _emit(
-        args,
-        data={
-            "ok": False,
-            "vm_id": inst.vm_id,
-            "qemu_status": qemu_status,
-            "ssh_error": False,
-            "crash_detected": False,
-            "hint": hint,
-        },
-        text=[
-            f"VM '{inst.vm_id}' is {qemu_status}; SSH operation was not started.",
-            f"Resume with: qmu cont --vm {inst.vm_id}",
-            "Debugger alternative: pry continue",
-        ],
-        stem=stem,
-    )
+    data, text = _stopped_guest_payload(inst, qemu_status)
+    _emit_refusal(args, data=data, text=text, stem=stem)
     return 1
 
 
@@ -366,8 +477,10 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
     parser.add_argument(
         "--no-kvm", dest="no_kvm", action="store_true",
         help="Disable KVM acceleration (force TCG emulation; sets [machine] "
-             "accel=tcg). Needed when gdbstub hardware watchpoints must fire — "
-             "they can silently no-op under KVM.",
+             "accel=tcg). A retest lever for a suspected KVM guest-debug "
+             "limitation: if a gdbstub hardware watchpoint does not fire on a "
+             "write you can prove happened, suspect a VA alias first, then "
+             "retest under TCG. (Measured: a jiffies watchpoint fires under KVM.)",
     )
     parser.add_argument("--name", default=None, help="VM instance name")
     parser.add_argument("--inject", action="append", dest="injects", default=None,

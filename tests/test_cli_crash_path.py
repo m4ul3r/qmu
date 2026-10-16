@@ -150,10 +150,56 @@ def test_rc255_ssh_down_reports_crash_appended_during_command(patch_exec, capsys
     rc = cli.main(["--format", "json", "exec", "trigger"])
     payload = json.loads(capsys.readouterr().out)
     assert rc == 3
-    assert fake.is_ready_calls >= 1
+    # The serial log settles it: a terminal panic appended after the command
+    # started needs no liveness probe (and the probe is what a rebooting
+    # `panic=N` guest fools).
+    assert fake.is_ready_calls == 0
     assert payload["ssh_error"] is True
     assert payload["crash_detected"] is True
+    assert payload["exit_code"] is None
+    assert payload["vm_id"] == "crash-vm"
     assert "panic" in payload["crash"].lower()
+
+
+REBOOT_AFTER_PANIC = PANIC_LOG + (
+    "[    3.114] Rebooting in 3 seconds..\n"
+    "[    0.000000] Linux version 7.0.0 (qmu@kbuild) (gcc 13) #1 SMP\n"
+    + "".join(f"[    0.{i:06d}] boot line {i}\n" for i in range(700))
+    + "localhost login: \n"
+)
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_rc255_panic_then_autoreboot_is_a_crash_not_exit_255(
+    patch_exec, capsys, fmt
+):
+    """A `panic=N` guest reboots inside the re-probe window and answers it.
+
+    Measured live: `[exit code: 255]`, exit 1, `crash_detected: false` for a
+    sysrq crash whose panic sat six lines after the command start. The probe
+    is the wrong authority here; the serial log holds the outcome.
+    """
+    fake = patch_exec(
+        255,
+        ready=True,
+        initial_serial="old boot\n",
+        serial_during_run=REBOOT_AFTER_PANIC,
+    )
+    rc = cli.main(["--format", fmt, "exec", "echo c > /proc/sysrq-trigger"])
+    captured = capsys.readouterr()
+
+    assert rc == 3
+    assert fake.is_ready_calls == 0
+    if fmt == "json":
+        payload = json.loads(captured.out)
+        assert payload["crash_detected"] is True
+        assert payload["ssh_error"] is True
+        assert "Kernel panic - not syncing" in payload["crash"]
+        assert "qmu crash" in payload["hint"]
+    else:
+        assert "Crash from serial log" in captured.out
+        assert "Kernel panic - not syncing" in captured.out
+        assert "[exit code: 255]" not in captured.out
 
 
 def test_rc255_ssh_down_ignores_precommand_crash(patch_exec, capsys):
@@ -423,10 +469,12 @@ def test_exec_json_ndjson_status_parity(patch_exec, capsys):
 
 
 class FakeCompileSSH:
-    def __init__(self, serial_path, serial_during_run):
+    def __init__(self, serial_path, serial_during_run, *, ready=False):
         self._serial_path = serial_path
         self._serial_during_run = serial_during_run
+        self._ready = ready
         self._run_count = 0
+        self.is_ready_calls = 0
 
     def push(self, local, remote):
         pass
@@ -442,18 +490,19 @@ class FakeCompileSSH:
         return 255, "", ""
 
     def is_ready(self, timeout=2):
-        return False
+        self.is_ready_calls += 1
+        return self._ready
 
 
 def _run_compile_crash_case(
-    monkeypatch, tmp_path, capsys, *, initial_serial, serial_during_run
+    monkeypatch, tmp_path, capsys, *, initial_serial, serial_during_run, ready=False
 ):
     source = tmp_path / "poc.c"
     source.write_text("int main(void) { return 0; }\n")
     serial = tmp_path / "compile.serial.log"
     serial.write_text(initial_serial)
     inst = _fake_instance(str(serial))
-    fake = FakeCompileSSH(serial, serial_during_run)
+    fake = FakeCompileSSH(serial, serial_during_run, ready=ready)
     monkeypatch.setattr(guest, "_preflight_ssh_guest", lambda *a, **kw: None)
     monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
     monkeypatch.setattr(guest, "_make_ssh", lambda selected: fake)
@@ -461,6 +510,22 @@ def _run_compile_crash_case(
 
     rc = cli.main(["--format", "json", "compile", str(source), "--run"])
     return rc, json.loads(capsys.readouterr().out)
+
+
+def test_compile_run_panic_then_autoreboot_is_a_crash(monkeypatch, tmp_path, capsys):
+    """Same `panic=N` trap as exec: the rebooted guest answers the probe, but
+    the serial log holds the panic the run produced."""
+    rc, payload = _run_compile_crash_case(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        initial_serial="old boot\n",
+        serial_during_run=REBOOT_AFTER_PANIC,
+        ready=True,
+    )
+    assert rc == 3
+    assert payload["crash_detected"] is True
+    assert "Kernel panic - not syncing" in payload["crash"]
 
 
 def test_compile_run_ignores_precommand_crash(monkeypatch, tmp_path, capsys):
