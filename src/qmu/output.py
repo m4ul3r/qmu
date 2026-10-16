@@ -117,6 +117,26 @@ def _artifact_envelope(payload: dict[str, Any], fmt: str) -> str:
     return render_value(payload, "ndjson" if fmt == "ndjson" else "json")
 
 
+# How much of a spilled text result still reaches stdout, so a human or a
+# `| head` pipeline sees what the output looked like without opening the file.
+TEXT_SPILL_HEAD_LINES = 40
+
+
+def _text_spill_pointer(payload: dict[str, Any], rendered: str) -> str:
+    """Text-mode stand-in for a spilled result: a one-line pointer plus the head.
+
+    `--format text` promises text on stdout; the JSON pointer envelope that
+    used to appear here broke `qmu exec ... | grep` and read as an error to a
+    caller who never asked for JSON. json/ndjson keep their envelopes.
+    """
+    head = rendered.splitlines()[:TEXT_SPILL_HEAD_LINES]
+    pointer = (
+        f"[qmu] Output spilled to {payload['artifact_path']} "
+        f"(~{payload['token_estimate']} tokens)"
+    )
+    return "\n".join([pointer, *head]) + "\n"
+
+
 def write_output_result(
     value: Any,
     *,
@@ -169,7 +189,66 @@ def write_output_result(
         source_ok=artifact_ok,
     )
     return OutputWriteResult(
-        rendered=_artifact_envelope(artifact, fmt),
+        rendered=(
+            _text_spill_pointer(artifact, rendered)
+            if fmt == "text"
+            else _artifact_envelope(artifact, fmt)
+        ),
         artifact=artifact,
         spilled=True,
+    )
+
+
+def write_bytes_result(
+    raw: bytes,
+    *,
+    out_path: Path | None,
+    stem: str,
+    spill_token_limit: int = DEFAULT_SPILL_TOKEN_LIMIT,
+) -> OutputWriteResult:
+    """Text-mode delivery of a byte payload with NO rendering applied.
+
+    `render_value` appends a newline to a string and the spill/`--out` paths
+    write that rendered form, so a file read back through them was never
+    checksum-comparable with its source. This variant writes `raw` verbatim:
+    inline when it fits the spill budget, otherwise to `out_path`/a spill file
+    exactly, with the usual artifact envelope describing the file.
+    """
+    rendered = raw.decode("utf-8", errors="replace")
+    token_estimate = _estimate_tokens(rendered)
+    summary = {"kind": "bytes", "bytes": len(raw)}
+
+    if out_path is None and token_estimate <= spill_token_limit:
+        return OutputWriteResult(rendered=rendered)
+
+    spilled = out_path is None
+    if out_path is None:
+        out_path = _spill_path(stem, ".bin")
+    else:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        invalidate_owned_spill_marker(out_path)
+    try:
+        out_path.write_bytes(raw)
+        if spilled:
+            mark_spill_artifact(out_path)
+    except BaseException:
+        if spilled:
+            out_path.unlink(missing_ok=True)
+        raise
+    artifact = _artifact_payload(
+        artifact_path=out_path,
+        fmt="text",
+        encoded=raw,
+        token_estimate=token_estimate,
+        value=summary,
+        source_ok=True,
+    )
+    return OutputWriteResult(
+        rendered=(
+            _text_spill_pointer(artifact, rendered)
+            if spilled
+            else _artifact_envelope(artifact, "text")
+        ),
+        artifact=artifact,
+        spilled=spilled,
     )

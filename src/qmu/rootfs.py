@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import shlex
 import shutil
+import stat as stat_mod
 import subprocess
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .instance import QMUError
@@ -149,15 +153,26 @@ SUPERMIN_KERNEL_HINT = (
 
 
 def _missing_dirs(
-    fish: str, image: str, partition: int, guest_dirs: list[str]
+    fish: str,
+    image: str,
+    partition: int,
+    guest_dirs: list[str],
+    *,
+    read_only: bool = False,
 ) -> list[str]:
-    """Return which of `guest_dirs` do not exist as directories in the image."""
+    """Return which of `guest_dirs` do not exist as directories in the image.
+
+    `read_only` opens the image `--ro`, which works while a VM still holds it:
+    `launch --inject` validates its targets *before* killing the VM it
+    replaces, and at that moment the old VM is still the holder.
+    """
     wanted = sorted({d for d in guest_dirs if d != "/"})
     if not wanted:
         return []
 
     script = "".join(f"is-dir {shlex.quote(d)}\n" for d in wanted)
-    cmd = [fish, "--rw", "-a", image] + _mount_args(partition)
+    mode = "--ro" if read_only else "--rw"
+    cmd = [fish, mode, "-a", image] + _mount_args(partition)
     proc = subprocess.run(cmd, input=script, text=True, capture_output=True)
     if proc.returncode != 0:
         out = (proc.stderr or proc.stdout or "").strip()
@@ -244,6 +259,51 @@ def _diagnose_guestfish_failure(output: str, image: str, partition: int) -> str 
     return None
 
 
+def _inject_guest_dirs(mappings: list[tuple[str, str]]) -> list[str]:
+    # GUEST is always a directory (documented contract); a trailing slash is
+    # optional. Normalizing keeps `/root` and `/root/` identical instead of
+    # silently diverging to `/` via dirname().
+    return [guest.rstrip("/") or "/" for _, guest in mappings]
+
+
+def preflight_inject(
+    image: str,
+    mappings: list[tuple[str, str]],
+    partition: int = 1,
+    *,
+    mkdir: bool = False,
+) -> None:
+    """Raise the error `inject` would raise for bad inputs, without writing.
+
+    Checks the image exists, every LOCAL exists, and (unless `mkdir`) every
+    GUEST directory exists — using a read-only guestfish open and no busy-image
+    guard, so it works while a VM still holds the image. `launch --inject` runs
+    this before replacing a same-named VM: a typo'd destination used to kill
+    the healthy VM and *then* fail, leaving nothing running.
+    """
+    fish = _require_guestfish()
+    img_path = Path(image)
+    if not img_path.exists():
+        raise QMUError(f"Image not found: {image}")
+    for local, _ in mappings:
+        if not Path(local).exists():
+            raise QMUError(f"Local file not found: {local}")
+    if mkdir:
+        return
+    guest_dirs = _inject_guest_dirs(mappings)
+    missing = _missing_dirs(
+        fish, str(img_path), partition, guest_dirs, read_only=True
+    )
+    if missing:
+        listed = ", ".join(sorted(missing))
+        raise QMUError(
+            f"Guest directory not found in {image}: {listed}. "
+            f"Injecting would have created it and reported success, hiding a "
+            f"typo. Pass --mkdir to create it on purpose, or check the path "
+            f"with `qmu rootfs ls {image} / --partition {partition}`."
+        )
+
+
 def inject(
     image: str,
     mappings: list[tuple[str, str]],
@@ -260,41 +320,38 @@ def inject(
     would land the binary in a fresh `/rooot` while `/root/exploit` still holds
     the previous iteration's build, which is exactly the stale-code failure
     injection is supposed to rule out.
+
+    Injected paths end up owned by root (0:0). `copy-in` preserves the host
+    uid/gid, so an unprivileged host user's files landed as e.g. 1005:1000 —
+    an uid that usually names nobody in the guest. Mode bits are kept as-is,
+    so an executable stays executable and a 0600 key stays private.
     """
     fish = _require_guestfish()
     img_path = Path(image)
     if not img_path.exists():
         raise QMUError(f"Image not found: {image}")
-    require_image_free(image)
-
-    # Validate locals up-front for clearer errors.
+    # Cheap input checks first, then the holder refusal (0.2 s), then the
+    # guestfish probe (seconds) — the same order a caller would want them in.
     for local, _ in mappings:
         if not Path(local).exists():
             raise QMUError(f"Local file not found: {local}")
-
-    # GUEST is always a directory (documented contract); a trailing slash is
-    # optional. Normalizing keeps `/root` and `/root/` identical instead of
-    # silently diverging to `/` via dirname().
-    guest_dirs = [guest.rstrip("/") or "/" for _, guest in mappings]
-
-    if not mkdir:
-        missing = _missing_dirs(fish, str(img_path), partition, guest_dirs)
-        if missing:
-            listed = ", ".join(sorted(missing))
-            raise QMUError(
-                f"Guest directory not found in {image}: {listed}. "
-                f"Injecting would have created it and reported success, hiding a "
-                f"typo. Pass --mkdir to create it on purpose, or check the path "
-                f"with `qmu rootfs ls {image} / --partition {partition}`."
-            )
+    require_image_free(image)
+    preflight_inject(image, mappings, partition, mkdir=mkdir)
+    guest_dirs = _inject_guest_dirs(mappings)
 
     script_lines: list[str] = []
+    dir_targets: list[str] = []
     for (local, _), guest_dir in zip(mappings, guest_dirs):
+        local_path = Path(local).resolve()
+        target = posixpath.join(guest_dir, local_path.name)
         if mkdir:
             script_lines.append(f"-mkdir-p {shlex.quote(guest_dir)}")
         script_lines.append(
-            f"copy-in {shlex.quote(str(Path(local).resolve()))} {shlex.quote(guest_dir)}"
+            f"copy-in {shlex.quote(str(local_path))} {shlex.quote(guest_dir)}"
         )
+        script_lines.append(f"chown 0 0 {shlex.quote(target)}")
+        if local_path.is_dir():
+            dir_targets.append(target)
 
     script = "\n".join(script_lines) + "\n"
     cmd = [fish, "--rw", "-a", str(img_path)] + _mount_args(partition)
@@ -308,6 +365,26 @@ def inject(
             f"guestfish inject failed (exit {proc.returncode}).\n{diagnosis}\n\n"
             f"guestfish said:\n{out}"
         )
+
+    # guestfish has no recursive chown; a copied-in directory tree needs its
+    # contents enumerated first, then chowned in a second pass. `find` prints
+    # paths relative to its argument (leading `/`), one per line, with nothing
+    # between consecutive lists, so each list is closed with an echo marker.
+    if dir_targets:
+        find_script = "".join(
+            f"find {shlex.quote(t)}\necho {_SEP_MARKER}\n" for t in dir_targets
+        )
+        found = _run_script(image, partition, find_script, "inject")
+        chown_lines: list[str] = []
+        lists = found.split(_SEP_MARKER + "\n")
+        for target, listing in zip(dir_targets, lists):
+            for rel in listing.split("\n"):
+                if rel:
+                    chown_lines.append(
+                        f"chown 0 0 {shlex.quote(target + rel)}"
+                    )
+        if chown_lines:
+            _run_script(image, partition, "".join(l + "\n" for l in chown_lines), "inject")
 
 
 def _run_script(
@@ -347,24 +424,139 @@ def _run_script(
     return proc.stdout
 
 
-def listdir(image: str, guest_path: str = "/", partition: int = 1) -> list[str]:
-    """List a directory inside the image.
+def _parse_stat_blocks(out: str) -> list[dict[str, int]]:
+    """Split concatenated `lstatns` output into one {field: int} per record."""
+    records: list[dict[str, int]] = []
+    for raw in out.splitlines():
+        line = raw.strip()
+        if ":" not in line or not line.startswith("st_"):
+            continue
+        key, _, value = line.partition(":")
+        if key == "st_dev":
+            records.append({})
+        if not records:
+            continue
+        try:
+            records[-1][key] = int(value.strip())
+        except ValueError:
+            continue
+    return records
 
-    Exists so an injection can be *verified*: a silently stale rootfs means the
-    next boot re-runs the previous iteration's binary while looking fresh.
+
+_TYPE_NAMES = (
+    (stat_mod.S_ISDIR, "dir"),
+    (stat_mod.S_ISREG, "file"),
+    (stat_mod.S_ISLNK, "symlink"),
+    (stat_mod.S_ISCHR, "chardev"),
+    (stat_mod.S_ISBLK, "blockdev"),
+    (stat_mod.S_ISFIFO, "fifo"),
+    (stat_mod.S_ISSOCK, "socket"),
+)
+
+
+def _entry_from_stat(name: str, st: dict[str, int], target: str | None) -> dict:
+    mode = st.get("st_mode", 0)
+    kind = next((label for test, label in _TYPE_NAMES if test(mode)), "unknown")
+    mtime = datetime.fromtimestamp(st.get("st_mtime_sec", 0), tz=timezone.utc)
+    entry = {
+        "name": name,
+        "type": kind,
+        "mode": f"{stat_mod.S_IMODE(mode):04o}",
+        "uid": st.get("st_uid", 0),
+        "gid": st.get("st_gid", 0),
+        "size": st.get("st_size", 0),
+        "mtime": mtime.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if kind == "symlink":
+        entry["target"] = target or ""
+    return entry
+
+
+def format_entry(entry: dict) -> str:
+    """One `ls -l`-style line for a `listdir` entry."""
+    mode = int(entry["mode"], 8)
+    type_bits = {
+        "dir": stat_mod.S_IFDIR, "file": stat_mod.S_IFREG, "symlink": stat_mod.S_IFLNK,
+        "chardev": stat_mod.S_IFCHR, "blockdev": stat_mod.S_IFBLK,
+        "fifo": stat_mod.S_IFIFO, "socket": stat_mod.S_IFSOCK,
+    }.get(entry["type"], 0)
+    line = (
+        f"{stat_mod.filemode(type_bits | mode)} {entry['uid']:>5} {entry['gid']:>5} "
+        f"{entry['size']:>9} {entry['mtime']} {entry['name']}"
+    )
+    if entry["type"] == "symlink":
+        line += f" -> {entry['target']}"
+    return line
+
+
+_LINKS_MARKER = "__QMU_LINKS__"
+_SEP_MARKER = "__QMU_SEP__"
+
+
+def listdir(image: str, guest_path: str = "/", partition: int = 1) -> list[dict]:
+    """List a directory inside the image as structured entries.
+
+    Each entry is `{name, type, mode, uid, gid, size, mtime[, target]}`:
+    `type` is one of file/dir/symlink/chardev/blockdev/fifo/socket, `mode` the
+    permission bits as 4-digit octal, `mtime` ISO-8601 UTC, `target` present
+    only for symlinks. Exists so an injection can be *verified*: a silently
+    stale rootfs means the next boot re-runs the previous iteration's binary
+    while looking fresh.
     """
     path = guest_path or "/"
-    out = _run_script(
-        image, partition, f"ll {shlex.quote(path)}\n", "ls", read_only=True
+    names_out = _run_script(
+        image, partition, f"ls {shlex.quote(path)}\n", "ls", read_only=True
     )
-    return [line for line in out.splitlines() if line.strip()]
+    names = [n for n in names_out.split("\n") if n]
+    if not names:
+        return []
+
+    full = [posixpath.join(path, n) for n in names]
+    script = "".join(f"lstatns {shlex.quote(p)}\n" for p in full)
+    # `-readlink` tolerates the error a non-symlink produces (stderr only);
+    # the separators keep the per-entry answers aligned with `names`.
+    script += f"echo {_LINKS_MARKER}\n"
+    script += "".join(f"-readlink {shlex.quote(p)}\necho {_SEP_MARKER}\n" for p in full)
+    out = _run_script(image, partition, script, "ls", read_only=True)
+
+    stat_part, _, links_part = out.partition(_LINKS_MARKER + "\n")
+    stats = _parse_stat_blocks(stat_part)
+    targets: list[str | None] = []
+    for chunk in links_part.split(_SEP_MARKER + "\n")[: len(names)]:
+        targets.append(chunk.rstrip("\n") or None)
+    if len(stats) != len(names):
+        raise QMUError(
+            f"guestfish ls returned {len(stats)} stat records for {len(names)} "
+            f"entries in {path}; the listing is inconclusive.\n\nguestfish said:\n"
+            f"{out.strip()}"
+        )
+    targets += [None] * (len(names) - len(targets))
+    return [
+        _entry_from_stat(name, st, target)
+        for name, st, target in zip(names, stats, targets)
+    ]
 
 
-def read_file(image: str, guest_path: str, partition: int = 1) -> str:
-    """Return the contents of a file inside the image."""
-    return _run_script(
-        image, partition, f"cat {shlex.quote(guest_path)}\n", "cat", read_only=True
-    )
+def read_file(image: str, guest_path: str, partition: int = 1) -> bytes:
+    """Return the exact bytes of a file inside the image.
+
+    Uses `download` rather than guestfish's `cat`, which appends a newline to
+    whatever it prints: a 74-byte script came back as 75 bytes, so a checksum
+    comparison against the local source failed for a file that was identical.
+    """
+    with tempfile.NamedTemporaryFile(prefix="qmu-rootfs-cat-", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        _run_script(
+            image,
+            partition,
+            f"download {shlex.quote(guest_path)} {shlex.quote(str(tmp_path))}\n",
+            "cat",
+            read_only=True,
+        )
+        return tmp_path.read_bytes()
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def remove(

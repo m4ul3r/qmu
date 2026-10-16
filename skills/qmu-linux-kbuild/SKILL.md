@@ -1,389 +1,208 @@
 ---
 name: qmu-linux-kbuild
-description: Build Linux kernels (v4.x-latest) for QEMU exploit development via Docker. Handles version-to-toolchain mapping, cross-compilation (x86_64, i386, arm64, arm32, arm32hf), and exploit-dev configs (KASAN, debug info). Output integrates directly with qmu launch --kernel.
+description: Build Linux kernels (v4.x–latest) for QEMU exploit development inside Docker, with the GCC matched to the kernel version. Cross-compiles x86_64, i386, arm64, arm32, arm32hf with an exploit-dev config (KASAN, full DWARF, GDB helpers). Output is eval-able for `qmu launch --kernel`.
 ---
 
 # qmu-linux-kbuild
 
-Use this skill when the user needs a Linux kernel image for `qmu launch --kernel` and does not have a pre-built one, wants a specific kernel version, or needs a cross-architecture kernel. The script builds kernels inside Docker containers with GCC versions matched to the target kernel, so even 4.x kernels build reliably on modern hosts.
+`tools/kbuild.sh` downloads a kernel.org tarball, builds it in a
+`qmu-kbuild:<ubuntu>-<arch>` container whose GCC matches the kernel's era, and
+prints eval-able paths to the boot image, `vmlinux`, `.config`, the retained
+source tree and the GDB helper loader. It answers "is this a bug?" against a
+kernel whose config you control. For "does this work on Ubuntu?" use
+`qmu-ubuntu-target` (`tools/mktarget.sh`), which installs Ubuntu's own kernel
+at a pinned ABI.
 
-> **Need a *distro* kernel rather than an upstream one?** Use
-> `qmu-ubuntu-target` (`tools/mktarget.sh`). This skill builds from kernel.org
-> with an exploit-dev config (KASAN, full DWARF, drivers built in) — ideal for
-> "is this a bug?". It cannot answer "does this work on Ubuntu?", which needs
-> Ubuntu's own patched kernel at a pinned ABI, its config, and its hardening.
+The script is not on `PATH`: from a qmu checkout it is `tools/kbuild.sh` (the
+form used below); from this skill's directory, `../../tools/kbuild.sh`.
 
-The script ships in the qmu project's `tools/` directory. It is not on `PATH`; resolve it relative to the install location — from this skill's directory that is `../../tools/kbuild.sh`, or from a checkout of the qmu repo just `tools/kbuild.sh` (the form used in the examples below).
+## Decision table
 
-## Quick reference
-
-```bash
-# Build x86_64 kernel (most common)
-tools/kbuild.sh --version 6.6.75
-
-# Build and immediately launch with qmu
-eval $(tools/kbuild.sh --version 6.6.75)
-qmu launch --kernel "$KERNEL"
-
-# Cross-compile for arm64
-tools/kbuild.sh --version 5.15.170 --arch arm64
-
-# Build an old 4.x kernel
-tools/kbuild.sh --version 4.4.138 --arch arm32
-
-# 32-bit x86
-tools/kbuild.sh --version 5.10.230 --arch i386
-
-# ARM hard-float
-tools/kbuild.sh --version 6.1.120 --arch arm32hf
-
-# Force rebuild (ignore cache)
-tools/kbuild.sh --version 6.6.75 --no-cache
-
-# Generate .config only (inspect/customize before building)
-tools/kbuild.sh --version 6.6.75 --config-only
-
-# Override container for edge cases
-tools/kbuild.sh --version 5.4.0 --container focal
-
-# Constrained host: cap parallel make jobs (default: nproc)
-tools/kbuild.sh --version 6.6.75 --jobs 4
-
-# Put the artifacts somewhere other than ~/.cache/qmu/kernels/<ver>/<arch>
-tools/kbuild.sh --version 6.6.75 --outdir /data/kernels/6.6.75
-
-# Keep in-tree build intermediates for a later `make -C $KERNEL_SRC`
-tools/kbuild.sh --version 6.6.75 --keep-residue
-
-# Show the Docker image build and full make output on stderr (default: -s)
-tools/kbuild.sh --version 6.6.75 --verbose
-```
-
-| Flag | Effect |
+| Need | Run |
 |---|---|
-| `--version VER` | required; `major.minor[.patch]` |
-| `--arch ARCH` | `x86_64` (default), `i386`, `arm64`, `arm32`, `arm32hf` |
-| `--container NAME` | override the auto-selected Ubuntu toolchain image (`xenial`…`noble`) |
-| `--outdir DIR` | artifact directory (default `$CACHE/kernels/VER/ARCH`); the shared source tree stays under `$CACHE/kernels/src/` |
-| `--jobs N` | `make -jN` (default `nproc`) |
-| `--no-cache` | rebuild even if a complete cached build exists |
-| `--config-only` | write `.config` and exit; prints only `CONFIG=` |
-| `--keep-residue` | keep `*.o`, `.*.cmd`, … in the source tree after a successful build (default: removed) |
-| `--verbose` | show Docker build + full make output (default passes `-s` to make) |
+| An x86_64 kernel and boot it | `eval "$(tools/kbuild.sh --version 6.6.75)"; qmu launch --kernel "$KERNEL"` |
+| A rootfs to go with it | `eval "$(tools/mkrootfs.sh)"` (`qmu-linux-rootfs`), then add `--rootfs "$ROOTFS" --ssh-key "$SSH_KEY"` |
+| arm64 kernel | `eval "$(tools/kbuild.sh --version 6.6.75 --arch arm64)"` → `KERNEL` is `Image`; boot per `skill://qmu/reference/cross-arch.md` |
+| i386 / arm32 / arm32hf | `--arch i386` (`bzImage`), `--arch arm32` or `--arch arm32hf` (`zImage`; `<5.0` uses `vexpress_defconfig`, else `multi_v7_defconfig`) |
+| Inspect the config before a long build | `tools/kbuild.sh --version 6.6.75 --config-only` → prints only `CONFIG=`. Read-only value: every build regenerates `.config` from defconfig + overlays, so a hand-edited `.config` is never consumed by kbuild — for a custom config run `make -C "$KERNEL_SRC"` yourself (after a `--keep-residue` build) |
+| GDB/pry source-level debugging | after a normal build: `pry gdb "add-auto-load-safe-path $(dirname "$VMLINUX_GDB")"; pry gdb "set substitute-path /src $KERNEL_SRC"; pry gdb "source $VMLINUX_GDB"` |
+| Constrained host | `--jobs 4` (default `nproc`) |
+| Build fails with a GCC error | `--container focal` (one newer than auto-selected; table below) |
+| Keep `*.o`/`.cmd` for an incremental `make -C "$KERNEL_SRC"` | `--keep-residue` (default removes them after a successful build) |
+| Reclaim residue left by older builds | `qmu cache du`, then `qmu prune --build-residue --dry-run`, then `qmu prune --build-residue` |
+| Force a rebuild | `--no-cache` |
+| Artifacts outside the cache | `--outdir /data/kernels/6.6.75` (the shared source tree stays under `$CACHE/kernels/src/`) |
 
-Environment: `QMU_CACHE_DIR` overrides `~/.cache/qmu` (the same root qmu and
-`mkrootfs.sh`/`mktarget.sh` use); `QMU_KBUILD_MIRROR` overrides the kernel.org
-mirror.
+## Output contract
 
-**Exit codes.** `2` — usage: a missing/invalid `--version`, unsupported
-`--arch`, unknown flag, or `--help` (printed by `die()`/`usage()` as `kbuild:
-error: …` on stderr). `1` — the containerised build failed; the last stderr
-line is `kbuild: build failed (exit N) — check <outdir>/build.log`. `0` —
-built or served from cache, variables on stdout. `130`/`143` on SIGINT/SIGTERM.
-
-## Output format
-
-A normal build prints five eval-able shell assignments to stdout (all logs go to
-stderr), always in this order:
+Stdout carries only `printf %q`-quoted assignments, in this order; all logs,
+Docker output and make output go to stderr.
 
 ```
 KERNEL=/home/user/.cache/qmu/kernels/6.6.75/x86_64/bzImage
 VMLINUX=/home/user/.cache/qmu/kernels/6.6.75/x86_64/vmlinux
 CONFIG=/home/user/.cache/qmu/kernels/6.6.75/x86_64/.config
-# also written (not an eval-able assignment):
-#   /home/user/.cache/qmu/kernels/6.6.75/x86_64/System.map
 KERNEL_SRC=/home/user/.cache/qmu/kernels/src/linux-6.6.75
 VMLINUX_GDB=/home/user/.cache/qmu/kernels/6.6.75/x86_64/vmlinux-gdb.py
 ```
 
 | Variable | Meaning |
 |---|---|
-| `KERNEL` | Boot image (`bzImage` / `Image` / `zImage`) |
-| `VMLINUX` | Unstripped ELF with debug symbols |
-| `CONFIG` | Final `.config` used for the build |
-| `KERNEL_SRC` | Retained kernel source/build tree (mounted at `/src` during Docker compilation) |
-| `VMLINUX_GDB` | Immediately usable build-root GDB loader (`vmlinux-gdb.py`) adjacent to `scripts/gdb/` |
-| *(no variable)* | `System.map` is also written next to `KERNEL` — symbol lookup when a `vmlinux` is unavailable; `qmu prune --build-residue` never removes it |
+| `KERNEL` | boot image: `bzImage` (x86_64, i386), `Image` (arm64), `zImage` (arm32, arm32hf) |
+| `VMLINUX` | unstripped ELF with DWARF; `qmu gdb --symbols "$VMLINUX"`, `pry load` |
+| `CONFIG` | the final `.config` the kernel was built with |
+| `KERNEL_SRC` | retained source tree, mounted at `/src` during the build (DWARF paths start with `/src`) |
+| `VMLINUX_GDB` | `vmlinux-gdb.py` loader next to a copied `scripts/gdb/` tree; never move it out of that directory |
+| *(no variable)* | `System.map` and `build.log` are also written next to `KERNEL` |
 
-Use `eval "$(tools/kbuild.sh ...)"` to capture these into shell variables.
+`--config-only` prints only `CONFIG=…` (no kernel, no `VMLINUX_GDB`, no `lx-*`
+helpers).
 
-**`--config-only`** prints only `CONFIG=...`. It does not build a kernel or
-run the helper-generation target, and cannot provide `VMLINUX_GDB` or `lx-*` helpers.
+| Exit | Meaning | Next |
+|---|---|---|
+| `0` | built, or served from cache; assignments on stdout | `qmu launch --kernel "$KERNEL"` |
+| `1` | the containerised build failed; last stderr line is `kbuild: build failed (exit N) — check <outdir>/build.log` | read `build.log`; GCC errors → `--container` one step newer; apt/network errors → retry |
+| `2` | usage: missing/invalid `--version` (`major.minor[.patch]`), unsupported `--arch` or `--container`, unknown flag, `--help`; lock file unusable (e.g. NFS); extraction failed; products missing after an apparently successful build. Message is `kbuild: error: …` on stderr | fix the argument; for the lock, use a local `QMU_CACHE_DIR` |
+| `130` / `143` | interrupted by SIGINT / SIGTERM; the build container is removed on the way out | rerun; nothing partial is served as a cache hit |
+| other | a host step failed under `set -e` (`curl` download, `tar`, `docker build` of the toolchain image); the status is that tool's | `curl` 22 ⇒ version does not exist on the mirror; retry apt failures |
 
-Every invocation for a given kernel version — across **all architectures**,
-and regardless of whether it would otherwise have been a cache hit — takes
-one per-version lock (`$CACHE/kernels/.src-linux-$VERSION.lock`) before the
-cache fast path even runs. A `--config-only` run waits for an in-flight build
-of the same version to finish and vice versa, but so does a fully **cached**
-build, and so does a build of a *different* `--arch` of the same version
-(e.g. `arm64` blocks behind an in-flight `x86_64` build of the same version,
-and vice versa) — the lock is keyed on version only, not on version+arch,
-because every arch shares the one extracted tree in
-`$CACHE/kernels/src/linux-$VERSION`, and config generation mrpropers and
-reconfigures that tree — interleaving it with a running build corrupts the
-shared tree. Different versions use different lock files and build in
+## Flags and environment
+
+| Flag | Effect |
+|---|---|
+| `--version VER` | required; `major.minor[.patch]`, e.g. `6.6.75`, `7.0` |
+| `--arch ARCH` | `x86_64` (default), `i386`, `arm64`, `arm32`, `arm32hf` |
+| `--container TAG` | override the auto-selected toolchain image: `xenial`, `bionic`, `focal`, `jammy`, `noble` |
+| `--outdir DIR` | artifact directory (default `$CACHE/kernels/VER/ARCH`) |
+| `--jobs N` | `make -jN` (default `nproc`) |
+| `--no-cache` | rebuild even if a complete cached build exists |
+| `--config-only` | generate `.config` and exit; prints only `CONFIG=` |
+| `--keep-residue` | keep `*.o`, `*.a`, `*.ko`, `.*.cmd`, `.tmp_vmlinux*` in `KERNEL_SRC` after a successful build |
+| `--verbose` | show the Docker image build and full make output (default passes `-s` to make) |
+| `-h`, `--help` | usage on stderr, exit 2 |
+
+`QMU_CACHE_DIR` overrides `~/.cache/qmu` (shared with mkrootfs/mktarget);
+`QMU_KBUILD_MIRROR` overrides `https://cdn.kernel.org/pub/linux/kernel`
+(the tarball URL is `$MIRROR/v<major>.x/linux-<ver>.tar.xz`).
+
+## Shared source tree and the per-version lock
+
+Every arch of one version shares one extracted tree,
+`$CACHE/kernels/src/linux-<ver>/`, and every build starts with `make mrproper`
++ defconfig + overlays in that tree. Every invocation for a version — cached or
+not, any `--arch`, `--config-only` included — takes an exclusive `flock` on
+`$CACHE/kernels/.src-linux-<ver>.lock` **before** the cache check, so two
+invocations for the same version serialize instead of corrupting each other
+(a `--config-only` mid-build used to delete `generated/autoconf.h` under the
+running compile). Different versions use different lock files and run in
 parallel.
 
-A blocked invocation prints `kbuild: waiting for another kbuild invocation…`
-on stderr once, then blocks with **no timeout, no `-w`, and no opt-out** — so
-that message tells you a wait is happening but not how long it will last;
-past that first line a genuine wait and a hang look identical. To find out
-who actually holds the lock: `fuser -v $CACHE/kernels/.src-linux-$VERSION.lock`.
+A blocked invocation prints `kbuild: waiting for another kbuild invocation
+holding the linux-<ver> source tree...` once, then blocks with no timeout and
+no opt-out; past that line a wait and a hang look the same. Who holds it:
+`fuser -v "$CACHE/kernels/.src-linux-<ver>.lock"`. When it gets the lock it
+prints `kbuild: acquired linux-<ver> source-tree lock` and continues — which,
+for a `--config-only` or a different-arch build, means mrproper on the tree
+the previous invocation just built in; the previous invocation's artifacts are
+already copied to its `--outdir`, so nothing it printed becomes stale.
 
-### GDB helper setup
+Consequence for `--config-only`: it is safe to run beside a build (it waits),
+but it still wipes residue of the finished build from the shared tree, so run
+it before a `--keep-residue` build you intend to `make -C` afterwards, not
+after.
 
-After a normal build, wire Linux's generated helpers into pry/GDB:
-
-```bash
-eval "$(tools/kbuild.sh --version 6.6.75)"
-pry gdb "add-auto-load-safe-path $(dirname "$VMLINUX_GDB")"
-pry gdb "set substitute-path /src $KERNEL_SRC"
-pry gdb "source $VMLINUX_GDB"
-```
-
-`/src` is the fixed Docker source mount / build working directory recorded in
-DWARF, so `set substitute-path /src $KERNEL_SRC` maps those paths to the
-retained host sources under `KERNEL_SRC`. The loader must stay next to
-`scripts/gdb/` (never flattened); the relative imports, including generated
-`scripts/gdb/linux/constants.py` on kernels that use it, depend on that layout.
-
-Helper generation follows the source tree's capabilities, not a version cutoff:
-if its top-level Makefile defines `scripts_gdb`, kbuild runs that target.
-Otherwise it runs `prepare`; older helper trees generate their GDB
-constants through `prepare` → `Kbuild` → `build_constants_py`. Failures remain
-fatal in either path; a failed modern `scripts_gdb` is not retried through a
-fallback. Early 4.x trees without `scripts/gdb/linux/constants.py.in` use their
-shipped Python helpers without generated constants. kbuild exports those real
-helpers and does not manufacture a `constants.py` file.
-
-## Version-to-container mapping
-
-The script auto-selects a Docker image (Ubuntu base + GCC version) that can build the target kernel. Each image is tagged per-architecture (`qmu-kbuild:<container>-<arch>`) and only installs the toolchain needed for that specific arch.
-
-| Container tag | Ubuntu | GCC | Kernel range | When to override |
-|---|---|---|---|---|
-| `xenial` | 16.04 | 5 | 4.0 - 4.9 | Very old kernels that fail with GCC 7 |
-| `bionic` | 18.04 | 7 | 4.10 - 5.3 | Default for late 4.x and early 5.x |
-| `focal` | 20.04 | 9 | 5.4 - 5.19 | Mid-range 5.x LTS kernels |
-| `jammy` | 22.04 | 11 | 6.0 - 6.6 | Current LTS kernels |
-| `noble` | 24.04 | 13 | 6.7+ | Latest mainline kernels (including 7.x) |
-
-If a build fails due to GCC incompatibility, override with `--container`:
-```bash
-# kernel 5.4.0 fails on bionic (GCC 7)? try focal (GCC 9)
-tools/kbuild.sh --version 5.4.0 --container focal
-```
-
-## Docker image design
-
-Images are built on first use and cached by Docker. The builder uses a single generic `build_docker_image()` function that:
-
-1. Picks the Ubuntu base + python package based on container tag
-2. Installs common build deps (`build-essential bc bison flex libelf-dev libssl-dev cpio kmod xz-utils`)
-3. Installs only the arch-specific toolchain in a separate layer:
-   - `x86_64`: no extra packages (native)
-   - `i386`: `gcc-multilib`
-   - `arm64`: `gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu`
-   - `arm32`: `gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi`
-   - `arm32hf`: `gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf`
-
-This avoids the `gcc-multilib` vs cross-compiler package conflict by never installing them together.
-
-Image tags follow the pattern `qmu-kbuild:<container>-<arch>` (e.g., `qmu-kbuild:xenial-arm32`, `qmu-kbuild:jammy-x86_64`).
-
-## Architecture details
-
-### x86_64 (default)
-
-- QEMU binary: `qemu-system-x86_64`
-- Kernel image: `bzImage`
-- KVM acceleration: works natively on x86_64 hosts
-- KASAN: supported since 4.0
-- Docker toolchain: native GCC (no cross-compiler needed)
-
-```bash
-eval $(tools/kbuild.sh --version 6.6.75)
-qmu launch --kernel "$KERNEL"
-```
-
-### i386 (32-bit x86)
-
-- QEMU binary: `qemu-system-i386`
-- Kernel image: `bzImage`
-- Docker toolchain: `gcc-multilib` (native GCC with -m32)
-- KASAN: **not supported** — 32-bit x86 has no `HAVE_ARCH_KASAN` (KASAN needs a 64-bit address space for its shadow region); use x86_64 if you need KASAN
-- Set `arch = "i386"` in qmu.toml
-
-```bash
-eval $(tools/kbuild.sh --version 5.10.230 --arch i386)
-qmu launch --kernel "$KERNEL" --arch i386
-```
-
-### arm64 (aarch64)
-
-- QEMU binary: `qemu-system-aarch64`
-- Kernel image: `Image` (not bzImage)
-- Docker toolchain: `gcc-aarch64-linux-gnu`
-- KASAN: supported since 4.15
-- Needs `-M virt -cpu cortex-a57` QEMU args
-
-Extra QEMU args are positional after `--` (there is no `--extra-args` flag), and the
-default profiles use an x86 cmdline, so override the console/root for arm64:
-
-```bash
-eval $(tools/kbuild.sh --version 5.15.170 --arch arm64)
-qmu launch --kernel "$KERNEL" --arch aarch64 \
-  --cmdline "console=ttyAMA0 root=/dev/vda rw" \
-  -- -M virt -cpu cortex-a57
-```
-
-See the qmu skill's **Cross-arch quickstarts** section for the full boot + virtio-drive +
-pry rebase recipe.
-
-Or in qmu.toml:
-```toml
-[machine]
-arch = "aarch64"
-extra_args = ["-M", "virt", "-cpu", "cortex-a57"]
-```
-
-### arm32 / arm32hf
-
-- QEMU binary: `qemu-system-arm`
-- Kernel image: `zImage`
-- Docker toolchain: `gcc-arm-linux-gnueabi` (arm32) or `gcc-arm-linux-gnueabihf` (arm32hf)
-- KASAN: **not supported** on arm32 upstream
-- Machine: prefer `-M virt -cpu cortex-a15` (works for `multi_v7`; `vexpress-a15` also works but is narrower)
-- Kernels < 5.0 use `vexpress_defconfig`; >= 5.0 use `multi_v7_defconfig`
-- On `-M virt`, virtio is MMIO — attach the rootfs as `if=none` + `-device virtio-blk-device` (see the qmu skill's Cross-arch quickstarts), which lands on `/dev/vda`
-- arm32 vs arm32hf: kernel itself is identical (kernel does not use FP); the difference is the cross-compiler ABI, which affects vermagic and any userspace built alongside
-
-```bash
-eval $(tools/kbuild.sh --version 6.1.120 --arch arm32hf)
-eval $(tools/mkrootfs.sh --arch arm32)
-qmu launch --kernel "$KERNEL" --arch arm --name arm32 --no-net \
-  --drive "file=${ROOTFS},if=none,format=raw,id=hd0,snapshot=on" \
-  --cmdline "console=ttyAMA0 root=/dev/vda rw" \
-  -- -M virt -cpu cortex-a15 -device virtio-blk-device,drive=hd0
-```
-
-## Kernel config overlays
-
-The script applies exploit-dev-focused config overlays on top of the arch-appropriate defconfig:
-
-**Always enabled:**
-- `EXT4_FS`, `ATA`, `ATA_PIIX`, `SATA_AHCI` (storage for rootfs)
-- `E1000`, `E1000E`, `VIRTIO_NET` (networking)
-- `DEVTMPFS`, `DEVTMPFS_MOUNT` (device infrastructure)
-- `KALLSYMS`, `KALLSYMS_ALL`, `DEBUG_KERNEL`, `MAGIC_SYSRQ` (debug)
-- `MODULES`, `MODULE_UNLOAD` (LKM exploit development)
-- `IKCONFIG`, `IKCONFIG_PROC` (runtime config inspection via `/proc/config.gz`)
-- `DEBUG_INFO`, `GDB_SCRIPTS` (debugger support)
-
-**Version-gated:**
-- `KASAN` + `KASAN_GENERIC` (>= 5.11) or `KASAN_OUTLINE` (< 5.11) — x86_64 >= 4.0, arm64 >= 4.15; i386 and arm32 never (no `HAVE_ARCH_KASAN`)
-- `DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT` — >= 5.18 only (before 5.18, `DEBUG_INFO=y` is sufficient)
-
-For x86_64/i386, `kvm_guest.config` is also applied for QEMU-optimized virtio defaults.
-
-To inspect the config inside a running guest: `zcat /proc/config.gz | grep KASAN`
-
-## Cache layout
-
-**Build residue is cleaned by default.** The build runs in-tree, so
-`kernels/src/linux-<ver>/` fills with `*.o`, `*.a`, `.*.cmd` and friends — on a
-box with a few kernels that is commonly more than half of `~/.cache/qmu`. After a
-successful build kbuild removes them. It never touches `Makefile`, `.config`,
-`vmlinux`, `System.map` or `arch/*/boot/`, so the next run is still a cache hit.
-
-Pass `--keep-residue` to keep them — worth it only if you intend to
-`make -C $KERNEL_SRC` after patching, since kbuild itself runs `make mrproper` at
-the start of every containerised build and never reuses them.
-
-To reclaim residue left by builds that predate this behaviour:
-
-```bash
-qmu cache du                          # how much is there
-qmu prune --build-residue --dry-run   # preview
-qmu prune --build-residue
-```
-
-Built kernels are cached and reused on subsequent runs. Source is shared across
-architectures; artifacts (including GDB helpers) are architecture-specific:
+## Cache
 
 ```
 ~/.cache/qmu/kernels/
-  src/
-    linux-6.6.75/              # shared kernel source (all arches) → KERNEL_SRC
-    linux-6.6.75.tar.xz        # downloaded tarball
-  6.6.75/
-    x86_64/
-      bzImage                  # kernel image → KERNEL
-      vmlinux                  # debug symbols → VMLINUX
-      .config                  # kernel config used → CONFIG
-      System.map               # symbol table (no variable; see Output format)
-      vmlinux-gdb.py           # build-root GDB loader → VMLINUX_GDB
-      scripts/gdb/
-        vmlinux-gdb.py         # upstream relative loader entry
-        linux/
-          constants.py         # generated by scripts_gdb
-          ...                  # other lx-* helper modules
-      build.log                # full build output
-    arm64/
-      Image
-      vmlinux
-      .config
-      vmlinux-gdb.py
-      scripts/gdb/...
-      build.log
+  src/linux-6.6.75/            # shared source (all arches) → KERNEL_SRC
+  src/linux-6.6.75.tar.xz
+  .src-linux-6.6.75.lock
+  6.6.75/x86_64/               # bzImage, vmlinux, .config, System.map, build.log,
+                               # vmlinux-gdb.py, scripts/gdb/…
+  6.6.75/arm64/                # Image, …
 ```
 
-Cache hits validate the complete helper/source contract (boot image, `vmlinux`,
-`.config`, `vmlinux-gdb.py`, `scripts/gdb/vmlinux-gdb.py`,
-and `KERNEL_SRC/Makefile`). `scripts/gdb/linux/constants.py` is also required
-when the retained source contains `scripts/gdb/linux/constants.py.in`;
-early upstream helper trees without that input do not require constants.
-Incomplete entries are rebuilt rather than reported as a successful cache.
-A boot image alone is never treated as complete.
+A cache hit requires **all** of: `KERNEL`, `vmlinux`, `.config`,
+`vmlinux-gdb.py`, `scripts/gdb/vmlinux-gdb.py`, `scripts/gdb/linux/constants.py`
+(when the source has `constants.py.in`) **and** `KERNEL_SRC/Makefile`. A
+missing piece logs `cached build is incomplete; rebuilding debugger
+artifacts` and runs a full build — including when only the source tree was
+deleted, which re-downloads the tarball and recompiles. `qmu prune
+--build-residue` never removes `Makefile`, `.config`, `vmlinux`, `System.map`
+or `arch/*/boot/`, so it keeps the hit intact; `rm -rf src/linux-<ver>` does
+not. `--config-only` hits on `.config` alone.
 
-Use `--no-cache` to force a rebuild. Use `--config-only` to generate and
-inspect `.config` before committing to a full build (emits only `CONFIG`; no
-debugger artifacts).
+Build residue (`*.o`, `*.a`, `*.ko`, `*.mod*`, `*.symtypes`, `.*.cmd`,
+`.tmp_vmlinux*`) is removed from the tree after every successful build unless
+`--keep-residue`; kbuild never reuses it (mrproper on every build), so keep it
+only for your own incremental `make -C "$KERNEL_SRC"` after patching.
 
-## Troubleshooting
+## Toolchain selection
 
-**Build fails with compiler errors (e.g., `-Wattribute-alias` as error):**
-Old kernels (4.x) are strict about compiler warnings and fail with newer GCC. The auto-selected container should handle this, but if it doesn't, try an older one:
-```bash
-tools/kbuild.sh --version 4.4.138 --arch arm32  # auto-selects xenial (GCC 5)
-# If xenial somehow fails, there's no older option — the kernel genuinely needs GCC 5
-```
+| Container | Ubuntu | GCC | Auto-selected for |
+|---|---|---|---|
+| `xenial` | 16.04 | 5 | 4.0–4.9 |
+| `bionic` | 18.04 | 7 | 4.10–5.3 |
+| `focal` | 20.04 | 9 | 5.4–5.19 |
+| `jammy` | 22.04 | 11 | 6.0–6.6 |
+| `noble` | 24.04 | 13 | 6.7 and later (7.x) |
 
-**Build fails with apt-get errors (exit code 100):**
-Docker image build failed to install packages. This can happen if Ubuntu mirrors are temporarily unavailable. Retry, or try a different container:
-```bash
-tools/kbuild.sh --version 5.3.18 --container focal  # bump up from bionic
-```
+Images are tagged `qmu-kbuild:<container>-<arch>` and built on first use with
+`build-essential bc bison flex libelf-dev libssl-dev cpio kmod xz-utils` plus
+only the arch's cross package (`gcc-multilib` for i386,
+`gcc-aarch64-linux-gnu`, `gcc-arm-linux-gnueabi`, `gcc-arm-linux-gnueabihf`).
+To rebuild one: `docker rmi qmu-kbuild:jammy-x86_64` then rerun kbuild.
 
-**KASAN not appearing in dmesg:**
-- arm32 and i386: KASAN is not supported upstream (no `HAVE_ARCH_KASAN`). Use x86_64 or arm64.
-- Check version: x86_64 needs >= 4.0, arm64 needs >= 4.15.
-- Verify: `zcat /proc/config.gz | grep KASAN` inside the guest.
+## Config
 
-**arm64 kernel panics immediately:**
-- Ensure QEMU uses `-M virt -cpu cortex-a57` (not the default PC machine type).
-- Use an arm64 rootfs, not an x86 one.
+Base: `defconfig` (x86_64, arm64), `i386_defconfig`, `multi_v7_defconfig` /
+`vexpress_defconfig` (arm32 ≥5.0 / <5.0); x86 also merges `kvm_guest.config`.
+Overlays, then `olddefconfig`:
 
-**"No space left on device" during build:**
-Docker storage may be full. Run `docker system prune` to reclaim space.
+- storage `EXT4_FS ATA ATA_PIIX SATA_AHCI`; network `E1000 E1000E VIRTIO_NET`;
+  `DEVTMPFS DEVTMPFS_MOUNT`; `MODULES MODULE_UNLOAD`; `IKCONFIG IKCONFIG_PROC`
+  (`zcat /proc/config.gz` in the guest)
+- debug `KALLSYMS KALLSYMS_ALL DEBUG_KERNEL MAGIC_SYSRQ DEBUG_INFO GDB_SCRIPTS`,
+  `DEBUG_INFO_REDUCED` disabled, `DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT` on ≥5.18
+- `KASAN` on x86_64 (≥4.0) and arm64 (≥4.15) only: `KASAN_GENERIC` on ≥5.11,
+  `KASAN_OUTLINE` before. i386 and arm32 have no `HAVE_ARCH_KASAN`.
 
-**Download fails:**
-- Check the version exists at https://cdn.kernel.org/pub/linux/kernel/
-- Override the mirror: `QMU_KBUILD_MIRROR=https://mirrors.edge.kernel.org/pub/linux/kernel`
-- For v7.x kernels, the URL becomes `v7.x/linux-7.0.11.tar.xz` — this is handled automatically.
+## Arch notes
 
-**Want to rebuild a Docker image from scratch:**
-```bash
-docker rmi qmu-kbuild:jammy-x86_64  # remove cached image
-tools/kbuild.sh --version 6.6.75 --no-cache  # rebuilds image + kernel
-```
+| Arch | QEMU | Image | Launch |
+|---|---|---|---|
+| `x86_64` | `qemu-system-x86_64`, KVM on x86 hosts | `bzImage` | `qmu launch --kernel "$KERNEL"` |
+| `i386` | `qemu-system-i386` | `bzImage` | `qmu launch --kernel "$KERNEL" --arch i386` |
+| `arm64` | `qemu-system-aarch64`, TCG | `Image` | `qmu launch --kernel "$KERNEL" --arch aarch64 --cmdline "console=ttyAMA0 root=/dev/vda rw" -- -M virt -cpu cortex-a57` |
+| `arm32`/`arm32hf` | `qemu-system-arm`, TCG | `zImage` | `-M virt -cpu cortex-a15` with an MMIO virtio-blk drive; kernel is identical, only the cross ABI (vermagic, userspace) differs |
+
+Extra QEMU args go after `--` (there is no `--extra-args` flag), and the
+built-in profiles carry an x86 cmdline, so ARM needs `--cmdline`. Full
+recipes, the arch-aware `qmu.toml` and pry rebasing:
+`skill://qmu/reference/cross-arch.md`.
+
+## GDB helpers
+
+`VMLINUX_GDB` is the build-root loader copied beside `scripts/gdb/` (with
+generated `scripts/gdb/linux/constants.py` on kernels that have
+`constants.py.in`). kbuild runs `make scripts_gdb` when the Makefile has that
+target, else `make prepare`; a failure there fails the build. DWARF records
+`/src`, so `set substitute-path /src $KERNEL_SRC` maps sources to the retained
+tree.
+
+## Recovery
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| exit 1, `build.log` shows `-Werror=attribute-alias` or similar | GCC newer than the kernel expects | `--container <older>`; below `xenial` there is nothing — the kernel needs GCC 5 |
+| exit 1, `build.log` ends in an internal compiler error or unknown option | GCC older than the kernel expects | `--container <newer>` |
+| `docker build` apt errors (status 100) | mirror hiccup while building the toolchain image | retry; or `--container <other>` |
+| `curl: (22)` on download | version not on the mirror | check `https://cdn.kernel.org/pub/linux/kernel/v<major>.x/`; `QMU_KBUILD_MIRROR=https://mirrors.edge.kernel.org/pub/linux/kernel` |
+| `waiting for another kbuild invocation…` for a long time | another invocation of the same version holds the lock (a full build is minutes) | `fuser -v $CACHE/kernels/.src-linux-<ver>.lock`; wait, or kill that invocation (its container is reaped) |
+| `kbuild: error: failed to acquire the linux-<ver> source-tree lock` (exit 2) | cache on a filesystem without `flock(2)` | `QMU_CACHE_DIR=/local/path` |
+| `cached build is incomplete; rebuilding` on a kernel you built before | one of the required products or `src/linux-<ver>/Makefile` is gone | let it rebuild; afterwards never delete `src/` by hand — use `qmu prune --build-residue` |
+| no KASAN report in the guest | i386/arm32 (unsupported), or version below the floor | use x86_64 or arm64; `zcat /proc/config.gz \| grep KASAN` |
+| arm64 guest prints nothing / panics at boot | x86 cmdline or machine type | `-M virt -cpu cortex-a57` after `--`, `console=ttyAMA0 root=/dev/vda`, an arm64 rootfs |
+| `No space left on device` in Docker | Docker storage full | `docker system prune`; `qmu prune --build-residue` for the cache |
+| `lx-*` commands refuse to load | loader moved away from `scripts/gdb/`, or `DEBUG_INFO_REDUCED` | source `$VMLINUX_GDB` in place; rebuild with kbuild (it disables reduced DWARF) |

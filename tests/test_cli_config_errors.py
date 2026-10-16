@@ -203,6 +203,105 @@ def test_config_show_json_preserves_schema_detail(
     assert fragment in json.loads(captured.out)["error"]
 
 
+# ---------------------------------------------------------------------------
+# Structured ConfigError envelope. `error` was one prose string with embedded
+# newlines; the class already carried source/key/hint, and a three-typo file
+# reported one key per run. The envelope now carries them as top-level fields
+# plus `errors[]` with every problem of the pass.
+# ---------------------------------------------------------------------------
+
+_MULTI_PROBLEM = 'ssh_key = "/tmp/k"\n[machine]\nmemroy = "8G"\n'
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+@pytest.mark.parametrize("command", ["config-show", "doctor", "launch"])
+@pytest.mark.parametrize("source_kind", ["project", "explicit"])
+def test_config_error_envelope_carries_structured_fields(
+    config_cli_env, monkeypatch, capsys, fmt, command, source_kind
+):
+    monkeypatch.setattr(
+        lifecycle, "launch_vm",
+        lambda **kwargs: pytest.fail("launch_vm must not run for invalid config"),
+    )
+    source, explicit_args = _install_source(config_cli_env, source_kind, _MULTI_PROBLEM)
+    rc = cli.main(["--format", fmt, *_command_argv(command, config_cli_env, explicit_args)])
+    captured = capsys.readouterr()
+    lines = [line for line in captured.out.splitlines() if line]
+    payload = json.loads(lines[0] if fmt == "ndjson" else captured.out)
+    if fmt == "ndjson":
+        assert len(lines) == 1
+
+    assert rc == 1
+    assert captured.err == ""
+    assert payload["ok"] is False
+    assert payload["error_type"] == "ConfigError"
+    # The three original keys are untouched...
+    assert payload["error"].startswith(
+        f"Invalid config {source}: key 'ssh_key': unknown top-level key"
+    )
+    # ...and the structured fields sit beside them: first problem at top level,
+    # every problem in `errors`.
+    assert payload["source"] == str(source)
+    assert payload["key"] == "ssh_key"
+    assert payload["hint"] == "the keys of '[ssh_key]' belong in '[ssh] key'"
+    assert payload["errors"] == [
+        {
+            "source": str(source), "key": "ssh_key",
+            "message": "unknown top-level key",
+            "hint": "the keys of '[ssh_key]' belong in '[ssh] key'",
+        },
+        {
+            "source": str(source), "key": "machine.memroy",
+            "message": "unknown key", "hint": "did you mean 'memory'?",
+        },
+    ]
+
+
+def test_config_error_text_reports_every_problem_one_line_each(
+    config_cli_env, capsys
+):
+    config_cli_env["project"].write_text(_MULTI_PROBLEM)
+    rc = cli.main(["doctor"])
+    err = capsys.readouterr().err
+    lines = err.splitlines()
+
+    assert rc == 1
+    assert lines[0] == (
+        f"[qmu] Error: Invalid config {config_cli_env['project'].resolve()}: "
+        "key 'ssh_key': unknown top-level key; the keys of '[ssh_key]' belong in '[ssh] key'"
+    )
+    assert lines[1] == (
+        f"Invalid config {config_cli_env['project'].resolve()}: "
+        "key 'machine.memroy': unknown key; did you mean 'memory'?"
+    )
+    assert lines[2].startswith("This file is validated before every")
+
+
+def test_parse_error_envelope_has_no_key_but_still_lists_the_problem(
+    config_cli_env, capsys
+):
+    source, explicit_args = _install_source(config_cli_env, "explicit", "[machine\n")
+    rc = cli.main(["--format", "json", "doctor", *explicit_args])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["source"] == str(source)
+    assert payload["key"] is None and payload["hint"] is None
+    assert len(payload["errors"]) == 1
+    assert payload["errors"][0]["message"].startswith("failed to parse TOML")
+
+
+def test_non_config_errors_keep_the_three_key_envelope(config_cli_env, capsys):
+    """The envelope hook is additive: an error without structured detail
+    renders exactly as before."""
+    config_cli_env["project"].write_text('[machine]\nmemory = "1G"\n')
+    rc = cli.main(["--format", "json", "launch", "--profile", "bogus"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert set(payload) == {"ok", "error", "error_type"}
+
+
 def test_harness_launch_accepts_machine_only_config(
     config_cli_env, monkeypatch, capsys
 ):
@@ -239,7 +338,8 @@ def test_harness_launch_accepts_machine_only_config(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert rc == 0
-    assert captured.err == ""
+    # A machine-only config is valid for a harness boot: no warning, no error.
+    assert "Warning" not in captured.err and "Error" not in captured.err
     assert payload["ok"] is True
     assert seen["harness"] is True
     assert seen["no_net"] is True

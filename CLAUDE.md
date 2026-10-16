@@ -65,8 +65,10 @@ a module attribute before calling `cli.main([...])` is seen by dispatch.
 
 `0` success · `1` operation failed (guest non-zero, doctor unhealthy, snapshot
 failed, no crash found, operational QMUError) · `2` usage/argparse ONLY · `3`
-guest kernel crash · `4` infra/internal (QMP/SSH failures, unexpected errors)
-· `124` wait timeout. `QMUError -> 1`, `QMPError`/`SSHError -> 4`, the catch-all
+guest kernel crash · `4` infra/internal (QMP/SSH failures, unexpected errors,
+`wait --pattern` on an unreadable log → `inconclusive: true`) · `124` timeout
+(`wait`, `run` never reaching SSH, a guest command outrunning `--timeout` on a
+reachable guest). `QMUError -> 1`, `QMPError`/`SSHError -> 4`, the catch-all
 `-> 4`. Never let a raw traceback escape to the agent.
 
 **Exit `3` requires a corroborating fresh serial crash report.** A dropped SSH
@@ -89,8 +91,11 @@ done`, which cannot terminate on either of the middle two.
 Every handler funnels its result through `_emit(args, data=<dict>, text=<str|list>, stem=...)`.
 Text mode renders `text`; `json`/`ndjson` render `data` as a `{"ok": bool, ...}`
 envelope. Results whose estimated size exceeds `DEFAULT_SPILL_TOKEN_LIMIT`
-(~10k tokens, chars/4) are spilled to a file under `$TMPDIR/qmu-spills` and the
-stdout is replaced with an artifact-pointer envelope. `--out` forces a file.
+(~10k tokens, chars/4) are spilled to a file under the spill root
+(`$QMU_TEMP_DIR/spills`, else XDG/platform temp). json/ndjson stdout becomes an
+artifact-pointer envelope; text stdout becomes `[qmu] Output spilled to <path>
+(~N tokens)` plus the first 40 lines, never JSON, because `--format text`
+promises text. `--out` forces a file.
 
 ### Instance lifecycle & PID-recycling guard (`instance.py`, `vm.py`)
 
@@ -120,14 +125,19 @@ Never collapse them into one enum.
   "is a crash retrievable" — those diverge, and conflating them is a bug that
   shipped once. Precedence, in order:
   - `panicked` — `serial.has_terminal_panic()` found `Kernel panic - not
-    syncing`; the guest is gone and reaping is correct.
+    syncing`; the guest is gone and reaping is correct. SSH is not probed.
   - `paused` — QMP `running:false`; where `qmu gdb` leaves every VM until
     `qmu cont`.
   - `crashed` — a report is retrievable AND the guest still serves. Under the
     default `exploit-dev` profile (deliberately no `oops=panic`) an Oops kills
     only the faulting task, so this is the common outcome of a trigger. It is
     neither `serving` (a report is waiting) nor `panicked` (**do not reap it**).
-  - `serving` / `unknown`.
+  - `serving` — **positive evidence only**: sshd answered, or (no SSH endpoint
+    / not probed) the current boot wrote to its console. A vCPU that merely
+    runs is not evidence — an aarch64 guest booted with an x86 cmdline runs
+    forever, writes nothing, and was reported `serving` for exactly that reason.
+  - `unknown` — nothing positive; `guest_detail` names what was checked
+    (`SSH down, 0 bytes of console output`).
 
   Both crash reads are scoped to `max(recorded epoch,
   serial.last_boot_offset())`. `guest_epoch_serial_offset` only advances on an
@@ -165,21 +175,50 @@ re-dump, `Modules linked in:`, `note: … exited`); ordinary kernel output in
 between proves the first event ended, so a resumed WARNING is never bridged
 into a later unrelated panic.
 
+Every guest command passes `abort_when=panicked` to `SSHClient.run`, a serial
+watcher polled while the child runs: a terminal panic raises `SSHAborted` with
+the output collected so far, so exec/compile/dmesg/run report exit 3 within a
+second instead of after the 15 s ssh keepalive plus re-probes. Text mode
+(`_run_guest_command`) prints guest stdout only on stdout; guest stderr and
+`[exit code: N]` (non-zero only) go to stderr so pipelines see guest bytes.
+
 ### Serial-pattern waiting (`serial.SerialTail`, `lifecycle._wait_for_pattern`)
 
 `SerialTail` is an offset-carrying line reader over a log QEMU is still writing.
 It withholds a trailing fragment with no newline so a matcher never sees half a
-line, and `flush()` releases it for the final pass. `_wait_for_pattern` takes
-*one extra scan* after `instance_alive()` goes false (the `saw_dead` flag): the
-guest can print its marker and exit between a scan and the liveness check, and
-dropping that line would turn a success into a spurious exit 1.
+line; `peek_fragment()` exposes it on an idle poll (so a `login:` prompt can
+match once the console goes quiet) and `flush()` releases it for the final
+pass. `_wait_for_pattern` takes *one extra scan* after `instance_alive()` goes
+false (the `saw_dead` flag): the guest can print its marker and exit between a
+scan and the liveness check, and dropping that line would turn a success into
+a spurious exit 1. A missing/unreadable log is exit 4 with `inconclusive:
+true`, never the exit 1 of a genuine no-match.
+
+### Bare `wait` and QMP contention (`lifecycle._query_qmp`, `qmp.QMPBusyError`)
+
+QEMU serves one QMP client. A `wait` that held the socket for its whole
+duration made every concurrent `status`/`kill` hang or lie, so bare `wait`
+polls every 0.5 s with one short-lived `query-status` (`_query_qmp`) plus a
+PID-liveness check; QMP *events* are not observed and `last_event` reports
+status transitions under the event name QEMU would have sent (a guest reboot
+is seen through the serial boot banner as `RESET`). `_QMPProbe.state` is
+`connected` / `busy` (accepted but never greeted — `QMPBusyError`) /
+`unreachable`; anything not `connected` claims nothing QMP-derived
+(`qemu_status: "unknown"`). `kill` under a held socket skips the graceful
+`quit` after 1 s and signals. Bare `wait` exits `3` (`reason:
+"terminal_panic"`) when the serial log shows a terminal panic while QEMU still
+runs, and `0` with `reason: "already_stopped"` when the pid had already gone.
 
 ### Config resolution (`config.py`)
 
 Layered: built-in defaults < global (`~/.config/qmu/config.toml`) < project
 (nearest `qmu.toml` walking up from CWD, or `--config`) < CLI flags. A broken
 *global* config warns and is skipped; a broken *project/explicit* config is
-fatal. Profiles (kernel cmdlines) from config extend/override the built-in
+fatal. Validation collects **every** schema problem of a file before raising:
+`ConfigError` carries `errors` (`[{source, key, message, hint}]`) and the
+envelope mirrors the first problem as `source`/`key`/`hint`, so an agent fixes
+the file in one round trip instead of one key per run. Profiles (kernel
+cmdlines) from config extend/override the built-in
 `exploit-dev`/`trigger-test`/`exploit-test`. `use_kvm()` only enables `-enable-kvm`
 when guest arch == host arch and `/dev/kvm` exists.
 
@@ -194,13 +233,34 @@ explicit CLI `--profile` clears a config `[boot] cmdline` (otherwise the flag is
 a silent no-op) and names the params that drop out — `nokaslr` especially, whose
 loss moves every kernel address.
 
+### Launch warnings and `doctor` taxonomy (`lifecycle.py`)
+
+`_prepare_boot` accumulates every launch-time warning in a `_BootPrep`
+(`warnings`, `config_sources`, `replaced`) via `_note()`; stderr keeps the
+lines for text readers and the launch envelope mirrors them as `warnings[]`,
+because an agent in `--format json` otherwise had to regex the other stream to
+learn that `--profile` dropped `nokaslr`. New launch-time lints go through
+`_note`, never a bare `sys.stderr.write`. `_warn_arch_cmdline_mismatch` is the
+arch/`console=`/`root=` lint; the SSH wait fails early with
+`ssh_status: "no-console-output"` when the serial log is still empty after
+~10 s, since a wrong-arch guest otherwise runs forever and answers nobody.
+
+`doctor` rows are `_doctor_row(check, status, detail)` with `status` in
+`ok|fail|warn|info` → glyph `[+] [!] [~] [i]`; `blocking` is `status == "fail"`
+and nothing else, and `ok` ⇔ no `fail` row. Choose the status by consequence:
+`fail` only when launch cannot work (missing configured kernel/rootfs/key,
+invalid global config); `warn` for optional capabilities (libguestfs, cross
+toolchains, key permissions); `info` for cache/pry/skills.
+
 ### Harness mode
 
 `--harness` = boot-and-die VMs (kernelCTF/syzkaller): implies `--no-wait-ssh` +
 `--no-net`, skips the rootfs/SSH-key requirement, allocates no SSH port. SSH
 commands (`push`/`pull`/`exec`/`compile`/`dmesg`) then error via `_require_ssh`;
 serial/QMP commands (`log`/`crash`/`wait`/`qmp`/`monitor`/`kill`) work. `qmu wait`
-blocks on QMP `STOP`/`SHUTDOWN`/`POWERDOWN` events with PID-liveness fallback.
+polls `query-status` + PID liveness (see *Bare `wait`* above) and auto-cleans a
+harness VM only after the recorded pid is positively gone; `--no-reboot` keeps a
+`panic=N` kernel from rebooting over its own report.
 
 ### Debugger↔VM coherence (`debug.py`)
 

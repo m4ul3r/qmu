@@ -16,7 +16,14 @@ from .paths import global_config_path
 CONFIG_FILENAME = "qmu.toml"
 
 class ConfigError(QMUError):
-    """A source-aware TOML parse or schema error."""
+    """A source-aware TOML parse or schema error.
+
+    One validation pass collects every problem in a file; the first is the
+    error's own `key_path`/`problem`/`hint` (so the leading message line is
+    the same as it always was) and the rest ride in `more`. The rendered
+    message is one `Invalid config <path>: ...` line per problem, then the
+    recovery paragraph; `envelope_fields()` is the JSON counterpart.
+    """
 
     def __init__(
         self,
@@ -26,32 +33,64 @@ class ConfigError(QMUError):
         key_path: str | None = None,
         hint: str | None = None,
         recovery: str | None = None,
+        more: Iterable[ConfigError] = (),
     ) -> None:
         self.source = Path(source).resolve()
         self.key_path = key_path
         self.problem = problem
         self.hint = hint
         self.recovery = recovery
-        message = f"Invalid config {self.source}"
-        if key_path is not None:
-            message += f": key '{key_path}'"
-        message += f": {problem}"
-        if hint is not None:
-            message += f"; {hint}"
+        self.more = tuple(more)
+        lines = [self._render_line(self)]
+        lines.extend(self._render_line(extra) for extra in self.more)
         if recovery is not None:
-            message += f"\n{recovery}"
-        super().__init__(message)
+            lines.append(recovery)
+        super().__init__("\n".join(lines))
+
+    @staticmethod
+    def _render_line(err: ConfigError) -> str:
+        return f"Invalid config {err.source}: {err._own_problem()}"
+
+    def _own_problem(self) -> str:
+        text = f"key '{self.key_path}': {self.problem}" if self.key_path else self.problem
+        if self.hint is not None:
+            text += f"; {self.hint}"
+        return text
 
     def describe_problem(self) -> str:
         """The fault without the `Invalid config <path>` prefix.
 
         For renderers that already name the file themselves — `doctor`'s
-        skipped-global row — so the path is not printed twice.
+        skipped-global row — so the path is not printed twice. Additional
+        problems from the same pass are appended, ` | `-separated.
         """
-        text = f"key '{self.key_path}': {self.problem}" if self.key_path else self.problem
-        if self.hint is not None:
-            text += f"; {self.hint}"
-        return text
+        return " | ".join(err._own_problem() for err in self.problems())
+
+    def problems(self) -> list[ConfigError]:
+        """Every problem of the pass, this one first."""
+        return [self, *self.more]
+
+    def envelope_fields(self) -> dict[str, Any]:
+        """Structured fields merged into the `{"ok": false, ...}` envelope.
+
+        `source`/`key`/`hint` describe the first problem (mirroring the
+        leading message line); `errors` lists every problem of the pass so a
+        caller fixes a file in one round trip instead of one key per run.
+        """
+        return {
+            "source": str(self.source),
+            "key": self.key_path,
+            "hint": self.hint,
+            "errors": [
+                {
+                    "source": str(err.source),
+                    "key": err.key_path,
+                    "message": err.problem,
+                    "hint": err.hint,
+                }
+                for err in self.problems()
+            ],
+        }
 
 
 _FIXED_SCHEMA: dict[str, dict[str, str]] = {
@@ -92,6 +131,41 @@ _PATH_FIELD_KEYS: dict[str, str] = {
     "rootfs": "[drive] rootfs",
     "ssh_key": "[ssh] key",
 }
+
+# QMUConfig field -> dotted TOML key, for per-key provenance (`config show`).
+# Order is the display order of the resolved config.
+_FIELD_TOML_KEYS: dict[str, str] = {
+    "kernel": "boot.kernel",
+    "initrd": "boot.initrd",
+    "cmdline": "boot.cmdline",
+    "profile": "boot.profile",
+    "arch": "machine.arch",
+    "memory": "machine.memory",
+    "cpus": "machine.cpus",
+    "cpu_model": "machine.cpu",
+    "nic_model": "machine.nic_model",
+    "net_backend": "machine.net_backend",
+    "accel": "machine.accel",
+    "extra_args": "machine.extra_args",
+    "rootfs": "drive.rootfs",
+    "drive_format": "drive.format",
+    "ssh_key": "ssh.key",
+    "ssh_user": "ssh.user",
+    "ssh_port_start": "ssh.port_start",
+    "gdb_port_start": "gdb.port_start",
+}
+
+
+def _layer_label(source: str) -> str:
+    """`_sources` entry -> short layer label (`global <path>`, `project
+    <path>`, `--config <path>`, `flag`, `built-in`)."""
+    kind, sep, path = source.partition(": ")
+    if not sep:
+        return "flag" if source == "CLI flags" else "built-in"
+    if kind == "config":
+        return f"--config {path}"
+    return f"{kind} {path}"
+
 
 _MIGRATION_DESTINATIONS: dict[str, tuple[str, ...]] = {
     # A `[vm]` table is the most common wrong guess: it reads like the obvious
@@ -162,7 +236,10 @@ def _migration_hint(key: str, *, is_table: bool = False) -> str | None:
         # named tables — so "move 'vm' to '[boot]'" would misdescribe the fix.
         return f"the keys of '[{key}]' belong in {target}"
     return f"move '{key}' to {target}"
-def _validate_value(value: Any, kind: str, source: Path, key_path: str) -> None:
+def _validate_value(
+    value: Any, kind: str, source: Path, key_path: str, problems: list[ConfigError]
+) -> None:
+    """Append a ConfigError to `problems` when `value` is not of `kind`."""
     if kind == "string":
         valid = isinstance(value, str)
         expected = "string"
@@ -171,77 +248,86 @@ def _validate_value(value: Any, kind: str, source: Path, key_path: str) -> None:
         expected = "integer"
     elif kind == "string_array":
         if not isinstance(value, list):
-            raise ConfigError(
+            problems.append(ConfigError(
                 source,
                 f"expected array of strings, got {_value_type_name(value)}",
                 key_path=key_path,
-            )
+            ))
+            return
         for index, item in enumerate(value):
             if not isinstance(item, str):
-                raise ConfigError(
+                problems.append(ConfigError(
                     source,
                     f"expected string, got {_value_type_name(item)}",
                     key_path=f"{key_path}[{index}]",
-                )
+                ))
         return
     elif kind == "net_backend":
         if not isinstance(value, str):
-            raise ConfigError(
+            problems.append(ConfigError(
                 source,
                 f"expected string, got {_value_type_name(value)}",
                 key_path=key_path,
-            )
-        if value not in ("user", "passt"):
-            raise ConfigError(
+            ))
+        elif value not in ("user", "passt"):
+            problems.append(ConfigError(
                 source,
                 "expected one of: user, passt",
                 key_path=key_path,
-            )
+            ))
         return
     elif kind == "accel":
         if not isinstance(value, str):
-            raise ConfigError(
+            problems.append(ConfigError(
                 source,
                 f"expected string, got {_value_type_name(value)}",
                 key_path=key_path,
-            )
-        if value not in ("auto", "kvm", "tcg"):
-            raise ConfigError(
+            ))
+        elif value not in ("auto", "kvm", "tcg"):
+            problems.append(ConfigError(
                 source,
                 "expected one of: auto, kvm, tcg",
                 key_path=key_path,
-            )
+            ))
         return
     else:
         raise AssertionError(f"unknown config schema kind: {kind}")
 
     if not valid:
-        raise ConfigError(
+        problems.append(ConfigError(
             source,
             f"expected {expected}, got {_value_type_name(value)}",
             key_path=key_path,
-        )
+        ))
 
 
-def _validate_profiles(profiles: dict[str, Any], source: Path) -> None:
+def _validate_profiles(
+    profiles: dict[str, Any], source: Path, problems: list[ConfigError]
+) -> None:
     for name, profile in profiles.items():
         profile_path = f"profiles.{name}"
         if isinstance(profile, str):
             continue
         if not isinstance(profile, dict):
-            raise ConfigError(
+            problems.append(ConfigError(
                 source,
                 f"expected string or table, got {_value_type_name(profile)}",
                 key_path=profile_path,
-            )
+            ))
+            continue
         for key, value in profile.items():
             key_path = f"{profile_path}.{key}"
             if key != "cmdline":
-                raise ConfigError(source, "unknown key", key_path=key_path)
-            _validate_value(value, "string", source, key_path)
+                problems.append(ConfigError(source, "unknown key", key_path=key_path))
+                continue
+            _validate_value(value, "string", source, key_path, problems)
 
 
 def _validate_toml(raw: dict[str, Any], source: Path) -> None:
+    """Check `raw` against the schema; raise ONE ConfigError carrying every
+    problem found. Stopping at the first key sent a three-typo file through
+    three fix-and-rerun round trips, each reporting the next key."""
+    problems: list[ConfigError] = []
     for section, section_value in raw.items():
         if section not in (*_FIXED_SCHEMA, "profiles"):
             hint = _migration_hint(section, is_table=True)
@@ -249,20 +335,22 @@ def _validate_toml(raw: dict[str, Any], source: Path) -> None:
                 near = _did_you_mean(section, (*_FIXED_SCHEMA, "profiles"))
                 if near is not None:
                     hint = f"did you mean '[{near}]'?"
-            raise ConfigError(
+            problems.append(ConfigError(
                 source,
                 "unknown top-level key",
                 key_path=section,
                 hint=hint,
-            )
+            ))
+            continue
         if not isinstance(section_value, dict):
-            raise ConfigError(
+            problems.append(ConfigError(
                 source,
                 f"expected table, got {_value_type_name(section_value)}",
                 key_path=section,
-            )
+            ))
+            continue
         if section == "profiles":
-            _validate_profiles(section_value, source)
+            _validate_profiles(section_value, source, problems)
             continue
 
         section_schema = _FIXED_SCHEMA[section]
@@ -278,13 +366,24 @@ def _validate_toml(raw: dict[str, Any], source: Path) -> None:
                     else:
                         valid = ", ".join(sorted(section_schema))
                         hint = f"valid keys for [{section}]: {valid}"
-                raise ConfigError(
+                problems.append(ConfigError(
                     source,
                     "unknown key",
                     key_path=key_path,
                     hint=hint,
-                )
-            _validate_value(value, kind, source, key_path)
+                ))
+                continue
+            _validate_value(value, kind, source, key_path, problems)
+
+    if problems:
+        first, *rest = problems
+        raise ConfigError(
+            source,
+            first.problem,
+            key_path=first.key_path,
+            hint=first.hint,
+            more=rest,
+        )
 
 
 def load_config_file(path: Path) -> dict[str, Any]:
@@ -412,12 +511,49 @@ class QMUConfig:
     # whole of `Kernel not found: ./bzImage` before.
     _path_sources: dict[str, str] = field(default_factory=dict, repr=False)
 
+    # tracking: the path string as WRITTEN in the config file, before
+    # anchoring, so a report can say `./bzImage` (what the user must edit)
+    # alongside the absolute file it resolved to.
+    _written_paths: dict[str, str] = field(default_factory=dict, repr=False)
+
+    def written_path(self, field_name: str) -> str | None:
+        """The path as typed in its config file, or the value itself for a
+        flag / unset field."""
+        return self._written_paths.get(field_name, getattr(self, field_name))
+
     def describe_path_source(self, field_name: str) -> str:
         """Suffix naming where a path field came from, or '' for a CLI flag."""
         source = self._path_sources.get(field_name)
         if source is None:
             return ""
         return f" (from {_PATH_FIELD_KEYS[field_name]} in {source})"
+
+    # tracking: which layer set EVERY field, keyed by QMUConfig field name
+    # (`profiles.<name>` for a profile cmdline). Values are the same source
+    # strings as `_sources` ("global: <path>", "project: <path>",
+    # "config: <path>", "CLI flags"); a field nobody set is absent and means
+    # built-in. `_path_sources` above is the path-only subset vm.py's
+    # not-found errors read; this is the superset `config show` renders, so a
+    # starter `[ssh] key` shadowing a global one is visible per key.
+    _field_sources: dict[str, str] = field(default_factory=dict, repr=False)
+
+    def source_layer(self, field_name: str) -> str:
+        """Short layer label for a field: `built-in`, `global <path>`,
+        `project <path>`, `--config <path>` or `flag`."""
+        source = self._field_sources.get(field_name)
+        if source is None:
+            return "built-in"
+        return _layer_label(source)
+
+    def source_layers(self) -> dict[str, str]:
+        """TOML dotted key -> layer label, for every configurable key."""
+        layers = {
+            toml_key: self.source_layer(field_name)
+            for field_name, toml_key in _FIELD_TOML_KEYS.items()
+        }
+        for name in self.profiles:
+            layers[f"profiles.{name}"] = self.source_layer(f"profiles.{name}")
+        return layers
 
     def qemu_binary(self) -> str:
         return f"qemu-system-{self.arch}"
@@ -471,6 +607,17 @@ def _anchor_path(value: str, base_dir: Path | None) -> str:
     return str(base_dir / expanded)
 
 
+_PATH_FIELDS = frozenset(_PATH_FIELD_KEYS)
+
+
+def _set_field(cfg: QMUConfig, field_name: str, value: Any, source: str) -> None:
+    """Set one field and record the layer that set it."""
+    setattr(cfg, field_name, value)
+    cfg._field_sources[field_name] = source
+    if field_name in _PATH_FIELDS:
+        cfg._path_sources[field_name] = source
+
+
 def _apply_toml(
     cfg: QMUConfig,
     raw: dict[str, Any],
@@ -483,66 +630,20 @@ def _apply_toml(
     `base_dir` is the directory of the file `raw` came from: path-typed
     values are anchored there, because the file is found by walking up from
     CWD and `./bzImage` next to it must mean the same file from any subdir.
+    `raw` has already passed `_validate_toml`, so values are type-correct.
     """
-    boot = raw.get("boot", {})
-    if "kernel" in boot:
-        cfg.kernel = _anchor_path(boot["kernel"], base_dir)
-        cfg._path_sources["kernel"] = source
-    if "initrd" in boot:
-        cfg.initrd = _anchor_path(boot["initrd"], base_dir)
-        cfg._path_sources["initrd"] = source
-    if "cmdline" in boot:
-        cfg.cmdline = boot["cmdline"]
-    if "profile" in boot:
-        cfg.profile = boot["profile"]
-
-    machine = raw.get("machine", {})
-    if "arch" in machine:
-        cfg.arch = machine["arch"]
-    if "memory" in machine:
-        cfg.memory = machine["memory"]
-    if "cpus" in machine:
-        cfg.cpus = int(machine["cpus"])
-    if "cpu" in machine:
-        cfg.cpu_model = machine["cpu"]
-    if "nic_model" in machine:
-        cfg.nic_model = machine["nic_model"]
-    if "net_backend" in machine:
-        backend = str(machine["net_backend"])
-        if backend not in ("user", "passt"):
-            raise QMUError(
-                f"Invalid net_backend '{backend}': must be 'user' or 'passt'"
-            )
-        cfg.net_backend = backend
-    if "accel" in machine:
-        accel = str(machine["accel"])
-        if accel not in ("auto", "kvm", "tcg"):
-            raise QMUError(
-                f"Invalid accel '{accel}': must be 'auto', 'kvm', or 'tcg'"
-            )
-        cfg.accel = accel
-    if "extra_args" in machine:
-        cfg.extra_args = list(machine["extra_args"])
-
-    drive = raw.get("drive", {})
-    if "rootfs" in drive:
-        cfg.rootfs = _anchor_path(drive["rootfs"], base_dir)
-        cfg._path_sources["rootfs"] = source
-    if "format" in drive:
-        cfg.drive_format = drive["format"]
-
-    ssh = raw.get("ssh", {})
-    if "key" in ssh:
-        cfg.ssh_key = _anchor_path(ssh["key"], base_dir)
-        cfg._path_sources["ssh_key"] = source
-    if "user" in ssh:
-        cfg.ssh_user = ssh["user"]
-    if "port_start" in ssh:
-        cfg.ssh_port_start = int(ssh["port_start"])
-
-    gdb = raw.get("gdb", {})
-    if "port_start" in gdb:
-        cfg.gdb_port_start = int(gdb["port_start"])
+    for field_name, toml_key in _FIELD_TOML_KEYS.items():
+        section, key = toml_key.split(".", 1)
+        table = raw.get(section, {})
+        if key not in table:
+            continue
+        value = table[key]
+        if field_name in _PATH_FIELDS:
+            cfg._written_paths[field_name] = str(value)
+            value = _anchor_path(value, base_dir)
+        elif field_name == "extra_args":
+            value = list(value)
+        _set_field(cfg, field_name, value, source)
 
     profiles = raw.get("profiles", {})
     if profiles:
@@ -552,6 +653,9 @@ def _apply_toml(
                 cfg.profiles[name] = prof["cmdline"]
             elif isinstance(prof, str):
                 cfg.profiles[name] = prof
+            else:
+                continue
+            cfg._field_sources[f"profiles.{name}"] = source
 
     cfg._sources.append(source)
 
@@ -563,9 +667,11 @@ def _apply_cli(cfg: QMUConfig, overrides: dict[str, Any]) -> None:
             continue
         if hasattr(cfg, key):
             setattr(cfg, key, value)
+            cfg._field_sources[key] = "CLI flags"
             # A flag is typed in this shell, so it stays CWD-relative and
             # carries no file provenance.
             cfg._path_sources.pop(key, None)
+            cfg._written_paths.pop(key, None)
 
 
 def _apply_config_file(
@@ -618,6 +724,7 @@ def _with_recovery(exc: ConfigError, recovery: str) -> ConfigError:
         key_path=exc.key_path,
         hint=exc.hint,
         recovery=recovery,
+        more=exc.more,
     )
 
 
@@ -739,9 +846,9 @@ def render_starter_config(arch: str | None = None) -> str:
 # See `qmu config show` for the full resolved config.
 
 [boot]
-# kernel = "./bzImage"           # CHANGE ME — every launch flag has a config key,
-#                                #   so setting this makes `qmu launch` self-contained.
-#                                #   --kernel still overrides it for one-off boots.
+kernel = "./bzImage"             # CHANGE ME — every launch flag has a config key,
+                                 #   so setting this makes `qmu launch` self-contained.
+                                 #   --kernel still overrides it for one-off boots.
 # initrd = "./initramfs.cpio.gz"
 # profile = "exploit-dev"        # named cmdline from [profiles.*] below
 # cmdline = "console=ttyS0 ..."  # full override; REPLACES the profile cmdline.

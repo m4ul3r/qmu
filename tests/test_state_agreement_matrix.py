@@ -162,9 +162,14 @@ def test_unavailable_stopped_serial_is_inconclusive_not_a_negative(
                    "--timeout", "0", "--format", "json"])
     payload = json.loads(capsys.readouterr().out)
 
-    assert rc == 1
+    # Infra class, never the exit 1 a genuine no-match returns: an agent
+    # branching on the code must not file unreadable evidence as a failed
+    # experiment.
+    assert rc == 4
     assert payload["ok"] is False
+    assert payload["inconclusive"] is True
     assert "error" in payload
+    assert "error_type" in payload
     assert "matched" not in payload
     assert instance_mod.load_instance(VM) is not None
 
@@ -1411,9 +1416,10 @@ def test_every_prune_branch_discloses_the_unmanaged_cache(argv, cache, monkeypat
 
 
 def test_doctor_reports_the_unmanaged_cache_without_going_unhealthy(cache, capsys):
-    """doctor treats only ok/info as healthy and returns 1 otherwise. A warn
-    here would exit 1 on every machine that ever built a kernel, with no way to
-    clear it -- breaking the health signal SKILL.md teaches."""
+    """doctor returns 1 exactly when a row is `fail`. An unmanaged cache is
+    informational: a warn-or-worse here would exit 1 on every machine that
+    ever built a kernel, with no way to clear it -- breaking the health signal
+    SKILL.md teaches."""
     (cache / "kernels").mkdir(exist_ok=True)
 
     cli.main(["--format", "json", "doctor"])
@@ -1422,6 +1428,77 @@ def test_doctor_reports_the_unmanaged_cache_without_going_unhealthy(cache, capsy
     assert "cache" in checks
     assert checks["cache"]["status"] == "info"
     assert "qmu cache du" in checks["cache"]["detail"]
+
+
+# ---------------------------------------------------------------------------
+# doctor rows and ConfigError. Two surfaces each: the text glyph vs the JSON
+# `status`/`blocking`, and the text error lines vs the JSON `errors[]`.
+# `[!]` once covered both MISSING and "not configured" while `[+]` covered ok
+# and info; the JSON vocabulary was `ok/info/warn/MISSING/not configured`.
+# ---------------------------------------------------------------------------
+
+
+_DOCTOR_GLYPH = {"ok": "+", "fail": "!", "warn": "~", "info": "i"}
+
+
+def test_doctor_text_glyph_agrees_with_json_status_and_exit_code(
+    cache, monkeypatch, capsys, tmp_path
+):
+    """Axis 3: text vs JSON. Every row's glyph is a function of its JSON
+    status; `blocking` is exactly `status == fail`; the exit code is exactly
+    "any row blocks", in both formats."""
+    # A starter file whose kernel/rootfs/key are still placeholders: one of
+    # each verdict appears (fail rows, warn rows, info rows, ok rows).
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["config", "init"]) == 0
+    capsys.readouterr()
+
+    rc_json = cli.main(["--format", "json", "doctor"])
+    payload = json.loads(capsys.readouterr().out)
+    rc_text = cli.main(["doctor"])
+    text = capsys.readouterr().out
+
+    assert rc_json == rc_text == 1
+    assert payload["ok"] is False
+    statuses = {c["status"] for c in payload["checks"]}
+    assert statuses <= set(_DOCTOR_GLYPH)
+    assert {"ok", "fail", "warn"} <= statuses or {"ok", "fail", "info"} <= statuses
+    for c in payload["checks"]:
+        assert c["blocking"] is (c["status"] == "fail"), c["check"]
+        assert f"  [{_DOCTOR_GLYPH[c['status']]}] {c['check']}: " in text, c["check"]
+    assert payload["ok"] is (not any(c["blocking"] for c in payload["checks"]))
+    assert "[!] kernel: ./bzImage (CHANGE ME placeholder; not found)" in text
+
+
+def test_config_error_text_and_json_report_the_same_problems(
+    cache, monkeypatch, capsys, tmp_path
+):
+    """Axis 3: text vs JSON. The text error prints one `Invalid config` line
+    per problem; the JSON envelope lists the same problems in `errors[]`, in
+    the same order, and the leading line is the first entry."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "qmu.toml").write_text(
+        'append = "nokaslr"\n[machine]\nmemroy = "8G"\ncpus = "two"\n'
+    )
+
+    assert cli.main(["config", "show"]) == 1
+    err = capsys.readouterr().err
+    assert cli.main(["--format", "json", "config", "show"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    prefix = f"Invalid config {(tmp_path / 'qmu.toml').resolve()}: "
+    text_problems = [
+        line.removeprefix("[qmu] Error: ").removeprefix(prefix)
+        for line in err.splitlines() if "Invalid config" in line
+    ]
+    json_problems = [
+        f"key '{e['key']}': {e['message']}" + (f"; {e['hint']}" if e["hint"] else "")
+        for e in payload["errors"]
+    ]
+    assert text_problems == json_problems
+    assert [e["key"] for e in payload["errors"]] == ["append", "machine.memroy", "machine.cpus"]
+    assert payload["key"] == payload["errors"][0]["key"]
+    assert payload["error"].splitlines()[0].endswith(json_problems[0])
 
 
 def test_cache_ls_never_presents_a_truncated_list_as_complete(cache, capsys):
@@ -1476,7 +1553,7 @@ class _TransportLostSSH:
                 stream.write(self._append)
             self._append = ""
 
-    def run(self, command, timeout=30.0, check=False):
+    def run(self, command, timeout=30.0, check=False, **kwargs):
         self._drop()
         return 255, "", "Connection timed out during banner exchange"
 
@@ -1578,6 +1655,84 @@ def test_every_ssh_command_agrees_on_a_lost_transport(
     }
     for command, view in views.items():
         assert view == expected, f"`qmu {command}` disagrees: {view}"
+
+
+class _ServingSSH:
+    """A guest that answers: fixed exec result, transfers succeed."""
+
+    def __init__(self, rc=0, stdout="", stderr=""):
+        self._result = (rc, stdout, stderr)
+
+    def run(self, command, timeout=30.0, check=False, **kwargs):
+        return self._result
+
+    def push(self, local, remote):
+        pass
+
+    def pull(self, remote, local):
+        pass
+
+    def is_ready(self, timeout=2):
+        return True
+
+
+def _serving_subject(cache, monkeypatch, ssh):
+    inst = _ssh_capable_instance(cache)
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+    monkeypatch.setattr(guest_mod, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(guest_mod, "_preflight_ssh_guest", lambda *a, **kw: None)
+    monkeypatch.setattr(guest_mod, "_make_ssh", lambda selected: ssh)
+    monkeypatch.setattr(guest_mod.time, "sleep", lambda _: None)
+    with open(inst.serial_log, "w") as stream:
+        stream.write("boot ok\n")
+    return inst
+
+
+@pytest.mark.parametrize("lost", [False, True])
+def test_every_ssh_command_envelope_names_the_vm(lost, cache, monkeypatch, capsys):
+    """Axis 4 (subcommand vs subcommand) × axis 2 (branch vs branch): a caller
+    correlating envelopes with VMs reads `vm_id` on every guest-command
+    envelope, success or lost transport. `exec` carried it only on some
+    paths, `dmesg`/`push`/`pull` on none, and `crash` spelled it `vm`."""
+    inst = _ssh_capable_instance(cache)
+    if lost:
+        ssh = _TransportLostSSH(inst.serial_log, "")
+    else:
+        ssh = _ServingSSH(0, "ok\n", "")
+    _serving_subject(cache, monkeypatch, ssh)
+    (Path("/tmp") / "payload.bin").write_bytes(b"x")
+
+    for command, argv in _LOST_ARGV.items():
+        cli.main(["--format", "json", *argv])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload.get("vm_id") == VM, f"`qmu {command}` envelope: {sorted(payload)}"
+
+
+@pytest.mark.parametrize("command", ["exec", "dmesg"])
+def test_text_stdout_is_the_guest_stdout_json_carries_the_rest(
+    command, cache, monkeypatch, capsys
+):
+    """Axis 3 (text vs JSON): what JSON reports as `stdout`/`text` is exactly
+    what text mode puts on stdout; guest stderr and the exit trailer are on
+    stderr in text mode and in their own keys in JSON. Measured live before
+    this row: `qmu exec 'echo out; echo err >&2; exit 5' > o 2> e` left
+    `[stderr] err` and `[exit code: 5]` in `o` and `e` empty."""
+    _serving_subject(cache, monkeypatch, _ServingSSH(5, "line 1\nline 2\n", "err\n"))
+
+    rc_json = cli.main(["--format", "json", *_LOST_ARGV[command]])
+    payload = json.loads(capsys.readouterr().out)
+    rc_text = cli.main(["--format", "text", *_LOST_ARGV[command]])
+    captured = capsys.readouterr()
+
+    assert rc_json == rc_text == 1
+    stdout_key = "stdout" if command == "exec" else "text"
+    assert captured.out == payload[stdout_key] == "line 1\nline 2\n"
+    assert payload["stderr"] == "err\n"
+    assert "err" in captured.err
+    assert "5" in captured.err  # the exit trailer, per-command wording aside
+    assert "[exit code" not in captured.out and "[dmesg failed" not in captured.out
 
 
 # ---------------------------------------------------------------------------
@@ -1685,13 +1840,14 @@ def test_ssh_commands_and_status_agree_a_rebooted_guest_is_serving(
     _qmp_running_for_cliutil(monkeypatch)
 
     class ServingSSH:
-        def run(self, command, timeout=30.0, check=False):
+        def run(self, command, timeout=30.0, check=False, **kwargs):
             return 0, "ok\n", ""
 
         def is_ready(self, timeout=2):
             return True
 
     monkeypatch.setattr(guest_mod, "_make_ssh", lambda selected: ServingSSH())
+    monkeypatch.setattr(lifecycle, "_make_ssh", lambda selected: ServingSSH())
 
     cli.main(["--format", "json", "status", "--vm", VM])
     assert json.loads(capsys.readouterr().out)["guest"] == "serving"
@@ -2006,3 +2162,275 @@ def test_gdb_refuses_an_attached_stub_identically_in_text_and_json(
     assert "pry bridge pid 4242" in message
     assert "pry kill --instance 4242" in message
     assert "TimeoutExpired" not in message
+
+
+# ---------------------------------------------------------------------------
+# Launch-time facts: text vs JSON axis. Every warning `launch` prints on
+# stderr (profile override casualties, dotted-param typo, arch/cmdline lint,
+# replace note) must exist in the JSON envelope's `warnings`, and the
+# `no-console-output` outcome must be the same state with the same cause in
+# both formats — it used to be a bare SSH timeout with an empty log.
+# ---------------------------------------------------------------------------
+
+
+def _launch_subject(tmp_path, monkeypatch, *, serial_text, ready):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "qmu.toml").write_text(
+        '[boot]\nkernel = "Image"\ncmdline = "console=ttyS0 root=/dev/sda nokaslr"\n'
+    )
+    serial = tmp_path / f"{VM}.serial.log"
+    serial.write_text(serial_text)
+    inst = VMInstance(
+        vm_id=VM, pid=4242, qmp_socket=str(tmp_path / "s.qmp"), ssh_port=10021,
+        ssh_key=str(tmp_path / "k"), gdb_port=None, serial_log=str(serial),
+        kernel="Image", rootfs=None, memory="1G", cpus=1,
+        cmdline="console=ttyS0 root=/dev/sda", profile="exploit-test",
+        started_at="2026-10-16T00:00:00Z",
+    )
+
+    def launch(**kwargs):
+        instance_mod.save_instance(inst)
+        return inst
+
+    class SSH:
+        def is_ready(self, timeout=2):
+            return ready
+
+    monkeypatch.setattr(lifecycle, "launch_vm", launch)
+    monkeypatch.setattr(lifecycle, "_make_ssh", lambda i: SSH())
+    monkeypatch.setattr(lifecycle, "load_instance", lambda name: None)
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda _: None)
+    monkeypatch.setattr(lifecycle, "NO_CONSOLE_OUTPUT_SECONDS", 0.0)
+    return inst
+
+
+_LAUNCH_WARNING_MARKERS = (
+    "--profile exploit-test overrides",   # config cmdline displaced
+    "nokaslr",                            # the named casualty
+    "kasan.faul",                         # dotted-param typo
+    "ttyAMA0",                            # console= lint for aarch64
+    "/dev/vda",                           # root= lint for aarch64
+)
+
+
+def test_launch_warnings_agree_between_stderr_and_json(tmp_path, monkeypatch, capsys):
+    _launch_subject(tmp_path, monkeypatch, serial_text="[0.0] Linux\n", ready=True)
+    argv = [
+        "launch", "--name", VM, "--arch", "aarch64", "--profile", "exploit-test",
+        "--append", "kasan.faul=panic",
+    ]
+
+    rc = cli.main(["--format", "text", *argv])
+    text = capsys.readouterr()
+    assert rc == 0
+    for marker in _LAUNCH_WARNING_MARKERS:
+        assert marker in text.err, marker
+    assert not text.out.lstrip().startswith("{")  # text stays text
+
+    rc = cli.main(["--format", "json", *argv])
+    captured = capsys.readouterr()
+    assert rc == 0
+    payload = json.loads(captured.out)
+    joined = "\n".join(payload["warnings"])
+    for marker in _LAUNCH_WARNING_MARKERS:
+        assert marker in joined, marker
+    assert payload["config_sources"] == [str(tmp_path.resolve() / "qmu.toml")]
+    assert payload["replaced"] is None
+    # The JSON run also warned on stderr: the mirror adds, it does not move.
+    for marker in _LAUNCH_WARNING_MARKERS:
+        assert marker in captured.err, marker
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_no_console_output_is_one_state_in_both_formats(
+    fmt, tmp_path, monkeypatch, capsys
+):
+    inst = _launch_subject(tmp_path, monkeypatch, serial_text="", ready=False)
+
+    rc = cli.main([
+        "--format", fmt, "launch", "--name", VM, "--arch", "aarch64",
+        "--ssh-timeout", "60",
+    ])
+    captured = capsys.readouterr()
+
+    assert rc == 4
+    if fmt == "json":
+        payload = json.loads(captured.out)
+        assert payload["ok"] is False
+        assert payload["ssh_status"] == "no-console-output"
+        assert payload["error_type"] == "SSHError"
+        message = payload["error"]
+    else:
+        assert "no-console-output" in captured.out
+        assert "[qmu] Error:" in captured.err
+        message = captured.err
+    assert "No console output" in message
+    assert "console=ttyAMA0" in message
+    assert "-M/-cpu" in message
+    assert f"qmu status --vm {VM}" in message
+    # Retained, like the SSH-timeout sibling: never "not found" afterwards.
+    assert instance_mod.load_instance(VM) is not None
+    assert "timeout (VM may still be booting)" not in message
+
+
+# ---------------------------------------------------------------------------
+# Guest axis honesty: `serving` needs positive evidence. A vCPU that merely
+# runs is not evidence — an aarch64 guest booted with the x86 cmdline runs
+# forever, writes nothing, answers nobody, and was reported `serving`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_silent_unreachable_guest_is_unknown_not_serving_everywhere(
+    fmt, cache, monkeypatch, capsys
+):
+    """Empty console + SSH down: `status` and `list` agree on `unknown` and
+    both say what was checked, in both formats."""
+    inst = _ssh_capable(_vm_with_log(cache, VM, ""), 10022)
+    _qmp(monkeypatch, True)
+    _register_running(monkeypatch, inst)
+
+    class DownSSH:
+        def is_ready(self, timeout=2):
+            return False
+
+    monkeypatch.setattr(lifecycle, "_make_ssh", lambda i: DownSSH())
+
+    rc = cli.main(["--format", fmt, "status", "--vm", VM])
+    status_out = capsys.readouterr().out
+    assert rc == 0
+    rc = cli.main(["--format", fmt, "list"])
+    list_out = capsys.readouterr().out
+    assert rc == 0
+
+    if fmt == "json":
+        status = json.loads(status_out)
+        row = next(v for v in json.loads(list_out)["vms"] if v["vm_id"] == VM)
+        assert status["guest"] == "unknown"
+        assert row["guest"] == "unknown"
+        assert status["ssh"] == "down"
+        assert row["ssh_ready"] is False
+        for detail in (status["guest_detail"], row["guest_detail"]):
+            assert "SSH down" in detail
+            assert "0 bytes of console output" in detail
+    else:
+        assert "serving" not in status_out + list_out
+        assert "Guest:     unknown (SSH down, 0 bytes of console output)" in status_out
+        assert "[running — guest unknown (SSH down, 0 bytes of console output)]" in list_out
+
+
+def test_no_endpoint_guest_with_no_console_output_is_unknown(cache, monkeypatch):
+    """No SSH to ask and nothing written: there is no positive evidence."""
+    inst = _vm_with_log(cache, "silent", "")
+    _qmp(monkeypatch, True)
+
+    assert lifecycle._guest_state(inst) == "unknown"
+
+
+def test_no_endpoint_guest_with_console_output_is_serving(cache, monkeypatch):
+    """A harness VM has no sshd by design; its console output is the evidence."""
+    inst = _vm_with_log(cache, "talks", "[ 0.0] Linux version 6.12.0\nharness up\n")
+    _qmp(monkeypatch, True)
+
+    assert lifecycle._guest_state(inst) == "serving"
+
+
+def test_ssh_ready_outranks_console_silence(cache, monkeypatch):
+    inst = _ssh_capable(_vm_with_log(cache, "quiet", ""), 10022)
+    _qmp(monkeypatch, True)
+
+    class ReadySSH:
+        def is_ready(self, timeout=2):
+            return True
+
+    monkeypatch.setattr(lifecycle, "_make_ssh", lambda i: ReadySSH())
+
+    assert lifecycle._observe_guest(inst, probe_ssh=True).guest == "serving"
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_status_does_not_probe_ssh_on_a_halted_vcpu(fmt, cache, monkeypatch, capsys):
+    """A paused guest cannot answer sshd; the probe could only time out (5.2 s
+    measured) to the `down` it would report anyway."""
+    inst = _ssh_capable(_vm_with_log(cache, VM, "[ 0.0] Linux version 6.12.0\n"), 10022)
+    _qmp(monkeypatch, False)
+    _register_running(monkeypatch, inst)
+    monkeypatch.setattr(
+        lifecycle, "_make_ssh",
+        lambda i: (_ for _ in ()).throw(AssertionError("SSH probed on a paused guest")),
+    )
+
+    rc = cli.main(["--format", fmt, "status", "--vm", VM])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    if fmt == "json":
+        payload = json.loads(out)
+        assert payload["guest"] == "paused"
+        assert payload["ssh"] == "skipped"
+    else:
+        assert "Guest:     paused" in out
+        assert "SSH:       port 10022 (not probed: guest paused)" in out
+
+
+# ---------------------------------------------------------------------------
+# status=panicked ⇒ bare `wait` agrees (#27). `wait` said "still running"
+# (124, crash:null) where `status` said panicked on the same VM.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_bare_wait_agrees_with_status_that_the_guest_panicked(
+    fmt, cache, monkeypatch, capsys
+):
+    inst = _vm_with_log(cache, VM, "[ 0.0] Linux version 6.12.0 (x) #1\n" + TERMINAL_PANIC)
+    _qmp(monkeypatch, True)
+    _register_running(monkeypatch, inst)
+    monkeypatch.setattr(lifecycle, "instance_alive", lambda i: True)
+    monkeypatch.setattr(lifecycle, "_CRASH_SETTLE_MAX", 0.0)
+
+    cli.main(["--format", "json", "status", "--vm", VM])
+    assert json.loads(capsys.readouterr().out)["guest"] == "panicked"
+
+    rc = cli.main(["--format", fmt, "wait", "--vm", VM, "--timeout", "5"])
+    captured = capsys.readouterr()
+
+    assert rc == 3
+    if fmt == "json":
+        payload = json.loads(captured.out)
+        assert payload["guest"] == "panicked"
+        assert payload["reason"] == "terminal_panic"
+        assert payload["stopped"] is False
+        assert "Fatal exception" in payload["crash"]
+        assert payload["cleaned"] is False
+    else:
+        assert "PANICKED" in captured.out
+        assert f"qmu kill --vm {VM}" in captured.out
+        assert "still running (" not in captured.out
+    # The evidence `status` pointed at is still there.
+    assert Path(inst.serial_log).exists()
+
+
+# ---------------------------------------------------------------------------
+# prune --orphans --dry-run names the VM, not just a pid
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_prune_orphans_preview_names_the_vm_it_would_kill(
+    fmt, cache, monkeypatch, capsys
+):
+    pid = _make_state(VM_ORPHANED, cache, monkeypatch)
+
+    rc = cli.main(["--format", fmt, "prune", "--orphans", "--dry-run"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    if fmt == "json":
+        payload = json.loads(out)
+        assert payload["would_kill"] == [{
+            "vm_id": VM, "pid": pid,
+            "serial_log": str(cache / "instances" / f"{VM}.serial.log"),
+        }]
+    else:
+        assert f"{VM}  pid {pid}" in out

@@ -82,7 +82,7 @@ class FakeSSH:
         self.run_calls: list[str] = []
         self.is_ready_calls: int = 0
 
-    def run(self, command, timeout=30.0, check=False):
+    def run(self, command, timeout=30.0, check=False, **kwargs):
         self.run_calls.append(command)
         if self._serial_during_run:
             with self._serial_path.open("a") as stream:
@@ -331,11 +331,12 @@ def test_exec_report_mode_kasan_text_warns_without_failing(patch_exec, capsys):
         stderr="",
     )
     rc = cli.main(["exec", "modprobe", "kasan_test"])
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert rc == 0
-    assert "STILL_ALIVE" in out
-    assert "Kernel warning from command serial output:" in out
-    assert "BUG: KASAN" in out
+    # Guest stdout is the whole of stdout; the survived report is a stderr note.
+    assert captured.out == "STILL_ALIVE\n"
+    assert "Kernel warning from command serial output:" in captured.err
+    assert "BUG: KASAN" in captured.err
 
 
 def test_exec_clean_success_has_stable_empty_warning_fields(patch_exec, capsys):
@@ -405,9 +406,12 @@ def test_exec_guest_nonzero_with_warning_preserves_remote_authority(patch_exec, 
         stderr="guest failed\n",
     )
     rc = cli.main(["exec", "false"])
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert rc == 1
-    assert "[exit code: 7]" in out
+    # Nothing on stdout (the guest printed nothing); guest stderr verbatim and
+    # the exit-code trailer on stderr.
+    assert captured.out == ""
+    assert captured.err.startswith("guest failed\n[exit code: 7]\n")
 
 
 def test_exec_transport_loss_with_fresh_crash_is_exit3_json(patch_exec, capsys):
@@ -479,7 +483,7 @@ class FakeCompileSSH:
     def push(self, local, remote):
         pass
 
-    def run(self, command, timeout=30.0, check=False):
+    def run(self, command, timeout=30.0, check=False, **kwargs):
         self._run_count += 1
         if self._run_count == 1:
             return 0, "", ""

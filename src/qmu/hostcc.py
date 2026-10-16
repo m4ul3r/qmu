@@ -91,6 +91,16 @@ def host_arch() -> str:
     return normalize_arch(platform.machine()) or "x86_64"
 
 
+def cross_package(arch: str | None) -> str | None:
+    """Debian/Ubuntu package providing the cross compiler for guest `arch`.
+
+    None for an arch the table has not heard of. Shared by the
+    `resolve_host_cc` error and `qmu doctor`'s cross-toolchain row so both
+    name the same install line.
+    """
+    return _CROSS_PACKAGES.get(normalize_arch(arch) or "")
+
+
 def candidate_compilers(arch: str | None) -> list[list[str]]:
     """Ordered candidate compiler argv prefixes for a guest arch.
 

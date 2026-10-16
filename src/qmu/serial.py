@@ -173,6 +173,18 @@ class SerialTail:
         # escape into JSON `matched_line` and breaks `$`-anchored patterns.
         return [line.rstrip("\r") for line in lines]
 
+    def peek_fragment(self) -> str | None:
+        """The withheld trailing fragment, left in place; None when empty.
+
+        For a matcher that wants to see a line the guest will never finish —
+        a `login:` prompt waits for input, not for a newline. The fragment is
+        not consumed: if more bytes do arrive, ``read_lines`` still returns
+        the completed line whole.
+        """
+        if not self._partial:
+            return None
+        return self._partial.rstrip("\r")
+
     def flush(self) -> list[str]:
         """Return any withheld trailing fragment, then clear it."""
         if not self._partial:

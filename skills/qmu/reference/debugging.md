@@ -144,7 +144,7 @@ measured on qemu 8.2.2, a `jiffies` watchpoint fired within a second under
 **both** KVM and TCG (`qmu launch --no-kvm`). Suspect the alias first and watch
 the VA the write actually goes through; `--no-kvm` is the retest lever for a
 QEMU/KVM build that drops gdbstub watchpoints, not a required setting.
-(`launch --help`'s claim that watchpoints "silently no-op under KVM" is stale.)
+(`launch --help` for `--no-kvm` says the same.)
 
 ## Debugger↔VM coherence (which operations invalidate debug state)
 

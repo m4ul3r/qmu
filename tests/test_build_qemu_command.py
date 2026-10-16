@@ -264,3 +264,16 @@ def test_ssh_port_none_without_no_net_uses_nic_user():
     i = cmd.index("-nic")
     assert cmd[i + 1].startswith("user,model=")
     assert not any("hostfwd" in a for a in cmd)
+
+
+def test_no_reboot_absent_by_default():
+    cmd = build_qemu_command(**_kwargs())
+    assert "-no-reboot" not in cmd
+
+
+def test_no_reboot_flag_emits_qemu_no_reboot_before_passthrough():
+    """`--no-reboot` used to require `-- -no-reboot` (and then `--format` had
+    to precede it). It is a first-class flag now and lands in the argv."""
+    cmd = build_qemu_command(**_kwargs(no_reboot=True, extra_args=["-M", "virt"]))
+    assert cmd.count("-no-reboot") == 1
+    assert cmd.index("-no-reboot") < cmd.index("-M")

@@ -15,14 +15,15 @@ line/scope rules that decide whether `--pattern` can ever match.
   line that mentions the word. Use
   `--pattern '^=+ results =+$'` (or `'^=+ QMU-BOOT-DONE =+$'` for the firmware
   probe template).
-- **A line needs its newline.** A line is only offered to the matcher once its
-  terminator has arrived. On a running VM a prompt-style fragment with no
-  trailing newline (`login:`, a `printf` without `\n`) is withheld and cannot
-  match until something ends the line (measured: `printf NOEOL-MARKER
-  >/dev/ttyS0` → exit 124; a later `printf '\n'` → exit 0 with
-  `matched_line: "localhost login: NOEOL-MARKER"`). Always `echo` the marker
-  with a newline. On a stopped VM (explicit `--vm`), the final unterminated
-  line is flushed and can match.
+- **Fragments match only once the console idles.** A complete line is
+  offered to the matcher as soon as its newline arrives. A trailing fragment
+  with no newline (`login:`, a `printf` without `\n`) is withheld while the
+  console is still being written and offered only after one idle poll
+  (0.25 s) — measured: `printf NOEOL-MARKER >/dev/ttyS0` then `wait --pattern
+  'NOEOL-MARKER$'` → exit 0 with `matched_line: "localhost login:
+  NOEOL-MARKER"`. Prefer `echo` with a newline so the match does not depend
+  on console idleness. On a stopped VM (explicit `--vm`), the final
+  unterminated line is flushed and can match.
 - **Scan scope.** The scan starts at the later of the recorded guest epoch and
   the latest timestamped kernel boot banner (`serial.current_boot_offset`),
   so earlier-boot evidence is excluded even when the reboot was not observed
@@ -54,35 +55,55 @@ not recorded as the VM's rootfs. SSH commands (`push`/`pull`/`exec`/`compile`/
 `dmesg`/`kbase`) error immediately on a harness VM; serial/QMP commands
 (`log`/`crash`/`wait`/`qmp`/`monitor`/`kill`) work.
 
-Pass `-- -no-reboot` for a kernel whose panic would otherwise reboot-loop
+Pass `--no-reboot` for a kernel whose panic would otherwise reboot-loop
 (`panic=N` on the cmdline): without it a panicking harness guest comes back up
 and `wait` ends in `124` with `crash: null` instead of reporting the panic.
 
 ## `qmu wait` without `--pattern`
 
-Blocks on QMP `STOP`/`SHUTDOWN`/`POWERDOWN` events with PID-liveness fallback:
+Bare `wait` holds no QMP connection: it polls every 0.5 s with one
+short-lived `query-status` plus a PID-liveness check, so it never occupies
+QEMU's single QMP slot. Every result carries `vm_id`, `reason`, `stopped`,
+`crash`, `guest`, `guest_detail`, `qmp` (`connected` · `busy` ·
+`unreachable` · null once stopped), `qemu_status`, `last_event`,
+`event_data`, `elapsed`, `cleaned`.
 
-- **Exit 0** — the recorded QEMU process identity exited; the result carries the
-  terminal crash (JSON `crash` field, null if none; text prints
-  `Crash from serial log:`).
-- **Exit 124** — `--timeout` elapsed while the QEMU process remained alive —
-  including a guest that panicked and halted without exiting; check `crash`.
-  Structured output has `ok:false`, `stopped:false`, and retains `qemu_status`,
-  `last_event`, and `event_data`.
-- **Exit 4** — QMP transport failed while the recorded process remained alive.
-  A connection can close just before normal process exit, so qmu allows up to
-  one second of identity polling, capped by the remaining `--timeout`. EOF alone
-  is never success, and a persistent transport failure never cleans the live VM.
-- QMP `RESET`, `STOP`, `SHUTDOWN`, and `POWERDOWN`, plus non-running states such
-  as `paused`, `postmigrate`, and `guest-panicked`, are observations rather than
-  proof that QEMU exited.
-- A VM stopped by `qmu kill` while it was being waited on reports the QMP
-  loss as exit 1/4 rather than a clean exit 0; treat that as "someone killed
-  it", not as a harness result.
+| Exit | `reason` | Meaning |
+|---|---|---|
+| `0` | `process_exited` | the recorded QEMU process identity exited during the wait; `crash` carries the terminal crash (null if none; text prints `Crash from serial log:`) |
+| `0` | `already_stopped` | QEMU had exited before the wait began (explicit `--vm`); `crash` is read from the retained log scoped to its last boot; harness auto-clean still honoured |
+| `3` | `terminal_panic` | `Kernel panic - not syncing` while QEMU still runs: `stopped: false`, `guest: "panicked"`, `crash` populated. `qmu kill --vm X` preserves the report for `qmu crash --vm X` |
+| `124` | `timeout` | `--timeout` elapsed with the process alive; `ok: false`, `stopped: false` |
+| `4` | — | `QMPError`: QMP unreachable for more than 1 s with the pid alive (EOF alone is never success; a persistent failure never cleans the live VM) |
 
-**`wait` auto-cleans harness VMs by default only after confirming that the
-recorded QEMU process identity exited** (removes metadata + `.serial.log`)
-unless you pass `--no-clean`. A live-PID timeout never auto-cleans. Read the
-terminal crash from `wait`'s own output rather than a later `qmu crash` — after
-a confirmed exit, the log may already be gone. Non-harness VMs are never
+- QMP events are not observed. `last_event` reports status **transitions**
+  under the event name QEMU would have sent (`SHUTDOWN`, `STOP`,
+  `GUEST_PANICKED`, `RUNNING`) with `event_data: {"source": "query-status",
+  "from", "to"}`. A guest-initiated reboot is observed via the serial boot
+  banner: `last_event: "RESET"`, `event_data: {"source": "boot-banner",
+  "offset": N}`. Non-running states (`paused`, `postmigrate`,
+  `guest-panicked`) are observations, not proof that QEMU exited.
+- Under QMP contention the wait continues with `qmp: "busy"`, `qemu_status:
+  "unknown"`; each busy poll costs the 2 s greeting timeout, so `--timeout`
+  can overshoot by up to 2 s (and `--timeout 0` may surface as exit 4).
+- A VM stopped by `qmu kill` while it was being waited on reports the loss as
+  exit 1/4 rather than a clean exit 0; treat that as "someone killed it".
+- `wait` does not print the `[qmu] Note: unclaimed by this kernel, from
+  profile …` line (only `launch` does); operator-param warnings still appear.
+
+**`wait` auto-cleans harness VMs only after confirming that the recorded QEMU
+process identity exited** (removes metadata + `.serial.log`) unless you pass
+`--no-clean`. A live-PID timeout or a terminal panic never auto-cleans. Read
+the terminal crash from `wait`'s own output rather than a later `qmu crash` —
+after a confirmed exit, the log may already be gone. Non-harness VMs are never
 auto-cleaned by `wait`.
+
+## `--pattern` outcomes
+
+| Exit | Meaning |
+|---|---|
+| `0` | matched; `matched_line`, `scan_offset`, `scan_scope` |
+| `3` | a terminal panic appeared first (`crash`); a *survived* Oops does not abort; `--ignore-crash` suppresses even the terminal abort |
+| `1` | the VM exited without the pattern and without terminal-panic evidence (a survived report stays in `crash`) |
+| `124` | `--timeout` elapsed with the VM running |
+| `4` | `inconclusive: true`: the serial log is missing or unreadable (`error`, `error_type`, `serial_log`; text `[qmu] Error: Cannot inspect serial log … inconclusive.` on stderr). Never the exit 1 of a genuine no-match |

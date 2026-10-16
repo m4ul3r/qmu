@@ -607,9 +607,10 @@ docker run --rm \
     else
       cp scripts/gdb/vmlinux-gdb.py /output/vmlinux-gdb.py
     fi
-  " >&2
+  " >&2 && RC=0 || RC=$?
 
-RC=$?
+# `set -e` would otherwise abort on a failing `docker run` with make's/docker's
+# own status and never reach the diagnostic below.
 if [[ $RC -ne 0 ]]; then
   log "build failed (exit $RC) — check $OUTDIR/build.log"
   exit 1

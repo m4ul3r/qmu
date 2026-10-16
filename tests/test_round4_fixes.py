@@ -7,6 +7,7 @@ or printed an attribute that did not describe the boot that actually happened.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -390,11 +391,11 @@ def test_ls_opens_read_only_and_skips_the_busy_guard(tmp_path, monkeypatch):
 
     def fake_run(cmd, input=None, text=None, capture_output=None):
         seen["cmd"] = cmd
-        return SimpleNamespace(returncode=0, stdout="total 0\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
 
-    rootfs_mod.listdir(str(image), "/root", partition=0)
+    assert rootfs_mod.listdir(str(image), "/root", partition=0) == []
 
     assert guarded == []
     assert "--ro" in seen["cmd"]
@@ -412,11 +413,15 @@ def test_cat_also_opens_read_only(tmp_path, monkeypatch):
 
     def fake_run(cmd, input=None, text=None, capture_output=None):
         seen["cmd"] = cmd
-        return SimpleNamespace(returncode=0, stdout="hi\n", stderr="")
+        # `download <guest> <local>`: the fake fills the local file like
+        # guestfish would.
+        local = input.split()[-1]
+        Path(local).write_bytes(b"hi\n")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
 
-    assert rootfs_mod.read_file(str(image), "/init.sh", partition=0) == "hi\n"
+    assert rootfs_mod.read_file(str(image), "/init.sh", partition=0) == b"hi\n"
     assert "--ro" in seen["cmd"]
 
 

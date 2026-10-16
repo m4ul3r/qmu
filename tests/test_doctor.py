@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -109,7 +110,7 @@ def test_doctor_unsupported_native_passt_is_unhealthy_even_when_passt_exists(
     native = _check(payload, "QEMU native passt (-netdev passt)")
     assert rc == 1
     assert payload["ok"] is False
-    assert native["status"] == "MISSING"
+    assert native["status"] == "fail"
     assert native["detail"] == native_passt_problem(caps)
     assert "does not advertise" in native["detail"]
     assert "QEMU 10.1" in native["detail"]
@@ -133,7 +134,7 @@ def test_doctor_supported_native_passt_is_unhealthy_when_external_passt_missing(
     native_check = _check(payload, "QEMU native passt (-netdev passt)")
     external_check = _check(payload, "passt (net_backend=passt)")
     assert native_check["status"] == "ok"
-    assert external_check["status"] == "MISSING"
+    assert external_check["status"] == "fail"
     assert rc == 1
     assert payload["ok"] is False
 
@@ -153,8 +154,8 @@ def test_doctor_reports_both_failures_when_capability_and_executable_are_missing
 
     native_check = _check(payload, "QEMU native passt (-netdev passt)")
     external_check = _check(payload, "passt (net_backend=passt)")
-    assert native_check["status"] == "MISSING"
-    assert external_check["status"] == "MISSING"
+    assert native_check["status"] == "fail"
+    assert external_check["status"] == "fail"
     assert rc == 1
 
 
@@ -179,8 +180,8 @@ def test_doctor_missing_selected_qemu_cannot_claim_unsupported_capability(
     qemu_check = _check(payload, "qemu-system-aarch64")
     native_check = _check(payload, "QEMU native passt (-netdev passt)")
     assert rc == 1
-    assert qemu_check["status"] == "MISSING"
-    assert native_check["status"] == "MISSING"
+    assert qemu_check["status"] == "fail"
+    assert native_check["status"] == "fail"
     assert native_check["detail"] == native_passt_problem(caps)
     assert "Cannot verify" in native_check["detail"]
     assert "not found in PATH" in native_check["detail"]
@@ -206,7 +207,7 @@ def test_doctor_probe_failure_is_unhealthy_not_a_traceback(
     qemu_check = _check(payload, "qemu-system-aarch64")
     native_check = _check(payload, "QEMU native passt (-netdev passt)")
     assert qemu_check["status"] == "ok"
-    assert native_check["status"] == "MISSING"
+    assert native_check["status"] == "fail"
     assert native_check["detail"] == native_passt_problem(caps)
     assert "timed out" in native_check["detail"]
     assert rc == 1
@@ -305,7 +306,10 @@ def test_doctor_names_a_rejected_global_config_instead_of_claiming_none(
 
     assert rc == 1
     row = _check(payload, "global config")
-    assert row["status"] == "warn"
+    # A file that exists and is rejected is a defect in the user's setup that
+    # every command re-warns about: gating, not a hint.
+    assert row["status"] == "fail"
+    assert row["blocking"] is True
     assert broken in row["detail"]
     assert "failed to parse TOML" in row["detail"]
     assert "Fix or delete that file" in row["detail"]
@@ -322,9 +326,13 @@ def test_doctor_still_reports_a_genuinely_absent_config(
     doctor_env, monkeypatch, capsys
 ):
     """The not-found branch must survive: nothing was rejected here, so
-    `qmu config init` really is the right advice."""
+    `qmu config init` really is the right advice. It names the REAL global
+    path (QMU_CONFIG_DIR is honored by `config path`; doctor said
+    `~/.config/qmu/config.toml` regardless), and it is a warning: launching
+    with flags works without any config file."""
     doctor_env.config._sources = ["built-in defaults"]
     doctor_env.config._skipped_sources = []
+    monkeypatch.setenv("QMU_CONFIG_DIR", "/custom/cfg")
     monkeypatch.setattr(
         lifecycle,
         "probe_qemu_netdevs",
@@ -335,10 +343,12 @@ def test_doctor_still_reports_a_genuinely_absent_config(
     rc = cli.main(["--format", "json", "doctor"])
     payload = json.loads(capsys.readouterr().out)
 
-    assert rc == 1
+    assert rc == 0
     config_row = _check(payload, "config")
+    assert config_row["status"] == "warn"
+    assert config_row["blocking"] is False
     assert config_row["detail"] == (
-        "No qmu.toml or ~/.config/qmu/config.toml found. Run: qmu config init"
+        "No qmu.toml or /custom/cfg/config.toml found. Run: qmu config init"
     )
     assert not [c for c in payload["checks"] if c["check"] == "global config"]
 
@@ -373,7 +383,7 @@ def test_doctor_reports_a_rejected_global_alongside_a_loaded_project(
     assert broken in _check(payload, "global config")["detail"]
 
 
-def test_doctor_text_shows_the_rejected_global_as_a_warn_row(
+def test_doctor_text_shows_the_rejected_global_as_a_fail_row(
     doctor_env, monkeypatch, capsys
 ):
     broken = "/home/agent/.config/qmu/config.toml"
@@ -392,8 +402,8 @@ def test_doctor_text_shows_the_rejected_global_as_a_warn_row(
     text = capsys.readouterr().out
 
     assert rc == 1
-    assert f"[~] global config: {broken} EXISTS but is invalid" in text
-    assert "No qmu.toml or ~/.config/qmu/config.toml found" not in text
+    assert f"[!] global config: {broken} EXISTS but is invalid" in text
+    assert "No qmu.toml or" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +446,7 @@ def test_doctor_blocks_on_a_configured_kernel_that_is_missing(
 
     row = _check(payload, "kernel")
     assert rc == 1 and payload["ok"] is False
-    assert row["status"] == "MISSING"
+    assert row["status"] == "fail"
     assert row["blocking"] is True
     assert str(tmp_path / "nope" / "bzImage") in row["detail"]
 
@@ -506,3 +516,262 @@ def test_every_doctor_check_carries_a_boolean_blocking_verdict(
     # `ok` is exactly "nothing blocks" — not a re-reading of status strings.
     assert payload["ok"] is (not any(c["blocking"] for c in payload["checks"]))
     assert _check(payload, "qemu-system-aarch64")["blocking"] is True
+
+
+# ---------------------------------------------------------------------------
+# One glyph per meaning. `[!]` used to cover both MISSING and "not configured",
+# `[+]` covered ok and info, and JSON statuses mixed case (`MISSING`, `not
+# configured`, `warn`). Now status ∈ {ok, fail, warn, info}, blocking is
+# exactly `status == "fail"`, and the text glyph is a function of status.
+# ---------------------------------------------------------------------------
+
+
+def test_every_doctor_row_uses_the_four_status_vocabulary(
+    doctor_env, monkeypatch, capsys
+):
+    _passt_ok(monkeypatch)
+    doctor_env.executables["qemu-system-aarch64"] = None
+    monkeypatch.setattr(
+        lifecycle, "probe_qemu_netdevs",
+        Mock(return_value=_caps(path=None, backends=frozenset())),
+        raising=False,
+    )
+
+    rc, payload = _run_json_doctor(capsys)
+
+    statuses = {c["status"] for c in payload["checks"]}
+    assert statuses <= {"ok", "fail", "warn", "info"}
+    assert all(c["blocking"] is (c["status"] == "fail") for c in payload["checks"])
+    assert rc == 1
+
+    cli.main(["doctor"])
+    text = capsys.readouterr().out
+    glyph = {"ok": "+", "fail": "!", "warn": "~", "info": "i"}
+    for c in payload["checks"]:
+        assert f"[{glyph[c['status']]}] {c['check']}:" in text, c["check"]
+
+
+def test_doctor_informational_rows_render_as_i_not_plus(
+    doctor_env, monkeypatch, capsys
+):
+    _passt_ok(monkeypatch)
+    doctor_env.executables["pry"] = None
+
+    rc, payload = _run_json_doctor(capsys)
+    assert rc == 0
+    assert _check(payload, "pry (GDB integration)")["status"] == "info"
+    assert _check(payload, "running VMs")["status"] == "info"
+
+    cli.main(["doctor"])
+    text = capsys.readouterr().out
+    assert "[i] pry (GDB integration):" in text
+    assert "[i] running VMs:" in text
+    assert "[+] pry" not in text
+
+
+def test_doctor_missing_skills_are_informational_not_gating(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    monkeypatch.setattr(lifecycle, "skill_install_roots", lambda: [tmp_path / "none"])
+
+    rc, payload = _run_json_doctor(capsys)
+
+    assert rc == 0
+    row = _check(payload, "skills")
+    assert row["status"] == "info" and row["blocking"] is False
+    assert "qmu skill install" in row["detail"]
+
+
+def test_doctor_key_permissions_warning_does_not_fail_the_check(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    """launch works with a 0644 key (the rootfs decides), so the row is a
+    non-blocking warning — it used to flip exit 1."""
+    _passt_ok(monkeypatch)
+    Path(doctor_env.config.ssh_key).chmod(0o644)
+
+    rc, payload = _run_json_doctor(capsys)
+
+    assert rc == 0
+    row = _check(payload, "SSH key permissions")
+    assert row["status"] == "warn" and row["blocking"] is False
+    cli.main(["doctor"])
+    assert "[~] SSH key permissions: mode=644" in capsys.readouterr().out
+
+
+def test_doctor_forced_kvm_without_dev_kvm_is_gating(
+    doctor_env, monkeypatch, capsys
+):
+    _passt_ok(monkeypatch)
+    doctor_env.config.accel = "kvm"
+    monkeypatch.setattr(lifecycle.Path, "exists", lambda self: False)
+
+    rc, payload = _run_json_doctor(capsys)
+
+    assert rc == 1
+    assert _check(payload, "KVM")["status"] == "fail"
+
+
+# ---------------------------------------------------------------------------
+# Cross toolchain: with a foreign guest arch, `compile --host` and `qmu gdb`
+# need a cross compiler and gdb-multiarch. Both are warnings naming the apt
+# package; neither blocks launch/exec.
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_adds_cross_toolchain_rows_for_a_foreign_arch(
+    doctor_env, monkeypatch, capsys
+):
+    _passt_ok(monkeypatch)
+    monkeypatch.setattr(lifecycle, "host_arch", lambda: "x86_64")
+
+    rc, payload = _run_json_doctor(capsys)
+
+    assert rc == 0
+    cc = _check(payload, "cross compiler for aarch64 (compile --host)")
+    assert cc["status"] == "warn" and cc["blocking"] is False
+    assert "aarch64-linux-gnu-gcc" in cc["detail"]
+    assert "apt install gcc-aarch64-linux-gnu" in cc["detail"]
+    gdb = _check(payload, "gdb-multiarch (qmu gdb / pry on a foreign arch)")
+    assert gdb["status"] == "warn"
+    assert "apt install gdb-multiarch" in gdb["detail"]
+
+    doctor_env.executables["aarch64-linux-gnu-gcc"] = "/usr/bin/aarch64-linux-gnu-gcc"
+    doctor_env.executables["gdb-multiarch"] = "/usr/bin/gdb-multiarch"
+    rc, payload = _run_json_doctor(capsys)
+    assert _check(payload, "cross compiler for aarch64 (compile --host)") == {
+        "check": "cross compiler for aarch64 (compile --host)",
+        "status": "ok", "detail": "/usr/bin/aarch64-linux-gnu-gcc",
+        "blocking": False,
+    }
+    assert _check(payload, "gdb-multiarch (qmu gdb / pry on a foreign arch)")["status"] == "ok"
+
+
+def test_doctor_has_no_cross_toolchain_rows_for_the_host_arch(
+    doctor_env, monkeypatch, capsys
+):
+    _passt_ok(monkeypatch)
+    monkeypatch.setattr(lifecycle, "host_arch", lambda: "aarch64")
+
+    _, payload = _run_json_doctor(capsys)
+
+    assert not [c for c in payload["checks"] if c["check"].startswith("cross compiler")]
+    assert not [c for c in payload["checks"] if c["check"].startswith("gdb-multiarch")]
+
+
+# ---------------------------------------------------------------------------
+# The starter file's `kernel = "./bzImage"  # CHANGE ME` line is live now, so
+# an unedited starter lands on the kernel row — and the row says why.
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_names_the_starter_placeholder_as_written(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    cfg = doctor_env.config
+    cfg.kernel = str(tmp_path / "bzImage")
+    cfg._written_paths["kernel"] = "./bzImage"
+    cfg._field_sources["kernel"] = f"project: {tmp_path / 'qmu.toml'}"
+
+    rc, payload = _run_json_doctor(capsys)
+
+    assert rc == 1
+    row = _check(payload, "kernel")
+    assert row["status"] == "fail"
+    assert row["detail"].startswith("./bzImage (CHANGE ME placeholder; not found)")
+    assert f"resolves to {tmp_path / 'bzImage'}" in row["detail"]
+    assert f"[project {tmp_path / 'qmu.toml'}]" in row["detail"]
+
+    cli.main(["doctor"])
+    assert "[!] kernel: ./bzImage (CHANGE ME placeholder; not found)" in capsys.readouterr().out
+
+
+def test_doctor_missing_rootfs_and_key_say_not_found_with_their_layer(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    cfg = doctor_env.config
+    cfg.rootfs = str(tmp_path / "gone.img")
+    cfg.ssh_key = str(tmp_path / "gone_key")
+    cfg._field_sources["rootfs"] = "global: /home/me/.config/qmu/config.toml"
+    cfg._field_sources["ssh_key"] = "CLI flags"
+
+    rc, payload = _run_json_doctor(capsys)
+
+    assert rc == 1
+    rootfs = _check(payload, "rootfs image")
+    assert rootfs["status"] == "fail"
+    assert rootfs["detail"] == (
+        f"{tmp_path / 'gone.img'} (not found) [global /home/me/.config/qmu/config.toml]"
+    )
+    key = _check(payload, "SSH key")
+    assert key["status"] == "fail"
+    assert key["detail"] == f"{tmp_path / 'gone_key'} (not found) [flag]"
+
+
+# ---------------------------------------------------------------------------
+# "Not configured" gates only when a flagless launch would fail on it: a
+# [boot] kernel is set and the boot is not harness-shaped (initrd, no rootfs).
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_unconfigured_rootfs_and_key_gate_only_with_a_kernel(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    cfg = doctor_env.config
+    cfg.rootfs = None
+    cfg.ssh_key = None
+
+    # No kernel: launch needs flags anyway — hints only.
+    rc, payload = _run_json_doctor(capsys)
+    assert rc == 0
+    assert _check(payload, "rootfs image")["status"] == "warn"
+    assert _check(payload, "SSH key")["status"] == "warn"
+    assert "--harness" in _check(payload, "SSH key")["detail"]
+
+    # Kernel set, no initrd: a flagless `qmu launch` fails on these.
+    kernel = tmp_path / "bzImage"
+    kernel.write_bytes(b"\x00")
+    cfg.kernel = str(kernel)
+    rc, payload = _run_json_doctor(capsys)
+    assert rc == 1
+    assert _check(payload, "rootfs image")["status"] == "fail"
+    assert "flagless launch will fail" in _check(payload, "rootfs image")["detail"]
+    assert _check(payload, "SSH key")["status"] == "fail"
+
+    # Kernel + initrd, no rootfs: the kernelCTF/syzkaller harness shape.
+    cfg.initrd = str(kernel)
+    rc, payload = _run_json_doctor(capsys)
+    assert rc == 0
+    assert _check(payload, "rootfs image")["status"] == "warn"
+    assert _check(payload, "SSH key")["status"] == "warn"
+
+
+# ---------------------------------------------------------------------------
+# The `qmu config init` tip is for a directory with no project config: with
+# one loaded, `config init` would only say "already exists".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sources", "expect_tip"),
+    [
+        (["built-in defaults"], True),
+        (["built-in defaults", "global: /home/me/.config/qmu/config.toml"], True),
+        (["built-in defaults", "project: /work/qmu.toml"], False),
+        (["built-in defaults", "config: /work/explicit.toml"], False),
+    ],
+)
+def test_doctor_config_init_tip_only_without_a_project_layer(
+    doctor_env, monkeypatch, capsys, sources, expect_tip
+):
+    _passt_ok(monkeypatch)
+    doctor_env.config._sources = sources
+
+    cli.main(["doctor"])
+    text = capsys.readouterr().out
+
+    assert ("Tip: run `qmu config init`" in text) is expect_tip

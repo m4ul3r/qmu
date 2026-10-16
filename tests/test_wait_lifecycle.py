@@ -1,16 +1,37 @@
+"""Bare `qmu wait` (no --pattern): process exit, terminal panic, contention.
+
+Bare wait polls — one short-lived `query-status` per tick plus a serial-log
+scan — instead of holding QEMU's single QMP client slot for its whole
+duration. These tests drive the production handler through `cli.main` with
+the collaborators patched on the owning module (`lifecycle`), a fake clock,
+and a real serial log under tmp_path.
+"""
+
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
-
-import json
 
 import pytest
 
 from qmu import cli
+from qmu import instance as instance_mod
 from qmu.commands import lifecycle
 from qmu.instance import VMInstance
-from qmu.qmp import QMPError
+from qmu.qmp import QMPBusyError, QMPError
+
+
+BOOT = "[    0.000000] Linux version 7.0.0 (builder@host) (gcc 13.3.0) #1 SMP\n"
+TERMINAL_PANIC = (
+    "[    2.0] Kernel panic - not syncing: sysrq triggered crash\n"
+    "[    2.1] ---[ end Kernel panic - not syncing: sysrq triggered crash ]---\n"
+)
+SURVIVED_OOPS = (
+    "[    1.6] BUG: kernel NULL pointer dereference, address: 0000000000000083\n"
+    "[    1.6] Oops: 0000 [#1] SMP NOPTI\n"
+    "[    1.6] ---[ end trace 0000000000000000 ]---\n"
+)
 
 
 class FakeClock:
@@ -25,16 +46,27 @@ class FakeClock:
 
 
 class FakeQMP:
-    def __init__(self, clock, *, status="running", events=(), connection_error=None):
-        self.clock = clock
-        self.status = status
-        self.events = list(events)
-        self.wait_calls = []
-        self.connection_error = connection_error
+    """One fresh connection per poll, answering `query-status` from a script.
+
+    `statuses` is consumed one entry per connection: a status name, or an
+    exception to raise at connect time (the last entry repeats). `connects`
+    counts how many short-lived connections the wait opened.
+    """
+
+    def __init__(self, statuses=("running",)):
+        self.statuses = list(statuses)
+        self.connects = 0
+
+    def _current(self):
+        if len(self.statuses) > 1:
+            return self.statuses.pop(0)
+        return self.statuses[0]
 
     def __enter__(self):
-        if self.connection_error is not None:
-            raise self.connection_error
+        self.connects += 1
+        self._status = self._current()
+        if isinstance(self._status, Exception):
+            raise self._status
         return self
 
     def __exit__(self, *args):
@@ -42,20 +74,10 @@ class FakeQMP:
 
     def execute(self, command):
         assert command == "query-status"
-        return {"running": self.status == "running", "status": self.status}
-
-    def wait_event(self, event_names, timeout=None):
-        self.wait_calls.append((event_names, timeout))
-        if self.events:
-            event = self.events.pop(0)
-            if isinstance(event, Exception):
-                raise event
-            return event
-        self.clock.now += 0.0 if timeout is None else timeout
-        return None
+        return {"running": self._status == "running", "status": self._status}
 
 
-def _instance(tmp_path, *, harness=True) -> VMInstance:
+def _instance(tmp_path, *, harness=True, epoch=0) -> VMInstance:
     return VMInstance(
         vm_id="wait-vm",
         pid=4243,
@@ -73,6 +95,7 @@ def _instance(tmp_path, *, harness=True) -> VMInstance:
         profile="exploit-dev",
         started_at="2026-07-09T00:00:00Z",
         harness=harness,
+        guest_epoch_serial_offset=epoch,
     )
 
 
@@ -81,24 +104,28 @@ def _invoke_wait(
     capsys,
     tmp_path,
     *,
-    status="running",
-    events=(),
+    statuses=("running",),
     alive=(True,),
     harness=True,
     timeout=1.0,
     no_clean=False,
     fmt="json",
-    crash_text="terminal panic",
-    connection_error=None,
+    serial=BOOT,
+    epoch=0,
+    inst=None,
 ):
-    inst = _instance(tmp_path, harness=harness)
+    """Run `wait --vm wait-vm` against a scripted VM; returns the receipts.
+
+    `alive` is a sequence consumed one value per `instance_alive` call (the
+    last repeats) or a callable of the fake clock's time.
+    """
+    inst = inst or _instance(tmp_path, harness=harness, epoch=epoch)
+    if serial is not None:
+        Path(inst.serial_log).write_text(serial)
     clock = FakeClock()
-    qmp = FakeQMP(
-        clock, status=status, events=events, connection_error=connection_error
-    )
+    qmp = FakeQMP(statuses)
     alive_values = None if callable(alive) else list(alive)
     remove_calls = []
-    crash_calls = []
 
     def identity_alive(selected):
         if alive_values is None:
@@ -108,16 +135,19 @@ def _invoke_wait(
             alive_values.pop(0)
         return value
 
-    def extract(path):
-        crash_calls.append(path)
-        return crash_text
-
     def forbidden_kill(*args, **kwargs):
         raise AssertionError("wait must not call _kill_vm after identity death")
 
     monkeypatch.setattr(lifecycle.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(lifecycle.time, "sleep", clock.sleep)
     monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(lifecycle, "_require_running", lambda vm, cmd: None)
+    monkeypatch.setattr(lifecycle, "_orphan_serial_logs", lambda: {})
+    monkeypatch.setattr(
+        lifecycle, "classify_vm",
+        lambda vm_id, **kw: {"state": "running", "instance": inst, "pid": inst.pid,
+                             "serial_log": inst.serial_log},
+    )
     monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda selected: qmp)
     monkeypatch.setattr(lifecycle, "instance_alive", identity_alive)
     monkeypatch.setattr(
@@ -127,7 +157,6 @@ def _invoke_wait(
             AssertionError("wait used pid-only liveness")
         ),
     )
-    monkeypatch.setattr(lifecycle, "extract_crash", extract)
     monkeypatch.setattr(
         lifecycle,
         "remove_instance",
@@ -146,554 +175,87 @@ def _invoke_wait(
     rc = cli.main(argv)
     captured = capsys.readouterr()
     payload = json.loads(captured.out) if fmt != "text" else None
-    return rc, payload, captured.out, qmp, remove_calls, crash_calls
+    return rc, payload, captured, qmp, clock, remove_calls
+
+
+# ---------------------------------------------------------------------------
+# Process exit
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("exit_at", [0.1, 1.0])
-def test_wait_qmp_eof_allows_bounded_identity_exit(
+def test_wait_returns_when_the_recorded_process_exits(
     exit_at, monkeypatch, capsys, tmp_path
 ):
-    rc, payload, _, qmp, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        events=[QMPError("QMP connection closed unexpectedly")],
+    rc, payload, _, qmp, clock, remove_calls = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
         alive=lambda now: now < exit_at,
         timeout=None,
     )
 
     assert rc == 0
-    assert payload["stopped"] is True
-    assert payload["reason"] == "process_exited"
-    assert payload["elapsed"] == pytest.approx(exit_at)
-    assert qmp.clock.now == pytest.approx(exit_at)
-    assert remove_calls == ["wait-vm"]
-    assert len(crash_calls) == 1
-
-
-@pytest.mark.parametrize(
-    ("phase", "error"),
-    [
-        ("connection", QMPError("Cannot connect to QMP socket")),
-        ("wait", QMPError("QMP connection closed unexpectedly")),
-        ("connection", OSError("connection refused")),
-        ("wait", OSError("connection reset by peer")),
-    ],
-)
-def test_wait_persistent_transport_failure_is_infrastructure_and_keeps_state(
-    phase, error, monkeypatch, capsys, tmp_path
-):
-    rc, payload, _, qmp, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        connection_error=error if phase == "connection" else None,
-        events=[error] if phase == "wait" else [],
-        timeout=None,
-    )
-
-    assert rc == 4
-    assert payload["ok"] is False
-    assert payload["error_type"] == "QMPError"
-    assert str(error) in payload["error"]
-    assert "stopped" not in payload
-    assert qmp.clock.now == pytest.approx(1.0)
-    assert remove_calls == []
-    assert crash_calls == []
-
-
-@pytest.mark.parametrize("exits_at_deadline", [False, True])
-def test_wait_transport_grace_uses_remaining_deadline_and_checks_boundary(
-    exits_at_deadline, monkeypatch, capsys, tmp_path
-):
-    def delayed_eof(qmp, event_names, timeout=None):
-        qmp.clock.now = 0.875
-        raise QMPError("QMP connection closed unexpectedly")
-
-    monkeypatch.setattr(FakeQMP, "wait_event", delayed_eof)
-    rc, payload, _, qmp, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        alive=lambda now: not exits_at_deadline or now < 1.0,
-        timeout=1.0,
-    )
-
-    assert qmp.clock.now == pytest.approx(1.0)
-    if exits_at_deadline:
-        assert rc == 0
-        assert payload["reason"] == "process_exited"
-        assert remove_calls == ["wait-vm"]
-        assert len(crash_calls) == 1
-    else:
-        assert rc == 4
-        assert payload["error_type"] == "QMPError"
-        assert remove_calls == []
-        assert crash_calls == []
-
-
-@pytest.mark.parametrize("alive", [False, True])
-def test_wait_connection_failure_at_zero_deadline_checks_identity_without_grace(
-    alive, monkeypatch, capsys, tmp_path
-):
-    rc, payload, _, qmp, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        connection_error=OSError("connection refused"),
-        alive=[alive],
-        timeout=0,
-    )
-
-    assert qmp.clock.now == 0
-    if alive:
-        assert rc == 4
-        assert payload["error_type"] == "QMPError"
-        assert remove_calls == []
-        assert crash_calls == []
-    else:
-        assert rc == 0
-        assert payload["reason"] == "process_exited"
-        assert remove_calls == ["wait-vm"]
-        assert len(crash_calls) == 1
-
-
-def test_wait_reset_with_live_pid_times_out_and_preserves_observation(
-    monkeypatch, capsys, tmp_path
-):
-    reset = {
-        "event": "RESET",
-        "data": {"guest": True, "reason": "guest-reset"},
-    }
-    rc, payload, _, _, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        events=[reset],
-        alive=[True],
-    )
-
-    assert rc == 124
-    assert payload["ok"] is False
-    assert payload["stopped"] is False
-    assert payload["reason"] == "timeout"
-    assert payload["qemu_status"] == "running"
-    assert payload["last_event"] == "RESET"
-    assert payload["event_data"] == reset["data"]
-    assert payload["crash"] is None
-    assert payload["cleaned"] is False
-    assert remove_calls == []
-    assert crash_calls == []
-
-
-@pytest.mark.parametrize("event_name", ("STOP", "SHUTDOWN", "POWERDOWN"))
-def test_wait_nonterminal_event_with_live_pid_times_out(
-    event_name, monkeypatch, capsys, tmp_path
-):
-    event = {"event": event_name, "data": {"source": "test"}}
-    rc, payload, _, _, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        events=[event],
-        alive=[True],
-    )
-
-    assert rc == 124
-    assert payload["ok"] is False
-    assert payload["stopped"] is False
-    assert payload["reason"] == "timeout"
-    assert payload["last_event"] == event_name
-    assert payload["event_data"] == event["data"]
-    assert payload["crash"] is None
-    assert payload["cleaned"] is False
-    assert remove_calls == []
-    assert crash_calls == []
-
-
-@pytest.mark.parametrize("status", ("paused", "postmigrate", "guest-panicked"))
-def test_wait_initial_nonrunning_status_with_live_pid_times_out(
-    status, monkeypatch, capsys, tmp_path
-):
-    rc, payload, _, _, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        status=status,
-        alive=[True],
-    )
-
-    assert rc == 124
-    assert payload["ok"] is False
-    assert payload["stopped"] is False
-    assert payload["reason"] == "timeout"
-    assert payload["qemu_status"] == status
-    assert payload["last_event"] is None
-    assert payload["event_data"] is None
-    assert payload["crash"] is None
-    assert payload["cleaned"] is False
-    assert remove_calls == []
-    assert crash_calls == []
-
-
-def test_wait_observation_continues_until_recorded_process_exits(
-    monkeypatch, capsys, tmp_path
-):
-    reset = {
-        "event": "RESET",
-        "data": {"guest": True, "reason": "guest-reset"},
-    }
-    rc, payload, _, _, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        events=[reset],
-        alive=[True, False],
-    )
-
-    assert rc == 0
     assert payload["ok"] is True
     assert payload["stopped"] is True
     assert payload["reason"] == "process_exited"
-    assert payload["last_event"] == "RESET"
-    assert payload["event_data"] == reset["data"]
-    assert payload["crash"] == "terminal panic"
+    assert payload["guest"] == "unknown"
+    assert payload["crash"] is None
     assert payload["cleaned"] is True
     assert remove_calls == ["wait-vm"]
-    assert crash_calls == [str(tmp_path / "wait-vm.serial.log")]
+    assert qmp.connects >= 1
 
 
-def test_wait_harness_cleanup_only_after_process_identity_exit(
+def test_wait_reports_the_crash_of_a_process_that_exited(
     monkeypatch, capsys, tmp_path
 ):
-    rc, payload, _, _, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
+    rc, payload, _, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
         alive=[False],
+        serial=BOOT + TERMINAL_PANIC,
     )
 
     assert rc == 0
-    assert payload["ok"] is True
     assert payload["stopped"] is True
-    assert payload["reason"] == "process_exited"
-    assert payload["cleaned"] is True
-    assert remove_calls == ["wait-vm"]
-    assert len(crash_calls) == 1
+    assert payload["guest"] == "panicked"
+    assert "sysrq triggered crash" in payload["crash"]
+
+
+def test_wait_non_harness_exit_does_not_auto_clean(monkeypatch, capsys, tmp_path):
+    rc, payload, _, _, _, remove_calls = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=[False], harness=False,
+    )
+
+    assert rc == 0
+    assert payload["stopped"] is True
+    assert payload["cleaned"] is False
+    assert remove_calls == []
 
 
 def test_wait_no_clean_preserves_terminal_harness_metadata(
     monkeypatch, capsys, tmp_path
 ):
-    rc, payload, _, _, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        alive=[False],
-        no_clean=True,
+    rc, payload, _, _, _, remove_calls = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=[False], no_clean=True,
     )
 
     assert rc == 0
-    assert payload["ok"] is True
-    assert payload["stopped"] is True
     assert payload["cleaned"] is False
     assert remove_calls == []
-    assert len(crash_calls) == 1
-
-
-def test_wait_non_harness_exit_does_not_auto_clean(
-    monkeypatch, capsys, tmp_path
-):
-    rc, payload, _, _, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        alive=[False],
-        harness=False,
-    )
-
-    assert rc == 0
-    assert payload["ok"] is True
-    assert payload["stopped"] is True
-    assert payload["cleaned"] is False
-    assert remove_calls == []
-    assert len(crash_calls) == 1
-
-
-@pytest.mark.parametrize(
-    ("status", "events", "observation"),
-    (
-        (
-            "running",
-            [{"event": "RESET", "data": {"reason": "guest-reset"}}],
-            "Observed QMP event RESET",
-        ),
-        ("paused", [], "Observed QEMU status paused"),
-    ),
-)
-def test_wait_text_does_not_call_live_vm_stopped(
-    status, events, observation, monkeypatch, capsys, tmp_path
-):
-    rc, _, text, _, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        status=status,
-        events=events,
-        alive=[True],
-        fmt="text",
-    )
-
-    assert rc == 124
-    assert "VM 'wait-vm' still running" in text
-    assert observation in text
-    assert "QEMU process still running" in text
-    assert "VM 'wait-vm' stopped" not in text
-    assert "Crash from serial log" not in text
-    assert "Instance metadata cleaned up" not in text
-    assert remove_calls == []
-    assert crash_calls == []
 
 
 @pytest.mark.parametrize(("alive", "expected_rc"), (([False], 0), ([True], 124)))
 def test_wait_zero_timeout_checks_identity_once(
     alive, expected_rc, monkeypatch, capsys, tmp_path
 ):
-    rc, payload, _, _, _, _ = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        alive=alive,
-        harness=False,
-        timeout=0,
+    rc, payload, _, _, clock, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=alive, harness=False, timeout=0,
     )
 
     assert rc == expected_rc
+    assert clock.now == 0
     assert payload["stopped"] is (expected_rc == 0)
     assert payload["reason"] == (
         "process_exited" if expected_rc == 0 else "timeout"
     )
-
-
-def test_wait_preserves_latest_qmp_event_until_timeout(
-    monkeypatch, capsys, tmp_path
-):
-    stop = {"event": "STOP", "data": {"sequence": 1}}
-    reset = {"event": "RESET", "data": {"sequence": 2}}
-    rc, payload, _, _, _, _ = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        events=[stop, reset],
-        alive=[True],
-    )
-
-    assert rc == 124
-    assert payload["last_event"] == "RESET"
-    assert payload["event_data"] == {"sequence": 2}
-
-
-def test_wait_process_exit_text_is_terminal(monkeypatch, capsys, tmp_path):
-    rc, _, text, _, remove_calls, crash_calls = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        alive=[False],
-        harness=False,
-        fmt="text",
-    )
-
-    assert rc == 0
-    assert "VM 'wait-vm' stopped (process_exited" in text
-    assert "Crash from serial log:\nterminal panic" in text
-    assert "still running" not in text
-    assert remove_calls == []
-    assert len(crash_calls) == 1
-
-
-def test_wait_reset_advances_epoch_before_next_liveness_check(
-    monkeypatch, capsys, tmp_path
-):
-    old = b"old epoch\n"
-    inst = _instance(tmp_path)
-    Path(inst.serial_log).write_bytes(old)
-    clock = FakeClock()
-    qmp = FakeQMP(
-        clock,
-        events=[{"event": "RESET", "data": {"reason": "guest-reset"}}],
-    )
-    calls = []
-    saved_offsets = []
-    original_wait = qmp.wait_event
-
-    def wait_event(event_names, timeout=None):
-        event = original_wait(event_names, timeout)
-        if event is not None:
-            calls.append(f"event:{event['event']}")
-        return event
-
-    qmp.wait_event = wait_event
-    alive_checks = 0
-
-    def identity_alive(selected):
-        nonlocal alive_checks
-        calls.append(
-            "alive_before_reset" if alive_checks == 0 else "alive_after_reset"
-        )
-        alive_checks += 1
-        return True
-
-    def save_epoch(record, offset):
-        calls.append("save_epoch")
-        saved_offsets.append(offset)
-        return replace(record, guest_epoch_serial_offset=offset)
-
-    monkeypatch.setattr(lifecycle.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
-    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda selected: qmp)
-    monkeypatch.setattr(lifecycle, "instance_alive", identity_alive)
-    monkeypatch.setattr(
-        lifecycle,
-        "serial_log_offset",
-        lambda path: Path(path).stat().st_size,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        lifecycle,
-        "save_guest_epoch_serial_offset",
-        save_epoch,
-        raising=False,
-    )
-
-    rc = cli.main(["wait", "--vm", "wait-vm", "--timeout", "1", "--format", "json"])
-    payload = json.loads(capsys.readouterr().out)
-
-    assert rc == 124
-    assert payload["stopped"] is False
-    assert payload["last_event"] == "RESET"
-    assert saved_offsets == [len(old)]
-    assert calls.index("event:RESET") < calls.index("save_epoch")
-    assert calls.index("save_epoch") < calls.index("alive_after_reset")
-
-
-@pytest.mark.parametrize("event", ["STOP", "SHUTDOWN", "POWERDOWN"])
-def test_wait_nonreset_observation_does_not_advance_epoch(
-    event, monkeypatch, capsys, tmp_path
-):
-    saved_offsets = []
-    monkeypatch.setattr(
-        lifecycle,
-        "save_guest_epoch_serial_offset",
-        lambda record, offset: saved_offsets.append(offset),
-        raising=False,
-    )
-    rc, payload, _, _, _, _ = _invoke_wait(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        events=[{"event": event, "data": {"source": "test"}}],
-        alive=[True],
-    )
-
-    assert rc == 124
-    assert payload["stopped"] is False
-    assert payload["last_event"] == event
-    assert saved_offsets == []
-
-
-def test_wait_repeated_reset_uses_latest_boundary(monkeypatch, capsys, tmp_path):
-    old = b"old epoch\n"
-    appended = b"new generation output\n"
-    inst = _instance(tmp_path)
-    log = Path(inst.serial_log)
-    log.write_bytes(old)
-    clock = FakeClock()
-    reset = {"event": "RESET", "data": {"reason": "guest-reset"}}
-    qmp = FakeQMP(clock, events=[reset, reset])
-    original_wait = qmp.wait_event
-    observed = 0
-    saved_offsets = []
-
-    def wait_event(event_names, timeout=None):
-        nonlocal observed
-        if qmp.events and observed == 1:
-            with log.open("ab") as stream:
-                stream.write(appended)
-        event = original_wait(event_names, timeout)
-        if event is not None:
-            observed += 1
-        return event
-
-    qmp.wait_event = wait_event
-
-    def save_epoch(record, offset):
-        saved_offsets.append(offset)
-        return replace(record, guest_epoch_serial_offset=offset)
-
-    monkeypatch.setattr(lifecycle.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
-    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda selected: qmp)
-    monkeypatch.setattr(lifecycle, "instance_alive", lambda selected: True)
-    monkeypatch.setattr(
-        lifecycle,
-        "serial_log_offset",
-        lambda path: Path(path).stat().st_size,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        lifecycle,
-        "save_guest_epoch_serial_offset",
-        save_epoch,
-        raising=False,
-    )
-
-    rc = cli.main(["wait", "--vm", "wait-vm", "--timeout", "1", "--format", "json"])
-    payload = json.loads(capsys.readouterr().out)
-
-    assert rc == 124
-    assert payload["stopped"] is False
-    assert payload["last_event"] == "RESET"
-    assert saved_offsets == [len(old), len(old) + len(appended)]
-
-
-@pytest.mark.parametrize("alive_after_reset", [False, True])
-def test_wait_reset_persistence_failure_prevents_live_result(
-    alive_after_reset, monkeypatch, capsys, tmp_path
-):
-    inst = _instance(tmp_path)
-    Path(inst.serial_log).write_text("old epoch\n")
-    clock = FakeClock()
-    qmp = FakeQMP(clock, events=[{"event": "RESET", "data": {}}])
-    alive_checks = 0
-
-    def identity_alive(selected):
-        nonlocal alive_checks
-        alive_checks += 1
-        return alive_checks == 1 or alive_after_reset
-
-    monkeypatch.setattr(lifecycle.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(lifecycle.time, "sleep", clock.sleep)
-    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
-    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda selected: qmp)
-    monkeypatch.setattr(lifecycle, "instance_alive", identity_alive)
-    monkeypatch.setattr(lifecycle, "serial_log_offset", lambda path: 10, raising=False)
-    monkeypatch.setattr(
-        lifecycle,
-        "save_guest_epoch_serial_offset",
-        lambda record, offset: (_ for _ in ()).throw(OSError("metadata failed")),
-        raising=False,
-    )
-
-    rc = cli.main(["wait", "--vm", "wait-vm", "--timeout", "1", "--format", "json"])
-    payload = json.loads(capsys.readouterr().out)
-
-    assert rc == 4
-    assert payload["ok"] is False
-    assert payload["error_type"] == "OSError"
-    assert "metadata failed" in payload["error"]
-    assert "stopped" not in payload
-    assert alive_checks == 1
-    assert clock.now == 0
 
 
 def test_wait_terminal_crash_uses_current_epoch(monkeypatch, capsys, tmp_path):
@@ -702,26 +264,568 @@ def test_wait_terminal_crash_uses_current_epoch(monkeypatch, capsys, tmp_path):
         "[ 1.1] old trace body\n"
         "[ 1.2] ---[ end trace 111 ]---\n"
     )
-    new = (
-        "[ 2.0] Kernel panic - not syncing: sysrq triggered crash\n"
-        "[ 2.1] ---[ end Kernel panic - not syncing: sysrq triggered crash ]---\n"
+    rc, payload, _, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        alive=[False], harness=False,
+        serial=old + TERMINAL_PANIC, epoch=len(old.encode()),
     )
-    inst = replace(
-        _instance(tmp_path, harness=False),
-        guest_epoch_serial_offset=len(old.encode()),
-    )
-    Path(inst.serial_log).write_text(old + new)
-    clock = FakeClock()
-    qmp = FakeQMP(clock)
-    monkeypatch.setattr(lifecycle.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
-    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda selected: qmp)
-    monkeypatch.setattr(lifecycle, "instance_alive", lambda selected: False)
-
-    rc = cli.main(["wait", "--vm", "wait-vm", "--timeout", "1", "--format", "json"])
-    payload = json.loads(capsys.readouterr().out)
 
     assert rc == 0
     assert payload["stopped"] is True
     assert "sysrq triggered crash" in payload["crash"]
     assert "uaf_init" not in payload["crash"]
+
+
+def test_wait_process_exit_text_is_terminal(monkeypatch, capsys, tmp_path):
+    rc, _, captured, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        alive=[False], harness=False, fmt="text", serial=BOOT + TERMINAL_PANIC,
+    )
+
+    assert rc == 0
+    assert "VM 'wait-vm' stopped (process_exited" in captured.out
+    assert "Guest: panicked" in captured.out
+    assert "Crash from serial log:\n" in captured.out
+    assert "still running" not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Timeout with a live process: the QMP slot is never held across polls
+# ---------------------------------------------------------------------------
+
+
+def test_wait_polls_with_one_connection_per_tick(monkeypatch, capsys, tmp_path):
+    rc, payload, _, qmp, clock, remove_calls = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=[True], timeout=2.0,
+    )
+
+    assert rc == 124
+    assert payload["ok"] is False
+    assert payload["stopped"] is False
+    assert payload["reason"] == "timeout"
+    assert payload["guest"] == "serving"
+    assert payload["qmp"] == "connected"
+    assert payload["qemu_status"] == "running"
+    assert payload["last_event"] is None
+    assert payload["crash"] is None
+    assert payload["cleaned"] is False
+    assert clock.now == pytest.approx(2.0)
+    # 2 s at a 0.5 s tick: five polls, each on its own short-lived connection.
+    assert qmp.connects == 5
+    assert remove_calls == []
+
+
+@pytest.mark.parametrize("status", ("paused", "postmigrate", "guest-panicked"))
+def test_wait_initial_nonrunning_status_with_live_pid_times_out(
+    status, monkeypatch, capsys, tmp_path
+):
+    rc, payload, _, _, _, remove_calls = _invoke_wait(
+        monkeypatch, capsys, tmp_path, statuses=[status], alive=[True],
+    )
+
+    assert rc == 124
+    assert payload["stopped"] is False
+    assert payload["reason"] == "timeout"
+    assert payload["qemu_status"] == status
+    # A status that was already in force when the wait began is not an event.
+    assert payload["last_event"] is None
+    assert payload["event_data"] is None
+    assert payload["guest"] == "paused"
+    assert remove_calls == []
+
+
+@pytest.mark.parametrize(
+    ("status", "event"),
+    (("shutdown", "SHUTDOWN"), ("paused", "STOP"), ("guest-panicked", "GUEST_PANICKED")),
+)
+def test_wait_reports_a_status_transition_as_the_event_qemu_would_have_sent(
+    status, event, monkeypatch, capsys, tmp_path
+):
+    rc, payload, captured, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        statuses=["running", status], alive=[True], timeout=1.0,
+    )
+
+    assert rc == 124
+    assert payload["stopped"] is False
+    assert payload["qemu_status"] == status
+    assert payload["last_event"] == event
+    assert payload["event_data"] == {
+        "source": "query-status", "from": "running", "to": status,
+    }
+
+
+def test_wait_keeps_the_latest_transition_until_timeout(
+    monkeypatch, capsys, tmp_path
+):
+    rc, payload, _, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        statuses=["running", "paused", "running"], alive=[True], timeout=1.5,
+    )
+
+    assert rc == 124
+    assert payload["last_event"] == "RUNNING"
+    assert payload["event_data"]["from"] == "paused"
+    assert payload["qemu_status"] == "running"
+
+
+def test_wait_text_does_not_call_live_vm_stopped(monkeypatch, capsys, tmp_path):
+    rc, _, captured, _, _, remove_calls = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        statuses=["running", "paused"], alive=[True], fmt="text",
+    )
+
+    assert rc == 124
+    assert "VM 'wait-vm' still running" in captured.out
+    assert "Observed QMP event STOP (QEMU process still running)." in captured.out
+    assert "Observed QEMU status paused (QEMU process still running)." in captured.out
+    assert "VM 'wait-vm' stopped" not in captured.out
+    assert "Crash from serial log" not in captured.out
+    assert "Instance metadata cleaned up" not in captured.out
+    assert remove_calls == []
+
+
+def test_wait_does_not_repeat_the_profile_param_note(monkeypatch, capsys, tmp_path):
+    """`apparmor=0` unclaimed is `launch`'s note; every wait re-printing it was
+    the alarm fatigue the operator/profile split exists to end."""
+    inst = replace(
+        _instance(tmp_path),
+        cmdline="console=ttyS0 apparmor=0 panic_on_oopsy=1",
+        profile="exploit-dev",
+    )
+    monkeypatch.setattr(
+        lifecycle, "extract_unknown_params",
+        lambda *a, **k: ["apparmor=0", "panic_on_oopsy=1"],
+    )
+    monkeypatch.setattr(lifecycle, "_profile_params", lambda i: {"apparmor=0"})
+    rc, payload, captured, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=[True], inst=inst,
+    )
+
+    assert rc == 124
+    assert "Note: unclaimed by this kernel, from profile" not in captured.err
+    assert "panic_on_oopsy=1" in captured.err
+    assert payload["unknown_kernel_params_by_source"]["profile"] == ["apparmor=0"]
+
+
+# ---------------------------------------------------------------------------
+# QMP contention and transport loss
+# ---------------------------------------------------------------------------
+
+
+def test_wait_keeps_waiting_while_another_client_holds_qmp(
+    monkeypatch, capsys, tmp_path
+):
+    """Busy is a sibling command, not a dead VM: liveness and the serial log
+    still decide; QMP-derived fields are reported as not observed."""
+    busy = QMPBusyError("no greeting")
+    rc, payload, captured, qmp, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        statuses=[busy], alive=[True, True, False], timeout=5.0,
+    )
+
+    assert rc == 0
+    assert payload["reason"] == "process_exited"
+    assert payload["qmp"] == "busy"
+    assert payload["qemu_status"] == "unknown"
+    assert qmp.connects == 2
+
+
+def test_wait_busy_timeout_reports_the_unobserved_status(
+    monkeypatch, capsys, tmp_path
+):
+    busy = QMPBusyError("no greeting")
+    rc, payload, captured, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path, statuses=[busy], alive=[True], fmt="text",
+    )
+
+    assert rc == 124
+    assert "QMP: busy (held by another client)" in captured.out
+    assert "still running" in captured.out
+
+
+@pytest.mark.parametrize("exit_at", [0.1, 1.0])
+def test_wait_qmp_loss_allows_bounded_identity_exit(
+    exit_at, monkeypatch, capsys, tmp_path
+):
+    """QEMU closes QMP ~100 ms before its pid vanishes; a lost connection is
+    followed by identity polling only, for at most one second."""
+    rc, payload, _, _, clock, remove_calls = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        statuses=[QMPError("Cannot connect to QMP socket")],
+        alive=lambda now: now < exit_at,
+        timeout=None,
+    )
+
+    assert rc == 0
+    assert payload["stopped"] is True
+    assert payload["reason"] == "process_exited"
+    assert payload["elapsed"] == pytest.approx(exit_at)
+    assert remove_calls == ["wait-vm"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [QMPError("Cannot connect to QMP socket"), OSError("connection refused")],
+)
+def test_wait_persistent_transport_failure_is_infrastructure_and_keeps_state(
+    error, monkeypatch, capsys, tmp_path
+):
+    rc, payload, _, _, clock, remove_calls = _invoke_wait(
+        monkeypatch, capsys, tmp_path, statuses=[error], timeout=None,
+    )
+
+    assert rc == 4
+    assert payload["ok"] is False
+    assert payload["error_type"] == "QMPError"
+    assert str(error) in payload["error"]
+    assert "stopped" not in payload
+    assert clock.now == pytest.approx(1.0)
+    assert remove_calls == []
+
+
+@pytest.mark.parametrize("exits_at_deadline", [False, True])
+def test_wait_transport_grace_uses_remaining_deadline_and_checks_boundary(
+    exits_at_deadline, monkeypatch, capsys, tmp_path
+):
+    """A transport lost at 0.5 s of a 1 s deadline gets 0.5 s of grace, and the
+    identity is checked AT the deadline, never after it."""
+    rc, payload, _, _, clock, remove_calls = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        statuses=["running", QMPError("QMP connection closed unexpectedly")],
+        alive=lambda now: not exits_at_deadline or now < 1.0,
+        timeout=1.0,
+    )
+
+    assert clock.now == pytest.approx(1.0)
+    if exits_at_deadline:
+        assert rc == 0
+        assert payload["reason"] == "process_exited"
+        assert remove_calls == ["wait-vm"]
+    else:
+        assert rc == 4
+        assert payload["error_type"] == "QMPError"
+        assert remove_calls == []
+
+
+@pytest.mark.parametrize("alive", [False, True])
+def test_wait_connection_failure_at_zero_deadline_checks_identity_without_grace(
+    alive, monkeypatch, capsys, tmp_path
+):
+    rc, payload, _, _, clock, remove_calls = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        statuses=[OSError("connection refused")], alive=[True, alive], timeout=0,
+    )
+
+    assert clock.now == 0
+    if alive:
+        assert rc == 4
+        assert payload["error_type"] == "QMPError"
+        assert remove_calls == []
+    else:
+        assert rc == 0
+        assert payload["reason"] == "process_exited"
+        assert remove_calls == ["wait-vm"]
+
+
+# ---------------------------------------------------------------------------
+# Terminal panic while QEMU keeps running (#27)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_wait_terminal_panic_with_a_live_process_exits_three(
+    fmt, monkeypatch, capsys, tmp_path
+):
+    """No -no-reboot and panic=0: the guest is gone, QEMU is not. Reporting
+    "still running" here contradicted `status` and sent the reader back to
+    wait again for a marker that can never come."""
+    rc, payload, captured, _, _, remove_calls = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        alive=[True], serial=BOOT + TERMINAL_PANIC, fmt=fmt, timeout=30.0,
+    )
+
+    assert rc == 3
+    if fmt == "json":
+        assert payload["ok"] is False
+        assert payload["stopped"] is False
+        assert payload["reason"] == "terminal_panic"
+        assert payload["guest"] == "panicked"
+        assert "sysrq triggered crash" in payload["crash"]
+        assert payload["cleaned"] is False
+    else:
+        assert "VM 'wait-vm' guest PANICKED (terminal_panic" in captured.out
+        assert "qmu kill --vm wait-vm" in captured.out
+        assert "Crash from serial log:\n" in captured.out
+        assert "still running (" not in captured.out
+    assert remove_calls == []
+
+
+def test_wait_terminal_panic_is_found_before_any_sleep(
+    monkeypatch, capsys, tmp_path
+):
+    rc, payload, _, _, clock, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        alive=[True], serial=BOOT + TERMINAL_PANIC, timeout=30.0,
+    )
+
+    assert rc == 3
+    # Only the crash-settle pause, never a poll tick.
+    assert clock.now < lifecycle._WAIT_POLL_INTERVAL
+
+
+def test_wait_terminal_panic_detected_mid_wait(monkeypatch, capsys, tmp_path):
+    inst = _instance(tmp_path)
+    log = Path(inst.serial_log)
+    polls = 0
+
+    def alive(selected):
+        nonlocal polls
+        polls += 1
+        if polls == 2:
+            log.write_text(log.read_text() + TERMINAL_PANIC)
+        return True
+
+    rc, payload, _, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=alive, timeout=5.0, inst=inst,
+    )
+
+    assert rc == 3
+    assert payload["reason"] == "terminal_panic"
+    assert payload["elapsed"] == pytest.approx(0.5 + lifecycle._CRASH_SETTLE_INTERVAL)
+
+
+def test_wait_panic_before_a_reboot_is_not_terminal(monkeypatch, capsys, tmp_path):
+    rc, payload, _, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        alive=[True], serial=BOOT + TERMINAL_PANIC + BOOT + "login: \n",
+    )
+
+    assert rc == 124
+    assert payload["reason"] == "timeout"
+    assert payload["guest"] == "serving"
+    assert payload["crash"] is None
+
+
+def test_wait_survived_oops_is_not_terminal(monkeypatch, capsys, tmp_path):
+    rc, payload, _, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=[True], serial=BOOT + SURVIVED_OOPS,
+    )
+
+    assert rc == 124
+    assert payload["guest"] == "crashed"
+    assert payload["crash"] is None
+
+
+# ---------------------------------------------------------------------------
+# Guest-initiated reboot, observed through the boot banner
+# ---------------------------------------------------------------------------
+
+
+def test_wait_observes_a_reboot_and_persists_the_epoch_before_the_next_liveness_check(
+    monkeypatch, capsys, tmp_path
+):
+    inst = _instance(tmp_path)
+    log = Path(inst.serial_log)
+    calls = []
+    saved_offsets = []
+    checks = 0
+
+    def alive(selected):
+        nonlocal checks
+        checks += 1
+        calls.append(f"alive{checks}")
+        if checks == 1:
+            with log.open("a") as stream:
+                stream.write("[ 9.0] reboot: Restarting system\n" + BOOT)
+        return True
+
+    def save_epoch(record, offset):
+        calls.append("save_epoch")
+        saved_offsets.append(offset)
+        return replace(record, guest_epoch_serial_offset=offset)
+
+    monkeypatch.setattr(lifecycle, "save_guest_epoch_serial_offset", save_epoch)
+    rc, payload, _, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=alive, inst=inst, timeout=1.0,
+    )
+
+    assert rc == 124
+    assert payload["last_event"] == "RESET"
+    assert payload["event_data"]["source"] == "boot-banner"
+    expected = len(BOOT.encode()) + len("[ 9.0] reboot: Restarting system\n".encode())
+    assert saved_offsets == [expected]
+    assert calls.index("alive1") < calls.index("save_epoch") < calls.index("alive2")
+
+
+def test_wait_reboot_scopes_the_exit_crash_to_the_new_boot(
+    monkeypatch, capsys, tmp_path
+):
+    """panic=1 loop: the VM reboots past a panic and then exits; the report
+    belongs to the last boot, and a clean last boot reports none."""
+    inst = _instance(tmp_path)
+    log = Path(inst.serial_log)
+    checks = 0
+
+    def alive(selected):
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            log.write_text(BOOT + TERMINAL_PANIC + BOOT + "clean boot\n")
+            return True
+        return False
+
+    monkeypatch.setattr(
+        lifecycle, "save_guest_epoch_serial_offset",
+        lambda record, offset: replace(record, guest_epoch_serial_offset=offset),
+    )
+    rc, payload, _, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=alive, inst=inst, serial="",
+    )
+
+    assert rc == 0
+    assert payload["reason"] == "process_exited"
+    assert payload["last_event"] == "RESET"
+    assert payload["crash"] is None
+    assert payload["guest"] == "unknown"
+
+
+def test_wait_reset_persistence_failure_prevents_live_result(
+    monkeypatch, capsys, tmp_path
+):
+    inst = _instance(tmp_path)
+    log = Path(inst.serial_log)
+    checks = 0
+
+    def alive(selected):
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            log.write_text(log.read_text() + BOOT)
+        return True
+
+    monkeypatch.setattr(
+        lifecycle, "save_guest_epoch_serial_offset",
+        lambda record, offset: (_ for _ in ()).throw(OSError("metadata failed")),
+    )
+    rc, payload, _, _, clock, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=alive, inst=inst,
+    )
+
+    assert rc == 4
+    assert payload["ok"] is False
+    assert payload["error_type"] == "OSError"
+    assert "metadata failed" in payload["error"]
+    assert "stopped" not in payload
+    assert checks == 1
+    assert clock.now == 0
+
+
+# ---------------------------------------------------------------------------
+# Already stopped before the wait began (#28)
+# ---------------------------------------------------------------------------
+
+
+def _stopped_record(tmp_path, *, harness, serial, epoch=0):
+    """A real stopped instance record under the isolated cache dir."""
+    inst = replace(
+        _instance(tmp_path, harness=harness, epoch=epoch),
+        pid=0, pid_start=None,
+    )
+    Path(inst.serial_log).write_text(serial)
+    instance_mod.save_instance(inst)
+    monkeypatch_targets = (lifecycle, instance_mod)
+    return inst, monkeypatch_targets
+
+
+def _invoke_stopped_wait(monkeypatch, capsys, tmp_path, *, harness, serial,
+                         epoch=0, no_clean=False, fmt="json"):
+    inst, mods = _stopped_record(tmp_path, harness=harness, serial=serial, epoch=epoch)
+    for mod in mods:
+        monkeypatch.setattr(mod, "find_orphan_qemus", lambda: [], raising=False)
+    monkeypatch.setattr(lifecycle, "_kill_vm", lambda *a, **k: pytest.fail("kill"))
+    argv = ["wait", "--vm", "wait-vm", "--timeout", "5"]
+    if no_clean:
+        argv.append("--no-clean")
+    if fmt != "text":
+        argv.extend(["--format", fmt])
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out) if fmt != "text" else None
+    return rc, payload, captured, inst
+
+
+def test_wait_on_an_already_stopped_vm_is_a_finished_wait(
+    monkeypatch, capsys, tmp_path
+):
+    """A 3 s harness beats a two-call agent to the exit; the answer must not
+    depend on whether `wait` started a second earlier or later."""
+    rc, payload, _, _ = _invoke_stopped_wait(
+        monkeypatch, capsys, tmp_path, harness=False, serial=BOOT + "done\n",
+    )
+
+    assert rc == 0
+    assert payload["ok"] is True
+    assert payload["stopped"] is True
+    assert payload["reason"] == "already_stopped"
+    assert payload["guest"] == "unknown"
+    assert payload["crash"] is None
+    assert payload["cleaned"] is False
+    assert payload["elapsed"] == 0.0
+
+
+def test_wait_on_an_already_stopped_vm_reports_its_last_boot_crash(
+    monkeypatch, capsys, tmp_path
+):
+    old = BOOT + "[ 1.0] WARNING: CPU: old_warning\n[ 1.1] ---[ end trace 1 ]---\n"
+    rc, payload, captured, _ = _invoke_stopped_wait(
+        monkeypatch, capsys, tmp_path, harness=False,
+        serial=old + BOOT + TERMINAL_PANIC,
+    )
+
+    assert rc == 0
+    assert payload["reason"] == "already_stopped"
+    assert payload["guest"] == "panicked"
+    assert "sysrq triggered crash" in payload["crash"]
+    assert "old_warning" not in payload["crash"]
+
+
+@pytest.mark.parametrize("no_clean", [False, True])
+def test_wait_on_an_already_stopped_harness_vm_honours_auto_clean(
+    no_clean, monkeypatch, capsys, tmp_path
+):
+    rc, payload, _, inst = _invoke_stopped_wait(
+        monkeypatch, capsys, tmp_path, harness=True, serial=BOOT, no_clean=no_clean,
+    )
+
+    assert rc == 0
+    assert payload["reason"] == "already_stopped"
+    assert payload["cleaned"] is (not no_clean)
+    assert (instance_mod.load_instance("wait-vm") is None) is (not no_clean)
+
+
+def test_wait_on_an_already_stopped_vm_text(monkeypatch, capsys, tmp_path):
+    rc, _, captured, _ = _invoke_stopped_wait(
+        monkeypatch, capsys, tmp_path, harness=False, serial=BOOT, fmt="text",
+    )
+
+    assert rc == 0
+    assert "VM 'wait-vm' stopped (already_stopped" in captured.out
+    assert "not found" not in captured.out + captured.err
+
+
+def test_wait_without_explicit_vm_still_needs_a_running_vm(
+    monkeypatch, capsys, tmp_path
+):
+    """Implicit selection stays running-only: an old stopped VM must not
+    silently satisfy a new wait."""
+    _stopped_record(tmp_path, harness=False, serial=BOOT)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "find_orphan_qemus", lambda: [], raising=False)
+
+    rc = cli.main(["wait", "--timeout", "0", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["ok"] is False
+    assert "No running VMs" in payload["error"]

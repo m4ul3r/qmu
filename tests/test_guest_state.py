@@ -104,7 +104,7 @@ class FakeSSH:
     def pull(self, remote, local):
         self.trace.append(("ssh", "pull", remote, local))
 
-    def run(self, command, timeout=30.0, check=False):
+    def run(self, command, timeout=30.0, check=False, **kwargs):
         self.trace.append(("ssh", "run", command, timeout))
         return 0, "", ""
 
@@ -426,7 +426,7 @@ class _BreakpointSSH:
     def __init__(self):
         self.is_ready_calls = 0
 
-    def run(self, command, timeout=30.0, check=False):
+    def run(self, command, timeout=30.0, check=False, **kwargs):
         raise SSHError(f"SSH command timed out after {timeout}s: {command}")
 
     def is_ready(self, timeout=2):
@@ -505,7 +505,7 @@ class LostSSH:
         self.runs: list[str] = []
         self.is_ready_calls = 0
 
-    def run(self, command, timeout=30.0, check=False):
+    def run(self, command, timeout=30.0, check=False, **kwargs):
         self.runs.append(command)
         if self._append:
             with self._serial_path.open("a") as stream:
@@ -595,11 +595,11 @@ def test_dmesg_nonzero_in_a_healthy_guest_is_still_exit1(dmesg_ssh, capsys):
               ready=True)
 
     rc = cli.main(["dmesg", "--vm", "state-vm"])
-    text = capsys.readouterr().out
+    captured = capsys.readouterr()
 
     assert rc == 1
-    assert "[dmesg failed, exit 1] dmesg: read kernel buffer failed" in text
-    assert "SSH connection lost" not in text
+    assert "[dmesg failed, exit 1] dmesg: read kernel buffer failed" in captured.err
+    assert "SSH connection lost" not in captured.out + captured.err
 
 
 def test_dmesg_guest_exit255_on_a_live_guest_is_not_a_crash(dmesg_ssh, capsys):
@@ -612,7 +612,7 @@ def test_dmesg_guest_exit255_on_a_live_guest_is_not_a_crash(dmesg_ssh, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert rc == 1
     assert fake.is_ready_calls >= 1
-    assert set(payload) == {"ok", "exit_code", "text", "stderr"}
+    assert set(payload) == {"ok", "exit_code", "text", "stderr", "vm_id"}
     assert payload["exit_code"] == 255
 
 
@@ -623,7 +623,7 @@ def test_dmesg_success_envelope_is_unchanged(dmesg_ssh, capsys):
 
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
-    assert set(payload) == {"ok", "exit_code", "text", "stderr"}
+    assert set(payload) == {"ok", "exit_code", "text", "stderr", "vm_id"}
     assert payload["ok"] is True
 
 
@@ -677,7 +677,7 @@ def test_compile_run_transport_loss_names_the_same_follow_up_as_exec(
         def push(self, local, remote):
             pass
 
-        def run(self, command, timeout=30.0, check=False):
+        def run(self, command, timeout=30.0, check=False, **kwargs):
             if not self._compiled:
                 self._compiled = True
                 return 0, "", ""

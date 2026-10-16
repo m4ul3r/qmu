@@ -52,6 +52,25 @@ built by `qmu-linux-rootfs`, and Debian cloud images like `trixie.img`, are
 whole-disk ext4 — they need `--partition 0`. If you get it wrong, the error
 names the partitions guestfish actually found.
 
+## Config layering and schema
+
+Resolution order, later wins: built-in defaults (arch=x86_64, memory=4G,
+cpus=2) → global `~/.config/qmu/config.toml` → project `qmu.toml` found by
+walking up from CWD (or `--config PATH`) → CLI flags. `--config` is
+registered only on `launch`, `run`, `status`/`show`, `list`, `log`, `crash`,
+`doctor` and `config show`; elsewhere it is an argparse error (exit 2).
+
+TOML settings are table-scoped. The accepted schema is:
+
+- `[boot]`: `kernel`, `initrd`, `cmdline`, `profile`
+- `[machine]`: `arch`, `memory`, `cpus`, `cpu`, `nic_model`, `net_backend`, `accel`, `extra_args`
+- `[drive]`: `rootfs`, `format`
+- `[ssh]`: `key`, `user`, `port_start`
+- `[gdb]`: `port_start`
+- `[profiles.<name>]`: `cmdline`; `[profiles] name = "..."` is also accepted
+
+`qmu config init` writes `[boot]` (`kernel` live as the first `# CHANGE ME`; `initrd`/`profile`/`cmdline` commented), `[machine]` (arch/memory/cpus, with commented `cpu`/`accel`/`nic_model`/`net_backend`/`extra_args`), `[drive]` (rootfs/format — rootfs is the second `# CHANGE ME`), `[ssh]` (key — the third `# CHANGE ME` — and user, with commented `port_start`), `[gdb]` (commented `port_start`), three `[profiles.*]` blocks, and a commented harness-mode block. It refuses to overwrite an existing file (`created: false`, exit 0). `[ssh] user` (default `root`) is recorded on the VM at launch, so set it **before** `qmu launch`; SSH/GDB ports start at `10021`/`1234` (`port_start` overrides); `arch` picks the `qemu-system-*` binary and whether KVM is enabled (guest arch == host only), with `extra_args` for machine flags (e.g. aarch64 `-M virt -cpu cortex-a57`); path values accept `~`. Per-user defaults belong in the global file; the starter's uncommented `[ssh] key` overrides it.
+
 ## Config validation rules
 
 Every loaded global, project, or explicit `--config` file is validated before
@@ -65,12 +84,16 @@ required: another layer or CLI flags may provide their values, and harness mode
 intentionally runs without them.
 
 An invalid **global** config (`~/.config/qmu/config.toml`) is non-fatal: qmu
-prints a one-line `[qmu] Warning:` naming the file and continues from built-in
-defaults and any valid project/CLI layers. `qmu doctor` then reports it as a
-`[~] global config` row naming the file and the parse error — it does not say
-"no config found", and `qmu config init` will not clear it, because that writes
-a *project* file. An invalid **project** (`qmu.toml`) or explicit `--config`
-file is fatal (exit 1) with the source path and offending key.
+prints `[qmu] Warning: ignoring global config: …` naming the file and every
+problem, and continues from built-in defaults and any valid project/CLI
+layers. `qmu doctor` then reports it as a `[!] global config` row — it does
+not say "no config found", and `qmu config init` will not clear it, because
+that writes a *project* file. An invalid **project** (`qmu.toml`) or explicit
+`--config` file is fatal: exit 1, `error_type: "ConfigError"`. **All schema
+problems of a file are reported in one run**: text prints one `Invalid config
+<path>: key '…': …` line per problem and the recovery paragraph last; JSON
+adds `source`, `key`, `hint` (first problem) and `errors: [{source, key,
+message, hint}]`.
 
 Every subcommand validates the project/explicit layer before it runs —
 including `kill`, `prune`, `crash`, `log` and `wait`, which answer from
@@ -92,8 +115,19 @@ source that set it.
 
 The starter `qmu.toml` writes an **uncommented** `[ssh] key = "~/.ssh/qmu_id_rsa"`,
 which overrides a global `~/.config/qmu/config.toml` key; comment it out if
-the per-user global is the one you mean. `qmu config show` prints the resolved
-values but not `nic_model`/`net_backend`/`accel`.
+the per-user global is the one you mean.
+
+## `config show`
+
+Text: a `Layers:` line (`built-in defaults -> global <path> -> project
+<path>`), then one row per setting ending with its layer tag `[built-in |
+global <path> | project <path> | --config <path> | flag]`; path rows show
+`<as written> -> <resolved>` and `(not found)`; `Accel:`, `NIC model:`, `Net
+backend:`, `Extra args:` are always present; profiles one per line with their
+layer. JSON: `boot`, `machine` (`arch`, `memory`, `cpus`, `cpu`, `nic_model`,
+`net_backend`, `accel`, `extra_args`), `drive`, `ssh`, `gdb`, `profiles`,
+`sources` (`{dotted key: layer}`), `layers` (ordered list), `paths` (resolved
+`boot.kernel`, `boot.initrd`, `drive.rootfs`, `ssh.key`).
 
 ## Auto-selection, precisely
 
@@ -130,21 +164,36 @@ centralized spill root, in precedence order: `$QMU_TEMP_DIR/spills`, then
 `$XDG_RUNTIME_DIR/qmu/spills` when that XDG runtime directory is
 absolute/existing/writable/searchable, then `<platform temp>/qmu/spills`.
 Automatic spills are marked with an adjacent ownership sidecar; explicit
-`--out` paths are never marked as qmu-owned. **Callers must continue consuming
-`artifact_path`** — never reconstruct spill names or paths. Read the path from
-the result envelope's `artifact_path` field or the `[qmu] Output spilled to
-<path>` stderr line; under `--format text` the pointer envelope itself is
-printed as JSON on stdout. The envelope's `{"token_estimate": <int>,
-"estimator": "chars/4"}` is a tokenizer-agnostic heuristic for sizing only.
+`--out` paths are never marked as qmu-owned. **Callers must consume the
+printed path** — never reconstruct spill names. Under `--format text` stdout
+is `[qmu] Output spilled to <path> (~N tokens)` followed by the first 40
+lines of the text; under json/ndjson (and with `--out`, in every format) a
+pointer envelope with `artifact_path` replaces the result. The same `[qmu]
+Output spilled to <path>` line goes to stderr in every mode. The envelope's
+`{"token_estimate": <int>, "estimator": "chars/4"}` is a tokenizer-agnostic
+heuristic for sizing only. Shapes: `output-contract.md`.
 
 ## `doctor` rows
 
-`qmu doctor` reports: config sources, QEMU binary, rootfs image, SSH key and
-its permissions (separate rows), KVM, pry, libguestfs, running VMs, and the
-installed skill links. Exits 1 when a gating row is `[!]` or no config is found
-(it prints a `qmu config init` tip). `pry` is informational (only required for
-`qmu gdb`).
-`doctor` also has a `kernel` row — the resolved `[boot] kernel` must exist and
-be a regular file (`[+]`), a missing one is gating (`[!]`), and an unconfigured
-one is an informational `[~]` since `--kernel`/`--harness` launches still work.
-It does not check cross toolchains or `gdb-multiarch`.
+Glyphs: `[+]` ok · `[!]` gating failure (drives exit 1) · `[~]` non-blocking
+warning · `[i]` informational. JSON rows are `{check, status: ok|fail|warn|
+info, detail, blocking: bool}` and `ok` ⇔ no `fail` row. `doctor` exits 1
+only when a `[!]` row is present; a missing config is `[~] config: No
+qmu.toml or <global path> found. Run: qmu config init` with exit 0 (the
+`Tip: run qmu config init` line appears only when no project/`--config`
+layer loaded).
+
+| Row | Verdict |
+|---|---|
+| `config` | `[+]` layers that applied; `[~]` none found / every file rejected |
+| `global config` | `[!]` when `~/.config/qmu/config.toml` exists but is invalid (it was skipped; `qmu config init` writes a *project* file and will not clear it) |
+| `kernel` | `[+]` regular file; `[!]` configured but missing — `<as written> (not found) — resolves to <abs> [<layer>]`, `CHANGE ME placeholder;` when the starter literal is unedited; `[~]` not configured (`--kernel`/`--harness` launches still work) |
+| `rootfs image`, `SSH key` | `[!]` missing/unconfigured only when `[boot] kernel` is set and the boot is not harness-shaped (`initrd` set, no `rootfs`); otherwise `[~] … not needed for --harness boots` |
+| `SSH key permissions` | `[~]` when not `0600` |
+| `qemu-system-<arch>`, `KVM` | `[!]` binary missing / `accel=kvm` without `/dev/kvm`; `[i]` disabled by `accel=tcg` |
+| `cross compiler for <arch> (compile --host)`, `gdb-multiarch` | only when `[machine] arch` ≠ host arch; `[~]` when missing, naming `apt install gcc-<triple>` / `apt install gdb-multiarch` |
+| `libguestfs` | `[~]` with the appliance fix (above) |
+| `pry`, `passt`, `running VMs`, `cache`, `skills` | `[i]`/`[+]`, never gating |
+
+`doctor` does not check `[boot] initrd` existence or whether a cached
+mkrootfs image predates the key-only sshd policy (`guest-commands.md`).

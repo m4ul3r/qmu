@@ -85,6 +85,15 @@ class MkrootfsEnv:
                 echo "docker $*" >>"$CALL_LOG"
                 case "${{1:-}}" in
                   build)
+                    # Keep what the build would have consumed: the Dockerfile
+                    # arrives on stdin (-f -), the context dir is the last arg.
+                    cat >"$STATE/dockerfile"
+                    ctx="${{@: -1}}"
+                    for f in qmu-guest-setup.sh qmu-export-fixup.sh; do
+                      if [[ -f "$ctx/$f" ]]; then
+                        cp "$ctx/$f" "$STATE/context-$f"
+                      fi
+                    done
                     # Real `docker build -q` writes the image id to stdout.
                     echo "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
                     exit 0
@@ -790,4 +799,260 @@ def test_missing_generated_pubkey_beside_an_existing_private_key_is_fatal(
     assert "ssh-keygen -y -f" in again.stderr
     assert "different SSH key" not in again.stderr
     assert again.stdout == ""
+    assert not _built(mkrootfs_env)
+
+
+# ---------------------------------------------------------------------------
+# sshd policy: root is key-only (cross-arch audit P0 contributing cause)
+# ---------------------------------------------------------------------------
+
+
+def _emit_guest_setup(mkrootfs_env: MkrootfsEnv) -> Path:
+    dest = mkrootfs_env.tmp_path / "guest-setup.sh"
+    result = mkrootfs_env.run_args("--emit-guest-setup", str(dest))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "", "emit must keep stdout eval-clean"
+    assert "docker" not in mkrootfs_env.calls.read_text()
+    return dest
+
+
+def _run_guest_setup(
+    setup: Path, root: Path, *, pubkey: str = "ssh-ed25519 AAAA test@qmu"
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update({
+        "QMU_GUEST_ROOT": str(root),
+        "PUBKEY": pubkey,
+        "ROOT_DEV": "/dev/vda",
+        "QMU_RELEASE": "bookworm",
+        "QMU_ARCH": "arm64",
+        "QMU_HOSTNAME": "qmu-rootfs",
+    })
+    return subprocess.run(
+        ["sh", str(setup)], env=env, text=True, capture_output=True, check=False
+    )
+
+
+def test_guest_setup_makes_root_ssh_key_only(mkrootfs_env: MkrootfsEnv):
+    """The image used to ship `passwd -d root` + PermitEmptyPasswords yes, so
+    sshd authenticated ANY key as root and a port mix-up silently ran commands
+    on the wrong VM. The generated config must authorize exactly one key and
+    refuse every password path, in the drop-in that sshd reads first."""
+    setup = _emit_guest_setup(mkrootfs_env)
+    root = mkrootfs_env.tmp_path / "guest-root"
+    (root / "etc" / "ssh").mkdir(parents=True)
+    # The package's sshd_config as the OLD script left it: both relaxations
+    # live, and no Include line, so the drop-in alone would be ignored.
+    (root / "etc" / "ssh" / "sshd_config").write_text(
+        "PermitRootLogin yes\nPermitEmptyPasswords yes\n"
+    )
+
+    result = _run_guest_setup(setup, root)
+    assert result.returncode == 0, result.stderr
+
+    dropin = (root / "etc/ssh/sshd_config.d/60-qmu.conf").read_text()
+    directives = {
+        line.split()[0]: line.split()[1]
+        for line in dropin.splitlines()
+        if line and not line.startswith("#")
+    }
+    assert directives == {
+        "PermitRootLogin": "prohibit-password",
+        "PubkeyAuthentication": "yes",
+        "PasswordAuthentication": "no",
+        "KbdInteractiveAuthentication": "no",
+        "PermitEmptyPasswords": "no",
+    }
+    # First match wins in sshd, so the Include must be the FIRST line.
+    main = (root / "etc/ssh/sshd_config").read_text().splitlines()
+    assert main[0] == "Include /etc/ssh/sshd_config.d/*.conf"
+
+    auth = root / "root/.ssh/authorized_keys"
+    assert auth.read_text() == "ssh-ed25519 AAAA test@qmu\n"
+    assert stat.S_IMODE(auth.stat().st_mode) == 0o600
+    assert stat.S_IMODE(auth.parent.stat().st_mode) == 0o700
+
+    # The offline run must not touch the live system.
+    assert "passwd" not in result.stderr
+
+
+def test_guest_setup_keeps_console_autologin_and_records_policy(mkrootfs_env: MkrootfsEnv):
+    setup = _emit_guest_setup(mkrootfs_env)
+    root = mkrootfs_env.tmp_path / "guest-root"
+    root.mkdir()
+
+    result = _run_guest_setup(setup, root)
+    assert result.returncode == 0, result.stderr
+
+    autologin = (root / "etc/systemd/system/serial-getty@.service.d/autologin.conf").read_text()
+    assert "--autologin root" in autologin
+    # /etc/hostname is bind-mounted during RUN and so cannot be written here;
+    # the export fixup owns it (see test_export_fixup_*). The stamp records
+    # the value the fixup will write.
+    assert not (root / "etc/hostname").exists()
+    assert (root / "etc/fstab").read_text() == "/dev/vda / ext4 defaults 0 1\n"
+    # A fresh sshd_config is created when the package has none, Include first.
+    assert (root / "etc/ssh/sshd_config").read_text().startswith("Include /etc/ssh/sshd_config.d/")
+
+    import json
+    record = json.loads((root / "etc/qmu-rootfs.json").read_text())
+    assert record["sshd_policy"] == "key-only"
+    assert record["root_password"] == "locked"
+    assert (record["release"], record["arch"]) == ("bookworm", "arm64")
+    assert record["ssh_pubkey_sha256"] == hashlib.sha256(
+        b"ssh-ed25519 AAAA test@qmu\n"
+    ).hexdigest()
+    assert record["hostname"] == "qmu-rootfs"
+    assert record["console"] == "serial-autologin-root"
+
+
+def test_guest_setup_refuses_to_run_without_a_key(mkrootfs_env: MkrootfsEnv):
+    """An empty PUBKEY would produce an image nobody can log in to -- or, with
+    the old relaxations, one everybody can. Fail the build instead."""
+    setup = _emit_guest_setup(mkrootfs_env)
+    root = mkrootfs_env.tmp_path / "guest-root"
+    root.mkdir()
+    env = os.environ.copy()
+    env.update({"QMU_GUEST_ROOT": str(root), "ROOT_DEV": "/dev/sda"})
+    env.pop("PUBKEY", None)
+    result = subprocess.run(["sh", str(setup)], env=env, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert "PUBKEY" in result.stderr
+    assert not (root / "etc").exists()
+
+
+def test_dockerfile_runs_the_generated_guest_setup_and_nothing_permissive(
+    mkrootfs_env: MkrootfsEnv,
+):
+    result = mkrootfs_env.run_args()
+    assert result.returncode == 0, result.stderr
+    # Build args carry what the setup script records.
+    calls = mkrootfs_env.calls.read_text()
+    assert "--build-arg ARCH=x86_64" in calls
+    assert "--build-arg GUEST_SETUP=qmu-guest-setup.sh" in calls
+    state = mkrootfs_env.tmp_path / "docker-state"
+    dockerfile = (state / "dockerfile").read_text()
+    assert "COPY ${GUEST_SETUP} /tmp/qmu-guest-setup.sh" in dockerfile
+    assert "sh /tmp/qmu-guest-setup.sh" in dockerfile
+    for relaxation in ("passwd -d root", "PermitRootLogin yes", "PermitEmptyPasswords yes"):
+        assert relaxation not in dockerfile, relaxation
+    # The script the build consumed is the one --emit-guest-setup shows.
+    shipped = (state / "context-qmu-guest-setup.sh").read_text()
+    emitted = _emit_guest_setup(mkrootfs_env).read_text()
+    assert shipped == emitted
+    assert "PermitEmptyPasswords no" in shipped
+
+
+def test_export_fixup_strips_container_markers_and_sets_hostname(
+    mkrootfs_env: MkrootfsEnv,
+):
+    """`docker export` ships /.dockerenv (bind-mounted during RUN, so no
+    Dockerfile step can remove it). On the booted VM systemd-detect-virt then
+    says "docker", the getty generator takes the container branch, ttyS0 goes
+    to console-getty.service and serial-getty@ttyS0 -- the unit the autologin
+    drop-in targets -- never exists: the serial console shows `login:` against
+    a locked root password. /etc/hostname exports as the 0-byte bind file, so
+    the guest is `localhost`. Both are fixed on the extracted tree, before
+    mke2fs; this runs the script the build consumed against a scratch tree."""
+    result = mkrootfs_env.run_args()
+    assert result.returncode == 0, result.stderr
+    state = mkrootfs_env.tmp_path / "docker-state"
+    fixup = state / "context-qmu-export-fixup.sh"
+    assert fixup.is_file(), "the export fixup must be shipped in the build context"
+
+    root = mkrootfs_env.tmp_path / "exported-root"
+    (root / "etc").mkdir(parents=True)
+    (root / "run").mkdir()
+    (root / ".dockerenv").write_bytes(b"")
+    (root / "run/.containerenv").write_bytes(b"")
+    (root / "etc/hostname").write_bytes(b"")  # what docker export ships
+    (root / "etc/hosts").write_bytes(b"")
+    run = subprocess.run(["sh", str(fixup), str(root)], text=True, capture_output=True)
+    assert run.returncode == 0, run.stderr
+    assert not (root / ".dockerenv").exists()
+    assert not (root / "run/.containerenv").exists()
+    assert (root / "etc/hostname").read_text() == "qmu-rootfs\n"
+    hosts = (root / "etc/hosts").read_text()
+    assert "127.0.1.1 qmu-rootfs\n" in hosts
+    assert "127.0.0.1 localhost\n" in hosts
+
+    # A tree that is not an extracted rootfs is refused, not "fixed".
+    bogus = mkrootfs_env.tmp_path / "not-a-rootfs"
+    bogus.mkdir()
+    run = subprocess.run(["sh", str(fixup), str(bogus)], text=True, capture_output=True)
+    assert run.returncode != 0
+
+
+def test_export_fixup_runs_before_mke2fs_on_both_image_paths(mkrootfs_env: MkrootfsEnv):
+    """The helper-container path and the sudo fallback each extract the tarball
+    themselves, so each must run the fixup, between tar -x and mke2fs. The
+    shim's helper `docker run` always fails, so one run exercises both."""
+    result, _scratch, calls = mkrootfs_env.run()
+    assert result.returncode == 0, result.stderr
+    log = calls.read_text()
+
+    # `docker $*` logs the bash -c script with its newlines, so the helper
+    # invocation spans from "docker run " to the next "docker " line.
+    helper = re.search(r"^docker run .*?(?=^docker |\Z)", log, re.M | re.S).group(0)
+    assert re.search(r"-v \S+:/qmu-ctx:ro", helper), helper
+    tar_i = helper.index("tar -x -C /rootfs")
+    fixup_i = helper.index("sh /qmu-ctx/qmu-export-fixup.sh /rootfs")
+    mke2fs_i = helper.index("mke2fs ")
+    assert tar_i < fixup_i < mke2fs_i, helper
+
+    lines = log.splitlines()
+    sudo_tar = next(i for i, l in enumerate(lines) if l.startswith("sudo tar "))
+    sudo_fixup = next(i for i, l in enumerate(lines) if re.match(r"sudo sh \S+/qmu-export-fixup\.sh ", l))
+    sudo_mke2fs = next(i for i, l in enumerate(lines) if l.startswith("sudo mke2fs "))
+    assert sudo_tar < sudo_fixup < sudo_mke2fs, lines
+
+    # And console-login readiness is part of the build digest, so an image
+    # exported before it existed (shipping /.dockerenv, no console login) is
+    # rebuilt.
+    source = MKROOTFS.read_text()
+    assert re.search(r'^CONSOLE_LOGIN_REV="\S+"$', source, re.M)
+    assert 'echo "console_login=$CONSOLE_LOGIN_REV"' in source
+    # serial-getty@ttyS0 BindsTo=dev-ttyS0.device, which only udev activates.
+    dockerfile = (mkrootfs_env.tmp_path / "docker-state" / "dockerfile").read_text()
+    assert re.search(r"apt-get install .*\budev\b", dockerfile, re.S), dockerfile
+
+
+def test_stamp_records_sshd_policy_and_pre_policy_images_are_rebuilt(
+    mkrootfs_env: MkrootfsEnv,
+):
+    """A cached image from before the key-only policy carries the old build
+    key and no sshd_policy line. It must be named for what it is and rebuilt,
+    never served as hardened -- its sshd still accepts any key."""
+    first = mkrootfs_env.run_args()
+    assert first.returncode == 0, first.stderr
+    stamp = Path(_rootfs_path(first)).with_name(".mkrootfs-stamp")
+    text = stamp.read_text()
+    assert "sshd_policy=key-only" in text
+
+    # Forge the stamp an older mkrootfs.sh wrote: a different digest (the
+    # policy was not part of it) and no sshd_policy line.
+    old = re.sub(r"^build_key=.*$", "build_key=" + "0" * 64, text, flags=re.M)
+    old = re.sub(r"^sshd_policy=.*\n", "", old, flags=re.M)
+    stamp.write_text(old)
+
+    again = mkrootfs_env.run_args()
+    assert again.returncode == 0, again.stderr
+    assert "predates the key-only sshd policy" in again.stderr
+    assert "accepted root with ANY key" in again.stderr
+    assert _built(mkrootfs_env), "a pre-policy image must be rebuilt, not served"
+    assert "sshd_policy=key-only" in stamp.read_text()
+
+    third = mkrootfs_env.run_args()
+    assert third.returncode == 0, third.stderr
+    assert not _built(mkrootfs_env), "the rebuilt image is a plain cache hit"
+
+
+def test_legacy_unstamped_note_warns_about_permissive_sshd(mkrootfs_env: MkrootfsEnv):
+    legacy = mkrootfs_env.rootfs_cache / "x86_64"
+    legacy.mkdir(parents=True)
+    (legacy / "rootfs.img").write_bytes(b"")
+    result = mkrootfs_env.run_args()
+    assert result.returncode == 0, result.stderr
+    assert "accepts root with ANY key" in result.stderr
+    assert "--no-cache" in result.stderr
     assert not _built(mkrootfs_env)

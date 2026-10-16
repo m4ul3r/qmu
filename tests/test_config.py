@@ -615,3 +615,197 @@ def test_later_layer_replaces_path_provenance(isolate_config, monkeypatch):
 
     assert cfg.kernel == str(project.resolve() / "p-bzImage")
     assert cfg._path_sources["kernel"].startswith("project: ")
+
+
+# ---------------------------------------------------------------------------
+# One validation pass reports EVERY problem. Stopping at the first key sent a
+# three-typo file through three fix-and-rerun round trips.
+# ---------------------------------------------------------------------------
+
+
+_THREE_PROBLEMS = (
+    'ssh_key = "/tmp/k"\n'
+    'rootfs = "/tmp/r"\n'
+    '[machine]\nmemroy = "8G"\n'
+)
+
+
+def test_validation_collects_every_problem_in_one_pass(isolate_config):
+    path = _write_toml(isolate_config / "three.toml", _THREE_PROBLEMS)
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_config(config_path_override=path)
+    error = excinfo.value
+
+    # The error's own fields are the FIRST problem, unchanged.
+    assert error.key_path == "ssh_key"
+    assert error.problem == "unknown top-level key"
+    assert [p.key_path for p in error.problems()] == [
+        "ssh_key", "rootfs", "machine.memroy",
+    ]
+    assert error.more[1].hint == "did you mean 'memory'?"
+
+    lines = str(error).splitlines()
+    # First line byte-identical to the single-problem rendering; one line per
+    # further problem; recovery paragraph last.
+    assert lines[0] == (
+        f"Invalid config {path.resolve()}: key 'ssh_key': unknown top-level "
+        "key; the keys of '[ssh_key]' belong in '[ssh] key'"
+    )
+    assert lines[1] == (
+        f"Invalid config {path.resolve()}: key 'rootfs': unknown top-level "
+        "key; the keys of '[rootfs]' belong in '[drive] rootfs'"
+    )
+    assert lines[2] == (
+        f"Invalid config {path.resolve()}: key 'machine.memroy': unknown key; "
+        "did you mean 'memory'?"
+    )
+    assert lines[3].startswith("This file is validated before every")
+    assert len(lines) == 4
+
+
+def test_single_problem_rendering_is_unchanged(isolate_config):
+    path = _write_toml(isolate_config / "one.toml", '[machine]\nmemroy = "8G"\n')
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_config(config_path_override=path)
+    error = excinfo.value
+    assert error.more == ()
+    assert str(error).splitlines()[0] == (
+        f"Invalid config {path.resolve()}: key 'machine.memroy': unknown key; "
+        "did you mean 'memory'?"
+    )
+
+
+def test_value_type_problems_collect_alongside_unknown_keys(isolate_config):
+    path = _write_toml(
+        isolate_config / "types.toml",
+        '[machine]\ncpus = "two"\nnet_backend = "slirp"\nextra_args = [1]\n'
+        '[profiles.x]\nbogus = 1\n',
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_config(config_path_override=path)
+    problems = {p.key_path: p.problem for p in excinfo.value.problems()}
+    assert problems == {
+        "machine.cpus": "expected integer, got string",
+        "machine.net_backend": "expected one of: user, passt",
+        "machine.extra_args[0]": "expected string, got integer",
+        "profiles.x.bogus": "unknown key",
+    }
+
+
+def test_envelope_fields_carry_every_problem(isolate_config):
+    path = _write_toml(isolate_config / "three.toml", _THREE_PROBLEMS)
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_config(config_path_override=path)
+    fields = excinfo.value.envelope_fields()
+
+    assert fields["source"] == str(path.resolve())
+    assert fields["key"] == "ssh_key"
+    assert fields["hint"] == "the keys of '[ssh_key]' belong in '[ssh] key'"
+    assert fields["errors"] == [
+        {
+            "source": str(path.resolve()), "key": "ssh_key",
+            "message": "unknown top-level key",
+            "hint": "the keys of '[ssh_key]' belong in '[ssh] key'",
+        },
+        {
+            "source": str(path.resolve()), "key": "rootfs",
+            "message": "unknown top-level key",
+            "hint": "the keys of '[rootfs]' belong in '[drive] rootfs'",
+        },
+        {
+            "source": str(path.resolve()), "key": "machine.memroy",
+            "message": "unknown key", "hint": "did you mean 'memory'?",
+        },
+    ]
+
+
+def test_rejected_global_records_every_problem(isolate_config):
+    _global_config(isolate_config, _THREE_PROBLEMS)
+    cfg = resolve_config()
+    problem = cfg._skipped_sources[0]["problem"]
+    assert "key 'ssh_key'" in problem
+    assert " | key 'rootfs'" in problem
+    assert " | key 'machine.memroy'" in problem
+
+
+# ---------------------------------------------------------------------------
+# Per-key provenance for EVERY field, not only the path-typed ones: a starter
+# qmu.toml's uncommented `[ssh] key` silently shadowed a global one and no
+# surface could say so.
+# ---------------------------------------------------------------------------
+
+
+def test_source_layers_name_the_layer_that_set_each_key(isolate_config, monkeypatch):
+    gpath = _global_config(
+        isolate_config,
+        '[machine]\nmemory = "8G"\n[ssh]\nkey = "~/.ssh/global_key"\n'
+        '[profiles.mine]\ncmdline = "console=ttyS0"\n',
+    )
+    project = isolate_config / "proj"
+    project.mkdir()
+    ppath = _write_toml(
+        project / CONFIG_FILENAME,
+        '[boot]\nkernel = "./bzImage"\n[ssh]\nkey = "~/.ssh/project_key"\n'
+        '[machine]\nnic_model = "e1000"\n',
+    )
+    monkeypatch.chdir(project)
+
+    cfg = resolve_config(cli_overrides={"memory": "1G", "cpus": None})
+    layers = cfg.source_layers()
+
+    assert layers["boot.kernel"] == f"project {ppath.resolve()}"
+    assert layers["ssh.key"] == f"project {ppath.resolve()}"
+    assert layers["machine.memory"] == "flag"
+    assert layers["machine.nic_model"] == f"project {ppath.resolve()}"
+    assert layers["machine.cpus"] == "built-in"
+    assert layers["machine.accel"] == "built-in"
+    assert layers["profiles.mine"] == f"global {gpath.resolve()}"
+    assert layers["profiles.exploit-dev"] == "built-in"
+    assert set(layers) >= {
+        "boot.kernel", "boot.initrd", "boot.cmdline", "boot.profile",
+        "machine.arch", "machine.memory", "machine.cpus", "machine.cpu",
+        "machine.nic_model", "machine.net_backend", "machine.accel",
+        "machine.extra_args", "drive.rootfs", "drive.format", "ssh.key",
+        "ssh.user", "ssh.port_start", "gdb.port_start",
+    }
+
+
+def test_explicit_config_layer_is_labelled_as_the_flag(isolate_config):
+    explicit = _write_toml(isolate_config / "explicit.toml", '[machine]\narch = "aarch64"\n')
+    cfg = resolve_config(config_path_override=explicit)
+    assert cfg.source_layer("arch") == f"--config {explicit.resolve()}"
+
+
+def test_written_path_keeps_the_value_as_typed(isolate_config, monkeypatch):
+    project = isolate_config / "proj"
+    project.mkdir()
+    _write_toml(project / CONFIG_FILENAME, '[boot]\nkernel = "./bzImage"\n')
+    monkeypatch.chdir(project)
+
+    cfg = resolve_config()
+    assert cfg.kernel == str(project.resolve() / "bzImage")
+    assert cfg.written_path("kernel") == "./bzImage"
+    assert cfg.written_path("rootfs") is None
+
+    cfg = resolve_config(cli_overrides={"kernel": "./flag-bzImage"})
+    assert cfg.written_path("kernel") == "./flag-bzImage"
+
+
+# ---------------------------------------------------------------------------
+# The starter file: every `# CHANGE ME` line is live, so editing the value
+# is enough — the kernel line used to be commented out, and `doctor` stayed
+# green while `launch` failed on it.
+# ---------------------------------------------------------------------------
+
+
+def test_starter_config_change_me_lines_are_all_live():
+    text = config_module.render_starter_config("x86_64")
+    live = [line for line in text.splitlines() if "CHANGE ME" in line and not line.startswith("#")]
+    assert [line.split("=")[0].strip() for line in live] == ["kernel", "rootfs", "key"]
+
+    parsed = tomllib.loads(text)
+    assert parsed["boot"]["kernel"] == "./bzImage"
+    assert parsed["drive"]["rootfs"] == "./rootfs.img"
+    assert parsed["ssh"]["key"] == "~/.ssh/qmu_id_rsa"
+    # Still a schema-valid file as shipped.
+    config_module._validate_toml(parsed, config_module.Path("qmu.toml"))

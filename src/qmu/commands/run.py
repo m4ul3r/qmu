@@ -10,7 +10,8 @@ contract with no new codes:
     1    guest command exited non-zero, or the VM died before SSH came up
     3    kernel crash / SSH transport loss (same discrimination as ``exec``)
     4    QMP/SSH infrastructure failure (raised, mapped by ``cli.main``)
-    124  the guest never became reachable within ``--ssh-timeout``
+    124  the guest never became reachable within ``--ssh-timeout``, or the
+         command outlived ``--timeout`` on a guest that still answers
 
 **Dependency direction.** This module is a leaf: ``cli`` imports it, and nothing
 imports it. It is the one place that imports sibling command modules, and it does
@@ -47,12 +48,38 @@ from ..vm import launch_vm
 from .._cliutil import (
     _add_common_opts,
     _add_launch_opts,
-    _emit,
     _kill_vm,
     _make_ssh,
 )
-from .guest import _join_exec_command, _run_guest_command
+from .guest import (
+    GUEST_COMMAND_HELP,
+    _emit_guest_result,
+    _join_exec_command,
+    _run_guest_command,
+)
 from .lifecycle import _prepare_boot
+
+
+class _NoHarnessAction(argparse.Action):
+    """Reject `--harness` / `--no-wait-ssh` with the reason, not "unrecognized".
+
+    `run` executes a guest command over SSH, so a mode that guarantees no SSH
+    cannot run one. Leaving the flags unregistered made the attempt a generic
+    top-level usage error that pointed nowhere; this is still exit 2 (a usage
+    error, rendered by the same `_UsageError` path), but it names the
+    sequence that does what the caller wanted.
+    """
+
+    def __init__(self, option_strings, dest, **kwargs):
+        kwargs["nargs"] = 0
+        kwargs["help"] = argparse.SUPPRESS
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            f"{option_string} is not accepted: run executes a guest command "
+            "over SSH; for boot-and-die kernels use launch --harness + wait + crash"
+        )
 
 
 def _add_run(sub: argparse._SubParsersAction) -> None:
@@ -62,17 +89,26 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
         description=(
             "Boot a throwaway VM, run COMMAND in the guest, and stop the VM. "
             "The exit code is the guest command's (0/1), or 3 on a kernel "
-            "crash, or 124 if the guest never became reachable. State is "
-            "preserved (not reaped) whenever there is something left to inspect."
+            "crash, or 124 if the guest never became reachable (or COMMAND "
+            "outlived --timeout). State is preserved (not reaped) whenever "
+            "there is something left to inspect. qmu flags may appear before "
+            "or after COMMAND; quote the guest command, or put -- before it, "
+            "when it has its own dash-words (`qmu run --name x -- uname -a`). "
+            "Text-mode stdout is the guest's stdout only, exactly as "
+            "`qmu exec` prints it. Boot-and-die kernels have no SSH: use "
+            "launch --harness + wait + crash instead."
         ),
     )
     _add_launch_opts(p, run_mode=True)
-    p.add_argument("command", nargs="+", help="Command to run in the guest")
+    p.add_argument("--harness", action=_NoHarnessAction)
+    p.add_argument("--no-wait-ssh", action=_NoHarnessAction)
+    p.add_argument("command", nargs="+", help=GUEST_COMMAND_HELP)
     p.add_argument(
         "--timeout",
         type=float,
         default=60.0,
-        help="Guest command timeout in seconds (default: 60)",
+        help="Guest command timeout in seconds (default: 60); on expiry the "
+             "output produced so far is still reported (exit 124)",
     )
     p.add_argument(
         "--keep",
@@ -221,6 +257,7 @@ def _handle_run(args: argparse.Namespace) -> int:
         nic_model=args.nic_model,
         net_backend=args.net_backend,
         harness=False,
+        no_reboot=args.no_reboot,
     )
 
     # Everything after a successful launch runs under this guard: an exception
@@ -231,16 +268,21 @@ def _handle_run(args: argparse.Namespace) -> int:
     try:
         ssh = _make_ssh(inst)
         outcome = _wait_for_guest(ssh, inst, float(args.ssh_timeout))
+        command = _join_exec_command(args.command)
         if outcome != "ready":
             status, data, text = _boot_failure_payload(
                 inst, outcome, float(args.ssh_timeout)
             )
-            command = _join_exec_command(args.command)
+            notes: list[str] = []
         else:
-            command = _join_exec_command(args.command)
-            status, data, text = _run_guest_command(
+            status, data, text, notes = _run_guest_command(
                 ssh, command, inst, timeout=args.timeout
             )
+            # The ssh ControlMaster (`ControlPersist=60`) outlives the command;
+            # the VM is about to be stopped under it, so close it now rather
+            # than leaving a master that times out on its own.
+            if not args.keep:
+                ssh.close_control_master()
     except BaseException:
         _kill_vm(inst, clean=False)
         raise
@@ -281,18 +323,19 @@ def _handle_run(args: argparse.Namespace) -> int:
         "state_preserved": bool(args.keep or preserve),
     }
 
-    lines = [text] if isinstance(text, str) else list(text)
     if data["state_preserved"]:
-        # Only annotate when there is a follow-up to make: on the clean path the
-        # text output stays byte-identical to what `qmu exec` would have printed,
-        # so an agent can pipe `qmu run` the same way.
-        lines.append(f"\nVM '{inst.vm_id}' {vm_state}. Serial log: {inst.serial_log}")
-        lines.append(
-            f"Inspect: qmu log --vm {inst.vm_id} --tail 200 | "
-            f"qmu crash --vm {inst.vm_id}"
-        )
+        # Follow-up hints are stderr notes, like the `[exit code: N]` trailer:
+        # text-mode stdout is the guest's stdout (plus the crash report on a
+        # lost transport) exactly as `qmu exec` prints it, so an agent can pipe
+        # `qmu run` the same way on every path.
+        notes = [
+            *notes,
+            f"VM '{inst.vm_id}' {vm_state}. Serial log: {inst.serial_log}",
+            f"Inspect: qmu log --vm {inst.vm_id} --tail 200, or "
+            f"qmu crash --vm {inst.vm_id}",
+        ]
         if not args.keep:
-            lines.append(f"Clean up:  qmu prune --vm {inst.vm_id}")
+            notes.append(f"Clean up: qmu prune --vm {inst.vm_id}")
 
-    _emit(args, data=data, text=lines, stem="run")
+    _emit_guest_result(args, data=data, text=text, notes=notes, stem="run")
     return status

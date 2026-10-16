@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -77,13 +78,14 @@ def test_ssh_and_scp_builders_share_current_bounded_control_options(
             assert not any(option.startswith("Control") for option in options)
 
 
-@pytest.mark.parametrize("method", ["run", "push", "pull"])
-def test_guest_streams_are_decoded_lossily_never_raised(monkeypatch, tmp_path, method):
+@pytest.mark.parametrize("method", ["push", "pull"])
+def test_scp_streams_are_decoded_lossily_never_raised(monkeypatch, tmp_path, method):
     """Guest output is arbitrary bytes (a leak primitive dumping raw memory).
 
     `text=True` without `errors=` made `exec 'head -c 100 /dev/urandom'` exit
     4 `UnicodeDecodeError` with the output discarded. Every subprocess call
-    that decodes guest-originated bytes must do so lossily.
+    that decodes guest-originated bytes must do so lossily (`run` reads raw
+    bytes and decodes them itself; see the real-subprocess tests below).
     """
     seen: dict[str, object] = {}
 
@@ -96,9 +98,7 @@ def test_guest_streams_are_decoded_lossily_never_raised(monkeypatch, tmp_path, m
     client = ssh.SSHClient(port=10022, key_path="/tmp/test-key")
     source = tmp_path / "payload.bin"
     source.write_bytes(b"data")
-    if method == "run":
-        client.run("head -c 100 /dev/urandom")
-    elif method == "push":
+    if method == "push":
         client.push(str(source), "/root/")
     else:
         client.pull("/root/payload.bin", str(tmp_path / "out.bin"))
@@ -107,17 +107,83 @@ def test_guest_streams_are_decoded_lossily_never_raised(monkeypatch, tmp_path, m
     assert seen["errors"] == "replace"
 
 
+def _fake_ssh_on_path(tmp_path, monkeypatch, script: str) -> ssh.SSHClient:
+    """Put a shell script named `ssh` first on PATH and return a client."""
+    fake_ssh = tmp_path / "ssh"
+    fake_ssh.write_text("#!/bin/sh\n" + script)
+    fake_ssh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{__import__('os').environ['PATH']}")
+    return ssh.SSHClient(port=10022, key_path="/tmp/test-key")
+
+
 def test_run_delivers_non_utf8_output_with_real_subprocess(tmp_path, monkeypatch):
     """End to end through a real child: bytes that are not UTF-8 come back
     as text (U+FFFD for the undecodable ones), with the exit code intact."""
-    fake_ssh = tmp_path / "ssh"
-    fake_ssh.write_text("#!/bin/sh\nprintf '\\377\\376\\200abc\\n'\nexit 7\n")
-    fake_ssh.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{tmp_path}:{__import__('os').environ['PATH']}")
-    client = ssh.SSHClient(port=10022, key_path="/tmp/test-key")
+    client = _fake_ssh_on_path(
+        tmp_path, monkeypatch, "printf '\\377\\376\\200abc\\n'\necho err >&2\nexit 7\n"
+    )
 
     rc, stdout, stderr = client.run("true")
 
     assert rc == 7
     assert stdout.endswith("abc\n")
     assert "\ufffd" in stdout
+    assert stderr == "err\n"
+
+
+def test_run_timeout_keeps_partial_output_and_does_not_wait_for_the_remote(
+    tmp_path, monkeypatch
+):
+    """`--timeout` reports what the command printed before the deadline.
+
+    Under ControlMaster the ssh child hands its pipes to the mux master, which
+    keeps them open until the REMOTE command ends — modelled here by a
+    background child holding stdout. `communicate()` after `kill()` therefore
+    blocked for the remote command's whole lifetime (measured: `--timeout 2`
+    on `sleep 10` returned after 10 s); the select loop must not.
+    """
+    client = _fake_ssh_on_path(
+        tmp_path, monkeypatch,
+        "echo partial\necho progress >&2\n(sleep 20) &\nsleep 20\n",
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ssh.SSHError) as excinfo:
+        client.run("echo partial; sleep 20", timeout=0.5)
+
+    assert time.monotonic() - started < 5
+    assert not isinstance(excinfo.value, ssh.SSHAborted)
+    assert "timed out after 0.5s" in str(excinfo.value)
+    assert excinfo.value.stdout == "partial\n"
+    assert excinfo.value.stderr == "progress\n"
+
+
+def test_run_abort_when_stops_the_child_with_its_output(tmp_path, monkeypatch):
+    """The watcher predicate ends the command as soon as it fires (the serial
+    log shows a panic) instead of waiting for ssh's keepalive to notice."""
+    client = _fake_ssh_on_path(tmp_path, monkeypatch, "echo pre\nsleep 20\n")
+    polls: list[float] = []
+
+    def panicked() -> bool:
+        polls.append(time.monotonic())
+        return len(polls) >= 2
+
+    started = time.monotonic()
+    with pytest.raises(ssh.SSHAborted) as excinfo:
+        client.run("trigger", timeout=30, abort_when=panicked, poll_interval=0.1)
+
+    assert time.monotonic() - started < 5
+    assert len(polls) == 2
+    assert excinfo.value.stdout == "pre\n"
+
+
+def test_run_completed_child_is_never_reported_as_timed_out(tmp_path, monkeypatch):
+    """A child that finishes inside the budget returns normally even when the
+    watcher is armed, and the predicate is not consulted after it exits."""
+    client = _fake_ssh_on_path(tmp_path, monkeypatch, "echo done\nexit 0\n")
+
+    rc, stdout, stderr = client.run(
+        "true", timeout=5, abort_when=lambda: True, poll_interval=5
+    )
+
+    assert (rc, stdout, stderr) == (0, "done\n", "")
