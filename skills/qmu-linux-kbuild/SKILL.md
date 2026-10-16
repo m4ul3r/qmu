@@ -45,7 +45,41 @@ tools/kbuild.sh --version 6.6.75 --config-only
 
 # Override container for edge cases
 tools/kbuild.sh --version 5.4.0 --container focal
+
+# Constrained host: cap parallel make jobs (default: nproc)
+tools/kbuild.sh --version 6.6.75 --jobs 4
+
+# Put the artifacts somewhere other than ~/.cache/qmu/kernels/<ver>/<arch>
+tools/kbuild.sh --version 6.6.75 --outdir /data/kernels/6.6.75
+
+# Keep in-tree build intermediates for a later `make -C $KERNEL_SRC`
+tools/kbuild.sh --version 6.6.75 --keep-residue
+
+# Show the Docker image build and full make output on stderr (default: -s)
+tools/kbuild.sh --version 6.6.75 --verbose
 ```
+
+| Flag | Effect |
+|---|---|
+| `--version VER` | required; `major.minor[.patch]` |
+| `--arch ARCH` | `x86_64` (default), `i386`, `arm64`, `arm32`, `arm32hf` |
+| `--container NAME` | override the auto-selected Ubuntu toolchain image (`xenial`…`noble`) |
+| `--outdir DIR` | artifact directory (default `$CACHE/kernels/VER/ARCH`); the shared source tree stays under `$CACHE/kernels/src/` |
+| `--jobs N` | `make -jN` (default `nproc`) |
+| `--no-cache` | rebuild even if a complete cached build exists |
+| `--config-only` | write `.config` and exit; prints only `CONFIG=` |
+| `--keep-residue` | keep `*.o`, `.*.cmd`, … in the source tree after a successful build (default: removed) |
+| `--verbose` | show Docker build + full make output (default passes `-s` to make) |
+
+Environment: `QMU_CACHE_DIR` overrides `~/.cache/qmu` (the same root qmu and
+`mkrootfs.sh`/`mktarget.sh` use); `QMU_KBUILD_MIRROR` overrides the kernel.org
+mirror.
+
+**Exit codes.** `2` — usage: a missing/invalid `--version`, unsupported
+`--arch`, unknown flag, or `--help` (printed by `die()`/`usage()` as `kbuild:
+error: …` on stderr). `1` — the containerised build failed; the last stderr
+line is `kbuild: build failed (exit N) — check <outdir>/build.log`. `0` —
+built or served from cache, variables on stdout. `130`/`143` on SIGINT/SIGTERM.
 
 ## Output format
 
@@ -69,6 +103,7 @@ VMLINUX_GDB=/home/user/.cache/qmu/kernels/6.6.75/x86_64/vmlinux-gdb.py
 | `CONFIG` | Final `.config` used for the build |
 | `KERNEL_SRC` | Retained kernel source/build tree (mounted at `/src` during Docker compilation) |
 | `VMLINUX_GDB` | Immediately usable build-root GDB loader (`vmlinux-gdb.py`) adjacent to `scripts/gdb/` |
+| *(no variable)* | `System.map` is also written next to `KERNEL` — symbol lookup when a `vmlinux` is unavailable; `qmu prune --build-residue` never removes it |
 
 Use `eval "$(tools/kbuild.sh ...)"` to capture these into shell variables.
 
@@ -286,6 +321,7 @@ architectures; artifacts (including GDB helpers) are architecture-specific:
       bzImage                  # kernel image → KERNEL
       vmlinux                  # debug symbols → VMLINUX
       .config                  # kernel config used → CONFIG
+      System.map               # symbol table (no variable; see Output format)
       vmlinux-gdb.py           # build-root GDB loader → VMLINUX_GDB
       scripts/gdb/
         vmlinux-gdb.py         # upstream relative loader entry

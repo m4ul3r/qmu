@@ -89,6 +89,20 @@ whatever pockets did answer. A `-updates` fetch that times out used to look
 identical to a `-updates` with no kernels in it, which quietly turned
 `--kernel-abi latest` into `ga`.
 
+### Prerequisite for offline edits of the target image
+
+Baking a PoC into `$ROOTFS` without booting it (`qmu rootfs inject`, `qmu
+launch --inject`) needs libguestfs with a readable appliance kernel. Ubuntu
+hosts ship `/boot/vmlinuz-*` as mode `0600`, so the supermin appliance fails
+with an opaque "appliance closed the connection unexpectedly". `qmu doctor`
+diagnoses it (`guestfish installed, but NO /boot/vmlinuz-* is readable`); fix
+with `sudo chmod 0644 /boot/vmlinuz-*`, or copy one kernel and point supermin
+at it: `sudo install -m 0644 /boot/vmlinuz-$(uname -r) /var/tmp/vmlinuz` then
+`export SUPERMIN_KERNEL=/var/tmp/vmlinuz SUPERMIN_KERNEL_VERSION=$(uname -r)
+SUPERMIN_MODULES=/lib/modules/$(uname -r)`. Building the target and the normal
+`qmu push`/`compile` path over SSH do not need it. The Ubuntu image is a
+whole-disk ext4, so pass `--partition 0`.
+
 ## Pinning an ABI — the part that makes a result citable
 
 **Always pin. Never use the floating `linux-image-generic` meta-package**, which

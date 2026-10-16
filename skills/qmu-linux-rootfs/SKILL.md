@@ -191,6 +191,19 @@ Use `--no-cache` to force a rebuild. Use `--outdir` to place output elsewhere.
   docker run --rm --privileged tonistiigi/binfmt:latest --install all
   ```
   Only needed once per host boot. Native-arch builds (x86_64 on x86_64) need no binfmt.
+- **libguestfs with a readable appliance kernel** — only for *offline* edits of
+  the built image (`qmu rootfs inject|ls|cat|rm`, `qmu launch --inject`), which
+  is how files get into a harness rootfs with no SSH. Debian/Ubuntu ship
+  `/boot/vmlinuz-*` as mode `0600`, so the supermin appliance fails with an
+  opaque "appliance closed the connection unexpectedly". `qmu doctor` diagnoses
+  it; fix with `sudo chmod 0644 /boot/vmlinuz-*`, or leave system permissions
+  alone and point supermin at a copy:
+  ```bash
+  sudo install -m 0644 /boot/vmlinuz-$(uname -r) /var/tmp/vmlinuz
+  export SUPERMIN_KERNEL=/var/tmp/vmlinuz SUPERMIN_KERNEL_VERSION=$(uname -r) \
+         SUPERMIN_MODULES=/lib/modules/$(uname -r)
+  ```
+  Building the image itself does not need libguestfs.
 
 ## Troubleshooting
 
