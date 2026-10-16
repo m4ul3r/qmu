@@ -18,9 +18,12 @@ domain modules, so tests patch the command module that owns the handler (e.g.
 from __future__ import annotations
 
 import argparse
+import sys
+from typing import NoReturn
 
 from .config import reset_global_config_warnings
 from .instance import QMUError
+from .output import render_value
 from .qmp import QMPError
 from .ssh import SSHError
 
@@ -53,10 +56,37 @@ _CONFIG_EXEMPT_SUBCOMMANDS = frozenset({
 })
 
 
+class _UsageError(Exception):
+    """An argparse usage error, carried out of parse_args instead of exiting.
+
+    argparse's `error()` prints usage and calls sys.exit(2) itself, which is
+    why usage errors under `--format json` used to produce an empty stdout —
+    the one error path that broke the "every error emits the envelope"
+    contract. The parser raises this instead and `main` renders it per format.
+    """
+
+    def __init__(self, parser: argparse.ArgumentParser, message: str) -> None:
+        super().__init__(message)
+        self.parser = parser
+        self.message = message
+
+
+class _QMUArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser whose usage errors are exceptions, not sys.exit calls.
+
+    `add_subparsers` defaults `parser_class` to `type(self)`, so every
+    subparser (and nested sub-subparser) created from this root is this class
+    too; `--help` still exits 0 through `exit()`, which is untouched.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        raise _UsageError(self, message)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the full argparse tree. Separate from :func:`main` so tests can
     exercise the REAL parser instead of a hand-mirrored copy that can desync."""
-    parser = argparse.ArgumentParser(
+    parser = _QMUArgumentParser(
         prog="qmu",
         description="Agent-friendly QEMU VM management CLI for kernel research",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -76,7 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
             "json contract:\n"
             "  With --format json|ndjson every result is a JSON object carrying\n"
             "  \"ok\": <bool>. Every error path emits\n"
-            "  {\"ok\": false, \"error\": ..., \"error_type\": ...} to stdout."
+            "  {\"ok\": false, \"error\": ..., \"error_type\": ...} to stdout —\n"
+            "  usage errors (exit 2) included, as error_type \"UsageError\"\n"
+            "  with a \"usage\" field."
         ),
     )
     # Register --vm/--format/--out on the top-level parser so they may be given
@@ -115,22 +147,69 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _requested_format(argv: list[str]) -> str:
+    """The --format value in argv, scanned without parsing.
+
+    Usage errors happen before argparse has produced a namespace, so this is
+    the only way to honor `--format json` on that path. Scanning stops at a
+    bare `--`: everything after it is a guest or QEMU argument.
+    """
+    fmt = "text"
+    tokens = iter(argv)
+    for token in tokens:
+        if token == "--":
+            break
+        if token == "--format":
+            fmt = next(tokens, fmt)
+        elif token.startswith("--format="):
+            fmt = token.split("=", 1)[1]
+    return fmt if fmt in ("json", "ndjson") else "text"
+
+
+def _emit_usage_error(exc: _UsageError, argv: list[str]) -> NoReturn:
+    """Report a usage error, then exit 2 exactly as argparse would have.
+
+    Text mode reproduces argparse's own output (usage, then
+    `qmu <sub>: error: <message>` on stderr). Under --format json|ndjson the
+    same error is the documented `{"ok": false, ...}` envelope on stdout, so
+    an agent branching on the envelope is never handed an empty stdout. The
+    exit is still `parser.exit(2)` (a SystemExit), so callers that treated
+    argparse errors as SystemExit keep seeing one.
+    """
+    fmt = _requested_format(argv)
+    usage = exc.parser.format_usage()
+    if fmt == "text":
+        sys.stderr.write(usage)
+        exc.parser.exit(2, f"{exc.parser.prog}: error: {exc.message}\n")
+    payload = {
+        "ok": False,
+        "error": exc.message,
+        "error_type": "UsageError",
+        "usage": usage.strip(),
+    }
+    sys.stdout.write(render_value(payload, fmt))
+    exc.parser.exit(2)
+
+
 def main(argv: list[str] | None = None) -> int:
     # Per-command, not per-process: two separate `qmu` invocations must each
     # warn on a broken global config; only resolve_config() calls WITHIN this
     # one dispatch (the gate below plus a handler that resolves again) dedupe.
     reset_global_config_warnings()
     parser = build_parser()
-    args = parser.parse_args(argv)
+    if argv is None:
+        argv = sys.argv[1:]
+    try:
+        args = parser.parse_args(argv)
+    except _UsageError as exc:
+        _emit_usage_error(exc, argv)
 
-    if not args.subcommand:
-        parser.print_help()
-        return 2
-
-    handler = getattr(args, "handler", None)
-    if handler is None:
-        parser.print_help()
-        return 2
+    if not args.subcommand or getattr(args, "handler", None) is None:
+        if _requested_format(argv) == "text":
+            parser.print_help()
+            return 2
+        _emit_usage_error(_UsageError(parser, "a subcommand is required"), argv)
+    handler = args.handler
 
     try:
         if args.subcommand not in _CONFIG_EXEMPT_SUBCOMMANDS:

@@ -317,7 +317,12 @@ def test_resumed_warning_is_not_bridged_into_a_later_panic(tmp_path):
 
 
 def test_rm_force_uses_rm_f_so_enoent_is_tolerated(tmp_path, monkeypatch):
-    """Skipping the probe was not enough: plain `rm` errors on ENOENT too."""
+    """Skipping the probe was not enough: plain `rm` errors on ENOENT too.
+
+    The existence probe comes first (so a missing path is *reported*, never
+    claimed removed); when it cannot answer, the removal under --force must
+    still be the ENOENT-tolerant verb.
+    """
     image = tmp_path / "rootfs.img"
     image.write_text("disk")
     scripts: list[str] = []
@@ -327,9 +332,10 @@ def test_rm_force_uses_rm_f_so_enoent_is_tolerated(tmp_path, monkeypatch):
         lambda img, part, script, action: scripts.append(script) or "",
     )
 
-    rootfs_mod.remove(str(image), ["/root/nope"], partition=0, force=True)
+    result = rootfs_mod.remove(str(image), ["/root/nope"], partition=0, force=True)
 
-    assert scripts == ["rm-f /root/nope\n"]
+    assert scripts[-1] == "rm-f /root/nope\n"
+    assert result == {"removed": ["/root/nope"], "missing": []}
 
 
 # ---------------------------------------------------------------------------

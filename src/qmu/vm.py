@@ -19,20 +19,28 @@ from .qemu import native_passt_problem, probe_qemu_netdevs
 from .qmp import QMPClient
 
 
-def _resolve_boot_file(value: str, label: str) -> Path:
+def _resolve_boot_file(value: str, label: str, source: str = "") -> Path:
+    """Resolve a kernel/initrd path, naming the absolute path on failure.
+
+    `source` is the config provenance suffix (see
+    `QMUConfig.describe_path_source`) so a value that came from a qmu.toml in
+    a parent directory is reported as the file it resolved to and the file
+    that set it, not as the bare relative string the user never typed here.
+    """
+    path = Path(value).expanduser()
     try:
         # Before 3.13, resolve() raises RuntimeError on a symlink loop even in
         # non-strict mode; from 3.13 the loop surfaces as ELOOP from stat().
-        path = Path(value).expanduser().resolve()
+        path = path.resolve()
         mode = path.stat().st_mode
     except (FileNotFoundError, NotADirectoryError):
-        raise QMUError(f"{label} not found: {value}") from None
+        raise QMUError(f"{label} not found: {path}{source}") from None
     except OSError as exc:
-        raise QMUError(f"{label} not accessible: {value} ({exc.strerror})") from None
+        raise QMUError(f"{label} not accessible: {path} ({exc.strerror}){source}") from None
     except RuntimeError as exc:
-        raise QMUError(f"{label} not accessible: {value} ({exc})") from None
+        raise QMUError(f"{label} not accessible: {path} ({exc}){source}") from None
     if not stat.S_ISREG(mode):
-        raise QMUError(f"{label} is not a regular file: {value!r}")
+        raise QMUError(f"{label} is not a regular file: {path}{source}")
     return path
 
 
@@ -70,6 +78,21 @@ def _validate_qmp(socket_path: Path) -> None:
         qmp.execute("query-status")
     finally:
         qmp.close()
+
+
+def _exits_within(proc: subprocess.Popen, grace: float) -> bool:
+    """True once `proc` has exited, polling for at most `grace` seconds.
+
+    Polls rather than `wait(timeout=)` so a child that is genuinely still
+    running is left alone (nothing is reaped or signalled here).
+    """
+    deadline = time.monotonic() + grace
+    while True:
+        if proc.poll() is not None:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 @dataclass
@@ -413,11 +436,25 @@ def launch_vm(
     harness: bool = False,
 ) -> VMInstance:
     """Launch a QEMU VM and return the instance."""
-    # Validate files
-    kernel_path = _resolve_boot_file(kernel, "Kernel")
+    # Validate files. Provenance only applies when the value is the one the
+    # config layer resolved; a caller passing its own string gets no suffix.
+    kernel_path = _resolve_boot_file(
+        kernel,
+        "Kernel",
+        config.describe_path_source("kernel") if kernel == config.kernel else "",
+    )
 
+    # Only the disk QEMU is actually handed is recorded on the instance:
+    # `rootfs inject` holder detection and `status.rootfs` both read it, and a
+    # --drive launch that recorded the configured image it never attached was
+    # reported as holding an image it did not use (and not holding the one it
+    # did). Explicit --drive specs replace the implicit rootfs drive entirely;
+    # a harness launch WITHOUT --drive attaches the configured rootfs if it
+    # exists (the caller may rely on it for `root=`), so it stays recorded.
     rootfs_path: Path | None = None
-    if not harness and not drives:
+    if drives:
+        pass
+    elif not harness:
         if config.rootfs is None:
             raise QMUError(
                 "No rootfs configured. Set [drive] rootfs in qmu.toml or pass --rootfs. "
@@ -427,10 +464,11 @@ def launch_vm(
             )
         rootfs_path = Path(config.rootfs).expanduser().resolve()
         if not rootfs_path.exists():
-            raise QMUError(f"Rootfs image not found: {config.rootfs}")
+            raise QMUError(
+                f"Rootfs image not found: {rootfs_path}"
+                f"{config.describe_path_source('rootfs')}"
+            )
     elif config.rootfs is not None:
-        # rootfs is configured but suppressed by --drive or --harness; only resolve
-        # so we can record the path on the instance for diagnostics.
         candidate = Path(config.rootfs).expanduser().resolve()
         if candidate.exists():
             rootfs_path = candidate
@@ -443,11 +481,17 @@ def launch_vm(
             )
         key_path = Path(config.ssh_key).expanduser().resolve()
         if not key_path.exists():
-            raise QMUError(f"SSH key not found: {config.ssh_key}")
+            raise QMUError(
+                f"SSH key not found: {key_path}{config.describe_path_source('ssh_key')}"
+            )
 
     initrd_path: Path | None = None
     if initrd is not None:
-        initrd_path = _resolve_boot_file(initrd, "Initrd")
+        initrd_path = _resolve_boot_file(
+            initrd,
+            "Initrd",
+            config.describe_path_source("initrd") if initrd == config.initrd else "",
+        )
 
     cmdline_override = cmdline is not None
     cmdline = resolve_cmdline(config, profile=profile, cmdline=cmdline, append=append)
@@ -465,13 +509,18 @@ def launch_vm(
     resolved_nic = nic_model or config.nic_model
 
     # Harness VMs run boot-and-die with no SSH, so never allocate an SSH port.
+    # --no-net emits `-nic none`, so qmu binds nothing either: an auto-allocated
+    # port would be recorded but never owned by this QEMU, and whichever VM was
+    # later handed that port would answer `qmu exec --vm <this>` as if it were
+    # this guest (the readiness probe is a bare TCP connect). Only a port the
+    # caller pinned (to match their own hostfwd in the extra QEMU args) is kept.
     # Otherwise auto-allocate any port the caller did not pin. Auto-allocated
     # ports have a TOCTOU window (find_free_port closes its probe before QEMU
     # binds), so a concurrent launch can steal one; QEMU then exits with a bind
     # error and we retry with fresh ports. Pinned ports are never re-allocated.
     if harness:
         ssh_port = None
-    auto_ssh = (not harness) and (ssh_port is None)
+    auto_ssh = (not harness) and (not no_net) and (ssh_port is None)
     auto_gdb = gdb and gdb_port is None
     bind_markers = ("Address already in use", "Could not set up host forwarding", "Failed to bind")
 
@@ -491,7 +540,8 @@ def launch_vm(
         else:
             # uuid suffix: timestamp-based ids collide when two harness VMs
             # launch within the same second (parallel agent workflows).
-            vm_id = f"vm-h{uuid.uuid4().hex[:8]}"
+            # 'h' = harness, 'n' = --no-net without a pinned SSH port.
+            vm_id = f"vm-{'h' if harness else 'n'}{uuid.uuid4().hex[:8]}"
         qmp_path = qmp_socket_path(vm_id)
         serial_path = serial_log_path(vm_id)
         qemu_log = qemu_log_path(vm_id)
@@ -562,6 +612,23 @@ def launch_vm(
                 )
             raise primary
 
+        qmp_error: Exception | None = None
+        if not exited:
+            # QMP socket appeared — verify connectivity. QEMU creates the QMP
+            # listener before it applies -netdev hostfwd rules or opens -drive
+            # files, so a failure there (port already taken, a stray word from
+            # an unquoted --cmdline parsed as a disk image) leaves the socket
+            # on disk and the connect refused. That is a dead QEMU whose reason
+            # is in its log, not a QMP problem; give the exit a moment to land
+            # before deciding which, so the real error is what gets reported.
+            try:
+                _validate_qmp(qmp_path)
+            except Exception as exc:
+                if _exits_within(proc, 1.0):
+                    exited = True
+                else:
+                    qmp_error = exc
+
         if exited:
             # Reap before reading diagnostics so the log is fully flushed.
             try:
@@ -593,12 +660,9 @@ def launch_vm(
                 raise cleanup_exc from primary
             raise primary
 
-        # QMP socket appeared — verify connectivity.
-        try:
-            _validate_qmp(qmp_path)
-        except Exception as exc:
-            primary = QMUError(f"QMP connection failed after launch: {exc}")
-            primary.__cause__ = exc
+        if qmp_error is not None:
+            primary = QMUError(f"QMP connection failed after launch: {qmp_error}")
+            primary.__cause__ = qmp_error
             try:
                 log_text = attempt.rollback(capture_output=True)
             except QMUError as cleanup_exc:
@@ -607,7 +671,7 @@ def launch_vm(
                 primary = QMUError(
                     f"{primary}\nCommand: {' '.join(cmd)}\nQEMU output:\n{log_text}"
                 )
-            raise primary from exc
+            raise primary from qmp_error
 
         # Build and save instance under the attempt transaction.
         inst = VMInstance(
