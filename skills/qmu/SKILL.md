@@ -500,9 +500,15 @@ are candidates; an old stopped VM cannot silently satisfy a new wait. Bare
 0x[0-9a-f]{16}"`. At the start of the wait, scanning begins at the later of the
 recorded guest epoch and the latest timestamped kernel boot banner in the log.
 This excludes earlier-boot evidence even when a reboot was not observed over
-QMP. Keep run/boot identity in the receipt: a regex match alone does not prove
-the operation's meaning. Re-establish the observation scope after a reboot
-during an active wait; the initial boundary is not a live reboot monitor.
+QMP. The result names that boundary (`scan_offset` and `scan_scope`:
+`boot-banner` or `epoch` in JSON; "scanned from byte N" in text), so a marker
+that fell before it is never a silent miss. One thing moves the boundary that
+is not a reboot: a guest that replays `dmesg` to the console reproduces the
+timestamped banner verbatim — print your marker *after* any such dump, or
+start the wait before it. Keep run/boot identity in the receipt: a regex match
+alone does not prove the operation's meaning. Re-establish the observation
+scope after a reboot during an active wait; the initial boundary is not a live
+reboot monitor.
 
 `qmu log` reads the same log after the fact:
 

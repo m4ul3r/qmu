@@ -20,11 +20,17 @@ from .qmp import QMPClient
 
 
 def _resolve_boot_file(value: str, label: str) -> Path:
-    path = Path(value).expanduser().resolve()
     try:
+        # Before 3.13, resolve() raises RuntimeError on a symlink loop even in
+        # non-strict mode; from 3.13 the loop surfaces as ELOOP from stat().
+        path = Path(value).expanduser().resolve()
         mode = path.stat().st_mode
     except (FileNotFoundError, NotADirectoryError):
         raise QMUError(f"{label} not found: {value}") from None
+    except OSError as exc:
+        raise QMUError(f"{label} not accessible: {value} ({exc.strerror})") from None
+    except RuntimeError as exc:
+        raise QMUError(f"{label} not accessible: {value} ({exc})") from None
     if not stat.S_ISREG(mode):
         raise QMUError(f"{label} is not a regular file: {value!r}")
     return path

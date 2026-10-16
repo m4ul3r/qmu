@@ -1504,10 +1504,13 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
     deadline = start + args.timeout if args.timeout is not None else None
     # Use the recorded RESET boundary and the log's latest boot banner. A
     # guest-initiated reboot can occur while no qmu command is observing QMP.
-    start_offset = inst.guest_epoch_serial_offset or 0
-    start_offset = max(
-        start_offset, last_boot_offset(inst.serial_log, start_offset=start_offset)
-    )
+    # The chosen boundary is reported back (`scan_offset`/`scan_scope`) so a
+    # marker that fell outside it is never a silent miss: a `dmesg` replay
+    # echoed to the console reproduces the banner and moves this boundary.
+    epoch_offset = inst.guest_epoch_serial_offset or 0
+    banner_offset = last_boot_offset(inst.serial_log, start_offset=epoch_offset)
+    start_offset = max(epoch_offset, banner_offset)
+    scan_scope = "boot-banner" if banner_offset > epoch_offset else "epoch"
     tail = SerialTail(inst.serial_log, offset=start_offset)
 
     matched_line: str | None = None
@@ -1590,6 +1593,8 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
         "pattern": args.pattern,
         "matched_line": matched_line,
         "reason": reason,
+        "scan_offset": start_offset,
+        "scan_scope": scan_scope,
         "elapsed": round(elapsed, 3),
         "crash": crash,
         "unknown_kernel_params": _unknown_params["all"],
@@ -1599,22 +1604,31 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
         },
     }
 
+    scope_note = (
+        f"scanned from byte {start_offset}: "
+        + (
+            "latest kernel boot banner"
+            if scan_scope == "boot-banner"
+            else "recorded guest epoch"
+        )
+        + "; earlier output was out of scope"
+    )
     if matched:
         lines_out = [f"Matched /{args.pattern}/ after {elapsed:.2f}s:", matched_line or ""]
     elif reason == "crash":
         lines_out = [
             f"Kernel crash on '{inst.vm_id}' after {elapsed:.2f}s, "
-            f"before /{args.pattern}/ matched.",
+            f"before /{args.pattern}/ matched ({scope_note}).",
         ]
     elif reason == "process_exited":
         lines_out = [
             f"VM '{inst.vm_id}' exited after {elapsed:.2f}s without matching "
-            f"/{args.pattern}/.",
+            f"/{args.pattern}/ ({scope_note}).",
         ]
     else:
         lines_out = [
             f"Timed out after {elapsed:.2f}s waiting for /{args.pattern}/ "
-            f"on '{inst.vm_id}'.",
+            f"on '{inst.vm_id}' ({scope_note}).",
         ]
     if crash:
         lines_out.append("\nCrash from serial log:\n" + crash)

@@ -327,12 +327,13 @@ def extract_unknown_params(
 # offset is a true byte position (a decode with errors="replace" can change
 # lengths and desync it from the file).
 #
-# The leading printk timestamp is REQUIRED, and is the whole point: the real
-# banner is emitted by printk and carries one, while anything userspace echoes
-# to the console cannot. Without it a guest could write a banner-shaped line
-# after a survived crash — `dmesg` or `cat /proc/version` to the console does it
-# without trying — and hide that crash from the guest-state axis. Matching at
-# line start additionally stops a banner quoted mid-line from counting.
+# The leading printk timestamp is REQUIRED: the real banner is emitted by printk
+# and carries one, so a bare `echo` or `cat /proc/version` to the console cannot
+# forge it. It does NOT exclude a `dmesg` replay written to the console, which
+# reproduces the timestamped line verbatim — that residual case is accepted and
+# made visible instead: `wait --pattern` reports the boundary it scanned from
+# (`scan_offset`/`scan_scope`). Matching at line start additionally stops a
+# banner quoted mid-line from counting.
 _BOOT_BANNER = re.compile(rb"(?m)^\[\s*\d+\.\d+\] Linux version \S+ \(")
 
 

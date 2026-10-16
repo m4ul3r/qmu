@@ -338,6 +338,13 @@ def test_stopped_pattern_wait_does_not_reuse_previous_boot_evidence(
     assert rc == 1
     assert payload["matched"] is False
     assert payload["reason"] == "process_exited"
+    # The boundary that excluded the marker is reported, never implicit: an
+    # agent reading `reason` alone cannot tell "never printed" from "printed
+    # before the scanned range".
+    assert payload["scan_offset"] == len(old)
+    assert payload["scan_scope"] == (
+        "epoch" if boundary == "recorded-epoch" else "boot-banner"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -880,9 +887,11 @@ def test_a_forged_boot_banner_cannot_hide_a_crash(cache, monkeypatch):
     """The banner must be a printk, not anything the guest can echo.
 
     A guest that writes a banner-shaped line to the console after a survived
-    crash would otherwise scope that crash out of the label — reachable without
-    trying via `dmesg` or `cat /proc/version`. The real banner carries a printk
-    timestamp; a userspace echo cannot.
+    crash would otherwise scope that crash out of the label — `echo` or
+    `cat /proc/version` to the console does it without trying. The real banner
+    carries a printk timestamp; those userspace echoes cannot. (A `dmesg` replay
+    does reproduce the timestamp; that residual case is accepted and surfaced
+    through `wait --pattern`'s `scan_scope`, not hidden.)
     """
     inst = _vm_with_log(
         cache, "forged",
