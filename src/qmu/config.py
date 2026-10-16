@@ -85,6 +85,14 @@ _FIXED_SCHEMA: dict[str, dict[str, str]] = {
     },
 }
 
+# QMUConfig path fields -> the TOML key that sets them, for provenance text.
+_PATH_FIELD_KEYS: dict[str, str] = {
+    "kernel": "[boot] kernel",
+    "initrd": "[boot] initrd",
+    "rootfs": "[drive] rootfs",
+    "ssh_key": "[ssh] key",
+}
+
 _MIGRATION_DESTINATIONS: dict[str, tuple[str, ...]] = {
     # A `[vm]` table is the most common wrong guess: it reads like the obvious
     # name for "the machine I am booting", but qmu splits those keys across
@@ -395,6 +403,22 @@ class QMUConfig:
     # doctor's loaded-file check) keep meaning "contributed values".
     _skipped_sources: list[dict[str, str]] = field(default_factory=list, repr=False)
 
+    # tracking: which layer set each path-typed field (`kernel`, `initrd`,
+    # `rootfs`, `ssh_key`) — the TOML key and file for a config layer, absent
+    # for a CLI flag. Config files are discovered by walking UP from CWD, so a
+    # relative value is anchored at the file that set it (see `_anchor_path`)
+    # and a not-found error names both the resolved path and that file; the
+    # bare relative string the user never typed in this directory was the
+    # whole of `Kernel not found: ./bzImage` before.
+    _path_sources: dict[str, str] = field(default_factory=dict, repr=False)
+
+    def describe_path_source(self, field_name: str) -> str:
+        """Suffix naming where a path field came from, or '' for a CLI flag."""
+        source = self._path_sources.get(field_name)
+        if source is None:
+            return ""
+        return f" (from {_PATH_FIELD_KEYS[field_name]} in {source})"
+
     def qemu_binary(self) -> str:
         return f"qemu-system-{self.arch}"
 
@@ -434,13 +458,39 @@ def find_project_config(start: Path | None = None) -> Path | None:
 
 
 
-def _apply_toml(cfg: QMUConfig, raw: dict[str, Any], source: str) -> None:
-    """Apply a parsed TOML dict onto a QMUConfig, recording the source."""
+def _anchor_path(value: str, base_dir: Path | None) -> str:
+    """Resolve a relative config path against the directory of its file.
+
+    `~` expands first so a home-relative value stays absolute. Only the
+    anchoring is done here — no `resolve()` — so symlinks and non-existent
+    files are reported as written, just rooted where the file lives.
+    """
+    expanded = Path(value).expanduser()
+    if base_dir is None or expanded.is_absolute():
+        return str(expanded)
+    return str(base_dir / expanded)
+
+
+def _apply_toml(
+    cfg: QMUConfig,
+    raw: dict[str, Any],
+    source: str,
+    *,
+    base_dir: Path | None = None,
+) -> None:
+    """Apply a parsed TOML dict onto a QMUConfig, recording the source.
+
+    `base_dir` is the directory of the file `raw` came from: path-typed
+    values are anchored there, because the file is found by walking up from
+    CWD and `./bzImage` next to it must mean the same file from any subdir.
+    """
     boot = raw.get("boot", {})
     if "kernel" in boot:
-        cfg.kernel = boot["kernel"]
+        cfg.kernel = _anchor_path(boot["kernel"], base_dir)
+        cfg._path_sources["kernel"] = source
     if "initrd" in boot:
-        cfg.initrd = boot["initrd"]
+        cfg.initrd = _anchor_path(boot["initrd"], base_dir)
+        cfg._path_sources["initrd"] = source
     if "cmdline" in boot:
         cfg.cmdline = boot["cmdline"]
     if "profile" in boot:
@@ -476,13 +526,15 @@ def _apply_toml(cfg: QMUConfig, raw: dict[str, Any], source: str) -> None:
 
     drive = raw.get("drive", {})
     if "rootfs" in drive:
-        cfg.rootfs = drive["rootfs"]
+        cfg.rootfs = _anchor_path(drive["rootfs"], base_dir)
+        cfg._path_sources["rootfs"] = source
     if "format" in drive:
         cfg.drive_format = drive["format"]
 
     ssh = raw.get("ssh", {})
     if "key" in ssh:
-        cfg.ssh_key = ssh["key"]
+        cfg.ssh_key = _anchor_path(ssh["key"], base_dir)
+        cfg._path_sources["ssh_key"] = source
     if "user" in ssh:
         cfg.ssh_user = ssh["user"]
     if "port_start" in ssh:
@@ -511,6 +563,9 @@ def _apply_cli(cfg: QMUConfig, overrides: dict[str, Any]) -> None:
             continue
         if hasattr(cfg, key):
             setattr(cfg, key, value)
+            # A flag is typed in this shell, so it stays CWD-relative and
+            # carries no file provenance.
+            cfg._path_sources.pop(key, None)
 
 
 def _apply_config_file(
@@ -520,7 +575,7 @@ def _apply_config_file(
 ) -> None:
     source = Path(path).resolve()
     raw = load_config_file(source)
-    _apply_toml(cfg, raw, f"{source_kind}: {source}")
+    _apply_toml(cfg, raw, f"{source_kind}: {source}", base_dir=source.parent)
 
 
 # Recovery guidance for the FATAL layer. The project/explicit config is

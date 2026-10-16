@@ -516,6 +516,110 @@ def test_empty_and_partial_prune_are_equally_disclosing(cache, monkeypatch, caps
 
 
 # ---------------------------------------------------------------------------
+# Axes 1+2+3 at once, for the two prune outcomes that used to be errors on the
+# `--vm` branch while `--all` reported them as facts: an absent subject
+# (issue #56 — a default `kill` already removed everything, so the cleanup
+# idiom `kill && prune --vm` failed) and an age-held one (`--vm --dry-run`
+# exited 1 and prescribed the destructive run it exists to preview).
+# ---------------------------------------------------------------------------
+
+
+def _prune_argv(mode, dry_run, output_format):
+    selector = [mode, VM] if mode == "--vm" else [mode]
+    return ["--format", output_format, "prune", *selector] + (
+        ["--dry-run"] if dry_run else []
+    )
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("mode", ["--vm", "--all"])
+def test_absent_subject_is_a_clean_prune_no_op(
+    mode, dry_run, output_format, cache, monkeypatch, capsys
+):
+    _make_state(VM_ABSENT, cache, monkeypatch)
+    _decoy_running(monkeypatch)
+
+    rc = cli.main(_prune_argv(mode, dry_run, output_format))
+    captured = capsys.readouterr()
+    message = captured.out + captured.err
+
+    assert rc == 0
+    assert "No stopped VM named" not in message
+    assert "not found" not in message
+    assert "Error" not in message
+    if output_format == "json":
+        payload = json.loads(captured.out)
+        assert payload["ok"] is True
+        assert payload["pruned"] == []
+        assert payload["dry_run"] is dry_run
+        assert payload["held_back"] == []
+        if dry_run:
+            assert payload["would_prune"] == []
+        if mode == "--vm":
+            assert payload["found"] is False
+        else:
+            assert "found" not in payload
+    elif mode == "--vm":
+        assert f"Nothing to prune for '{VM}'" in captured.out
+        assert "no state on disk" in captured.out
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_held_back_subject_is_reported_the_same_by_vm_and_all(
+    dry_run, output_format, cache, monkeypatch, capsys
+):
+    _make_state(VM_HELD_BACK, cache, monkeypatch)
+    serial = cache / "instances" / f"{VM}.serial.log"
+    _decoy_running(monkeypatch)
+
+    results = {}
+    for mode in ("--vm", "--all"):
+        rc = cli.main(_prune_argv(mode, dry_run, output_format))
+        captured = capsys.readouterr()
+        results[mode] = (rc, captured.out, captured.err)
+
+    for mode, (rc, out, err) in results.items():
+        assert rc == 0, mode
+        assert "Error" not in out + err, mode
+        assert VM in out, mode
+        if output_format == "text":
+            assert "--older-than 0" in out, mode
+        # A preview must never prescribe the destructive run as the remedy.
+        assert "to remove it now" not in out, mode
+        if output_format == "json":
+            payload = json.loads(out)
+            assert payload["ok"] is True, mode
+            assert payload["held_back"] == [VM], mode
+            assert payload["pruned"] == [], mode
+            assert payload["dry_run"] is dry_run, mode
+            if dry_run:
+                assert payload["would_prune"] == [], mode
+    if output_format == "json":
+        assert json.loads(results["--vm"][1])["found"] is True
+    # Held back means held back: the remnant survives both modes.
+    assert serial.exists()
+
+
+def test_vm_and_all_agree_on_what_an_old_enough_remnant_is(
+    cache, monkeypatch, capsys
+):
+    """The cutoff that lets `--all` prune a remnant must let `--vm` prune it."""
+    _make_state(VM_HELD_BACK, cache, monkeypatch)
+    _decoy_running(monkeypatch)
+
+    cli.main(["--format", "json", "prune", "--all", "--dry-run", "--older-than", "0"])
+    via_all = json.loads(capsys.readouterr().out)
+    cli.main(["--format", "json", "prune", "--vm", VM, "--dry-run", "--older-than", "0"])
+    via_vm = json.loads(capsys.readouterr().out)
+
+    assert via_all["would_prune"] == via_vm["would_prune"] == [VM]
+    assert via_all["held_back"] == via_vm["held_back"] == []
+    assert via_vm["found"] is True
+
+
+# ---------------------------------------------------------------------------
 # The second axis: guest usability, orthogonal to existence.
 #
 # Proven orthogonal by a real VM that was simultaneously orphaned AND panicked.
@@ -767,6 +871,105 @@ def test_status_publishes_both_axes_in_json(cache, monkeypatch, capsys):
     assert payload["guest"] == "panicked"
 
 
+# ---------------------------------------------------------------------------
+# Axis 4, kill vs status. `status` tells the reader to pull the report BEFORE
+# reaping; `kill` then deleted it without a word. Both commands look at the
+# same guest axis, so `kill` must keep what `status` just promised was there.
+# ---------------------------------------------------------------------------
+
+
+def _fake_kill(monkeypatch):
+    """Terminate nothing; do the same cleanup `_kill_vm` does."""
+    calls = []
+
+    def kill(inst, force=False, clean=True):
+        calls.append(clean)
+        if clean:
+            instance_mod.remove_instance(inst.vm_id)
+
+    monkeypatch.setattr(lifecycle, "_kill_vm", kill)
+    return calls
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+@pytest.mark.parametrize("body, guest", [
+    (TERMINAL_PANIC, "panicked"),
+    (SURVIVED_OOPS, "crashed"),
+])
+def test_kill_keeps_the_report_status_told_the_reader_to_pull(
+    body, guest, output_format, cache, monkeypatch, capsys
+):
+    inst = _vm_with_log(cache, "ev", body)
+    _qmp(monkeypatch, True)
+    _register_running(monkeypatch, inst)
+    calls = _fake_kill(monkeypatch)
+
+    cli.main(["--format", "json", "status", "--vm", "ev"])
+    assert json.loads(capsys.readouterr().out)["guest"] == guest
+
+    rc = cli.main(["--format", output_format, "kill", "--vm", "ev"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert calls == [False]
+    assert Path(inst.serial_log).exists()
+    if output_format == "json":
+        payload = json.loads(out)
+        assert payload["guest"] == guest
+        assert payload["cleaned"] is False
+        assert payload["logs_preserved"] is True
+        assert payload["serial_log"] == inst.serial_log
+    else:
+        assert "Crash report preserved: qmu crash --vm ev" in out
+        assert "qmu prune --vm ev" in out
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_kill_of_a_healthy_guest_still_cleans_and_returns_no_dead_path(
+    output_format, cache, monkeypatch, capsys
+):
+    inst = _vm_with_log(cache, "hv", "[ 0.0] Linux version 6.12.0\n")
+    _qmp(monkeypatch, True)
+    _register_running(monkeypatch, inst)
+    calls = _fake_kill(monkeypatch)
+
+    rc = cli.main(["--format", output_format, "kill", "--vm", "hv"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert calls == [True]
+    assert not Path(inst.serial_log).exists()
+    if output_format == "json":
+        payload = json.loads(out)
+        assert payload["guest"] == "serving"
+        assert payload["cleaned"] is True
+        assert payload["logs_preserved"] is False
+        # The path was just unlinked; handing it back would send the reader
+        # to a file that is not there.
+        assert payload["serial_log"] is None
+        assert payload["bridge_reaped"] is False
+    else:
+        assert out.strip() == "VM 'hv' stopped."
+
+
+def test_kill_no_clean_on_a_panicked_guest_names_the_report(
+    cache, monkeypatch, capsys
+):
+    """--no-clean and evidence preservation must not contradict each other."""
+    inst = _vm_with_log(cache, "nc", TERMINAL_PANIC)
+    _qmp(monkeypatch, True)
+    _register_running(monkeypatch, inst)
+    _fake_kill(monkeypatch)
+
+    cli.main(["--format", "json", "kill", "--vm", "nc", "--no-clean"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["cleaned"] is False
+    assert payload["logs_preserved"] is True
+    assert payload["serial_log"] == inst.serial_log
+    assert Path(inst.serial_log).exists()
+
+
 def test_orphan_guest_state_can_reach_serving(cache, monkeypatch):
     """An orphan's QMP socket sits at a derivable path; don't give up on it."""
     idir = cache / "instances"
@@ -881,6 +1084,128 @@ def test_reachable_guest_is_never_labelled_panicked(cache, monkeypatch, capsys):
     entry = json.loads(capsys.readouterr().out)["vms"][0]
 
     assert not (entry["ssh_ready"] and entry["guest"] == "panicked")
+
+
+# ---------------------------------------------------------------------------
+# `list` cost. One serial ssh handshake per running VM made a ten-VM host
+# take 15–60 s per call. The probes run concurrently and are skipped where
+# the guest axis already fixes the answer; the OUTPUT for the same facts must
+# not change — only the time it takes to produce it.
+# ---------------------------------------------------------------------------
+
+
+def _ssh_capable(inst, port):
+    return __import__("dataclasses").replace(inst, ssh_port=port, harness=False)
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+@pytest.mark.parametrize("body, qmp_running, guest", [
+    (TERMINAL_PANIC, True, "panicked"),
+    ("[ 0.0] Linux version 6.12.0\n", False, "paused"),
+])
+def test_list_does_not_probe_ssh_on_a_guest_that_cannot_answer(
+    body, qmp_running, guest, output_format, cache, monkeypatch, capsys
+):
+    inst = _ssh_capable(_vm_with_log(cache, "np", body), 10022)
+    _qmp(monkeypatch, qmp_running)
+    _register_running(monkeypatch, inst)
+    monkeypatch.setattr(
+        lifecycle, "_make_ssh",
+        lambda i: pytest.fail(f"probed sshd on a {guest} guest"),
+    )
+
+    cli.main(["--format", output_format, "list"])
+    out = capsys.readouterr().out
+
+    if output_format == "json":
+        entry = json.loads(out)["vms"][0]
+        assert entry["guest"] == guest
+        assert entry["ssh_ready"] is False
+    else:
+        # Byte-identical to what a timed-out probe reported before.
+        assert "ssh=10022(down)" in out
+
+
+def test_list_probes_running_vms_concurrently_and_keeps_their_order(
+    cache, monkeypatch, capsys
+):
+    vms = [
+        _ssh_capable(_vm_with_log(cache, f"c{i}", "[ 0.0] Linux version 6.12.0\n"), 10030 + i)
+        for i in range(4)
+    ]
+    _qmp(monkeypatch, True)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: list(vms))
+        monkeypatch.setattr(mod, "find_orphan_qemus", lambda: [], raising=False)
+
+    class SlowSSH:
+        def __init__(self, port):
+            self.port = port
+
+        def is_ready(self, timeout=2):
+            time.sleep(0.3)
+            return self.port % 2 == 0
+
+    monkeypatch.setattr(lifecycle, "_make_ssh", lambda i: SlowSSH(i.ssh_port))
+
+    started = time.monotonic()
+    cli.main(["--format", "json", "list"])
+    elapsed = time.monotonic() - started
+    rows = [
+        r for r in json.loads(capsys.readouterr().out)["vms"]
+        if r["status"] == "running"
+    ]
+
+    assert elapsed < 0.3 * len(vms), "probes ran in series"
+    assert [r["vm_id"] for r in rows] == [v.vm_id for v in vms]
+    assert [r["ssh_ready"] for r in rows] == [True, False, True, False]
+
+    cli.main(["list"])
+    text = capsys.readouterr().out
+    assert "ssh=10030(ok)" in text and "ssh=10031(down)" in text
+
+
+def test_list_never_presents_a_dead_pid_as_live(cache, monkeypatch, capsys):
+    """A stopped record keeps the pid its process had; `list` showed it as
+    if it were still a process to signal."""
+    inst = _vm_with_log(cache, "dead", "boot\n")
+    instance_mod.save_instance(inst)
+    monkeypatch.setattr(lifecycle, "list_instances", lambda: [])
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+
+    cli.main(["--format", "json", "list"])
+    entry = [v for v in json.loads(capsys.readouterr().out)["vms"] if v["vm_id"] == "dead"][0]
+
+    assert entry["status"] == "stopped"
+    assert entry["pid"] is None
+
+
+def test_profile_override_is_machine_readable_wherever_text_says_so(
+    cache, monkeypatch, capsys
+):
+    """Axis 3. `status` text printed "(NOT applied — cmdline was overridden)"
+    while every JSON row still carried the bare profile name."""
+    inst = _vm_with_log(cache, "ov", "[ 0.0] Linux version 6.12.0\n")
+    inst = __import__("dataclasses").replace(inst, cmdline_override=True, kvm=False)
+    _qmp(monkeypatch, True)
+    _register_running(monkeypatch, inst)
+
+    cli.main(["status", "--vm", "ov"])
+    text = capsys.readouterr().out
+    cli.main(["--format", "json", "status", "--vm", "ov"])
+    status = json.loads(capsys.readouterr().out)
+    cli.main(["--format", "json", "list"])
+    row = json.loads(capsys.readouterr().out)["vms"][0]
+
+    assert "NOT applied" in text
+    assert status["profile_applied"] is False
+    assert row["profile_applied"] is False
+    # The facts an agent otherwise had to read from the instance file.
+    assert status["kvm"] is False and row["kvm"] is False
+    assert "Accel:     tcg" in text
+    assert status["qmp_socket"] == inst.qmp_socket
+    assert status["qemu_log"].endswith("ov.qemu.log")
+    assert status["arch"] == row["arch"]
 
 
 def test_a_forged_boot_banner_cannot_hide_a_crash(cache, monkeypatch):
@@ -1027,6 +1352,32 @@ def test_empty_and_populated_residue_are_equally_disclosing(cache, capsys):
         assert set(_BUCKETS) <= set(payload["build_residue"])
         assert "unmanaged_cache" in payload
         assert payload["dry_run"] is True
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_residue_prune_refuses_a_root_that_is_not_a_qmu_cache(
+    dry_run, cache, monkeypatch, capsys
+):
+    """#49: QMU_CACHE_DIR is taken on faith, so a typo pointing at $HOME must
+    be refused before classification — in preview and real run alike. An
+    absent or empty root is NOT that typo (nothing under it to reclaim)."""
+    (cache / "Documents").mkdir()
+    (cache / "notes.o").write_bytes(b"not residue")
+
+    rc = cli.main(
+        ["--format", "json", "prune", "--build-residue"]
+        + (["--dry-run"] if dry_run else [])
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["ok"] is False
+    assert str(cache) in payload["error"]
+    assert "QMU_CACHE_DIR" in payload["error"]
+    assert (cache / "notes.o").exists()
+
+    monkeypatch.setenv("QMU_CACHE_DIR", str(cache / "fresh-cache"))
+    assert cli.main(["prune", "--build-residue", "--dry-run"]) == 0
 
 
 @pytest.mark.parametrize(
@@ -1227,3 +1578,431 @@ def test_every_ssh_command_agrees_on_a_lost_transport(
     }
     for command, view in views.items():
         assert view == expected, f"`qmu {command}` disagrees: {view}"
+
+
+# ---------------------------------------------------------------------------
+# A guest `status`/`list` call PANICKED must be refused by every SSH-facing
+# command, in both formats, before any SSH attempt — and a panic the guest
+# already rebooted past must NOT be. Measured live before this row: `exec`
+# spent 15–45 s in ssh keepalive and said "No fresh crash detected" (exit 4)
+# while `status` said panicked and `crash` printed the report.
+# ---------------------------------------------------------------------------
+
+
+_PANICKED_ARGV = {
+    **_LOST_ARGV,
+    "compile": ["compile", "--vm", VM, "/tmp/x.c"],
+}
+
+
+def _qmp_running_for_cliutil(monkeypatch):
+    """Both authorities see a running vCPU: lifecycle's copy for `status`, the
+    SSH preflight's copy for the guest commands."""
+    from qmu import _cliutil
+
+    class FakeQMP:
+        def execute(self, cmd):
+            return {"running": True, "status": "running"}
+
+    class Ctx:
+        def __enter__(self): return FakeQMP()
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(lifecycle, "_qmp_ctx", lambda inst: Ctx())
+    monkeypatch.setattr(_cliutil, "_qmp_ctx", lambda inst: Ctx())
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_every_ssh_command_agrees_with_status_that_the_guest_panicked(
+    fmt, cache, monkeypatch, capsys
+):
+    inst = _ssh_capable_instance(cache)
+    with open(inst.serial_log, "w") as stream:
+        stream.write("[ 0.0] Linux version 6.12.0 (x) #1\n" + TERMINAL_PANIC)
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+        monkeypatch.setattr(mod, "find_orphan_qemus", lambda: [], raising=False)
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(guest_mod, "choose_instance", lambda vm=None: inst)
+    _qmp_running_for_cliutil(monkeypatch)
+    monkeypatch.setattr(
+        guest_mod, "_make_ssh",
+        lambda selected: (_ for _ in ()).throw(AssertionError("SSH attempted")),
+    )
+
+    cli.main(["--format", "json", "status", "--vm", VM])
+    assert json.loads(capsys.readouterr().out)["guest"] == "panicked"
+
+    for command, argv in _PANICKED_ARGV.items():
+        rc = cli.main(["--format", fmt, *argv])
+        captured = capsys.readouterr()
+        assert rc == 1, f"`qmu {command}` rc={rc}"
+        if fmt == "json":
+            payload = json.loads(captured.out)
+            view = {
+                "ok": payload["ok"],
+                "guest_state": payload["guest_state"],
+                "ssh_error": payload["ssh_error"],
+                "crash_detected": payload["crash_detected"],
+                "names_qmu_crash": f"qmu crash --vm {VM}" in payload["hint"],
+            }
+            assert view == {
+                "ok": False,
+                "guest_state": "panicked",
+                "ssh_error": False,
+                "crash_detected": False,
+                "names_qmu_crash": True,
+            }, f"`qmu {command}` disagrees: {view}"
+        else:
+            # Refusals are prose: stderr with the documented prefix, never
+            # stdout, so `eval "$(qmu kbase ...)"` and pipes stay clean.
+            assert captured.out == "", f"`qmu {command}` wrote a refusal to stdout"
+            assert captured.err.startswith("[qmu] Error:"), f"`qmu {command}`"
+            assert "PANICKED" in captured.err, f"`qmu {command}`"
+            assert f"qmu crash --vm {VM}" in captured.err, f"`qmu {command}`"
+
+
+def test_ssh_commands_and_status_agree_a_rebooted_guest_is_serving(
+    cache, monkeypatch, capsys
+):
+    """Scope is the current boot on BOTH paths: a panic the guest already
+    rebooted past (`panic=N`) refuses nothing and `status` says serving."""
+    inst = _ssh_capable_instance(cache)
+    with open(inst.serial_log, "w") as stream:
+        stream.write(
+            "[ 0.0] Linux version 6.12.0 (x) #1\n" + TERMINAL_PANIC
+            + "[ 1.7] Rebooting in 3 seconds..\n"
+            "[ 0.0] Linux version 6.12.0 (x) #1\n"
+            "localhost login: \n"
+        )
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+        monkeypatch.setattr(mod, "find_orphan_qemus", lambda: [], raising=False)
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(guest_mod, "choose_instance", lambda vm=None: inst)
+    _qmp_running_for_cliutil(monkeypatch)
+
+    class ServingSSH:
+        def run(self, command, timeout=30.0, check=False):
+            return 0, "ok\n", ""
+
+        def is_ready(self, timeout=2):
+            return True
+
+    monkeypatch.setattr(guest_mod, "_make_ssh", lambda selected: ServingSSH())
+
+    cli.main(["--format", "json", "status", "--vm", VM])
+    assert json.loads(capsys.readouterr().out)["guest"] == "serving"
+
+    for command in ("exec", "dmesg"):
+        rc = cli.main(["--format", "json", *_LOST_ARGV[command]])
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0, f"`qmu {command}` refused a serving guest: {payload}"
+        assert payload["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# A networked-looking VM with NO SSH endpoint: `launch --no-net` without
+# `--ssh-port`. qmu emits `-nic none` and binds nothing, so there is no port
+# to record — it used to record an auto-allocated one anyway, `status` said
+# `ssh: ready` once another VM was handed that port, and `exec --vm A` ran
+# the command on VM B (exit 0, wrong kernel). Every command that reports on
+# or uses SSH must agree: no endpoint, no probe, refuse before any SSH
+# attempt, and say why (`--ssh-port`), in both formats.
+# ---------------------------------------------------------------------------
+
+
+_NO_ENDPOINT_ARGV = {
+    **_PANICKED_ARGV,
+    "kbase": ["kbase", "--vm", VM, "--symbols", "/tmp/vmlinux"],
+}
+
+
+def _no_net_instance(cache, vm_id=VM):
+    """What `launch --no-net` (no --ssh-port) now records: not harness, a key,
+    and ssh_port None."""
+    idir = cache / "instances"
+    idir.mkdir(parents=True, exist_ok=True)
+    serial = idir / f"{vm_id}.serial.log"
+    serial.write_text("[ 0.0] Linux version 6.12.0 (x) #1\n")
+    return VMInstance(
+        vm_id=vm_id, pid=4242, qmp_socket=str(idir / f"{vm_id}.qmp.sock"),
+        ssh_port=None, ssh_key=str(idir / f"{vm_id}.key"), gdb_port=None,
+        serial_log=str(serial), kernel="/boot/bzImage",
+        rootfs="/var/rootfs.img", memory="4G", cpus=2, cmdline="console=ttyS0",
+        profile="exploit-dev", started_at="2026-10-16T00:00:00Z", harness=False,
+    )
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_every_ssh_command_and_status_agree_a_no_net_vm_has_no_endpoint(
+    fmt, cache, monkeypatch, capsys
+):
+    inst = _no_net_instance(cache)
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+        monkeypatch.setattr(mod, "find_orphan_qemus", lambda: [], raising=False)
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(guest_mod, "choose_instance", lambda vm=None: inst)
+    from qmu.commands import qmp_cmds as qmp_cmds_mod
+    monkeypatch.setattr(qmp_cmds_mod, "choose_instance", lambda vm=None: inst)
+    _qmp_running_for_cliutil(monkeypatch)
+    # No command may so much as build an SSH client: there is no port to probe,
+    # and a bare TCP probe is exactly how the wrong VM answered before.
+    for mod in (lifecycle, guest_mod, qmp_cmds_mod):
+        monkeypatch.setattr(
+            mod, "_make_ssh",
+            lambda selected: (_ for _ in ()).throw(AssertionError("SSH attempted")),
+            raising=False,
+        )
+
+    rc = cli.main(["--format", fmt, "status", "--vm", VM])
+    captured = capsys.readouterr()
+    assert rc == 0
+    if fmt == "json":
+        status = json.loads(captured.out)
+        assert status["ssh_port"] is None
+        assert status["harness"] is False
+        assert status["ssh"] not in ("ready", "down")
+    else:
+        assert "ready" not in captured.out
+
+    rc = cli.main(["--format", fmt, "list"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    if fmt == "json":
+        row = next(r for r in json.loads(captured.out)["vms"] if r["vm_id"] == VM)
+        assert row["ssh_port"] is None
+        assert row["ssh_ready"] is None
+        assert row["harness"] is False
+    else:
+        line = next(l for l in captured.out.splitlines() if VM in l)
+        assert "ssh=" not in line or "ssh=none" in line
+
+    for command, argv in _NO_ENDPOINT_ARGV.items():
+        rc = cli.main(["--format", fmt, *argv])
+        captured = capsys.readouterr()
+        assert rc == 1, f"`qmu {command}` rc={rc}"
+        if fmt == "json":
+            payload = json.loads(captured.out)
+            assert payload["ok"] is False, f"`qmu {command}`"
+            assert payload["error_type"] == "QMUError", f"`qmu {command}`"
+            message = payload["error"]
+        else:
+            assert captured.out == "", f"`qmu {command}` wrote a refusal to stdout"
+            assert captured.err.startswith("[qmu] Error:"), f"`qmu {command}`"
+            message = captured.err
+        assert "--no-net" in message and "--ssh-port" in message, f"`qmu {command}`: {message}"
+        assert "harness" not in message, f"`qmu {command}` misreports --no-net as harness"
+
+
+# ---------------------------------------------------------------------------
+# HMP-wrapping commands. HMP reports its own failures as result TEXT, so five
+# commands can each decide "did it work" differently -- and did: `snapshot
+# delete <missing>` and `snapshot save 'has space'` said ok:true, `monitor
+# nonsense-cmd` exited 0, while `snapshot load <missing>` exited 1 with a
+# `message` instead of `error` (snapshot audit D3/D4/D8, contract #5). Axis 4
+# (subcommand vs subcommand) and axis 3 (text vs JSON) in one row.
+# ---------------------------------------------------------------------------
+
+
+class _HmpFailingQMP:
+    """Every HMP verb answers with an HMP error form; `info snapshots` is
+    empty so the dedicated handlers' listing cross-checks also say "no"."""
+
+    def __init__(self, text):
+        self._text = text
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        if command == "query-status":
+            return {"running": True, "status": "running"}
+        if command == "human-monitor-command":
+            return self._text
+        return {}
+
+    def execute_hmp(self, command_line, timeout=30.0):
+        if command_line == "info snapshots":
+            return ""
+        return self._text
+
+
+_HMP_FAILURE_ARGV = {
+    "snapshot save": ["snapshot", "save", "x", "--vm", VM],
+    "snapshot load": ["snapshot", "load", "x", "--vm", VM],
+    "snapshot delete": ["snapshot", "delete", "x", "--vm", VM],
+    "monitor": ["monitor", "--vm", VM, "nonsense-cmd"],
+    "qmp human-monitor-command": [
+        "qmp", "--vm", VM, "human-monitor-command",
+        "--args", '{"command-line": "nonsense-cmd"}',
+    ],
+}
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_every_hmp_route_agrees_an_hmp_error_form_is_a_failure(
+    cache, monkeypatch, capsys, fmt
+):
+    from qmu.commands import qmp_cmds
+
+    inst = _ssh_capable_instance(cache)
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+    import contextlib
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx",
+        lambda inst: contextlib.nullcontext(_HmpFailingQMP("unknown command: 'x'\r\n")),
+    )
+
+    for command, argv in _HMP_FAILURE_ARGV.items():
+        rc = cli.main(["--format", fmt, *argv])
+        captured = capsys.readouterr()
+        assert rc == 1, f"`qmu {command}` exit {rc}"
+        if fmt == "json":
+            payload = json.loads(captured.out)
+            assert payload["ok"] is False, f"`qmu {command}`"
+            assert "error" in payload and "error_type" in payload, f"`qmu {command}`: {payload}"
+            assert "message" not in payload, f"`qmu {command}` still uses `message`"
+        else:
+            assert captured.out == "", f"`qmu {command}` wrote a failure to stdout"
+            assert captured.err.startswith("[qmu] Error:"), f"`qmu {command}`: {captured.err}"
+
+
+# ---------------------------------------------------------------------------
+# The guest epoch after a qmu-ISSUED reset. `snapshot load` advanced it; the
+# three raw routes to `system_reset` did not, so `wait --pattern 'login:'`
+# matched the previous boot in 0.00 s after `qmu qmp system_reset` (snapshot
+# audit D5). Four commands, one observable state: all must persist the same
+# boundary -- the log size captured BEFORE the mutation landed.
+# ---------------------------------------------------------------------------
+
+
+class _MutatingQMP:
+    """Every mutation succeeds; the serial log grows as a side effect, the
+    way a real reset prints a new boot banner."""
+
+    def __init__(self, serial_log):
+        self._serial = serial_log
+
+    def _grow(self):
+        with open(self._serial, "a") as stream:
+            stream.write("[    0.000000] Linux version 7.0.0 (reboot)\n")
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        if command == "query-status":
+            return {"running": True, "status": "running"}
+        if command in ("system_reset", "human-monitor-command"):
+            self._grow()
+        return "" if command == "human-monitor-command" else {}
+
+    def execute_hmp(self, command_line, timeout=30.0):
+        if command_line == "info snapshots":
+            return (
+                "List of snapshots present on all disks:\n"
+                "ID        TAG               VM SIZE                DATE       VM CLOCK\n"
+                "--        clean             486 MiB 2026-05-28 23:11:52 0000:01:01.992\n"
+            )
+        self._grow()
+        return ""
+
+
+_RESET_ARGV = {
+    "qmp system_reset": ["qmp", "--vm", VM, "system_reset"],
+    "monitor system_reset": ["monitor", "--vm", VM, "system_reset"],
+    "qmp human-monitor-command system_reset": [
+        "qmp", "--vm", VM, "human-monitor-command",
+        "--args", '{"command-line": "system_reset"}',
+    ],
+    "snapshot load": ["snapshot", "load", "clean", "--vm", VM],
+    "monitor loadvm": ["monitor", "--vm", VM, "loadvm", "clean"],
+}
+
+
+@pytest.mark.parametrize("command", sorted(_RESET_ARGV))
+def test_every_qmu_issued_reset_advances_the_guest_epoch(
+    command, cache, monkeypatch, capsys
+):
+    from qmu.commands import qmp_cmds
+    import contextlib
+
+    inst = _vm_with_log(cache, VM, "[ 0.0] Linux version 7.0.0\nlocalhost login:\n")
+    before = Path(inst.serial_log).stat().st_size
+    assert inst.guest_epoch_serial_offset == 0
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+    monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: False)
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx",
+        lambda inst: contextlib.nullcontext(_MutatingQMP(inst.serial_log)),
+    )
+
+    rc = cli.main(["--format", "json", *_RESET_ARGV[command]])
+    capsys.readouterr()
+    assert rc == 0, f"`qmu {command}` exit {rc}"
+    saved = instance_mod.load_instance(VM)
+    assert saved.guest_epoch_serial_offset == before, (
+        f"`qmu {command}` persisted epoch {saved.guest_epoch_serial_offset}, "
+        f"expected the pre-mutation log size {before}"
+    )
+    # The boundary is the PRE-mutation size: the new boot's banner must still
+    # be inside the current epoch, or `wait`/`crash` would skip it.
+    assert Path(inst.serial_log).stat().st_size > before
+
+
+# ---------------------------------------------------------------------------
+# "A debugger client is attached" is an observable state (the gdb stub serves
+# one client). `qmu gdb` must refuse to spawn a second bridge and say so the
+# same way in text and JSON; it used to hang 15 s, exit 4 with a raw
+# TimeoutExpired repr, and leak a bridge per attempt (debug audit D4).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_gdb_refuses_an_attached_stub_identically_in_text_and_json(
+    cache, monkeypatch, capsys, fmt
+):
+    from qmu.commands import qmp_cmds
+
+    inst = _vm_with_log(cache, VM, "[ 0.0] Linux version 7.0.0\n")
+    inst.gdb_port = 1234
+    inst.gdb_bridge_pid = 4242
+    inst.gdb_bridge_pid_start = "1"
+    instance_mod.save_instance(inst)
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(qmp_cmds.shutil, "which", lambda name: "/usr/bin/pry")
+    monkeypatch.setattr(qmp_cmds, "gdb_client_attached", lambda inst: True)
+    monkeypatch.setattr(qmp_cmds, "bridge_alive", lambda inst: True)
+    spawned = []
+    monkeypatch.setattr(
+        qmp_cmds.subprocess, "run", lambda *a, **kw: spawned.append(a) or None
+    )
+
+    rc = cli.main(["--format", fmt, "gdb", "--vm", VM])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert spawned == []
+    if fmt == "json":
+        payload = json.loads(captured.out)
+        assert payload["ok"] is False
+        assert payload["error_type"] == "QMUError"
+        message = payload["error"]
+    else:
+        assert captured.out == ""
+        assert captured.err.startswith("[qmu] Error:")
+        message = captured.err
+    assert "already attached to port 1234" in message
+    assert "pry bridge pid 4242" in message
+    assert "pry kill --instance 4242" in message
+    assert "TimeoutExpired" not in message

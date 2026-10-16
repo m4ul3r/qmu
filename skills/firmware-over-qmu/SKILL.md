@@ -47,7 +47,8 @@ may join the main baseline only after explicit approval; approval authorizes an
 adaptation, not a claim that it matches unobserved hardware. Keep a blocked main
 goal separate from a passed isolated experiment.
 
-Apply qmu's **Evidence and handoff contract**: identify artifacts by revision or
+Apply qmu's **Evidence and handoff contract** (`read
+skill://qmu/reference/evidence-contract.md`): identify artifacts by revision or
 digest, keep writable worker state private, use unique VM names with
 `--no-replace` and explicit `--vm`, and preserve a discoverable same-host recipe
 and linked receipts. Report milestone/state/strongest observation/substitutions

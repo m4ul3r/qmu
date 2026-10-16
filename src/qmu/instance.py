@@ -62,6 +62,13 @@ class VMInstance:
     # None keeps instance JSON written before this field existed loadable
     # (accel unknown).
     kvm: bool | None = None
+    # The pry bridge (headless GDB) `qmu gdb` spawned for this VM, with its
+    # /proc start-time so a recycled pid is never mistaken for it (#40). qmu
+    # owns this process: `kill` reaps it through `debug.reap_bridge` and a
+    # second `qmu gdb` names it instead of spawning another. None when no
+    # bridge was spawned or the record predates the field.
+    gdb_bridge_pid: int | None = None
+    gdb_bridge_pid_start: str | None = None
 
 
 def _instance_from_dict(data: dict) -> VMInstance:

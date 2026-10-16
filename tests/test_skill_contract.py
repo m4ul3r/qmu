@@ -23,6 +23,10 @@ import pytest
 from qmu.cli import build_parser
 
 SKILL = Path(__file__).resolve().parents[1] / "skills" / "qmu" / "SKILL.md"
+REFERENCE_DIR = SKILL.parent / "reference"
+# #42 split: every companion file is scanned for `qmu …` lines too, so moving a
+# section out of SKILL.md never moves it out of the contract.
+SKILL_FILES = [SKILL, *sorted(REFERENCE_DIR.glob("*.md"))]
 
 # A documented line containing any of these is a template, not a runnable
 # command; its VALUE checks may fail, but an unknown flag still must not.
@@ -56,8 +60,8 @@ def _cut_at_unquoted(line: str) -> str:
     return line.strip()
 
 
-def _documented_commands() -> list[tuple[int, str]]:
-    """Every `qmu ...` invocation inside a fenced code block, with its line number.
+def _documented_commands(path: Path = SKILL) -> list[tuple[int, str]]:
+    """Every `qmu ...` invocation inside a fenced code block of PATH, with its line number.
 
     Backslash continuations are JOINED rather than skipped: the multi-line
     `launch` examples carry the most flags in the whole document, so they are
@@ -76,7 +80,7 @@ def _documented_commands() -> list[tuple[int, str]]:
             found.append((start, line))
         pending.clear()
 
-    for lineno, raw in enumerate(SKILL.read_text().splitlines(), 1):
+    for lineno, raw in enumerate(path.read_text().splitlines(), 1):
         if raw.lstrip().startswith("```"):
             flush()
             fenced = not fenced
@@ -103,7 +107,11 @@ def _documented_commands() -> list[tuple[int, str]]:
     return found
 
 
-DOCUMENTED = _documented_commands()
+DOCUMENTED = [
+    (path, lineno, command)
+    for path in SKILL_FILES
+    for lineno, command in _documented_commands(path)
+]
 
 
 def test_skill_documents_some_commands():
@@ -112,17 +120,17 @@ def test_skill_documents_some_commands():
 
 
 @pytest.mark.parametrize(
-    "lineno,command",
+    "path,lineno,command",
     DOCUMENTED,
-    ids=[f"L{n}" for n, _ in DOCUMENTED],
+    ids=[f"{p.name}:L{n}" for p, n, _ in DOCUMENTED],
 )
-def test_documented_command_parses(lineno, command):
+def test_documented_command_parses(path, lineno, command):
     parser = build_parser()
     try:
         argv = shlex.split(command)[1:]
     except ValueError as exc:
-        pytest.fail(f"SKILL.md:{lineno} is not shell-parseable: {exc}\n  $ {command}")
-    assert argv, f"SKILL.md:{lineno}: bare 'qmu'"
+        pytest.fail(f"{path.name}:{lineno} is not shell-parseable: {exc}\n  $ {command}")
+    assert argv, f"{path.name}:{lineno}: bare 'qmu'"
 
     out, err = io.StringIO(), io.StringIO()
     try:
@@ -136,9 +144,36 @@ def test_documented_command_parses(lineno, command):
         if PLACEHOLDER.search(command) and not unknown:
             pytest.skip(f"template line: {command}")
         pytest.fail(
-            f"SKILL.md:{lineno} documents a command the CLI rejects:\n"
+            f"{path.name}:{lineno} documents a command the CLI rejects:\n"
             f"  $ {command}\n  -> {reason}"
         )
+
+
+def test_reference_files_exist_and_are_pointed_at():
+    """#42: every `reference/<file>.md` the main skill names must exist, and
+    every companion file must be reachable from the main skill — a moved
+    section whose pointer was lost is invisible to the agent that needs it."""
+    text = SKILL.read_text()
+    named = set(re.findall(r"reference/([\w-]+\.md)", text))
+    assert named, "SKILL.md points at no reference files"
+    on_disk = {p.name for p in REFERENCE_DIR.glob("*.md")}
+    assert named <= on_disk, f"dangling reference pointers: {sorted(named - on_disk)}"
+    assert on_disk <= named, f"companion files nothing points at: {sorted(on_disk - named)}"
+
+
+@pytest.mark.parametrize("path", SKILL_FILES, ids=[p.name for p in SKILL_FILES])
+def test_markdown_anchors_resolve(path):
+    """`](#anchor)` links must name a heading in the same file."""
+    text = path.read_text()
+
+    def slug(heading: str) -> str:
+        heading = re.sub(r"[`*_]", "", heading).strip().lower()
+        heading = re.sub(r"[^\w\s-]", "", heading)
+        return re.sub(r"\s+", "-", heading)
+
+    headings = {slug(m) for m in re.findall(r"^#+\s+(.+)$", text, flags=re.M)}
+    for anchor in re.findall(r"\]\(#([^)]+)\)", text):
+        assert anchor in headings, f"{path.name}: dangling anchor #{anchor}"
 
 
 def test_skill_schema_section_matches_validator():

@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,10 +62,22 @@ def _summary(value: Any) -> dict[str, Any]:
 
 
 def _spill_path(stem: str, suffix: str) -> Path:
+    """Create a unique, empty spill file and return its path.
+
+    The name is `<stem>-<HHMMSS>-<random><suffix>` created with O_EXCL via
+    mkstemp, so two spills in the same second (two large `exec` results back
+    to back) never share a file: the second used to overwrite the first while
+    the first envelope still advertised that path and a sha256 that no longer
+    matched it.
+    """
     now = datetime.now(timezone.utc)
     directory = spill_root() / now.strftime("%Y%m%d")
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{stem}-{now.strftime('%H%M%S')}{suffix}"
+    fd, name = tempfile.mkstemp(
+        dir=directory, prefix=f"{stem}-{now.strftime('%H%M%S')}-", suffix=suffix
+    )
+    os.close(fd)
+    return Path(name)
 
 
 def _estimate_tokens(rendered: str) -> int:

@@ -551,22 +551,32 @@ def _handle_rootfs_cat(args: argparse.Namespace) -> int:
 
 
 def _handle_rootfs_rm(args: argparse.Namespace) -> int:
-    rootfs_mod.remove(
+    result = rootfs_mod.remove(
         args.image,
         args.paths,
         partition=args.partition,
         recursive=args.recursive,
         force=args.force,
     )
-    lines = [f"Removed from {args.image} (partition {args.partition}):"]
-    lines.extend(f"  {p}" for p in args.paths)
+    if result["removed"]:
+        lines = [f"Removed from {args.image} (partition {args.partition}):"]
+        lines.extend(f"  {p}" for p in result["removed"])
+        lines.extend(
+            f"  (not present, ignored by --force) {p}" for p in result["missing"]
+        )
+    else:
+        lines = [
+            f"Nothing to remove: {', '.join(result['missing'])} does not exist "
+            "(--force)."
+        ]
     _emit(
         args,
         data={
             "ok": True,
             "image": args.image,
             "partition": args.partition,
-            "removed": args.paths,
+            "removed": result["removed"],
+            "missing": result["missing"],
         },
         text=lines,
         stem="rootfs-rm",

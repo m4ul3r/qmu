@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from .paths import cache_home, instances_dir
+from .paths import cache_home
 
 
 # Subtrees qmu knows about. Anything else found at the cache root is still
@@ -599,10 +599,6 @@ def human_bytes(value: int) -> str:
             return f"{size:.1f}{unit}"
         size /= step
     return f"{size:.1f}T"  # pragma: no cover
-
-
-def instances_subtree_path() -> Path:
-    return instances_dir()
 
 
 def source_tree_names(root: Path | None = None) -> list[str]:

@@ -41,7 +41,13 @@ def gdb_vm(tmp_path):
     )
 
 
-def _install_gdb_seams(monkeypatch, gdb_vm, *, returncode=0, stdout="", stderr=""):
+_BRIDGE_PID = 777001
+_LAUNCH_JSON = json.dumps({"launched": True, "pid": _BRIDGE_PID, "instance_id": "qmu-debug-vm"})
+
+
+def _install_gdb_seams(
+    monkeypatch, gdb_vm, *, returncode=0, stdout=_LAUNCH_JSON, stderr="", attached=False
+):
     calls = []
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: gdb_vm)
     monkeypatch.setattr(
@@ -49,6 +55,11 @@ def _install_gdb_seams(monkeypatch, gdb_vm, *, returncode=0, stdout="", stderr="
         "which",
         lambda name: "/usr/bin/pry" if name == "pry" else None,
     )
+    # The attach gate reads the real /proc/net/tcp; on a shared host another
+    # VM's debugger may sit on port 1234, so the probe is pinned per test.
+    monkeypatch.setattr(qmp_cmds, "gdb_client_attached", lambda inst: attached)
+    # The bridge pid is recorded with its /proc start-time; the fake pid has none.
+    monkeypatch.setattr(qmp_cmds, "proc_pid_start", lambda pid: "4242")
 
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
@@ -63,15 +74,14 @@ def _install_gdb_seams(monkeypatch, gdb_vm, *, returncode=0, stdout="", stderr="
     return calls
 
 
+_LAUNCH_PREFIX = [
+    "pry", "launch", "--format", "json", "--instance-id", "qmu-debug-vm",
+    "--connect", "localhost:1234",
+]
+
+
 def _symbols_argv(symbols):
-    return [
-        "pry",
-        "launch",
-        "--connect",
-        "localhost:1234",
-        "--symbols",
-        str(symbols.resolve()),
-    ]
+    return _LAUNCH_PREFIX + ["--symbols", str(symbols.resolve())]
 
 
 def _assert_no_misleading_kaslr_claim(message: str) -> None:
@@ -183,7 +193,7 @@ def test_gdb_without_symbols_omits_symbol_warning_and_metadata(
     monkeypatch, gdb_vm, capsys
 ):
     calls = _install_gdb_seams(monkeypatch, gdb_vm)
-    argv = ["pry", "launch", "--connect", "localhost:1234"]
+    argv = _LAUNCH_PREFIX
 
     json_rc = cli.main([
         "--format", "json", "gdb", "--vm", "debug-vm"
@@ -205,16 +215,19 @@ def test_gdb_without_symbols_omits_symbol_warning_and_metadata(
     assert calls[1][0] == argv
 
 
-def test_gdb_failed_pry_omits_success_warnings(
+def test_gdb_failed_pry_is_an_operational_error(
     monkeypatch, tmp_path, gdb_vm, capsys
 ):
+    """A pry launch failure is the exit-1 class with `error` + `error_type`
+    (pry's own JSON error text when it gives one), on stderr in text mode."""
     symbols = tmp_path / "vmlinux"
     symbols.write_bytes(b"ELF")
     calls = _install_gdb_seams(
         monkeypatch,
         gdb_vm,
         returncode=2,
-        stderr="bridge startup failed",
+        stdout=json.dumps({"ok": False, "error": "bridge startup failed"}),
+        stderr="",
     )
 
     json_rc = cli.main([
@@ -228,15 +241,131 @@ def test_gdb_failed_pry_omits_success_warnings(
     captured = capsys.readouterr()
 
     assert json_rc == 1
-    assert payload == {"ok": False, "error": "bridge startup failed"}
-    assert "warning" not in payload
-    assert "cpu_state" not in payload
-    assert _SYMBOL_FIELDS.isdisjoint(payload)
+    assert payload == {
+        "ok": False,
+        "error": "pry launch failed: bridge startup failed",
+        "error_type": "QMUError",
+    }
     assert text_rc == 1
-    assert captured.err == ""
-    assert captured.out == "pry launch failed: bridge startup failed\n"
-    assert "HALTED" not in captured.out
-    assert "link-time" not in captured.out
-    assert "qmu kbase" not in captured.out
+    assert captured.out == ""
+    assert captured.err == "[qmu] Error: pry launch failed: bridge startup failed\n"
     assert calls[0][0] == _symbols_argv(symbols)
     assert calls[1][0] == _symbols_argv(symbols)
+
+
+# --- bridge ownership (#40, debug audit D4/D5) ------------------------------
+
+
+def test_gdb_records_the_bridge_pid_and_exposes_it(
+    monkeypatch, gdb_vm, capsys
+):
+    from qmu.instance import load_instance
+
+    _install_gdb_seams(monkeypatch, gdb_vm)
+    rc = cli.main(["--format", "json", "gdb", "--vm", "debug-vm"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["bridge_pid"] == _BRIDGE_PID
+    assert payload["bridge_instance_id"] == "qmu-debug-vm"
+    saved = load_instance("debug-vm")
+    assert saved.gdb_bridge_pid == _BRIDGE_PID
+    assert saved.gdb_bridge_pid_start == "4242"
+
+    text_rc = cli.main(["gdb", "--vm", "debug-vm"])
+    text = capsys.readouterr().out
+    assert text_rc == 0
+    assert f"pry bridge pid {_BRIDGE_PID}" in text
+    assert "pry --instance" in text
+
+
+def test_gdb_tolerates_a_launch_reply_without_a_pid(monkeypatch, gdb_vm, capsys):
+    _install_gdb_seams(monkeypatch, gdb_vm, stdout="")
+    rc = cli.main(["--format", "json", "gdb", "--vm", "debug-vm"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["bridge_pid"] is None
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_gdb_refuses_when_a_client_is_already_attached(
+    monkeypatch, gdb_vm, capsys, output_format
+):
+    """The stub serves one client: a second `pry launch` used to hang 15 s,
+    exit 4 with a raw TimeoutExpired and leak a bridge per attempt."""
+    gdb_vm.gdb_bridge_pid = _BRIDGE_PID
+    gdb_vm.gdb_bridge_pid_start = "4242"
+    calls = _install_gdb_seams(monkeypatch, gdb_vm, attached=True)
+    monkeypatch.setattr(qmp_cmds, "bridge_alive", lambda inst: True)
+
+    rc = cli.main(["--format", output_format, "gdb", "--vm", "debug-vm"])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert calls == []  # nothing spawned
+    if output_format == "json":
+        payload = json.loads(captured.out)
+        assert payload["ok"] is False
+        assert payload["error_type"] == "QMUError"
+        message = payload["error"]
+    else:
+        assert captured.out == ""
+        message = captured.err
+    assert "already attached to port 1234" in message
+    assert f"pry bridge pid {_BRIDGE_PID}" in message
+    assert f"pry kill --instance {_BRIDGE_PID}" in message
+
+
+def test_gdb_refusal_without_a_known_bridge_points_at_pry_doctor(
+    monkeypatch, gdb_vm, capsys
+):
+    calls = _install_gdb_seams(monkeypatch, gdb_vm, attached=True)
+    rc = cli.main(["gdb", "--vm", "debug-vm"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert calls == []
+    assert "already attached to port 1234" in err
+    assert "pry doctor" in err
+
+
+def test_gdb_timeout_is_an_operational_error_and_reaps_the_attempt(
+    monkeypatch, gdb_vm, capsys
+):
+    """`subprocess.TimeoutExpired` must never escape as a raw repr (exit 4);
+    the attempt's bridge is killed by its instance id."""
+    calls = _install_gdb_seams(monkeypatch, gdb_vm)
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[:2] == ["pry", "launch"]:
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(qmp_cmds.subprocess, "run", run)
+    rc = cli.main(["--format", "json", "gdb", "--vm", "debug-vm"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["error_type"] == "QMUError"
+    assert "TimeoutExpired" not in payload["error"]
+    assert "did not connect" in payload["error"]
+    assert "port 1234" in payload["error"]
+    assert calls[1][0] == ["/usr/bin/pry", "kill", "--instance", "qmu-debug-vm"]
+
+
+def test_gdb_reaps_a_stranded_bridge_before_spawning(monkeypatch, gdb_vm, capsys):
+    """A recorded bridge alive with NO client attached is the #40 stranded
+    case; it holds the VM's instance id, so it is reaped first."""
+    gdb_vm.gdb_bridge_pid = 555
+    gdb_vm.gdb_bridge_pid_start = "1"
+    calls = _install_gdb_seams(monkeypatch, gdb_vm, attached=False)
+    monkeypatch.setattr(qmp_cmds, "bridge_alive", lambda inst: True)
+    reaped = []
+    monkeypatch.setattr(qmp_cmds, "reap_bridge", lambda inst: reaped.append(inst.vm_id) or True)
+
+    rc = cli.main(["--format", "json", "gdb", "--vm", "debug-vm"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert reaped == ["debug-vm"]
+    assert payload["bridge_pid"] == _BRIDGE_PID
+    assert calls[0][0] == _LAUNCH_PREFIX

@@ -184,11 +184,17 @@ class SerialTail:
 
 def extract_crash(
     log_path: str | Path,
-    max_context_lines: int = 500,
     *,
     start_offset: int = 0,
 ) -> str | None:
-    """Return the last crash wholly discoverable at or after a byte boundary."""
+    """Return the last crash wholly discoverable at or after a byte boundary.
+
+    The whole slice from `start_offset` to EOF is scanned. A fixed tail window
+    (500 lines, once) silently dropped any crash followed by more output than
+    the window held — a `panic=N` guest reboots and appends ~700 boot lines,
+    so `qmu crash --full-history` answered "no crash markers" for a panic the
+    log plainly held. Serial logs are megabytes at most; the walk is linear.
+    """
     try:
         with Path(log_path).open("rb") as stream:
             size = os.fstat(stream.fileno()).st_size
@@ -200,12 +206,9 @@ def extract_crash(
     except OSError:
         return None
 
-    lines = text.splitlines()
-    if not lines:
+    tail = text.splitlines()
+    if not tail:
         return None
-
-    # Only scan the tail for performance
-    tail = lines[-max_context_lines:]
 
     # Walk backwards to find the first line of the last crash event. A soft
     # WARNING "end trace" remains part of the same event only when it leads
@@ -360,6 +363,20 @@ def last_boot_offset(log_path: str | Path, *, start_offset: int = 0) -> int:
     for match in _BOOT_BANNER.finditer(chunk):
         last = match
     return offset + last.start() if last is not None else offset
+
+
+def current_boot_offset(log_path: str | Path, epoch_offset: int | None) -> int:
+    """Byte offset where the *current* guest's output begins.
+
+    The later of the recorded guest epoch (advanced only on an observed QMP
+    RESET) and the newest kernel boot banner in the log. This is the one scope
+    every reader of guest state must share — the guest-usability axis, SSH
+    preflight, and `wait --pattern` — so that a panic from a previous boot can
+    never label a healthy guest as gone on one path while another path calls
+    it serving.
+    """
+    start = epoch_offset or 0
+    return max(start, last_boot_offset(log_path, start_offset=start))
 
 
 def is_terminal_panic_start(line: str) -> bool:

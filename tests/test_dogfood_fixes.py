@@ -335,7 +335,9 @@ def test_doctor_flags_an_unreadable_appliance_kernel(monkeypatch, tmp_path):
 
     result = lifecycle._check_libguestfs()
 
-    assert result["status"] == "MISSING"
+    # Optional tooling: a warning with the fix text, never a doctor blocker.
+    assert result["status"] == "warn"
+    assert result["blocking"] is False
     assert "SUPERMIN_KERNEL" in result["detail"]
 
 
@@ -551,22 +553,47 @@ def test_rm_errors_on_a_missing_path(tmp_path, monkeypatch):
     assert "--force" in str(exc.value)
 
 
-def test_rm_force_ignores_a_missing_path(tmp_path, monkeypatch):
+def test_rm_force_reports_a_missing_path_instead_of_claiming_removal(
+    tmp_path, monkeypatch
+):
+    """`--force` tolerates a missing path; it must not report it as removed."""
     image = tmp_path / "rootfs.img"
     image.write_text("disk")
     scripts: list[str] = []
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
     monkeypatch.setattr(
         rootfs_mod, "_run_script",
-        lambda img, part, script, action: scripts.append(script) or "",
+        lambda img, part, script, action: scripts.append(script) or "false\n",
     )
 
-    rootfs_mod.remove(str(image), ["/root/nope.txt"], partition=0, force=True)
+    result = rootfs_mod.remove(
+        str(image), ["/root/nope.txt"], partition=0, force=True
+    )
 
-    # No existence probe, and `rm-f` so ENOENT is genuinely tolerated —
-    # plain `rm` errors on a missing path even with the probe skipped.
+    assert result == {"removed": [], "missing": ["/root/nope.txt"]}
+    # Only the existence probe ran: nothing was there to delete.
     assert len(scripts) == 1
-    assert scripts[0].startswith("rm-f ")
+    assert scripts[0].startswith("exists ")
+
+
+def test_rm_force_removes_only_the_present_paths(tmp_path, monkeypatch):
+    image = tmp_path / "rootfs.img"
+    image.write_text("disk")
+    scripts: list[str] = []
+    monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
+    monkeypatch.setattr(
+        rootfs_mod, "_run_script",
+        lambda img, part, script, action: scripts.append(script) or "true\nfalse\n",
+    )
+
+    result = rootfs_mod.remove(
+        str(image), ["/root/here.txt", "/root/nope.txt"], partition=0, force=True
+    )
+
+    assert result == {"removed": ["/root/here.txt"], "missing": ["/root/nope.txt"]}
+    # `rm-f` so ENOENT is genuinely tolerated — plain `rm` errors on a missing
+    # path — and only the path that exists is handed to it.
+    assert scripts[-1] == "rm-f /root/here.txt\n"
 
 
 def test_rm_recursive_uses_rm_rf(tmp_path, monkeypatch):

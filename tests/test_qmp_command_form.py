@@ -29,6 +29,7 @@ class _FakeInst:
     serial_log = "/tmp/nonexistent.serial.log"
     guest_epoch_serial_offset = 0
     gdb_port = 1234
+    ssh_port = None
 
 
 class FakeQMP:
@@ -50,6 +51,11 @@ def qmp(monkeypatch):
     )
     # Default: no debugger attached, so the #46 warning stays out of the way.
     monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: False)
+    # A qmu-issued system_reset persists the guest epoch; _FakeInst is not a
+    # record, so pin the persistence seam to a no-op here.
+    monkeypatch.setattr(
+        qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst
+    )
     return fake
 
 
@@ -322,9 +328,9 @@ def test_argument_shape_errors_are_caller_errors(erroring, capsys, desc):
 @pytest.mark.parametrize(
     "qmp_class,desc",
     [
-        # Operational GenericErrors: these describe host/VM state, not the
-        # command text, so re-classifying them would tell the caller they
-        # typo'd something they got right.
+        # Operational errors: these describe host/VM state, not the command
+        # text, so they get no "fix your arguments" correction -- but the wire
+        # worked and QEMU answered, so they are still the exit-1 class.
         ("GenericError", "failed to open file '/nope/x.ppm': No such file or directory"),
         ("GenericError", "Property 'pc-i440fx-machine.nope' not found"),
         ("GenericError", "File descriptor named 'y' has not been found"),
@@ -332,12 +338,16 @@ def test_argument_shape_errors_are_caller_errors(erroring, capsys, desc):
         ("KVMMissingCap", "kvm does not support guest debugging"),
     ],
 )
-def test_state_errors_stay_on_the_infra_exit_code(erroring, capsys, qmp_class, desc):
+def test_every_error_reply_is_the_operational_exit_code(erroring, capsys, qmp_class, desc):
+    """`qmu qmp --help` promises exit 4 for the transport only; `device_del`
+    with a bad id used to land on 4 anyway (snapshot audit #9)."""
     erroring(QMPCommandError(desc, qmp_class))
-    assert cli.main(["qmp", "screendump"]) == 4
+    assert cli.main(["qmp", "screendump"]) == 1
     err = capsys.readouterr().err
-    # Exactly one prefix, owned by the CLI.
-    assert err.strip() == f"[qmu] QMP error: {desc}"
+    assert err.strip() == (
+        f"[qmu] Error: QMP command 'screendump' failed ({qmp_class}): {desc}"
+    )
+    assert "QAPI" not in err
 
 
 def test_transport_failure_is_still_exit_4(erroring, capsys):
@@ -351,14 +361,15 @@ def test_transport_failure_is_still_exit_4(erroring, capsys):
 
 
 def test_state_error_json_envelope_names_the_reply_class(erroring, capsys):
-    """Same key, same exit code, strictly more specific value: a QEMU error
-    REPLY is not a transport fault, and the envelope now says which it was."""
+    """Same exit code as every other QEMU "no"; the reply class rides in the
+    message so the caller still knows WHICH no it was."""
     erroring(QMPCommandError("Device 'nope' not found", "DeviceNotFound"))
-    assert cli.main(["--format", "json", "qmp", "device_del"]) == 4
+    assert cli.main(["--format", "json", "qmp", "device_del"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
-    assert payload["error_type"] == "QMPCommandError"
-    assert payload["error"] == "Device 'nope' not found"
+    assert payload["error_type"] == "QMUError"
+    assert "DeviceNotFound" in payload["error"]
+    assert "Device 'nope' not found" in payload["error"]
 
 
 def test_command_not_found_json_envelope_is_the_caller_error_class(

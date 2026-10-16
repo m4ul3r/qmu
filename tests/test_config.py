@@ -501,3 +501,117 @@ def test_explicit_config_suppresses_invalid_discovered_project(
     assert cfg.arch == "aarch64"
     assert f"config: {explicit.resolve()}" in cfg._sources
     assert not any(source.startswith("project:") for source in cfg._sources)
+
+
+# ---------------------------------------------------------------------------
+# Path-typed values are anchored at the file that set them
+# ---------------------------------------------------------------------------
+#
+# qmu.toml is discovered by walking UP from CWD, so `kernel = "./bzImage"`
+# must name the file next to the qmu.toml from any subdirectory of the
+# project. Resolving against CWD made the same file "work" for discovery and
+# fail for every path (`Kernel not found: ./bzImage`, naming nothing).
+
+
+_PATH_BODY = (
+    '[boot]\nkernel = "./bzImage"\ninitrd = "boot/initrd.img"\n'
+    '[drive]\nrootfs = "./rootfs.img"\n'
+    '[ssh]\nkey = "keys/id_ed25519"\n'
+)
+
+
+def _assert_anchored_at(cfg, base):
+    base = base.resolve()
+    assert cfg.kernel == str(base / "bzImage")
+    assert cfg.initrd == str(base / "boot" / "initrd.img")
+    assert cfg.rootfs == str(base / "rootfs.img")
+    assert cfg.ssh_key == str(base / "keys" / "id_ed25519")
+
+
+def test_project_config_paths_anchor_at_the_file_from_a_subdirectory(
+    isolate_config, monkeypatch
+):
+    project = isolate_config / "proj"
+    child = project / "sub" / "deeper"
+    child.mkdir(parents=True)
+    _write_toml(project / CONFIG_FILENAME, _PATH_BODY)
+    monkeypatch.chdir(child)
+
+    cfg = resolve_config()
+
+    _assert_anchored_at(cfg, project)
+    source = f"project: {(project / CONFIG_FILENAME).resolve()}"
+    assert cfg._path_sources == {
+        "kernel": source, "initrd": source, "rootfs": source, "ssh_key": source,
+    }
+    assert cfg.describe_path_source("kernel") == f" (from [boot] kernel in {source})"
+
+
+def test_global_config_paths_anchor_at_the_global_file(isolate_config):
+    _global_config(isolate_config, _PATH_BODY)
+
+    cfg = resolve_config()
+
+    _assert_anchored_at(cfg, isolate_config / "global-config")
+    assert cfg._path_sources["rootfs"].startswith("global: ")
+
+
+def test_explicit_config_paths_anchor_at_that_file(isolate_config, monkeypatch):
+    elsewhere = isolate_config / "elsewhere"
+    elsewhere.mkdir()
+    explicit = _write_toml(elsewhere / "cfg.toml", _PATH_BODY)
+    monkeypatch.chdir(isolate_config / "work")
+
+    cfg = resolve_config(config_path_override=explicit)
+
+    _assert_anchored_at(cfg, elsewhere)
+    assert cfg._path_sources["kernel"] == f"config: {explicit.resolve()}"
+
+
+def test_tilde_and_absolute_config_paths_are_left_alone(isolate_config, monkeypatch):
+    home = isolate_config / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    project = isolate_config / "proj"
+    project.mkdir()
+    _write_toml(
+        project / CONFIG_FILENAME,
+        '[boot]\nkernel = "~/k/bzImage"\n[drive]\nrootfs = "/abs/rootfs.img"\n',
+    )
+    monkeypatch.chdir(project)
+
+    cfg = resolve_config()
+
+    assert cfg.kernel == str(home / "k" / "bzImage")
+    assert cfg.rootfs == "/abs/rootfs.img"
+
+
+def test_cli_flag_paths_stay_cwd_relative_without_file_provenance(
+    isolate_config, monkeypatch
+):
+    project = isolate_config / "proj"
+    project.mkdir()
+    _write_toml(project / CONFIG_FILENAME, _PATH_BODY)
+    monkeypatch.chdir(project)
+
+    cfg = resolve_config(cli_overrides={"kernel": "./from-flag", "rootfs": None})
+
+    assert cfg.kernel == "./from-flag"
+    assert "kernel" not in cfg._path_sources
+    assert cfg.describe_path_source("kernel") == ""
+    # The layer below is untouched by a None override.
+    assert cfg.rootfs == str(project.resolve() / "rootfs.img")
+    assert cfg._path_sources["rootfs"].startswith("project: ")
+
+
+def test_later_layer_replaces_path_provenance(isolate_config, monkeypatch):
+    _global_config(isolate_config, '[boot]\nkernel = "./g-bzImage"\n')
+    project = isolate_config / "proj"
+    project.mkdir()
+    _write_toml(project / CONFIG_FILENAME, '[boot]\nkernel = "./p-bzImage"\n')
+    monkeypatch.chdir(project)
+
+    cfg = resolve_config()
+
+    assert cfg.kernel == str(project.resolve() / "p-bzImage")
+    assert cfg._path_sources["kernel"].startswith("project: ")

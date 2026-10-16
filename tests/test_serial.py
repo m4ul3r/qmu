@@ -426,6 +426,31 @@ def test_extract_crash_negative_offset_scans_from_zero(tmp_path):
     assert extract_crash(log, start_offset=-1) == extract_crash(log)
 
 
+def test_extract_crash_finds_panic_buried_under_a_later_boot(tmp_path):
+    """A `panic=N` guest reboots and appends ~700 boot lines after the panic.
+
+    The old 500-line tail window dropped it: `qmu crash --full-history` said
+    "no crash markers found" for a panic `qmu log --grep` printed. The whole
+    requested scope is scanned now; the report is unchanged.
+    """
+    reboot = (
+        "[    5.0] Rebooting in 3 seconds..\n"
+        "[    0.000000] Linux version 7.0.0 (qmu@kbuild) (gcc 13) #1 SMP\n"
+        + "".join(f"[    0.{i:06d}] boot line {i}\n" for i in range(2000))
+        + "localhost login: \n"
+    )
+    log = _write(tmp_path, "rebooted.serial.log", SYSRQ_PANIC_LOG + reboot)
+
+    report = extract_crash(log)
+
+    alone = extract_crash(_write(tmp_path, "alone.serial.log", SYSRQ_PANIC_LOG))
+    # Same report; the reboot notice is itself an end marker and so is kept.
+    assert report.startswith(alone)
+    assert report.endswith("Rebooting in 3 seconds..\n")
+    assert "Kernel panic - not syncing: sysrq triggered crash" in report
+    assert "boot line" not in report
+
+
 def test_extract_crash_does_not_attribute_event_started_before_boundary(tmp_path):
     start = "[ 1.0] Kernel panic - not syncing: old event\n"
     ending = "[ 1.1] ---[ end Kernel panic - not syncing: old event ]---\n"

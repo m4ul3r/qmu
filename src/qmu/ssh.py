@@ -4,10 +4,34 @@ import subprocess
 import time
 from pathlib import Path
 
+from .instance import QMUError
 from .paths import ssh_control_path
 
 
 class SSHError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        returncode: int | None = None,
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+class SCPFileError(QMUError):
+    """A transfer the *filesystem* refused — not the transport.
+
+    A missing local file, a directory where a file was expected, a remote path
+    that does not exist, a permission denial: scp reports these with a non-255
+    exit code and the connection was fine. They are caller errors in the
+    operational class (exit 1), never the transport/infra class (exit 4) an
+    agent reads as "retry or relaunch" — looping on a typo. The scp wording is
+    preserved so the reason stays visible.
+    """
+
     def __init__(
         self,
         message: str,
@@ -130,6 +154,26 @@ class SSHClient:
             time.sleep(poll_interval)
         return False
 
+    def close_control_master(self, timeout: float = 5.0) -> bool:
+        """Tear down the multiplexed ControlMaster for this guest, if any.
+
+        The master connection outlives the command that opened it
+        (`ControlPersist=60`). After the guest's TCP state is rewound or reset
+        underneath it (`snapshot load`, `system_reset`), the next command
+        reuses the stale master and stalls for the keepalive window before
+        reporting a `Broken pipe`. Closing it first makes the next command
+        open a fresh connection. Returns True when a master was closed; False
+        when multiplexing is off or no master was alive — never raises.
+        """
+        if not _control_opts():
+            return False
+        cmd = self._ssh_base() + ["-O", "exit", self._target()]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return result.returncode == 0
+
     def run(
         self,
         command: str,
@@ -143,6 +187,10 @@ class SSHClient:
                 cmd,
                 capture_output=True,
                 text=True,
+                # Guest output is arbitrary bytes (a leak primitive dumping raw
+                # memory is the everyday case); a strict decode threw the whole
+                # result away as an internal error.
+                errors="replace",
                 timeout=timeout,
             )
             if check and result.returncode != 0:
@@ -160,23 +208,25 @@ class SSHClient:
         """Copy a file to the guest."""
         local = Path(local_path)
         if not local.exists():
-            raise SSHError(f"Local file not found: {local_path}")
+            raise SCPFileError(f"Local file not found: {local_path}")
+        if local.is_dir():
+            raise SCPFileError(
+                f"push transfers single files only; {local_path!r} is a "
+                "directory (archive it first, e.g. tar)"
+            )
         cmd = self._scp_base() + [
             str(local),
             f"{self._target()}:{remote_path}",
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, errors="replace", timeout=30
+            )
         except subprocess.TimeoutExpired as exc:
             raise SSHError(
                 f"SCP push timed out after 30s: {local_path} -> {remote_path}"
             ) from exc
-        if result.returncode != 0:
-            raise SSHError(
-                f"SCP push failed: {result.stderr.strip()}",
-                returncode=result.returncode,
-                stderr=result.stderr,
-            )
+        _raise_scp_failure("push", result)
 
     def pull(self, remote_path: str, local_path: str = ".") -> None:
         """Copy a file from the guest."""
@@ -185,14 +235,32 @@ class SSHClient:
             local_path,
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, errors="replace", timeout=30
+            )
         except subprocess.TimeoutExpired as exc:
             raise SSHError(
                 f"SCP pull timed out after 30s: {remote_path} -> {local_path}"
             ) from exc
-        if result.returncode != 0:
-            raise SSHError(
-                f"SCP pull failed: {result.stderr.strip()}",
-                returncode=result.returncode,
-                stderr=result.stderr,
-            )
+        _raise_scp_failure("pull", result)
+
+
+def _raise_scp_failure(operation: str, result: subprocess.CompletedProcess) -> None:
+    """Map a failed scp to the error class its exit code proves.
+
+    scp exits 255 only when ssh itself failed (transport dropped, banner
+    timeout, control-master hiccup) — that stays SSHError, carrying the
+    returncode/stderr evidence the callers use to tell a crash from a merely
+    unreachable guest. Any other non-zero code came from scp's file handling
+    on a working connection and is a caller/filesystem error.
+    """
+    if result.returncode == 0:
+        return
+    message = f"SCP {operation} failed: {result.stderr.strip()}"
+    if result.returncode == 255:
+        raise SSHError(
+            message, returncode=result.returncode, stderr=result.stderr
+        )
+    raise SCPFileError(
+        message, returncode=result.returncode, stderr=result.stderr
+    )

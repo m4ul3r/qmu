@@ -21,12 +21,14 @@ import shutil
 import signal
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from dataclasses import replace
 
 from ..config import resolve_config
+from .. import debug as debug_mod
 from ..debug import debug_session_present, reset_dropped_breakpoints_warning
 from ..instance import (
     QMUError,
@@ -51,6 +53,7 @@ from ..instance import (
 from .. import rootfs as rootfs_mod
 from ..cache import (
     MIN_BUILD_RESIDUE_AGE,
+    cache_root_is_sane,
     classify_residue,
     source_tree_names,
     human_bytes,
@@ -60,7 +63,9 @@ from ..cache import (
 from ..runtime import prune_runtime_artifacts
 from ..paths import (
     all_skill_source_dirs,
+    cache_home,
     instances_dir,
+    qemu_log_path,
     qmp_socket_path,
     skill_install_roots,
 )
@@ -322,6 +327,18 @@ def _prepare_boot(args: argparse.Namespace) -> tuple[Any, str | None]:
     ``--harness`` is launch-only (`run` needs SSH to run its command), so it is
     read defensively rather than assumed present.
     """
+    # `--vm` is the instance selector on every other subcommand, so it is
+    # accepted here as an alias for --name. Two different names is a conflict
+    # the caller must resolve: silently launching one of them put a VM on the
+    # box under a name the caller never checked for and left the other name
+    # unlaunched with no error.
+    vm_alias = getattr(args, "vm", None)
+    if args.name and vm_alias and args.name != vm_alias:
+        raise QMUError(
+            f"--name {args.name} and --vm {vm_alias} name different VMs; on "
+            "launch, --vm is an alias for --name, so pass only one of them."
+        )
+
     config = _resolve_config_from_args(args)
 
     # Harness mode bundles --no-wait-ssh + --no-net
@@ -393,8 +410,12 @@ def _handle_launch(args: argparse.Namespace) -> int:
     )
 
     exit_code = 0
-    if inst.harness or inst.ssh_port is None:
+    if inst.harness:
         ssh_status = "n/a (harness)"
+    elif inst.ssh_port is None:
+        # A non-harness VM without an SSH endpoint: launched with --no-net and
+        # no --ssh-port, so there is no port to wait on or to report.
+        ssh_status = "none (--no-net, no --ssh-port)"
     elif not args.no_wait_ssh:
         ssh = _make_ssh(inst)
         sys.stderr.write(f"[qmu] VM launched (pid={inst.pid}). Waiting for SSH on port {inst.ssh_port}...\n")
@@ -406,13 +427,26 @@ def _handle_launch(args: argparse.Namespace) -> int:
     else:
         ssh_status = "skipped"
 
+    if inst.harness and getattr(inst, "rootfs", None):
+        sys.stderr.write(
+            f"[qmu] Harness mode: attached rootfs {inst.rootfs} (from config; "
+            "pass --drive to choose the disk)\n"
+        )
+
     # Only meaningful once the guest has booted far enough to have printed the
     # line; a --no-wait-ssh launch returns too early, so `wait` and `status`
-    # re-check it later.
-    unknown_params = (
-        _warn_unknown_kernel_params(inst) if ssh_status == "ready"
-        else {"all": [], "operator": [], "profile": []}
-    )
+    # re-check it later. When the check did not run, the JSON says so with
+    # null — an empty list is indistinguishable from "checked, clean".
+    if ssh_status == "ready":
+        unknown_params = _warn_unknown_kernel_params(inst)
+        unknown_all: list[str] | None = unknown_params["all"]
+        unknown_by_source: dict[str, list[str]] | None = {
+            "operator": unknown_params["operator"],
+            "profile": unknown_params["profile"],
+        }
+    else:
+        unknown_all = None
+        unknown_by_source = None
 
     result = {
         "ok": exit_code == 0,
@@ -423,13 +457,16 @@ def _handle_launch(args: argparse.Namespace) -> int:
         "gdb_port": inst.gdb_port,
         "kernel": inst.kernel,
         "profile": inst.profile,
+        "profile_applied": not getattr(inst, "cmdline_override", False),
+        "cmdline": getattr(inst, "cmdline", None),
+        "rootfs": getattr(inst, "rootfs", None),
         "serial_log": inst.serial_log,
+        "qemu_log": str(qemu_log_path(inst.vm_id)),
+        "qmp_socket": getattr(inst, "qmp_socket", None),
         "arch": config.arch,
-        "unknown_kernel_params": unknown_params["all"],
-        "unknown_kernel_params_by_source": {
-            "operator": unknown_params["operator"],
-            "profile": unknown_params["profile"],
-        },
+        "kvm": getattr(inst, "kvm", None),
+        "unknown_kernel_params": unknown_all,
+        "unknown_kernel_params_by_source": unknown_by_source,
     }
 
     lines = [
@@ -649,6 +686,13 @@ def _handle_kill(args: argparse.Namespace) -> int:
                 f"--older-than 0`."
             )
     inst = choose_instance(args.vm)
+    # A panicked or crashed guest has a report in its serial log that `status`
+    # just told the reader to pull. The default clean deleted it without a
+    # word, so the evidence vanished under the one command every cleanup runs.
+    # Keep the logs (exactly what --no-clean keeps) and say where they are.
+    guest = _guest_state(inst)
+    preserve_crash = guest in (GUEST_PANICKED, GUEST_CRASHED)
+    clean = not args.no_clean and not preserve_crash
     # #40: `qmu gdb` spawns a pry bridge that qmu does not track, so killing the
     # VM leaves that bridge pointing at a dead GDB stub — and the operator only
     # discovers it as a "Multiple bridge instances" error on the next `pry`
@@ -656,8 +700,15 @@ def _handle_kill(args: argparse.Namespace) -> int:
     # connection, and if one is present, say so on stderr so cleanup is not a
     # later surprise. qmu still does not manage the pry lifecycle.
     had_bridge = debug_session_present(inst) if inst.gdb_port is not None else False
-    _kill_vm(inst, force=args.force, clean=not args.no_clean)
-    if args.no_clean:
+    _kill_vm(inst, force=args.force, clean=clean)
+    bridge_reaped = _reap_recorded_bridge(inst)
+    if preserve_crash:
+        msg = (
+            f"VM '{inst.vm_id}' stopped. Crash report preserved: "
+            f"qmu crash --vm {inst.vm_id}; remove with: "
+            f"qmu prune --vm {inst.vm_id}"
+        )
+    elif args.no_clean:
         msg = f"VM '{inst.vm_id}' stopped. State preserved at {inst.serial_log}"
     else:
         msg = f"VM '{inst.vm_id}' stopped."
@@ -666,13 +717,17 @@ def _handle_kill(args: argparse.Namespace) -> int:
         data={
             "ok": True,
             "vm_id": inst.vm_id,
-            "cleaned": not args.no_clean,
-            "serial_log": inst.serial_log,
+            "guest": guest,
+            "cleaned": clean,
+            "logs_preserved": not clean,
+            # Never hand back a path the clean just unlinked.
+            "serial_log": inst.serial_log if not clean else None,
+            "bridge_reaped": bridge_reaped,
         },
         text=msg,
         stem="kill",
     )
-    if had_bridge:
+    if had_bridge and not bridge_reaped:
         sys.stderr.write(
             f"[qmu] Note: VM '{inst.vm_id}' had an attached debugger on GDB port "
             f"{inst.gdb_port}. That pry bridge now points at a dead stub; qmu does "
@@ -681,6 +736,21 @@ def _handle_kill(args: argparse.Namespace) -> int:
             "kill it).\n"
         )
     return 0
+
+
+def _reap_recorded_bridge(inst: Any) -> bool:
+    """Reap the pry bridge `qmu gdb` recorded on this instance, if any.
+
+    `debug.reap_bridge` owns the how; this only decides whether there is a
+    recorded bridge to reap. A VM launched before the bridge was tracked, or
+    one never attached, has nothing to reap and reports False.
+    """
+    if getattr(inst, "gdb_bridge_pid", None) is None:
+        return False
+    reap = getattr(debug_mod, "reap_bridge", None)
+    if reap is None:
+        return False
+    return bool(reap(inst))
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +957,18 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> int:
             f"running corrupts it. Use `--older-than "
             f"{MIN_BUILD_RESIDUE_AGE:g}` or higher, or inspect first with "
             f"`qmu cache du --older-than {older_than:g}`."
+        )
+
+    # QMU_CACHE_DIR is honoured with no validation, so a typo pointing at
+    # $HOME must stop here — before anything is classified, let alone unlinked.
+    # An absent or empty root is not that typo: there is nothing under it to
+    # reclaim, and a fresh install must not be told its cache is broken.
+    root = cache_home()
+    if not cache_root_is_sane() and root.is_dir() and any(root.iterdir()):
+        raise QMUError(
+            f"Refusing to prune build residue: {root} does not look like a "
+            "qmu cache (no instances/, kernels/, rootfs/ or targets/ subtree, "
+            "but it is not empty). Check QMU_CACHE_DIR."
         )
 
     trees = getattr(args, "tree", None)
@@ -1153,12 +1235,19 @@ def _handle_prune(args: argparse.Namespace) -> int:
     running_ids = {inst.vm_id for inst in running}
     prunable = list_prunable_instance_ids(older_than_seconds=args.older_than)
 
+    # `found` is the --vm answer to "was there anything on disk". Reported on
+    # that path only; --all has no single subject.
+    found: bool | None = None
     if vm is not None:
         if vm in running_ids:
             raise QMUError(
                 f"VM '{vm}' is running. Use 'qmu kill --vm {vm}' first."
             )
-        if vm not in prunable:
+        found = True
+        held_back: list[str] = []
+        if vm in prunable:
+            targets = [vm]
+        else:
             # Three different reasons a name can be unprunable, and naming the
             # wrong one is worse than saying nothing. A live orphan is NOT
             # age-gated — telling the caller to re-run with a smaller
@@ -1171,35 +1260,44 @@ def _handle_prune(args: argparse.Namespace) -> int:
                     f"not removed. Reap the process first with "
                     f"`qmu kill --vm {vm}` or `qmu prune --orphans`, then prune."
                 )
-            if info["state"] == VM_HELD_BACK:
-                raise QMUError(
-                    f"VM '{vm}' has leftover artifacts newer than the "
-                    f"--older-than cutoff ({args.older_than:g}s), so it was not "
-                    f"pruned. Re-run with `qmu prune --vm {vm} --older-than 0` "
-                    f"to remove it now."
-                )
-            raise QMUError(f"No stopped VM named '{vm}'.")
-        targets = [vm]
+            if info["state"] == VM_STOPPED:
+                targets = [vm]
+            elif info["state"] == VM_HELD_BACK:
+                # The age gate is an outcome, not an error: `prune --all`
+                # reports the same remnant as `held_back` with exit 0, and
+                # `--dry-run` must land in the preview envelope rather than
+                # fail and prescribe the destructive run.
+                targets = []
+                held_back = [vm]
+            else:
+                # Absent. A default `kill` already removed everything, so the
+                # cleanup idiom `kill && prune --vm` must not fail on it.
+                found = False
+                targets = []
     elif prune_all:
         targets = prunable
+        # Disclosed unconditionally: on every branch, in both modes, and in
+        # JSON. Round 5 fixed only the nothing-is-prunable branch of the real
+        # run, so a mixed cache still reported "Pruned 1 VM(s) (removed)" with
+        # a remnant holding megabytes of serial log left behind, and the
+        # preview — the thing a cautious operator runs first — reintroduced
+        # the original false statement outright.
+        held_back = held_back_vm_ids(
+            older_than_seconds=args.older_than, orphan_pids=_orphan_serial_logs()
+        )
     else:
         raise QMUError(
             "Specify a mode: " + _all_modes_phrase() + "."
         )
 
-    # Disclosed unconditionally: on every branch, in both modes, and in JSON.
-    # Round 5 fixed only the nothing-is-prunable branch of the real run, so a
-    # mixed cache still reported "Pruned 1 VM(s) (removed)" with a remnant
-    # holding megabytes of serial log left behind, and the preview — the thing
-    # a cautious operator runs first — reintroduced the original false
-    # statement outright.
-    held_back = held_back_vm_ids(
-        older_than_seconds=args.older_than, orphan_pids=_orphan_serial_logs()
-    ) if prune_all else []
     held_note = (
         f"Held back by the --older-than cutoff ({args.older_than:g}s): "
         f"{', '.join(held_back)}. Re-run with `--older-than 0` to include them."
     ) if held_back else None
+    absent_note = (
+        f"Nothing to prune for '{vm}': no state on disk (already removed by "
+        "kill, or never existed)."
+    ) if found is False else None
 
     unmanaged = _unmanaged_cache()
     # Text footer renders only where the branch implies "everything is now
@@ -1223,8 +1321,12 @@ def _handle_prune(args: argparse.Namespace) -> int:
             "held_back": held_back,
             "keep_logs": args.keep_logs,
         }
-        if not targets:
-            text: Any = ["Nothing to prune. Nothing would be removed."]
+        if found is not None:
+            data["found"] = found
+        if absent_note:
+            text: Any = [absent_note]
+        elif not targets:
+            text = ["Nothing to prune. Nothing would be removed."]
         else:
             verb = "keep logs for" if args.keep_logs else "remove"
             text = [f"Would {verb} {len(targets)} VM(s): {', '.join(targets)}"]
@@ -1241,7 +1343,9 @@ def _handle_prune(args: argparse.Namespace) -> int:
         remove_instance(vm_id, keep_logs=args.keep_logs)
         pruned.append(vm_id)
 
-    if not pruned:
+    if absent_note:
+        lines = [absent_note]
+    elif not pruned:
         lines = ["No stopped VMs to prune."] if not held_back else [
             "No stopped VMs were old enough to prune."
         ]
@@ -1252,19 +1356,17 @@ def _handle_prune(args: argparse.Namespace) -> int:
         lines.append(held_note)
     if cache_note:
         lines.append(cache_note)
-    _emit(
-        args,
-        data={
-            "ok": True,
-            "dry_run": False,
-            "unmanaged_cache": unmanaged,
-            "pruned": pruned,
-            "held_back": held_back,
-            "keep_logs": args.keep_logs,
-        },
-        text=lines,
-        stem="prune",
-    )
+    data = {
+        "ok": True,
+        "dry_run": False,
+        "unmanaged_cache": unmanaged,
+        "pruned": pruned,
+        "held_back": held_back,
+        "keep_logs": args.keep_logs,
+    }
+    if found is not None:
+        data["found"] = found
+    _emit(args, data=data, text=lines, stem="prune")
     return 0
 
 
@@ -1655,6 +1757,38 @@ def _add_list(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_list)
 
 
+# Upper bound on concurrent per-VM probes in `list`. Each is one QMP round
+# trip plus one ssh handshake; a busy host has tens of VMs, not thousands.
+_LIST_MAX_PROBES = 16
+
+
+def _probe_running(inst: Any) -> tuple[str, bool | None]:
+    """Both axes for one running VM: (guest state, ssh_ready).
+
+    `list` used to probe every running VM's sshd in series — a full handshake
+    each, 2–5 s per VM whose sshd is gone — so ten VMs cost 15–60 s per call,
+    and an agent calls `list` between every step. The guest axis is read first
+    because it decides whether an ssh probe can tell us anything: a panicked
+    guest has no sshd and a paused one cannot answer, so both can only time
+    out to the `down` they would report anyway.
+    """
+    guest = _guest_state(inst)
+    if inst.harness or inst.ssh_port is None:
+        return guest, None
+    if guest in (GUEST_PANICKED, GUEST_PAUSED):
+        return guest, False
+    return guest, _make_ssh(inst).is_ready()
+
+
+def _probe_all_running(running: list[Any]) -> list[tuple[str, bool | None]]:
+    """Probe every running VM concurrently; results keep `running`'s order."""
+    if not running:
+        return []
+    workers = min(len(running), _LIST_MAX_PROBES)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_probe_running, running))
+
+
 def _handle_list(args: argparse.Namespace) -> int:
     # The project-config gate lives at the cli.main dispatch choke point, so
     # this handler is already running under a validated project config.
@@ -1664,63 +1798,68 @@ def _handle_list(args: argparse.Namespace) -> int:
         _emit(args, data={"ok": True, "vms": []}, text="No VMs.", stem="list")
         return 0
 
+    # Hoisted: _orphan_serial_logs() walks all of /proc, so calling it per
+    # stopped VM made `list --format json` scan the process table N times.
+    # Both branches must also read the SAME snapshot, or they can disagree
+    # about who is orphaned.
+    orphan_logs = _orphan_serial_logs()
+    probes = _probe_all_running(running)
+
     if args.format != "text":
-        # Hoisted: _orphan_serial_logs() walks all of /proc, so calling it per
-        # stopped VM made `list --format json` scan the process table N times.
-        # The text branch below already does this once; both branches must also
-        # read the SAME snapshot, or they can disagree about who is orphaned.
-        orphan_logs = _orphan_serial_logs()
         data = []
-        for inst in running:
-            entry: dict[str, Any] = {
+        for inst, (guest, ssh_ready) in zip(running, probes):
+            data.append({
                 "vm_id": inst.vm_id,
                 "status": "running",
-                "guest": _guest_state(inst),
+                "guest": guest,
                 "pid": inst.pid,
                 "harness": inst.harness,
                 "ssh_port": inst.ssh_port,
+                "ssh_ready": ssh_ready,
                 "gdb_port": inst.gdb_port,
                 "kernel": inst.kernel,
                 "profile": inst.profile,
-            }
-            if inst.harness or inst.ssh_port is None:
-                entry["ssh_ready"] = None
-            else:
-                entry["ssh_ready"] = _make_ssh(inst).is_ready()
-            data.append(entry)
+                "profile_applied": not inst.cmdline_override,
+                "arch": inst.arch,
+                "kvm": inst.kvm,
+                "serial_log": inst.serial_log,
+            })
         for inst in stopped:
             orphan_pid = orphan_logs.get(inst.serial_log)
             data.append({
                 "vm_id": inst.vm_id,
                 "status": "orphaned" if orphan_pid else "stopped",
                 "guest": _guest_state(inst) if orphan_pid else GUEST_UNKNOWN,
-                "pid": orphan_pid or inst.pid or None,
+                # A stopped record's pid is the dead process's; never present
+                # it as if it were live.
+                "pid": orphan_pid or None,
                 "harness": inst.harness,
                 "ssh_port": inst.ssh_port,
+                "ssh_ready": None,
                 "gdb_port": inst.gdb_port,
                 "kernel": inst.kernel or None,
                 "profile": inst.profile or None,
-                "ssh_ready": None,
+                "profile_applied": not inst.cmdline_override,
+                "arch": inst.arch,
+                "kvm": inst.kvm,
                 "serial_log": inst.serial_log,
             })
         _output({"ok": True, "vms": data}, args, stem="list")
         return 0
 
-    orphan_logs = _orphan_serial_logs()
-
     lines = []
-    for inst in running:
-        if inst.harness or inst.ssh_port is None:
+    for inst, (guest, ssh_ok) in zip(running, probes):
+        if inst.harness:
             ssh_str = "harness"
+        elif inst.ssh_port is None:
+            ssh_str = "ssh=none"
         else:
-            ssh_ok = _make_ssh(inst).is_ready()
             ssh_str = f"ssh={inst.ssh_port}({'ok' if ssh_ok else 'down'})"
         gdb_str = f" gdb={inst.gdb_port}" if inst.gdb_port else ""
         kernel_str = f"kernel={Path(inst.kernel).name}" if inst.kernel else ""
         # Report the guest axis alongside the existence axis. Presenting a
         # panicked or paused VM as a plain [running] is the same flattening
         # that made `list` and `status` contradict each other.
-        guest = _guest_state(inst)
         state_str = {
             GUEST_PANICKED: "[running — GUEST PANICKED, run `qmu crash`]",
             GUEST_CRASHED: "[running — crash report waiting, run `qmu crash`]",
@@ -1847,14 +1986,17 @@ def _handle_status(args: argparse.Namespace) -> int:
     except (QMPError, OSError):
         pass
 
-    if inst.harness or inst.ssh_port is None:
+    if inst.harness:
         ssh_state = "n/a (harness)"
-        ssh_ok = None
+    elif inst.ssh_port is None:
+        # Non-harness VM launched with --no-net and no --ssh-port: there is no
+        # endpoint to probe, which is a different fact from "down".
+        ssh_state = "none"
     else:
-        ssh_ok = _make_ssh(inst).is_ready()
-        ssh_state = "ready" if ssh_ok else "down"
+        ssh_state = "ready" if _make_ssh(inst).is_ready() else "down"
 
     guest = _guest_state(inst)
+    accel = {True: "kvm", False: "tcg"}.get(inst.kvm, "unknown")
     result = {
         "ok": True,
         "vm_id": inst.vm_id,
@@ -1864,7 +2006,10 @@ def _handle_status(args: argparse.Namespace) -> int:
         "guest": guest,
         "pid": inst.pid,
         "harness": inst.harness,
+        "arch": inst.arch,
+        "kvm": inst.kvm,
         "qmp": "connected" if qmp_ok else "unreachable",
+        "qmp_socket": inst.qmp_socket,
         "qemu_status": qemu_status,
         "ssh_port": inst.ssh_port,
         "ssh": ssh_state,
@@ -1874,8 +2019,12 @@ def _handle_status(args: argparse.Namespace) -> int:
         "memory": inst.memory,
         "cpus": inst.cpus,
         "profile": inst.profile,
+        # False when a full cmdline override replaced the profile — the text
+        # already says "(NOT applied — cmdline was overridden)"; JSON must too.
+        "profile_applied": not inst.cmdline_override,
         "cmdline": inst.cmdline,
         "serial_log": inst.serial_log,
+        "qemu_log": str(qemu_log_path(inst.vm_id)),
         "started_at": inst.started_at,
     }
 
@@ -1886,14 +2035,18 @@ def _handle_status(args: argparse.Namespace) -> int:
         f"  QMP:       {'connected' if qmp_ok else 'unreachable'}",
         f"  QEMU:      {qemu_status}",
     ]
-    if inst.harness or inst.ssh_port is None:
+    if inst.harness:
         lines.append(f"  Mode:      harness")
         lines.append(f"  SSH:       n/a")
+    elif inst.ssh_port is None:
+        lines.append(f"  SSH:       none (--no-net, no --ssh-port)")
     else:
         lines.append(f"  SSH:       port {inst.ssh_port} ({ssh_state})")
     if inst.gdb_port:
         lines.append(f"  GDB:       port {inst.gdb_port}")
     lines.extend([
+        f"  Arch:      {inst.arch}",
+        f"  Accel:     {accel}",
         f"  Kernel:    {inst.kernel}",
         f"  Rootfs:    {inst.rootfs}",
         f"  Memory:    {inst.memory}",
@@ -1925,7 +2078,12 @@ def _add_doctor(sub: argparse._SubParsersAction) -> None:
 
 
 def _check_libguestfs() -> dict[str, Any]:
-    """Report whether libguestfs can actually build its appliance."""
+    """Report whether libguestfs can actually build its appliance.
+
+    Every failure here is a warning, never a blocker: libguestfs serves only
+    `qmu rootfs *` and `launch --inject`, so a host where launch/exec/crash all
+    work must not be red-lined by a 0600 /boot kernel. The fix text stays.
+    """
     check = "libguestfs (rootfs inject / launch --inject)"
     fish = shutil.which("guestfish")
     if fish is None:
@@ -1935,6 +2093,7 @@ def _check_libguestfs() -> dict[str, Any]:
             "detail": "guestfish not found in PATH — required only for "
                       "`qmu rootfs *` and `qmu launch --inject`. "
                       "Install libguestfs-tools.",
+            "blocking": False,
         }
 
     # An explicit supermin kernel overrides the /boot lookup entirely.
@@ -1943,9 +2102,10 @@ def _check_libguestfs() -> dict[str, Any]:
         readable = os.access(override, os.R_OK)
         return {
             "check": check,
-            "status": "ok" if readable else "MISSING",
+            "status": "ok" if readable else "warn",
             "detail": f"{fish}; SUPERMIN_KERNEL={override}"
                       + ("" if readable else " is NOT readable"),
+            "blocking": False,
         }
 
     kernels = sorted(Path("/boot").glob("vmlinuz-*")) if Path("/boot").is_dir() else []
@@ -1955,19 +2115,21 @@ def _check_libguestfs() -> dict[str, Any]:
             "status": "warn",
             "detail": f"{fish}; no /boot/vmlinuz-* found for the supermin "
                       f"appliance. Set SUPERMIN_KERNEL to a readable kernel.",
+            "blocking": False,
         }
     if any(os.access(k, os.R_OK) for k in kernels):
-        return {"check": check, "status": "ok", "detail": fish}
+        return {"check": check, "status": "ok", "detail": fish, "blocking": False}
 
     return {
         "check": check,
-        "status": "MISSING",
+        "status": "warn",
         "detail": f"{fish} is installed, but NO /boot/vmlinuz-* is readable "
                   f"(they are mode 0600), so the appliance cannot build and "
                   f"every inject will fail. Fix: sudo chmod 0644 /boot/vmlinuz-* "
                   f"— or leave system perms alone and export SUPERMIN_KERNEL / "
                   f"SUPERMIN_KERNEL_VERSION / SUPERMIN_MODULES pointing at a "
                   f"readable copy.",
+        "blocking": False,
     }
 
 
@@ -2068,6 +2230,30 @@ def _handle_doctor(args: argparse.Namespace) -> int:
                 if passt_problem is None
                 else passt_problem
             ),
+        })
+
+    # Kernel. doctor went green on a starter qmu.toml whose `kernel =` line was
+    # still commented out, and the very next `launch` failed on it. A missing
+    # configured file blocks (launch would fail identically); "not configured"
+    # only warns, because --harness and --kernel launches still work.
+    if config.kernel:
+        kernel_path = Path(config.kernel).expanduser()
+        kernel_ok = kernel_path.is_file()
+        checks.append({
+            "check": "kernel",
+            "status": "ok" if kernel_ok else "MISSING",
+            "detail": config.kernel if kernel_ok else (
+                f"{config.kernel} is not a readable file ([boot] kernel / "
+                "--kernel); launch will fail with `Kernel not found`."
+            ),
+        })
+    else:
+        checks.append({
+            "check": "kernel",
+            "status": "warn",
+            "detail": "not configured (set [boot] kernel or pass --kernel; "
+                      "--harness/launch flags still work)",
+            "blocking": False,
         })
 
     # Rootfs
@@ -2221,8 +2407,13 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             "detail": "Run: qmu skill install",
         })
 
+    # `blocking` is the per-check verdict a script can branch on; the overall
+    # `ok` and the exit code are derived from it, nothing else. A check that
+    # does not set it explicitly blocks whenever it is not ok/info.
     healthy = ("ok", "info")
-    all_ok = all(c["status"] in healthy for c in checks)
+    for c in checks:
+        c.setdefault("blocking", c["status"] not in healthy)
+    all_ok = not any(c["blocking"] for c in checks)
     lines = ["qmu doctor:"]
     for c in checks:
         if c["status"] in healthy:

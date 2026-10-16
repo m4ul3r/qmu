@@ -32,14 +32,23 @@ from ..instance import (
     choose_instance,
     find_instance,
 )
-from ..serial import extract_crash, read_log, serial_log_offset, tail_log
+from ..serial import (
+    current_boot_offset,
+    extract_crash,
+    has_terminal_panic,
+    read_log,
+    serial_log_offset,
+    tail_log,
+)
 from ..ssh import SSHClient, SSHError, is_transport_failure
 from .._cliutil import (
     _add_common_opts,
     _emit,
     _make_ssh,
     _preflight_ssh_guest,
+    _qmp_stopped_status,
     _require_ssh,
+    _stopped_guest_payload,
 )
 
 
@@ -139,8 +148,9 @@ class _DeliveryTransportLost(SSHError):
 
 def _add_push(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("push", help="Copy file to guest")
-    p.add_argument("local", help="Local file path")
-    p.add_argument("remote", nargs="?", default="/root/", help="Remote path (default: /root/)")
+    p.add_argument("local", help="Local file path (a single regular file; archive directories first)")
+    p.add_argument("remote", nargs="?", default="/root/",
+                   help="Remote path (default: /root/); a trailing / means 'into that directory'")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_push)
 
@@ -300,8 +310,13 @@ def _ssh_lost_payload(
         text_msg = f"\nCrash from serial log:\n{crash}"
     else:
         text_msg = "\nNo fresh crash detected in serial log. Check: qmu log --tail 100"
+    # `exit_code`/`vm_id` are present on every exec envelope: the guest's exit
+    # code is unknown here (ssh's own 255 is not the guest's), so it is null
+    # rather than absent — a caller reads one key set on every path.
     result: dict[str, Any] = {
         "ok": False,
+        "vm_id": inst.vm_id,
+        "exit_code": None,
         "ssh_error": True,
         "crash_detected": crash is not None,
         "command": command,
@@ -312,6 +327,36 @@ def _ssh_lost_payload(
     # (no sshd, guest wedged) is transport-layer, i.e. 4.
     status = 3 if crash is not None else 4
     return status, result, [f"SSH connection lost while running: {command}", text_msg]
+
+
+def _explain_lost_transport(
+    command: str,
+    inst: VMInstance,
+    *,
+    start_offset: int,
+) -> tuple[int, dict[str, Any], list[str]] | None:
+    """Explain a dropped/expired SSH session from evidence qmu already holds.
+
+    Consulted BEFORE the liveness re-probe, which is slow (two 3 s probes) and
+    can be fooled: a `panic=N` guest reboots inside the probe window and
+    answers the probe, so the panic was reported as the guest "returning 255"
+    with `crash_detected: false`. The serial log is authoritative — a terminal
+    panic appended after the command started IS the outcome of the command,
+    whatever the probe says afterwards (exit 3 with the report). Likewise a
+    vCPU QMP says is halted (a breakpoint fired mid-command) explains the loss
+    exactly; probing SSH against a stopped CPU only adds 7 s before a wrong
+    "VM may be unreachable" in the transport class. Returns None when neither
+    explains it, leaving the probe to decide.
+    """
+    if has_terminal_panic(inst.serial_log, start_offset=start_offset):
+        return _ssh_lost_payload(command, inst, start_offset=start_offset)
+    qemu_status = _qmp_stopped_status(inst)
+    if qemu_status is not None:
+        data, text = _stopped_guest_payload(inst, qemu_status)
+        data["exit_code"] = None
+        data["command"] = command
+        return 1, data, [f"SSH connection lost while running: {command}", *text]
+    return None
 
 
 def _emit_ssh_lost(
@@ -336,6 +381,7 @@ def _emit_ssh_lost(
 
 def _command_timeout_payload(
     command: str,
+    inst: VMInstance,
     timeout: float,
 ) -> tuple[int, dict[str, Any], list[str]]:
     """The guest is alive and answering; the command just outlived --timeout.
@@ -349,6 +395,8 @@ def _command_timeout_payload(
         124,
         {
             "ok": False,
+            "vm_id": inst.vm_id,
+            "exit_code": None,
             "ssh_error": False,
             "crash_detected": False,
             "timed_out": True,
@@ -399,10 +447,16 @@ def _run_guest_command(
         # qmu's own timeout expired. That is NOT by itself a crash: a guest that
         # still answers SSH merely ran longer than --timeout, and reporting exit
         # 3 there told the caller a healthy kernel had died (reproduced live with
-        # `qmu run --timeout 1 -- 'sleep 10'`). Probe first; only an unreachable
-        # guest takes the crash/transport-loss path.
+        # `qmu run --timeout 1 -- 'sleep 10'`). The serial log and QMP are
+        # consulted first (instant, and authoritative); only then probe, and
+        # only an unreachable guest takes the crash/transport-loss path.
+        explained = _explain_lost_transport(
+            command, inst, start_offset=command_start_offset
+        )
+        if explained is not None:
+            return explained
         if not _transport_lost(ssh):
-            return _command_timeout_payload(command, timeout)
+            return _command_timeout_payload(command, inst, timeout)
         return _ssh_lost_payload(
             command, inst, start_offset=command_start_offset
         )
@@ -410,14 +464,21 @@ def _run_guest_command(
     # A kernel panic during the command drops the connection and ssh exits 255 —
     # often with EMPTY stderr (LogLevel=ERROR suppresses the keepalive message),
     # so a stderr-marker test is unreliable. rc=255 is also a legal guest exit
-    # code, so disambiguate with an authoritative liveness probe (retried once to
-    # avoid a false positive on a busy live guest): if SSH is still unreachable
-    # the guest vanished (crash); if it answers, the guest genuinely returned 255
-    # and we take the normal path.
-    if rc == 255 and _transport_lost(ssh):
-        return _ssh_lost_payload(
+    # code, so disambiguate: the serial log / QMP first (a panic appended after
+    # the command started, or a halted vCPU, settle it), then an authoritative
+    # liveness probe (retried once to avoid a false positive on a busy live
+    # guest): if SSH is still unreachable the guest vanished (crash); if it
+    # answers, the guest genuinely returned 255 and we take the normal path.
+    if rc == 255:
+        explained = _explain_lost_transport(
             command, inst, start_offset=command_start_offset
         )
+        if explained is not None:
+            return explained
+        if _transport_lost(ssh):
+            return _ssh_lost_payload(
+                command, inst, start_offset=command_start_offset
+            )
 
     kernel_warning = extract_crash(
         inst.serial_log, start_offset=command_start_offset
@@ -439,6 +500,7 @@ def _run_guest_command(
     # explicit contract (not an implicit "key omitted on success").
     data: dict[str, Any] = {
         "ok": rc == 0,
+        "vm_id": inst.vm_id,
         "exit_code": rc,
         "stdout": stdout,
         "stderr": stderr,
@@ -486,8 +548,9 @@ def _add_compile(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--cc",
         default=None,
-        help="With --host: compiler to use, overriding arch-based selection "
-             "(e.g. 'clang --target=aarch64-linux-gnu')",
+        help="Compiler command to use (default: gcc in the guest; with --host, "
+             "overrides the arch-based host toolchain selection, e.g. "
+             "'clang --target=aarch64-linux-gnu')",
     )
     _add_common_opts(p)
     p.set_defaults(handler=_handle_compile)
@@ -607,10 +670,11 @@ def _handle_compile(args: argparse.Namespace) -> int:
         ssh.push(str(source), remote_src)
 
         # Compile. The remote paths are quoted (a source name with a space or shell
-        # metacharacter must not detonate the root shell); --cflags is intentionally
-        # left unquoted — it is a list of shell flags.
+        # metacharacter must not detonate the root shell); --cflags and --cc are
+        # intentionally left unquoted — they are shell command words.
         compile_cmd = (
-            f"gcc {args.cflags} -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)}"
+            f"{args.cc or 'gcc'} {args.cflags} -o {shlex.quote(remote_bin)} "
+            f"{shlex.quote(remote_src)}"
         )
         rc, stdout, stderr = ssh.run(compile_cmd, timeout=30)
 
@@ -659,11 +723,16 @@ def _handle_compile(args: argparse.Namespace) -> int:
         rc, stdout, stderr = ssh.run(shlex.quote(remote_bin), timeout=args.timeout)
         # A kernel panic during the run drops the connection and ssh exits 255
         # (often with empty stderr). rc=255 is also a legal guest exit code, so
-        # confirm with a liveness probe (retried once to avoid a false positive
-        # on a busy live guest): if SSH still does not answer the guest vanished
-        # — raise SSHError so the crash-extraction except-block below handles it
-        # uniformly with the timeout case.
-        if rc == 255 and _transport_lost(ssh):
+        # the serial log decides first (a terminal panic appended after the run
+        # started is the outcome, even if a `panic=N` guest is already back up
+        # and answering the probe), then a liveness probe (retried once to
+        # avoid a false positive on a busy live guest): if SSH still does not
+        # answer the guest vanished — raise SSHError so the crash-extraction
+        # except-block below handles it uniformly with the timeout case.
+        if rc == 255 and (
+            has_terminal_panic(inst.serial_log, start_offset=run_start_offset)
+            or _transport_lost(ssh)
+        ):
             raise SSHError("SSH transport lost (rc=255) — guest likely crashed")
         result.update({
             "ok": rc == 0,
@@ -739,9 +808,18 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
     try:
         rc, stdout, stderr = ssh.run(cmd, timeout=15)
     except SSHError:
-        # qmu's own SSH timeout expired. A guest that still answers merely ran
-        # dmesg slowly, which stays an infra error (the re-raise -> 4); an
-        # unreachable one takes the shared crash-vs-transport-loss path.
+        # qmu's own SSH timeout expired. The serial log / QMP explain it first
+        # (a panic appended during the read, a halted vCPU); otherwise a guest
+        # that still answers merely ran dmesg slowly, which stays an infra
+        # error (the re-raise -> 4), and an unreachable one takes the shared
+        # crash-vs-transport-loss path.
+        explained = _explain_lost_transport(
+            cmd, inst, start_offset=command_start_offset
+        )
+        if explained is not None:
+            status, data, text = explained
+            _emit(args, data=data, text=text, stem="dmesg")
+            return status
         if not _transport_lost(ssh):
             raise
         return _emit_ssh_lost(
@@ -750,14 +828,22 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
 
     # A panic during the read drops the connection and ssh exits 255, often
     # with only a banner-exchange timeout on stderr. rc=255 is also a legal
-    # guest exit code, so disambiguate with the same probed liveness check
-    # exec/push/pull use. Without this, `qmu dmesg` on a dead guest returned
-    # exit 1 — the "guest command non-zero" class — reading as "dmesg failed
-    # inside the guest" while the kernel was gone.
-    if rc == 255 and _transport_lost(ssh):
-        return _emit_ssh_lost(
-            args, cmd, inst, start_offset=command_start_offset, stem="dmesg"
+    # guest exit code, so disambiguate exactly as exec does: serial log / QMP
+    # first, then the probed liveness check. Without this, `qmu dmesg` on a
+    # dead guest returned exit 1 — the "guest command non-zero" class —
+    # reading as "dmesg failed inside the guest" while the kernel was gone.
+    if rc == 255:
+        explained = _explain_lost_transport(
+            cmd, inst, start_offset=command_start_offset
         )
+        if explained is not None:
+            status, data, text = explained
+            _emit(args, data=data, text=text, stem="dmesg")
+            return status
+        if _transport_lost(ssh):
+            return _emit_ssh_lost(
+                args, cmd, inst, start_offset=command_start_offset, stem="dmesg"
+            )
 
     # L3: honor the guest exit code; do not silently render stderr as if it were
     # the kernel log. The kernel log is stdout; stderr is labelled distinctly.
@@ -805,7 +891,17 @@ def _handle_crash(args: argparse.Namespace) -> int:
     crash_autoselect_note = autoselect_note(inst, args.vm)
     history = args.full_history
     scope = "history" if history else "current"
-    start_offset = 0 if history else inst.guest_epoch_serial_offset
+    # The current scope is the current BOOT — the later of the recorded epoch
+    # and the newest boot banner — the same primitive `status`/`list` and the
+    # SSH preflight use. On the raw epoch alone, a `panic=N` guest that
+    # rebooted on its own reported its pre-reboot panic as "current" while
+    # `status` called the guest serving. `--full-history` keeps scanning
+    # everything.
+    start_offset = (
+        0
+        if history
+        else current_boot_offset(inst.serial_log, inst.guest_epoch_serial_offset)
+    )
     crash = extract_crash(inst.serial_log, start_offset=start_offset)
 
     log_exists = Path(inst.serial_log).exists()

@@ -2,9 +2,10 @@
 
 HMP loadvm/savevm errors arrive as a normal result string, not a QMP protocol
 error, so nothing raises and the snapshot handlers previously returned exit 0
-even when loadvm did NOT restore the VM. cli._snapshot_failed(msg) classifies the
-returned HMP text so the handlers can exit non-zero on a real failure while still
-treating benign savevm slirp WARNINGS as success.
+even when loadvm did NOT restore the VM. cli._snapshot_failed(msg) (now a thin
+wrapper over `qmp.hmp_failed`, shared with `qmu monitor`) classifies the
+returned HMP text so the raw HMP routes can exit non-zero on a real failure
+while still treating benign savevm slirp WARNINGS as success.
 
 The marker set reflects the captured QEMU 11 HMP transcript: a benign
 "warning: Slirp: Save of field ... failed" save still produced a listable
@@ -66,21 +67,29 @@ def test_plain_success_message_is_not_failure():
 import argparse
 import contextlib
 
+from qmu.snapshot import SnapshotResult
+
 
 class _FakeInst:
     vm_id = "dev"
     qmp_socket = "/tmp/nonexistent.sock"
     serial_log = "/tmp/nonexistent.serial.log"
     guest_epoch_serial_offset = 0
+    ssh_port = None
+
+
+def _outcome(msg):
+    return SnapshotResult(not qmp_cmds._snapshot_failed(msg), msg)
 
 
 def _patch_save(monkeypatch, msg):
     """Stub the handler's collaborators so _handle_snapshot_save runs offline:
     choose_instance returns a dummy inst, _qmp_ctx is a no-op CM, and
-    save_snapshot returns the HMP `msg` verbatim (as snapshot.py does)."""
+    save_snapshot returns the HMP `msg` verbatim, classified the way
+    snapshot.py does."""
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: _FakeInst())
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(None))
-    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: msg)
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: _outcome(msg))
 
 
 def _save_args():
@@ -119,7 +128,7 @@ def test_snapshot_save_success_emits_no_hint(monkeypatch, capsys):
 def _patch_load(monkeypatch, msg):
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: _FakeInst())
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(None))
-    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name: msg)
+    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name: _outcome(msg))
 
 
 def _load_args():

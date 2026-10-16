@@ -136,12 +136,13 @@ Never collapse them into one enum.
   guest as gone — instructing a destructive action on working state. The
   kernel's own boot banner is the log-local ground truth.
 
-  **Known, scoped separately:** `qmu crash` still uses the raw epoch, so it can
-  be satisfied by pre-reboot content. `wait --pattern` uses the same
-  `max(epoch, last banner)` boundary as the guest axis and reports it
-  (`scan_offset`/`scan_scope`); the one residual blind spot is a `dmesg`
-  replay echoed to the console, which reproduces the timestamped banner and
-  moves the boundary past any marker printed before it.
+  All three readers — the guest axis, `qmu crash`, and `wait --pattern` —
+  share `serial.current_boot_offset(log_path, epoch_offset)` as the one
+  scope primitive (`qmu crash --full-history` scans from 0), and
+  `wait --pattern` reports the boundary it used (`scan_offset`/`scan_scope`).
+  The one residual blind spot is a `dmesg` replay echoed to the console,
+  which reproduces the timestamped banner and moves the boundary past any
+  marker printed before it.
 
 The cross product is real — orphaned+panicked is the everyday outcome of a
 triggered crash on a VM whose metadata was lost — so adding `paused`/`panicked`
@@ -238,11 +239,15 @@ umbrella #48; auto re-sync/re-arm and true pry-bridge reap need pry-side work.
 
 ## Gotchas
 
-- **Snapshots need a qcow2 disk AND `net_backend=passt`.** HMP `savevm` can't
-  store internal snapshots in the default `raw` image / `snapshot=on` overlay,
-  and slirp (`-net user`) state can't be serialized by `savevm`/`loadvm`.
-  `qmu snapshot save` fails out of the box by design; the handler emits the
-  actionable hint.
+- **Snapshots work out of the box with the default raw rootfs and slirp.**
+  qmu's `snapshot=on` overlay is itself a qcow2, so HMP `savevm`/`loadvm`
+  store in-session checkpoints there (verified on QEMU 8.2.2: save ≈2.5s,
+  load 1–4s, no slirp warning); they vanish with the QEMU process. Durable
+  snapshots need an explicit writable qcow2 `--drive` without `snapshot=on`.
+  `net_backend=passt` is an opt-in for QEMU builds whose slirp state fails
+  to restore, gated on a capability probe — not a prerequisite. `snapshot
+  load` tears down the SSH ControlMaster so the first post-load `exec` does
+  not stall on the rewound connection.
 - **`rootfs inject` treats GUEST as a directory** (with or without a trailing
   slash); the local filename is preserved. A missing GUEST directory is an
   ERROR unless `--mkdir` — silently creating it turns a typo'd destination into

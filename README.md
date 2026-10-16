@@ -14,8 +14,8 @@ qmu skill install
 ## Quick Start
 
 ```bash
-qmu config init                            # Drop a starter qmu.toml here, then edit the two `# CHANGE ME` lines
-qmu doctor                                 # Verify rootfs / SSH key / QEMU all resolve
+qmu config init                            # Drop a starter qmu.toml here, then edit the three `# CHANGE ME` lines
+qmu doctor                                 # Verify kernel / rootfs / SSH key / QEMU all resolve
 qmu launch --kernel /path/to/bzImage
 qmu exec "uname -a"
 qmu compile exploit.c --run

@@ -67,7 +67,9 @@ def test_kernel_can_come_from_config(captured_launch, tmp_path):
     rc = cli.main(["launch", "--config", str(cfg), "--harness"])
 
     assert rc == 0
-    assert captured_launch[0]["kernel"] == "./bzImage"
+    # Anchored at the qmu.toml's directory, not CWD (the file is found by
+    # walking up, so `./bzImage` must mean the same file from any subdir).
+    assert captured_launch[0]["kernel"] == str(tmp_path.resolve() / "bzImage")
 
 
 def test_launch_flag_beats_config_kernel(captured_launch, tmp_path):
@@ -93,7 +95,7 @@ def test_initrd_profile_and_cmdline_come_from_config(captured_launch, tmp_path):
     rc = cli.main(["launch", "--config", str(cfg), "--harness"])
 
     assert rc == 0
-    assert captured_launch[0]["initrd"] == "./initramfs.cpio.gz"
+    assert captured_launch[0]["initrd"] == str(tmp_path.resolve() / "initramfs.cpio.gz")
     assert captured_launch[0]["profile"] == "trigger-test"
 
 
@@ -205,7 +207,8 @@ def test_vm_is_accepted_as_an_alias_for_name(captured_launch, tmp_path):
     assert captured_launch[0]["name"] == "poc64556"
 
 
-def test_name_wins_when_both_are_given(captured_launch, tmp_path):
+def test_conflicting_name_and_vm_are_rejected(captured_launch, tmp_path, capsys):
+    """`--name A --vm B` used to launch A and drop B without a word."""
     cfg = _write_config(tmp_path, '[boot]\nkernel = "./bzImage"\n')
 
     rc = cli.main(
@@ -215,8 +218,10 @@ def test_name_wins_when_both_are_given(captured_launch, tmp_path):
         ]
     )
 
-    assert rc == 0
-    assert captured_launch[0]["name"] == "from-name"
+    assert rc == 1
+    assert captured_launch == []
+    err = capsys.readouterr().err
+    assert "from-vm" in err and "from-name" in err
 
 
 def test_cmdline_without_root_warns_when_a_rootfs_is_attached(

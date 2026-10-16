@@ -297,12 +297,179 @@ def test_paused_guest_text_names_state_and_recovery_without_crash_wording(
 
     assert rc == 1
     make_ssh.assert_not_called()
-    assert "VM 'state-vm' is paused" in captured.out
-    assert "qmu cont --vm state-vm" in captured.out
-    assert "pry continue" in captured.out
-    assert "SSH connection lost" not in captured.out
-    assert "crash" not in captured.out.lower()
-    assert captured.err == ""
+    # A refusal is prose, not a result: it goes to stderr with the documented
+    # prefix so `eval "$(qmu kbase ...)"` / `qmu exec ... | grep` never see it.
+    assert captured.out == ""
+    assert captured.err.startswith("[qmu] Error: VM 'state-vm' is paused")
+    assert "qmu cont --vm state-vm" in captured.err
+    assert "pry continue" in captured.err
+    assert "SSH connection lost" not in captured.err
+    assert "crash" not in captured.err.lower()
+
+
+@pytest.mark.parametrize("status", ("restore-vm", "prelaunch", "inmigrate"))
+@pytest.mark.parametrize("case", CASES)
+def test_any_non_running_qmp_status_fails_before_ssh(
+    case, status, monkeypatch, tmp_path, capsys
+):
+    """The gate keys on `running: false`, not on the names paused/debug.
+
+    A failed `snapshot load` leaves QEMU in `restore-vm`; `status` called it
+    `paused` while every SSH command spent 15–30 s and exited 4 "unreachable".
+    """
+    inst = _instance(tmp_path)
+    trace = []
+    argv, _ = _case(case, tmp_path, "json")
+    make_ssh = Mock(side_effect=AssertionError("SSH client was constructed"))
+    monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(
+        _cliutil, "_qmp_ctx", lambda selected: FakeQMP(trace, status=status)
+    )
+    monkeypatch.setattr(guest, "_make_ssh", make_ssh)
+
+    rc = cli.main(argv)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    make_ssh.assert_not_called()
+    assert payload["ok"] is False
+    assert payload["guest_state"] == "paused"
+    assert payload["qemu_status"] == status
+    assert payload["ssh_error"] is False
+    assert payload["crash_detected"] is False
+    assert "qmu cont --vm state-vm" in payload["hint"]
+
+
+TERMINAL_PANIC = (
+    "[    0.000000] Linux version 7.0.0 (qmu@kbuild) (gcc 13) #1 SMP\n"
+    "[    9.1] sysrq: Trigger a crash\n"
+    "[    9.2] Kernel panic - not syncing: sysrq triggered crash\n"
+    "[    9.3] ---[ end Kernel panic - not syncing: sysrq triggered crash ]---\n"
+)
+
+
+@pytest.mark.parametrize("fmt", ("json", "text"))
+@pytest.mark.parametrize("case", CASES)
+def test_panicked_guest_fails_before_ssh_and_qmp(
+    case, fmt, monkeypatch, tmp_path, capsys
+):
+    """A terminal panic in the current boot refuses SSH work in <1 s.
+
+    Measured live: `exec true` on a VM `status` already called PANICKED spent
+    15.8 s in ssh keepalive and reported exit 4 "No fresh crash detected".
+    Exit 1, not 3: the panic is not fresh for this command; not 4: the guest
+    is known gone, not merely unreachable.
+    """
+    inst = _instance(tmp_path)
+    (tmp_path / "state-vm.serial.log").write_text(TERMINAL_PANIC)
+    argv, _ = _case(case, tmp_path, fmt)
+    make_ssh = Mock(side_effect=AssertionError("SSH client was constructed"))
+    qmp = Mock(side_effect=AssertionError("QMP was consulted"))
+    monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(_cliutil, "_qmp_ctx", qmp)
+    monkeypatch.setattr(guest, "_make_ssh", make_ssh)
+
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    make_ssh.assert_not_called()
+    qmp.assert_not_called()
+    if fmt == "json":
+        payload = json.loads(captured.out)
+        assert payload["ok"] is False
+        assert payload["vm_id"] == "state-vm"
+        assert payload["guest_state"] == "panicked"
+        assert payload["ssh_error"] is False
+        assert payload["crash_detected"] is False
+        assert "crash" not in payload
+        assert "qmu crash --vm state-vm" in payload["hint"]
+        assert "qmu kill --vm state-vm" in payload["hint"]
+    else:
+        assert captured.out == ""
+        assert captured.err.startswith("[qmu] Error: VM 'state-vm' guest is PANICKED")
+        assert "qmu crash --vm state-vm" in captured.err
+        assert "qmu kill --vm state-vm" in captured.err
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_panic_followed_by_reboot_is_not_refused(
+    case, monkeypatch, tmp_path, capsys
+):
+    """Scope is the current boot: a banner after the panic means a new guest."""
+    inst = _instance(tmp_path)
+    (tmp_path / "state-vm.serial.log").write_text(
+        TERMINAL_PANIC
+        + "[    9.4] Rebooting in 3 seconds..\n"
+        + "[    0.000000] Linux version 7.0.0 (qmu@kbuild) (gcc 13) #1 SMP\n"
+        + "localhost login: \n"
+    )
+    trace = []
+    argv, expected_ssh = _case(case, tmp_path, "json")
+    monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(
+        _cliutil, "_qmp_ctx", lambda selected: FakeQMP(trace, status="running")
+    )
+    monkeypatch.setattr(guest, "_make_ssh", lambda selected: FakeSSH(trace))
+
+    rc = cli.main(argv)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["ok"] is True
+    assert [t for t in trace if t[0] == "ssh"] == expected_ssh
+
+
+class _BreakpointSSH:
+    """`ssh.run` times out because a breakpoint halted the vCPU mid-command."""
+
+    def __init__(self):
+        self.is_ready_calls = 0
+
+    def run(self, command, timeout=30.0, check=False):
+        raise SSHError(f"SSH command timed out after {timeout}s: {command}")
+
+    def is_ready(self, timeout=2):
+        self.is_ready_calls += 1
+        return False
+
+
+def test_debugger_stop_mid_exec_is_reported_not_transport_loss(
+    monkeypatch, tmp_path, capsys
+):
+    """Measured live: 26.7 s on `--timeout 15`, exit 4 "VM may be unreachable"
+    while QMP said `debug`. The vCPU state explains the loss; no probe."""
+    inst = _instance(tmp_path)
+    (tmp_path / "state-vm.serial.log").write_text("[ 0.0] Linux version 7.0.0 (x) #1\n")
+    trace = []
+    qmp_status = {"status": "running"}
+    monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(
+        _cliutil, "_qmp_ctx",
+        lambda selected: FakeQMP(trace, status=qmp_status["status"]),
+    )
+    fake = _BreakpointSSH()
+
+    def make_ssh(selected):
+        qmp_status["status"] = "debug"  # the breakpoint fires during run()
+        return fake
+
+    monkeypatch.setattr(guest, "_make_ssh", make_ssh)
+    monkeypatch.setattr(guest.time, "sleep", lambda _: None)
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "state-vm", "--timeout", "15", "uname -r"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert fake.is_ready_calls == 0
+    assert payload["ok"] is False
+    assert payload["guest_state"] == "paused"
+    assert payload["qemu_status"] == "debug"
+    assert payload["ssh_error"] is False
+    assert payload["crash_detected"] is False
+    assert payload["exit_code"] is None
+    assert payload["command"] == "uname -r"
+    assert "pry continue" in payload["hint"]
 
 
 # ---------------------------------------------------------------------------

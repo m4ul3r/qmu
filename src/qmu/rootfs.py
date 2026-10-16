@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import subprocess
@@ -21,6 +22,27 @@ def _require_guestfish() -> str:
     if path is None:
         raise QMUError(GUESTFISH_HINT)
     return path
+
+
+def _drive_files_from_proc(pid: int | None) -> list[str]:
+    """Every `file=` path in a live QEMU's argv (its -drive specs).
+
+    A relative `file=./rootfs.img` is relative to where that QEMU was
+    launched, not to this caller's CWD, so it is anchored at the process cwd.
+    """
+    if pid is None:
+        return []
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+        cwd = Path(os.readlink(f"/proc/{pid}/cwd"))
+    except OSError:
+        return []
+    files: list[str] = []
+    for part in argv.split("\0"):
+        for option in part.split(","):
+            if option.startswith("file=") and option[5:]:
+                files.append(str(cwd / option[5:]))
+    return files
 
 
 def require_image_free(image: str) -> None:
@@ -48,13 +70,21 @@ def require_image_free(image: str) -> None:
 
     holders = []
     for inst in list_instances():
-        if not inst.rootfs or not instance_alive(inst):
+        if not instance_alive(inst):
             continue
-        try:
-            if Path(inst.rootfs).expanduser().resolve() == target:
-                holders.append(inst.vm_id)
-        except OSError:
-            continue
+        # `inst.rootfs` is only the implicit drive. A --drive launch records
+        # none (the configured image was never attached), so its disks are
+        # read from the live process argv, the same `file=` fields the orphan
+        # scan parses; otherwise a tracked, `qmu list`-visible VM holding the
+        # image fell through to libguestfs and was blamed on an orphan.
+        candidates = [inst.rootfs] if inst.rootfs else _drive_files_from_proc(inst.pid)
+        for candidate in candidates:
+            try:
+                if Path(candidate).expanduser().resolve() == target:
+                    holders.append(inst.vm_id)
+                    break
+            except OSError:
+                continue
 
     # An orphan has no metadata by definition, so matching it by instance
     # record can never work — but its own argv carries the -drive file=, from
@@ -344,35 +374,42 @@ def remove(
     *,
     recursive: bool = False,
     force: bool = False,
-) -> None:
+) -> dict[str, list[str]]:
     """Delete files (or, with `recursive`, directories) inside the image.
+
+    Returns `{"removed": [...], "missing": [...]}` so the caller reports what
+    actually happened rather than echoing its arguments back as "Removed".
 
     A path that does not exist is an ERROR unless `force` is set. `rm-f`'s
     shell semantics — succeed silently on a missing path — are wrong for a
     command whose purpose is ruling out stale state: a typo'd path would report
     "Removed" while the real file stayed put. `cat` and `ls` already error on a
-    missing path; this keeps `rm` consistent with its siblings.
+    missing path; this keeps `rm` consistent with its siblings. With `force`
+    the existence probe still runs, because "ignore missing paths" must not
+    become "claim they were removed": the missing ones come back in `missing`.
     """
     fish = _require_guestfish()
     img_path = Path(image)
     if not img_path.exists():
         raise QMUError(f"Image not found: {image}")
 
-    if not force:
-        script = "".join(f"exists {shlex.quote(p)}\n" for p in guest_paths)
-        out = _run_script(image, partition, script, "rm")
-        answers = out.split()
-        if len(answers) == len(guest_paths):
-            absent = [
-                p for p, ok in zip(guest_paths, answers)
-                if ok.strip().lower() != "true"
-            ]
-            if absent:
-                raise QMUError(
-                    f"Not found in {image}: {', '.join(absent)}. "
-                    f"Nothing was removed. Pass --force to ignore missing paths, "
-                    f"or check with `qmu rootfs ls`."
-                )
+    present = list(guest_paths)
+    missing: list[str] = []
+    script = "".join(f"exists {shlex.quote(p)}\n" for p in guest_paths)
+    out = _run_script(image, partition, script, "rm")
+    answers = out.split()
+    if len(answers) == len(guest_paths):
+        present = []
+        for guest_path, answer in zip(guest_paths, answers):
+            (present if answer.strip().lower() == "true" else missing).append(guest_path)
+    if missing and not force:
+        raise QMUError(
+            f"Not found in {image}: {', '.join(missing)}. "
+            f"Nothing was removed. Pass --force to ignore missing paths, "
+            f"or check with `qmu rootfs ls`."
+        )
+    if not present:
+        return {"removed": [], "missing": missing}
 
     # `--force` must actually tolerate a missing path: skipping the existence
     # probe is not enough, because plain `rm` errors on ENOENT too. This is the
@@ -383,8 +420,9 @@ def remove(
         verb = "rm-f"
     else:
         verb = "rm"
-    script = "".join(f"{verb} {shlex.quote(p)}\n" for p in guest_paths)
+    script = "".join(f"{verb} {shlex.quote(p)}\n" for p in present)
     _run_script(image, partition, script, "rm")
+    return {"removed": present, "missing": missing}
 
 
 def shell(image: str, partition: int = 1) -> int:

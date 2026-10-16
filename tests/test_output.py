@@ -130,6 +130,33 @@ def test_auto_spill_writes_valid_ownership_marker():
     assert isinstance(payload["created_at"], float)
 
 
+def test_back_to_back_spills_never_share_a_file():
+    """Two spills in one wall-clock second used to share `exec-HHMMSS.json`:
+    the second overwrote the first while the first envelope still advertised
+    that path and a sha256 the file no longer matched."""
+    import hashlib
+
+    first = write_output_result(
+        {"which": "FIRST", "pad": "x" * 400},
+        fmt="json", out_path=None, stem="exec", spill_token_limit=50,
+    )
+    second = write_output_result(
+        {"which": "SECOND", "pad": "x" * 400},
+        fmt="json", out_path=None, stem="exec", spill_token_limit=50,
+    )
+
+    first_path = Path(first.artifact["artifact_path"])
+    second_path = Path(second.artifact["artifact_path"])
+    assert first_path != second_path
+    assert first_path.name.startswith("exec-")
+    assert first_path.suffix == ".json"
+    assert json.loads(first_path.read_text())["which"] == "FIRST"
+    assert json.loads(second_path.read_text())["which"] == "SECOND"
+    for result, path in ((first, first_path), (second, second_path)):
+        assert result.artifact["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+        assert spill_marker_path(path).exists()
+
+
 def test_marker_binds_identity_and_preserves_replacement_mismatch():
     result = write_output_result(
         _text_with_estimate(51),
