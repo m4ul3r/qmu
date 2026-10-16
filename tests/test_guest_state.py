@@ -337,7 +337,14 @@ def test_any_non_running_qmp_status_fails_before_ssh(
     assert payload["qemu_status"] == status
     assert payload["ssh_error"] is False
     assert payload["crash_detected"] is False
-    assert "qmu cont --vm state-vm" in payload["hint"]
+    if status == "restore-vm":
+        # A load that failed mid-restore: resuming is the inconsistent machine
+        # #87 is about, so the recovery is another load or a relaunch.
+        assert "qmu cont" not in payload["hint"]
+        assert "qmu snapshot load" in payload["hint"]
+        assert "qmu kill --vm state-vm" in payload["hint"]
+    else:
+        assert "qmu cont --vm state-vm" in payload["hint"]
 
 
 TERMINAL_PANIC = (

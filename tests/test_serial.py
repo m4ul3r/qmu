@@ -34,6 +34,7 @@ from qmu.serial import (
     _is_crash_end,
     _is_crash_start,
     extract_crash,
+    has_terminal_panic,
     scan_console_growth,
     serial_log_offset,
     tail_log,
@@ -602,13 +603,33 @@ def test_scan_growth_panic_before_a_banner_in_the_same_chunk_does_not_count(tmp_
     assert panicked is False
 
 
-def test_scan_growth_rescans_a_log_that_shrank(tmp_path):
-    log = _write(tmp_path, "t.serial.log", BANNER + "a\nb\nc\n")
-    scanned, boot, _ = scan_console_growth(log, scanned=0, boot_offset=0)
+def test_scan_growth_rescans_a_log_that_truly_shrank_with_a_retained_boundary(tmp_path):
+    """Receipt 226: a ~4.6 KB log whose last banner sat near its end is
+    replaced by a ~100-byte banner+panic. The old boot boundary must not
+    survive the shrink — it hid every byte of the new generation (#103)."""
+    old = BANNER + "old-line\n" * 500 + BANNER + "current boot\n"
+    log = _write(tmp_path, "t.serial.log", old)
+    scanned, boot, panicked = scan_console_growth(log, scanned=0, boot_offset=0)
+    assert scanned == serial_log_offset(log) == len(old)
+    assert boot == len(old) - len(BANNER + "current boot\n") and panicked is False
+
     log.write_text(BANNER + PANIC)
+    assert serial_log_offset(log) == len(BANNER + PANIC) < boot
     scanned, boot, panicked = scan_console_growth(log, scanned=scanned, boot_offset=boot)
     assert panicked is True
+    assert boot == 0, "the boundary follows the new log's banner, not the old generation's"
     assert scanned == serial_log_offset(log)
+    assert has_terminal_panic(log, start_offset=boot) is True
+
+
+def test_scan_growth_shrunk_log_without_a_banner_rescans_from_zero(tmp_path):
+    log = _write(tmp_path, "u.serial.log", BANNER + "x\n" * 200 + BANNER + "y\n")
+    scanned, boot, _ = scan_console_growth(log, scanned=0, boot_offset=0)
+    assert boot > 0
+
+    log.write_text(PANIC)
+    scanned, boot, panicked = scan_console_growth(log, scanned=scanned, boot_offset=boot)
+    assert (scanned, boot, panicked) == (len(PANIC), 0, True)
 
 
 def test_scan_growth_missing_log_is_inert(tmp_path):

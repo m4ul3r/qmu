@@ -24,11 +24,19 @@ qmu exec --vm X "./exploit" --timeout 120 --format json
 
 JSON: `vm_id`, `command`, `exit_code` (null when the command did not finish),
 `stdout`, `stderr`, `timed_out`, `ssh_error`, `crash_detected`, `crash`,
-`hint`. The exit code is the guest's (`exit 255` is 255, not a crash).
+`hint`. qmu's own exit is **not** the guest's: it is 0 when the guest command
+exited 0 and 1 when it exited non-zero, with the guest's code preserved only
+in `exit_code` (`exit 255` → qmu exit 1, `exit_code: 255`, `ok: false`,
+`ssh_error: false`, `crash_detected: false` — not a crash; 3 always needs a
+fresh serial report). The reserved codes 2/3/4/124 are never guest values.
 
 - `--timeout` (default 30 s; `run` 60 s): on expiry the envelope keeps the
   `stdout`/`stderr` captured so far, `exit_code: null`, `timed_out: true`,
-  exit 124. The remote command is **not** killed in the guest.
+  exit 124. The remote command is **not** killed in the guest. A held QMP
+  slot (debugger bridge, another command) does not defeat the deadline: the
+  watcher's QMP probe runs off the deadline thread, so the result is 124
+  within ~N+0.3 s of the command starting (the pre-command QMP preflight may
+  itself spend its 2 s busy budget first).
 - A kernel panic while the command runs is reported as exit 3 as soon as the
   serial log shows `Kernel panic - not syncing` (sub-second), with the partial
   `stdout`/`stderr` on the crash envelope — not after the SSH keepalive
@@ -86,9 +94,14 @@ toolchain from the guest arch recorded on the instance — the only path when
 the guest has no gcc, and several times faster than compiling inside a TCG
 guest (`cross-arch.md`). JSON: `compile_cmd`, `compile_exit`, `compiled`,
 `compiled_on`, `run_exit`, `run_stdout`, `run_stderr`, `crash_detected`; the
-host path adds `compiler`, `guest_arch`. A lost transport during `--run` adds
-`run_exit: null` with the partial `run_stdout`/`run_stderr`. Text mode prints
-`Compiled and ran X:` on stderr and the run's stdout on stdout.
+host path adds `compiler`, `guest_arch`. `--timeout` bounds the **run**: on
+expiry with the guest still answering SSH the exit is 124 (not 4) with
+`timed_out: true`, `run_exit: null`, `ssh_error: false`, the partial
+`run_stdout`/`run_stderr`, and a `hint` (`Guest command exceeded --timeout
+(Ns) but the guest is still answering SSH …`). A lost transport during
+`--run` likewise keeps `run_exit: null` with the partial streams
+(`run_stdout_lossy` when bytes were replaced). Text mode prints `Compiled and
+ran X:` on stderr and the run's stdout on stdout, byte-exact.
 
 After **any** suspected panic, including a bare `[exit code: 255]`, confirm
 with `qmu crash --vm X`. A `panic=N` guest reboots instead of staying down;
@@ -108,8 +121,14 @@ qmu pull --vm X /root/output.txt ./results/
 `push` transfers ONE regular file (archive directories first). A caller error
 — missing local file, a directory, missing remote directory, permission
 denied, any scp exit ≠ 255 — is exit 1 with `error_type: "SCPFileError"`, so
-exit 4 keeps meaning the transport dropped or timed out (and 3, a fresh
-crash). Both carry `vm_id`.
+exit 4 keeps meaning the transport dropped or timed out. A terminal panic
+appended to the serial log since the step began is that step's outcome:
+exit 3 with `crash`, exactly as for `exec` — a sysrq panic in the middle of
+a multi-GiB `push` aborts scp within a second and returns the report, not a
+bare `SSHAborted`/exit 4. The same rule covers every watched SSH step of
+`compile` (source push, in-guest `gcc`, host-build delivery and `chmod`). An
+scp *timeout* with no fresh panic stays 4 `SSHError`; a halted vCPU is the
+paused envelope, exit 1. All carry `vm_id`.
 
 ## `dmesg`
 
@@ -137,17 +156,24 @@ qmu rootfs shell ./rootfs.img                                  # interactive gue
 ```
 
 - `inject`: GUEST is a directory (with or without trailing `/`); the local
-  filename is kept, so `./exploit:/root` lands at `/root/exploit`. Injected
-  paths are owned by root (`0:0`), mode bits preserved. JSON `injected[]`
-  items carry `path` (landed path) and `owner`; text `LOCAL -> /landed/path
-  (owner 0:0)`. Exit 1 — nothing written — when the image, a LOCAL file, or
-  (without `--mkdir`) the GUEST directory does not exist, or a running VM
-  holds the image. A silent `mkdir` would turn `./exploit:/rooot` into a
-  reported success while the stale binary stays in place: **verify after
-  every inject** with `ls`/`cat`.
+  filename is kept, so `./exploit:/root` lands at `/root/exploit`. Exactly
+  the paths this injection copied are re-owned to root (`0:0`) with `lchown`
+  — a symlink is re-owned itself, never its target, so a dangling link or a
+  link to an existing guest file is fine — and each non-link path then gets
+  its source mode back, **special bits included** (a `6755` fixture lands as
+  `6755`, not `0755`). Files already in the destination from the image or an
+  earlier inject keep their owner. JSON `injected[]` items carry `path`
+  (landed path) and `owner`; text `LOCAL -> /landed/path (owner 0:0)`. Exit
+  1 — nothing written — when the image, a LOCAL file, or (without `--mkdir`)
+  the GUEST directory does not exist, or a running VM holds the image. A
+  silent `mkdir` would turn `./exploit:/rooot` into a reported success while
+  the stale binary stays in place: **verify after every inject** with
+  `ls`/`cat`.
 - `ls`: text is `mode uid gid size mtime name [-> target]` per entry (no
-  `total` line); JSON `entries[]` of `{name, type, mode, uid, gid, size,
-  mtime, target?}`.
+  `total` line), sorted by name; JSON `entries[]` of `{name, type, mode, uid,
+  gid, size, mtime, target?}`. Names and link targets are exact — newlines,
+  quotes, backslashes, non-ASCII and a target such as `/etc/passwd` all come
+  back as written, never as an empty string or a quoting error.
 - `cat`: text is the file's exact bytes (no added newline; binary passes
   through; large output spills to a `.bin`); JSON `content`, `size`,
   `encoding` (`utf-8` or `base64`).

@@ -211,7 +211,12 @@ def test_log_only_entry_with_no_live_process_stays_stopped(
 
     cli.main(["list"])
 
-    assert "[stopped]" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # The invariant is the existence axis: a dead remnant is stopped, never
+    # orphaned. The marker may carry a qualifier (held back from prune, crash
+    # report retained); it must still open the stopped class.
+    assert "[stopped" in out
+    assert "ORPHANED" not in out
 
 
 # ---------------------------------------------------------------------------

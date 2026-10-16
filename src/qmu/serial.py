@@ -500,13 +500,19 @@ def scan_console_growth(
     two reads is still seen whole. A newer banner moves `boot_offset`, and
     only lines after it count toward the panic verdict: a panic before the
     banner belongs to the boot that just ended. A log that shrank underneath
-    the loop (truncated, replaced) is rescanned from its start.
+    the loop (truncated, replaced) is a new log generation: BOTH boundaries
+    reset and the whole file is rescanned, so the returned `boot_offset` can
+    be lower than the one passed in. Resetting `scanned` alone kept the old
+    generation's boot boundary, which then hid every byte of the new log —
+    banner and panic included — behind an offset past its end.
     """
     try:
         with Path(log_path).open("rb") as stream:
             size = os.fstat(stream.fileno()).st_size
-            if scanned > size:
+            shrank = scanned > size
+            if shrank:
                 scanned = 0
+                boot_offset = 0
             if size <= scanned:
                 return scanned, boot_offset, False
             stream.seek(scanned)
@@ -518,11 +524,12 @@ def scan_console_growth(
     for match in _BOOT_BANNER.finditer(chunk):
         last = match
     region_start = 0
-    if last is not None and scanned + last.start() > boot_offset:
+    if last is not None and (shrank or scanned + last.start() > boot_offset):
         boot_offset = scanned + last.start()
         region_start = last.start()
     elif scanned < boot_offset:
-        # Rescanning from 0 after a shrink: skip what precedes the boot.
+        # A caller whose `scanned` trails its `boot_offset`: skip what
+        # precedes the boot.
         region_start = min(len(chunk), boot_offset - scanned)
 
     newline = chunk.rfind(b"\n")

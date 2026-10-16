@@ -43,9 +43,20 @@ fi
 mkdir -p /etc/dropbear 2>/dev/null
 echo "QMU-NET-CONFIGURED $address"
 
-# -F foreground (PID 1 stays alive + reaps) · -s no-password (key only) · -R auto host keys
-# · -E log to console. If your dropbear is >= 2018.76 you may use ed25519 keys; older
-# (e.g. bionic 2017.75) supports only ecdsa/rsa — use ECDSA host + client keys.
-shopt -s execfail
-exec dropbear -F -E -s -R -p 22
-fail "dropbear-exec"
+# -F foreground · -s no-password (key only) · -R auto host keys · -E log to console.
+# If your dropbear is >= 2018.76 you may use ed25519 keys; older (e.g. bionic
+# 2017.75) supports only ecdsa/rsa — use ECDSA host + client keys.
+#
+# PID 1 must outlive the daemon. `exec dropbear` hands PID 1 to the helper, so a
+# helper that starts and then exits (ABI/loader refusal, missing library, startup
+# error — an exec that *succeeded*) takes init with it: the kernel panics with
+# "Attempted to kill init!" and the console carries no parked marker. Run it as a
+# supervised child instead; bash as PID 1 also reaps the per-session children
+# dropbear leaves behind. On exit the marker line below is what to wait for:
+#   qmu wait --vm fw-access --pattern '^=== QMU-HELPER-EXITED' --timeout 60
+dropbear -F -E -s -R -p 22 &
+helper=$!
+wait "$helper"
+status=$?
+echo "=== QMU-HELPER-EXITED code=$status ==="
+fail "dropbear-exited $status"

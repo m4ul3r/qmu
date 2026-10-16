@@ -26,7 +26,7 @@ import pytest
 from qmu import cli
 from qmu.commands import lifecycle, run
 from qmu.instance import VMInstance
-from qmu.ssh import SSHError
+from qmu.ssh import GuestText, SSHError
 
 # Captured before any test stubs it: the fixture replaces this seam with a
 # no-op, and the --no-replace test needs the real guard back.
@@ -332,6 +332,19 @@ def test_keep_leaves_the_vm_running(harness, capsys):
     captured = capsys.readouterr()
     assert captured.out == "ok\n"
     assert "run-vm" in captured.err and "running" in captured.err
+
+
+def test_text_stdout_is_the_guest_bytes_with_no_added_newline(harness, capsysbinary):
+    """`qmu run -- 'printf x' | od -An -tx1` measured `78 0a` (#80): the
+    text renderer line-terminated the guest's stdout. `run` shares exec's
+    emitter, so it is byte-exact too, with the follow-up notes on stderr."""
+    install, state = harness
+    install(run_result=(0, GuestText(b"x"), GuestText(b"")))
+
+    rc = cli.main(_argv("printf x"))
+
+    assert rc == 0
+    assert capsysbinary.readouterr().out == b"x"
 
 
 def test_unexpected_error_after_launch_still_stops_the_vm(monkeypatch, harness):

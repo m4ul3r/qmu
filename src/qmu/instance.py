@@ -204,25 +204,39 @@ def list_instances() -> list[VMInstance]:
 def list_stopped_instances() -> list[VMInstance]:
     """Return VMInstance records whose process has exited.
 
-    Also surfaces orphan serial logs (no .json) by synthesizing a minimal record,
-    so users can still recover forensics from a stale .serial.log.
+    Also surfaces metadata-free remnants (no parseable .json) by synthesizing
+    a minimal record — a stale `.serial.log` so users can still recover
+    forensics, and equally a `.qemu.log`- or `.qmp.sock`-only bundle. Those
+    used to be invisible here while `prune --older-than 0` still removed
+    them, so `list`/`status`/`kill` called a remnant absent that `prune`
+    then reported pruning (#104). The one discovery (`discover_instance_
+    artifacts`) feeds both this and prune eligibility so they cannot drift.
     """
     records = _iter_instance_records()
     stopped = [inst for inst in records if not instance_alive(inst)]
     known_ids = {inst.vm_id for inst in records}
 
-    idir = instances_dir()
-    if idir.exists():
-        for p in sorted(idir.glob("*.serial.log")):
-            vm_id = p.name[: -len(".serial.log")]
-            if vm_id in known_ids:
+    for bundle in discover_instance_artifacts():
+        if bundle.vm_id in known_ids:
+            continue
+        if bundle.serial_log is None and bundle.qemu_log is None:
+            # A lone unparseable .json names nothing qmu can describe or
+            # remove, and a lone QMP socket something still answers on is
+            # not a stopped VM; both stay absent rather than "held back"
+            # with an age-gate explanation that would be false.
+            if bundle.qmp_socket is None or not _qmp_safe_to_prune(bundle.qmp_socket):
                 continue
-            stopped.append(_synthesize_orphan(vm_id, p))
+        stopped.append(_synthesize_orphan(bundle.vm_id, bundle.serial_log))
     return stopped
 
 
-def _synthesize_orphan(vm_id: str, log_path: Path) -> VMInstance:
-    """Build a minimal VMInstance for a serial log that lost its .json."""
+def _synthesize_orphan(vm_id: str, log_path: Path | None) -> VMInstance:
+    """Build a minimal VMInstance for a remnant that lost its .json.
+
+    `log_path` is None for a bundle with no serial log; the record then
+    names the conventional path, which readers already treat as "no log"
+    when it does not exist.
+    """
     return VMInstance(
         vm_id=vm_id,
         pid=0,
@@ -230,7 +244,7 @@ def _synthesize_orphan(vm_id: str, log_path: Path) -> VMInstance:
         ssh_port=None,
         ssh_key=None,
         gdb_port=None,
-        serial_log=str(log_path),
+        serial_log=str(log_path if log_path is not None else serial_log_path(vm_id)),
         kernel="",
         rootfs=None,
         memory="",

@@ -36,7 +36,7 @@ from qmu import cli
 from qmu._cliutil import _wait_pid_exit
 from qmu.commands import guest
 from qmu.instance import VMInstance
-from qmu.ssh import SSHAborted, SSHError
+from qmu.ssh import GuestText, SSHAborted, SSHError
 
 PANIC = (
     "[    3.111] general protection fault: 0000 [#1] PREEMPT SMP\n"
@@ -292,6 +292,96 @@ def test_json_mode_is_unchanged_by_the_stream_split(wired, capsys):
     assert payload["vm_id"] == "exec-vm"
 
 
+def test_text_mode_stdout_is_the_guest_bytes_with_no_added_newline(wired, capsysbinary):
+    """`qmu run -- 'printf x' | od` measured `78 0a` and `printf '\\377'`
+    measured `ef bf bd 0a` against the help text's "byte for byte": the text
+    renderer decoded and line-terminated the guest's output. The guest's
+    bytes reach stdout untouched; the lossy decode is for JSON only."""
+    wired(rc=0, stdout=GuestText(b"x"))
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "printf x"])
+
+    assert rc == 0
+    assert capsysbinary.readouterr().out == b"x"
+
+
+def test_text_mode_delivers_non_utf8_stdout_and_stderr_verbatim(wired, capsysbinary):
+    wired(rc=3, stdout=GuestText(b"\xff\xfe\x80leak"), stderr=GuestText(b"\xffwarn"))
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "./leak"])
+
+    captured = capsysbinary.readouterr()
+    assert rc == 1
+    assert captured.out == b"\xff\xfe\x80leak"
+    # guest stderr verbatim; qmu's trailer starts on its own line after it
+    assert captured.err == b"\xffwarn\n[exit code: 3]\n"
+
+
+def test_json_marks_a_lossy_decode_and_keeps_the_replacement_string(wired, capsys):
+    wired(rc=0, stdout=GuestText(b"\xffabc\n"), stderr=GuestText(b"ok\n"))
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "cmd"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stdout"] == "\ufffdabc\n"
+    assert payload["stdout_lossy"] is True
+    assert "stderr_lossy" not in payload
+
+
+def test_json_has_no_lossy_flag_for_clean_output(wired, capsys):
+    wired(rc=0, stdout=GuestText("caf\u00e9\n".encode()))
+
+    cli.main(["--format", "json", "exec", "--vm", "exec-vm", "cmd"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stdout"] == "caf\u00e9\n"
+    assert "stdout_lossy" not in payload
+
+
+def test_lost_transport_text_leads_with_the_exact_stdout_bytes(wired, capsysbinary):
+    """The partial output before a panic keeps its bytes too; the report
+    follows on a fresh line."""
+    wired(stdout=GuestText(b"\xff step"), append_during_run=PANIC)
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "trigger"])
+
+    out = capsysbinary.readouterr().out
+    assert rc == 3
+    assert out.startswith(b"\xff step\nSSH connection lost while running: trigger\n")
+
+
+def test_text_out_file_holds_the_exact_stdout_bytes(wired, tmp_path, capsys):
+    out = tmp_path / "stdout.bin"
+    wired(rc=0, stdout=GuestText(b"\x00\xff no newline"))
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "--out", str(out), "cmd"])
+
+    assert rc == 0
+    assert out.read_bytes() == b"\x00\xff no newline"
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["artifact_path"] == str(out)
+    assert envelope["bytes"] == 13
+
+
+def test_text_spill_preserves_the_bytes_in_the_artifact(wired, capsys, monkeypatch, tmp_path):
+    monkeypatch.setenv("QMU_TEMP_DIR", str(tmp_path / "rt"))
+    body = b"\xff" + b"0" * 200_000
+    wired(rc=0, stdout=GuestText(body))
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "cmd"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    pointer = captured.out.splitlines()[0]
+    assert pointer.startswith("[qmu] Output spilled to ")
+    assert len(captured.out) < 5000
+    artifact = pointer.split(" ")[4]
+    assert artifact.endswith(".txt")
+    with open(artifact, "rb") as stream:
+        assert stream.read() == body
+
+
 # --- the serial watcher -----------------------------------------------------
 
 
@@ -436,6 +526,79 @@ def test_the_watcher_does_not_ask_qmp_before_its_cadence(wired, monkeypatch):
     assert calls == []
 
 
+# --- a held QMP socket must not move the deadline ---------------------------
+
+
+def _fake_ssh_on_path(tmp_path, monkeypatch, script: str):
+    fake_ssh = tmp_path / "ssh"
+    fake_ssh.write_text("#!/bin/sh\n" + script)
+    fake_ssh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    from qmu.ssh import SSHClient
+
+    return SSHClient(port=10022, key_path="/tmp/test-key")
+
+
+def test_a_blocked_qmp_probe_does_not_defeat_the_command_deadline(
+    tmp_path, monkeypatch
+):
+    """Measured with a sibling holding the QMP socket: `exec --timeout 2
+    'sleep 2.5; printf done'` returned 0 after 3.1 s. The watcher's QMP
+    probe ran synchronously inside the drain loop and sat out the 2 s
+    greeting budget per cadence, so the loop neither drained nor enforced
+    the deadline while blocked, and a child that finished meanwhile was
+    accepted as completed. The probe is now off-thread with a bounded wait:
+    the deadline holds within +0.3 s, output seen before it is kept, and the
+    busy socket is still treated as "running" (no spurious abort)."""
+    def held_qmp(inst):
+        time.sleep(2.0)  # a QMPClient.connect() waiting out its greeting budget
+        return None
+
+    monkeypatch.setattr(guest, "_qmp_stopped_status", held_qmp)
+    serial = tmp_path / "vm.serial.log"
+    serial.write_text("boot ok\n")
+    client = _fake_ssh_on_path(
+        tmp_path, monkeypatch, "echo early\nsleep 2.5\nprintf done\n"
+    )
+    watcher = guest._guest_abort_watcher(_instance(str(serial)), start_offset=0)
+
+    started = time.monotonic()
+    with pytest.raises(SSHError) as excinfo:
+        client.run("sleep 2.5; printf done", timeout=2.0, abort_when=watcher)
+    elapsed = time.monotonic() - started
+
+    assert not isinstance(excinfo.value, SSHAborted)
+    assert elapsed < 2.3, elapsed
+    assert excinfo.value.stdout == "early\n"
+
+
+def test_a_slow_qmp_answer_is_still_read_on_a_later_tick(monkeypatch, tmp_path):
+    """The bounded wait defers, it does not discard: a halt QMP reports after
+    the first tick's budget is seen on a later tick, so the halted-vCPU
+    abort still happens without a synchronous stall."""
+    def slow_halt(inst):
+        time.sleep(0.5)
+        return "debug"
+
+    monkeypatch.setattr(guest, "_qmp_stopped_status", slow_halt)
+    serial = tmp_path / "vm.serial.log"
+    serial.write_text("boot ok\n")
+    watcher = guest._guest_abort_watcher(
+        _instance(str(serial)), start_offset=0, qmp_interval=0.0
+    )
+
+    first = time.monotonic()
+    answers = [watcher()]
+    first_cost = time.monotonic() - first
+    deadline = time.monotonic() + 3.0
+    while not answers[-1] and time.monotonic() < deadline:
+        time.sleep(0.1)
+        answers.append(watcher())
+
+    assert first_cost < 0.4, first_cost
+    assert answers[0] is False and answers[-1] is True
+
+
 @pytest.mark.parametrize("command", ["compile", "dmesg"])
 def test_compile_run_and_dmesg_abort_on_a_halted_vcpu_too(
     wired, monkeypatch, tmp_path, capsys, command
@@ -522,6 +685,102 @@ def test_timeout_text_mode_prints_partial_stdout_then_the_notice(wired, capsys):
     captured = capsys.readouterr()
     assert rc == 124
     assert captured.out.startswith("partial\nGuest command timed out after 2s")
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_compile_run_timeout_on_a_serving_guest_is_124_with_partial_output(
+    wired, tmp_path, capsys, fmt
+):
+    """`compile ./slow.c --run --timeout 1` on a program that prints then
+    sleeps measured 4 `ssh_error:true` ("VM unreachable") against a guest
+    that answered the very next exec. `compile --run` kept its own copy of
+    the lost-transport branch and never asked whether the guest still
+    answers; it now takes exec's classification: 124, `timed_out`, the
+    partial `run_stdout`, no crash claim."""
+    fake = wired(ready=True)
+    source = tmp_path / "slow.c"
+    source.write_text("int main(void){return 0;}\n")
+    original = fake.run
+
+    def run(cmd, *a, **kw):
+        if cmd.startswith("/root/slow"):
+            fake.runs.append(cmd)
+            raise SSHError(
+                f"SSH command timed out after 1.0s: {cmd}", stdout="before-timeout\n"
+            )
+        return original(cmd, *a, **kw)
+
+    fake.run = run
+
+    rc = cli.main([
+        "--format", fmt, "compile", "--vm", "exec-vm", str(source), "--run",
+        "--timeout", "1",
+    ])
+
+    captured = capsys.readouterr()
+    assert rc == 124
+    assert fake.runs[-1] == "/root/slow"
+    if fmt == "json":
+        payload = json.loads(captured.out)
+        assert payload["ok"] is False
+        assert payload["compiled"] is True
+        assert payload["timed_out"] is True
+        assert payload["ssh_error"] is False
+        assert payload["crash_detected"] is False
+        assert payload["run_exit"] is None
+        assert payload["run_stdout"] == "before-timeout\n"
+        assert payload["timeout"] == 1.0
+        assert "command" not in payload
+    else:
+        assert captured.out.startswith("before-timeout\nGuest command timed out after 1s")
+        assert captured.err.startswith("Compiled and ran slow.c:\n")
+
+
+def test_a_panic_under_the_guest_compile_step_is_the_crash_class(wired, tmp_path, capsys):
+    """The gcc step is watched; its abort used to re-raise as a bare infra
+    error unless QMP said halted. A terminal panic appended under gcc is the
+    same exit 3 with the report every other watched step produces."""
+    fake = wired(append_during_run=PANIC)
+    source = tmp_path / "x.c"
+    source.write_text("int main(void){return 0;}\n")
+
+    rc = cli.main(["--format", "json", "compile", "--vm", "exec-vm", str(source), "--run"])
+
+    assert rc == 3
+    assert [cmd.startswith("gcc") for cmd in fake.runs] == [True]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ssh_error"] is True
+    assert payload["crash_detected"] is True
+    assert "Kernel panic - not syncing" in payload["crash"]
+    assert payload["command"].startswith("gcc")
+    assert "compiled" not in payload
+
+
+@pytest.mark.parametrize("failure", ["aborted", "timeout"])
+def test_a_panic_under_the_source_push_is_the_crash_class(wired, tmp_path, capsys, failure):
+    fake = wired()
+    source = tmp_path / "x.c"
+    source.write_text("int main(void){return 0;}\n")
+
+    def push(local, remote, **kwargs):
+        fake.pushes.append((local, remote))
+        with open(fake._serial_path, "a") as stream:
+            stream.write(PANIC)
+        if failure == "aborted":
+            assert kwargs["abort_when"]() is True
+            raise SSHAborted(f"SCP push aborted by qmu: {local} -> {remote}")
+        raise SSHError(f"SCP push timed out after 30s: {local} -> {remote}")
+
+    fake.push = push
+
+    rc = cli.main(["--format", "json", "compile", "--vm", "exec-vm", str(source)])
+
+    assert rc == 3
+    assert fake.runs == []
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["crash_detected"] is True
+    assert payload["operation"] == "push"
+    assert payload["remote"] == "/root/x.c"
 
 
 # --- envelope key consistency -----------------------------------------------

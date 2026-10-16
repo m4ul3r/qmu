@@ -106,13 +106,15 @@ def test_above_limit_spills(isolate_spill_runtime):
     )
     assert res.spilled is True
     assert res.artifact is not None
-    # text mode stays text: a one-line pointer, then the head of the output
+    # text mode stays text: a one-line pointer, the head of the output, and a
+    # trailer accounting for what the preview left out
     lines = res.rendered.splitlines()
     assert lines[0] == (
         f"[qmu] Output spilled to {res.artifact['artifact_path']} "
         f"(~{res.artifact['token_estimate']} tokens)"
     )
-    assert lines[1:] == [value]
+    assert lines[1] == value
+    assert lines[2].startswith("[qmu] Preview: ")
     # the spill file actually exists under the isolated runtime root
     artifact_path = Path(res.artifact["artifact_path"])
     assert artifact_path.is_relative_to(isolate_spill_runtime / "spills")
@@ -130,9 +132,46 @@ def test_text_spill_keeps_only_the_head_on_stdout(isolate_spill_runtime):
     lines = res.rendered.splitlines()
     assert res.spilled is True
     assert lines[0].startswith("[qmu] Output spilled to ")
-    assert lines[1:] == [f"line {i}" for i in range(1, TEXT_SPILL_HEAD_LINES + 1)]
+    assert lines[1:-1] == [f"line {i}" for i in range(1, TEXT_SPILL_HEAD_LINES + 1)]
+    assert lines[-1].startswith("[qmu] Preview: ")
+    assert f"{TEXT_SPILL_HEAD_LINES} of 2000 lines" in lines[-1]
     assert "{" not in res.rendered
     assert Path(res.artifact["artifact_path"]).read_text() == body + "\n"
+
+
+def test_text_spill_preview_is_bounded_by_bytes_for_a_single_long_line(
+    isolate_spill_runtime,
+):
+    """`exec 'printf %0200000d 0'` spilled and then printed the whole
+    200 000-character line after the pointer (stdout 200120 bytes): forty
+    lines is no bound at all for newline-free output. The preview is capped
+    by bytes as well, the artifact stays complete, and the trailer says how
+    much was omitted."""
+    from qmu.output import TEXT_SPILL_HEAD_BYTES
+
+    body = "0" * 200_000
+    res = write_output_result(body, fmt="text", out_path=None, stem="exec")
+
+    assert res.spilled is True
+    assert len(res.rendered.encode()) < TEXT_SPILL_HEAD_BYTES + 512
+    pointer, head, trailer = res.rendered.splitlines()
+    assert head == "0" * TEXT_SPILL_HEAD_BYTES
+    assert trailer == (
+        f"[qmu] Preview: first {TEXT_SPILL_HEAD_BYTES} of 200001 bytes "
+        f"({200001 - TEXT_SPILL_HEAD_BYTES} omitted; 1 of 1 lines)"
+    )
+    assert Path(res.artifact["artifact_path"]).read_text() == body + "\n"
+
+
+def test_text_spill_byte_cap_never_splits_a_multibyte_character(isolate_spill_runtime):
+    from qmu.output import TEXT_SPILL_HEAD_BYTES
+
+    body = "é" * 100_000  # 2 bytes each; 4096 is even, so shift the boundary
+    res = write_output_result("x" + body, fmt="text", out_path=None, stem="exec")
+
+    head = res.rendered.splitlines()[1]
+    assert "\ufffd" not in head
+    assert len(head.encode()) == TEXT_SPILL_HEAD_BYTES - 1
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
@@ -161,11 +200,25 @@ def test_auto_spill_writes_valid_ownership_marker():
     assert isinstance(payload["created_at"], float)
 
 
-def test_back_to_back_spills_never_share_a_file():
+def test_back_to_back_spills_never_share_a_file(monkeypatch):
     """Two spills in one wall-clock second used to share `exec-HHMMSS.json`:
     the second overwrote the first while the first envelope still advertised
-    that path and a sha256 the file no longer matched."""
+    that path and a sha256 the file no longer matched. The clock is frozen so
+    both spills really do name the same second — two calls that happened to
+    straddle a second boundary passed the old implementation by accident."""
     import hashlib
+    from datetime import datetime, timezone
+
+    frozen = datetime(2026, 10, 16, 12, 34, 56, tzinfo=timezone.utc)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen
+
+    from qmu import output
+
+    monkeypatch.setattr(output, "datetime", FrozenDatetime)
 
     first = write_output_result(
         {"which": "FIRST", "pad": "x" * 400},
@@ -179,8 +232,8 @@ def test_back_to_back_spills_never_share_a_file():
     first_path = Path(first.artifact["artifact_path"])
     second_path = Path(second.artifact["artifact_path"])
     assert first_path != second_path
-    assert first_path.name.startswith("exec-")
-    assert first_path.suffix == ".json"
+    assert first_path.name.startswith("exec-123456-")
+    assert second_path.name.startswith("exec-123456-")
     assert json.loads(first_path.read_text())["which"] == "FIRST"
     assert json.loads(second_path.read_text())["which"] == "SECOND"
     for result, path in ((first, first_path), (second, second_path)):

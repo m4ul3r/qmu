@@ -8,11 +8,12 @@ pry path is exercised through a fake `pry` on PATH so no real GDB is started.
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
 
-from qmu import debug
+from qmu import cli, debug
 from qmu.instance import VMInstance, proc_pid_start, save_instance, load_instance
 
 
@@ -158,6 +159,60 @@ def test_reap_bridge_without_instance_json_does_not_create_one(tmp_path, sleeper
     )
     assert debug.reap_bridge(inst) is True
     assert load_instance("bridge-vm") is None
+
+
+# --- `kill` on an already-stopped VM still reaps its recorded bridge (#78) ---
+
+
+def _stopped_record_with_bridge(tmp_path, sleeper, *, start):
+    """A stopped instance record (dead pid, logs retained) whose `qmu gdb`
+    bridge is the live sleeper."""
+    serial = tmp_path / "bridge-vm.serial.log"
+    serial.write_text("[    0.000000] Linux version 7.0.0 (b@h) (gcc) #1 SMP\nlogin: \n")
+    inst = _inst(
+        tmp_path, pid=999_999_999, pid_start="dead", serial_log=str(serial),
+        gdb_bridge_pid=sleeper.pid, gdb_bridge_pid_start=start,
+    )
+    save_instance(inst)
+    return inst, serial
+
+
+def test_kill_on_a_stopped_vm_reaps_its_recorded_bridge(tmp_path, sleeper, monkeypatch, capsys):
+    """Guest poweroff / external `qmp quit`, then the idempotent `kill`: QEMU
+    is gone but the gdb bridge parked on its dead stub is not. The stopped
+    success path must finish the same cleanup the live path does, without
+    touching the retained logs."""
+    monkeypatch.setattr(debug.shutil, "which", lambda name: None)
+    inst, serial = _stopped_record_with_bridge(
+        tmp_path, sleeper, start=proc_pid_start(sleeper.pid),
+    )
+
+    rc = cli.main(["kill", "--vm", "bridge-vm", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["already_stopped"] is True
+    assert payload["bridge_reaped"] is True
+    assert _wait_gone(sleeper)
+    assert serial.exists() and payload["logs_retained"] is True
+    record = load_instance("bridge-vm")
+    assert record is not None and record.gdb_bridge_pid is None
+
+
+def test_kill_on_a_stopped_vm_never_signals_a_recycled_bridge_pid(
+    tmp_path, sleeper, monkeypatch, capsys
+):
+    monkeypatch.setattr(debug.shutil, "which", lambda name: None)
+    _stopped_record_with_bridge(tmp_path, sleeper, start="1")
+
+    rc = cli.main(["kill", "--vm", "bridge-vm", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["already_stopped"] is True
+    assert payload["bridge_reaped"] is False
+    assert sleeper.poll() is None, "an unrelated process wearing the pid is untouched"
+    assert load_instance("bridge-vm").gdb_bridge_pid == sleeper.pid
 
 
 # --- the reset warning names the KASLR re-slide (debug audit F9) -----------

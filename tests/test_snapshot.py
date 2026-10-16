@@ -12,8 +12,9 @@ errors arrive as a normal result string, not a QMP protocol error, and HMP is
 silent for some failures (`delvm` of a missing tag) and chatty for some
 successes (the benign savevm slirp warning). snapshot.py therefore classifies
 the text with `qmp.hmp_failed`, cross-checks `info snapshots` where the text
-alone cannot decide, and restores the pre-load run state when `loadvm` fails
-(QEMU stops the guest first and restarts it only on success).
+alone cannot decide, and after a failed `loadvm` restores the pre-load run
+state ONLY when QEMU provably refused before restoring anything -- a load
+that failed after the disks were reverted is left paused (#87).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from qmu.snapshot import (
     parse_snapshot_list,
     save_snapshot,
     load_snapshot,
+    loadvm_restore_state,
     delete_snapshot,
 )
 
@@ -117,10 +119,11 @@ class FakeQMP:
     of successive answers) and records `cont`.
     """
 
-    def __init__(self, response: str, *, listing: str = "", running=None):
+    def __init__(self, response: str, *, listing: str = "", running=None, stopped="paused"):
         self._response = response
         self._listing = listing
         self._running = list(running or [])
+        self._stopped = stopped
         self.calls: list[str] = []
         self.qmp_calls: list[str] = []
 
@@ -134,7 +137,7 @@ class FakeQMP:
         self.qmp_calls.append(command)
         if command == "query-status":
             running = self._running.pop(0) if self._running else True
-            return {"running": running, "status": "running" if running else "paused"}
+            return {"running": running, "status": "running" if running else self._stopped}
         return {}
 
 
@@ -182,52 +185,152 @@ def test_save_silent_but_unlisted_is_a_failure():
 
 
 def test_load_empty_output_synthesizes_success_message():
-    qmp = FakeQMP("")
+    qmp = FakeQMP("", listing=_LISTED_CLEAN)
     assert load_snapshot(qmp, "clean") == SnapshotResult(True, "Snapshot 'clean' loaded.")
-    assert qmp.calls == ["loadvm clean"]
+    assert qmp.calls == ["info snapshots", "loadvm clean"]
     assert "cont" not in qmp.qmp_calls
+
+
+def test_successful_load_resumes_a_guest_stopped_by_a_failed_restore():
+    """The recovery #87's hint names: `hmp_loadvm` restarts the guest after a
+    successful load only if it was running before, so loading a known-good
+    tag over a `restore-vm` pause would succeed and leave the guest stopped
+    with no error saying so."""
+    qmp = FakeQMP("", listing=_LISTED_CLEAN, running=[False, True], stopped="restore-vm")
+    result = load_snapshot(qmp, "clean")
+    assert result == SnapshotResult(True, "Snapshot 'clean' loaded.", resumed=True)
+    assert qmp.qmp_calls == ["query-status", "cont", "query-status"]
+
+
+@pytest.mark.parametrize("stopped", ["paused", "debug"])
+def test_successful_load_leaves_an_operator_or_debugger_pause_alone(stopped):
+    qmp = FakeQMP("", listing=_LISTED_CLEAN, running=[False], stopped=stopped)
+    result = load_snapshot(qmp, "clean")
+    assert result == SnapshotResult(True, "Snapshot 'clean' loaded.")
+    assert "cont" not in qmp.qmp_calls
+
+
+def test_load_missing_tag_never_reaches_loadvm():
+    """QEMU's hmp_loadvm stops the guest BEFORE it looks for the tag, so the
+    common typo used to pause a running guest and need a resume; the listing
+    pre-check (the same one `delete` does) keeps loadvm from being issued at
+    all, and the guest never stops."""
+    qmp = FakeQMP("", listing="", running=[True])
+    result = load_snapshot(qmp, "nope")
+    assert result == SnapshotResult(
+        False, "Snapshot 'nope' does not exist", reason="missing", restore_state="none"
+    )
+    assert qmp.calls == ["info snapshots"]
+    assert qmp.qmp_calls == []
+
+
+# The receipt-165 failure verbatim (QEMU 8.2.2): a snapshot saved under an
+# e1000 NIC loaded into a virtio-net boot. QEMU had already reverted the disks
+# (`bdrv_all_goto_snapshot`) and reset the machine when the vmstate load hit
+# the unknown RAM block; what is left is pre-snapshot devices over
+# post-snapshot disks, stopped in `restore-vm`.
+_INCOMPATIBLE_DEVICE_LOAD = (
+    'Unknown ramblock "0000:00:03.0/e1000.rom", cannot accept migration\r\n'
+    "error while loading state for instance 0x0 of device 'ram'\r\n"
+    "Error: Error -22 while loading VM state"
+)
 
 
 def test_load_error_is_a_failure_with_the_text_intact():
     """A loadvm HMP error ('Missing section footer / Section footer error') must
     survive verbatim in the result so the CLI can show it."""
     err = "Missing section footer for slirp\nError: Section footer error, section_id: 1"
-    qmp = FakeQMP(err, running=[True, True])
+    qmp = FakeQMP(err, listing=_LISTED_CLEAN, running=[True, False])
     result = load_snapshot(qmp, "clean")
     assert result.ok is False
     assert "Missing section footer" in result.message
     assert "Section footer error" in result.message
+    assert result.restore_state == "partial"
+
+
+@pytest.mark.parametrize("message, expected", [
+    ("Error: Snapshot 'nope' does not exist in one or more devices", "none"),
+    ("Snapshot 'nope' does not exist in one or more devices", "none"),
+    ("Error: This is a disk-only snapshot. Revert to it  offline using qemu-img", "none"),
+    ("Error: No block device supports snapshots", "none"),
+    ("Error: Device 'ide0-hd0' is writable but does not support snapshots", "none"),
+    ('loadvm: extraneous characters at the end of line\r\nTry "help loadvm" for more information', "none"),
+    (_INCOMPATIBLE_DEVICE_LOAD, "partial"),
+    ("Missing section footer for slirp\nError: Section footer error, section_id: 1", "partial"),
+    ("Error: Could not open VM state file", "partial"),
+    ("Error: Could not load snapshot 'clean' on 'drive0': Failed to load snapshot", "partial"),
+    ("Error: Error -5 while loading VM state", "partial"),
+    # A pre-restore line followed by a post-restore one is still partial.
+    ("Error: Snapshot 'x' does not exist\nError: Error -22 while loading VM state", "partial"),
+    # Anything qmu cannot place must not be guessed safe.
+    ("Error: Some refusal this table has never seen", "unknown"),
+    ("", "unknown"),
+])
+def test_loadvm_restore_state_places_qemu_error_forms(message, expected):
+    assert loadvm_restore_state(message) == expected
 
 
 def test_failed_load_resumes_a_guest_that_was_running():
-    """QEMU's hmp_loadvm stops the guest before it looks for the tag and only
-    restarts it on success (audit D2): a typo must not leave it paused."""
-    err = "Error: Snapshot 'nope' does not exist in one or more devices"
+    """QEMU refused before touching the machine (the tag is listed -- a
+    partial, non-loadable snapshot passes the pre-check -- but loadvm's own
+    check says no): the guest is exactly what it was, so the pause QEMU
+    applied first is undone."""
+    err = "Error: Snapshot 'clean' does not exist in one or more devices"
     # before: running; after loadvm: stopped; after cont: running again
-    qmp = FakeQMP(err, running=[True, False, True])
-    result = load_snapshot(qmp, "nope")
+    qmp = FakeQMP(err, listing=_LISTED_CLEAN, running=[True, False, True])
+    result = load_snapshot(qmp, "clean")
     assert result == SnapshotResult(
-        False, err, resumed=True, guest_paused=False, reason="missing"
+        False, err, resumed=True, guest_paused=False, reason="missing",
+        restore_state="none",
     )
     assert qmp.qmp_calls == ["query-status", "query-status", "cont", "query-status"]
 
 
 def test_failed_load_reports_guest_paused_when_cont_does_not_take():
-    err = "Error: Snapshot 'nope' does not exist in one or more devices"
-    qmp = FakeQMP(err, running=[True, False, False])
-    result = load_snapshot(qmp, "nope")
+    err = "Error: Snapshot 'clean' does not exist in one or more devices"
+    qmp = FakeQMP(err, listing=_LISTED_CLEAN, running=[True, False, False])
+    result = load_snapshot(qmp, "clean")
     assert result == SnapshotResult(
-        False, err, resumed=False, guest_paused=True, reason="missing"
+        False, err, resumed=False, guest_paused=True, reason="missing",
+        restore_state="none",
     )
 
 
 def test_failed_load_leaves_an_already_paused_guest_alone():
     """A guest the operator paused on purpose stays paused: qmu only restores
     the state IT saw before the load."""
-    err = "Error: Snapshot 'nope' does not exist in one or more devices"
-    qmp = FakeQMP(err, running=[False])
-    result = load_snapshot(qmp, "nope")
-    assert result == SnapshotResult(False, err, reason="missing")
+    err = "Error: Snapshot 'clean' does not exist in one or more devices"
+    qmp = FakeQMP(err, listing=_LISTED_CLEAN, running=[False])
+    result = load_snapshot(qmp, "clean")
+    assert result == SnapshotResult(False, err, reason="missing", restore_state="none")
+    assert "cont" not in qmp.qmp_calls
+
+
+@pytest.mark.parametrize("err, restore_state", [
+    (_INCOMPATIBLE_DEVICE_LOAD, "partial"),
+    ("Error: Some refusal this table has never seen", "unknown"),
+])
+def test_failed_load_after_restoration_began_is_left_paused(err, restore_state):
+    """#87: the disks are already rewound when the vmstate load fails, so the
+    paused machine is inconsistent. `cont` on it is not a rollback -- the old
+    code issued one anyway and reported `resumed: true` -- so no `cont` is
+    sent and the pause is reported as the state the caller must deal with."""
+    qmp = FakeQMP(err, listing=_LISTED_CLEAN, running=[True, False])
+    result = load_snapshot(qmp, "clean")
+    assert result == SnapshotResult(
+        False, err, resumed=False, guest_paused=True, reason="hmp",
+        restore_state=restore_state,
+    )
+    assert "cont" not in qmp.qmp_calls
+    assert qmp.calls == ["info snapshots", "loadvm clean"]
+
+
+def test_failed_partial_load_of_a_paused_guest_still_reports_the_pause():
+    """The inconsistency does not depend on the pre-load run state."""
+    qmp = FakeQMP(_INCOMPATIBLE_DEVICE_LOAD, listing=_LISTED_CLEAN, running=[False, False])
+    result = load_snapshot(qmp, "clean")
+    assert result.guest_paused is True
+    assert result.restore_state == "partial"
     assert "cont" not in qmp.qmp_calls
 
 

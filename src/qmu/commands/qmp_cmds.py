@@ -29,6 +29,7 @@ from ..snapshot import (
     delete_snapshot,
     list_snapshots,
     load_snapshot,
+    loadvm_restore_state,
     save_snapshot,
 )
 from ..serial import serial_log_offset
@@ -137,6 +138,33 @@ def _snapshot_failure_hint(name: str, vm_id: str, reason: str | None) -> str:
     )
 
 
+def _inconsistent_restore_hint(vm_id: str, result: SnapshotResult) -> str:
+    """The recovery for a load that failed after restoration began.
+
+    `qmu cont` is deliberately NOT offered: `loadvm` reverts the disks before
+    it loads the vmstate, so after this failure the paused machine is
+    pre-snapshot RAM/devices over post-snapshot disks. The way back to a
+    coherent guest is another (compatible) snapshot or a relaunch.
+    """
+    how_far = (
+        "after restoration began (restore_state: partial)"
+        if result.restore_state == "partial"
+        else "at a point qmu cannot place (restore_state: unknown)"
+    )
+    state = (
+        "qmu left the guest paused"
+        if result.guest_paused
+        else "the guest is not paused, but its state is still suspect"
+    )
+    return (
+        f"loadvm failed {how_far}: the machine may be inconsistent (disks "
+        f"rewound, device state not), so {state}. Recover with a known-good "
+        f"snapshot: qmu snapshot load <tag> --vm {vm_id}, or relaunch: "
+        f"qmu kill --vm {vm_id} and qmu launch. Do not resume it blindly "
+        f"with qmu cont --vm {vm_id}."
+    )
+
+
 def _emit_snapshot_result(
     args: argparse.Namespace,
     op: str,
@@ -150,18 +178,27 @@ def _emit_snapshot_result(
     executes prose."""
     stem = f"snapshot-{op}"
     if result.ok:
-        _emit(
-            args,
-            data={"ok": True, "name": args.name, "message": result.message},
-            text=result.message,
-            stem=stem,
-        )
+        data: dict[str, object] = {"ok": True, "name": args.name, "message": result.message}
+        text = result.message
+        if op == "load":
+            # A load that recovered a guest left stopped by a previous failed
+            # restore (`restore-vm`) resumed it; QEMU alone would not have.
+            data["resumed"] = result.resumed
+            if result.resumed:
+                text = f"{text} Guest resumed (it was stopped by a previous failed load)."
+        _emit(args, data=data, text=text, stem=stem)
         return 0
     error = f"snapshot {op} failed: {result.message}"
     hint = _snapshot_failure_hint(args.name, inst.vm_id, result.reason)
     notes: list[str] = []
     if op == "load":
-        if result.resumed:
+        if result.restore_state in ("partial", "unknown"):
+            # The machine, not the pause, is the urgent fact: QEMU reverts
+            # the disks before it loads the vmstate, so a load that failed
+            # here left pre-snapshot devices over post-snapshot disks. qmu
+            # leaves it paused on purpose; `cont` would run that (#87).
+            hint = _inconsistent_restore_hint(inst.vm_id, result)
+        elif result.resumed:
             notes.append(
                 "loadvm paused the guest before failing; qmu resumed it "
                 "(resumed: true)."
@@ -172,7 +209,7 @@ def _emit_snapshot_result(
                 "loadvm left the guest paused and qmu could not resume it. "
                 f"Resume with: qmu cont --vm {inst.vm_id}. Then: {hint}"
             )
-    data: dict[str, object] = {
+    data = {
         "ok": False,
         "error": error,
         "error_type": _SNAPSHOT_ERROR_TYPE,
@@ -182,6 +219,7 @@ def _emit_snapshot_result(
     if op == "load":
         data["resumed"] = result.resumed
         data["guest_paused"] = result.guest_paused
+        data["restore_state"] = result.restore_state
     if getattr(args, "format", "text") == "text":
         sys.stderr.write(f"[qmu] Error: {error}\n")
         for note in notes:
@@ -248,10 +286,15 @@ def _handle_snapshot_load(args: argparse.Namespace) -> int:
                 "may be build-optional), or use a manually managed external passt process "
                 "with QEMU's stream backend. qmu does not manage that external process.\n"
             )
+        # A load that got as far as reverting the disks also reset the
+        # machine (`qemu_system_reset(SHUTDOWN_CAUSE_SNAPSHOT_LOAD)` precedes
+        # the vmstate load), so the #44 divergence applies to it as well.
+        if result.restore_state != "none" and debug_session_present(inst):
+            sys.stderr.write(loadvm_stale_session_warning(inst.vm_id) + "\n")
         return rc
     # #44: loadvm rewound the guest, but an attached debugger keeps its pre-load
     # vCPU state and never re-syncs — a silent divergence in the rewind-iterate
-    # fast path. Warn only on a successful load (a failed one did not rewind).
+    # fast path. A pre-restore refusal (`restore_state: none`) did not rewind.
     if debug_session_present(inst):
         sys.stderr.write(loadvm_stale_session_warning(inst.vm_id) + "\n")
     return 0
@@ -862,10 +905,19 @@ def _hmp_error(command_line: str, output: str) -> QMUError:
     """
     hint = ""
     if _hmp_verb(command_line) == "loadvm":
-        hint = (
-            " (loadvm stops the guest before it looks for the tag and only "
-            "restarts it on success: check `qmu status`, resume with `qmu cont`)"
-        )
+        if loadvm_restore_state(output) == "none":
+            hint = (
+                " (loadvm stops the guest before it looks for the tag and only "
+                "restarts it on success: check `qmu status`, resume with `qmu cont`)"
+            )
+        else:
+            # Past the tag check loadvm reverts the disks before loading the
+            # vmstate; a `cont` here runs the inconsistent result (#87).
+            hint = (
+                " (loadvm may have failed after restoration began: the disks "
+                "may be rewound under device state that is not. Do not `qmu "
+                "cont` it; load a known-good snapshot or `qmu kill` and relaunch)"
+            )
     return QMUError(f"HMP command {command_line!r} failed: {output.strip()}{hint}")
 
 
@@ -903,12 +955,18 @@ def _after_mutation(
     and an empty stderr, which is precisely the wrong-answer-with-no-error
     class debug.py exists to prevent. savevm/loadvm suppress on a failed op
     (the same classifier the snapshot handlers use), since a failed op
-    mutated nothing.
+    mutated nothing. A failed epoch persist is raised only AFTER the SSH
+    master drop and the coherence warning, which the mutation that already
+    landed still needs.
     """
     failed = verb in ("savevm", "loadvm") and _snapshot_failed(output)
+    persist_error: OSError | None = None
     if verb in _TCP_RESETTING_VERBS and not failed:
         if epoch is not None:
-            inst = save_guest_epoch_serial_offset(inst, epoch)
+            try:
+                inst = save_guest_epoch_serial_offset(inst, epoch)
+            except OSError as exc:
+                persist_error = exc
         _drop_ssh_master(inst)
     if verb == "system_reset":
         if debug_session_present(inst):
@@ -919,7 +977,66 @@ def _after_mutation(
     elif verb == "loadvm":
         if debug_session_present(inst) and not failed:
             sys.stderr.write(loadvm_stale_session_warning(inst.vm_id) + "\n")
+    if persist_error is not None:
+        raise persist_error
     return inst
+
+
+def _finish_mutation(
+    args: argparse.Namespace,
+    inst: VMInstance,
+    verb: str,
+    output: str,
+    epoch: int | None,
+    *,
+    data: dict[str, object],
+    text: object,
+    stem: str,
+) -> int:
+    """Post-mutation bookkeeping, THEN exactly one envelope.
+
+    `_after_mutation` persists the guest epoch, and that write can fail
+    (an instance dir the operator chmod'ed, a full disk). The guest mutation
+    has already landed by then, so the honest report is a single `ok:false`
+    envelope that still carries the QMP result and says the reset happened
+    -- never a success envelope followed by a second failure object, which
+    is what emitting first produced (#88: exit 4 with two JSON documents on
+    stdout, the first of which a consumer could accept as the result).
+    Exit 4: the guest did what was asked; qmu's own state is what failed.
+    """
+    try:
+        _after_mutation(inst, verb, output, epoch)
+    except OSError as exc:
+        error = (
+            f"{verb or 'command'} reached the guest, but qmu could not record "
+            f"it: {exc}"
+        )
+        hint = (
+            f"The guest mutation was applied; only VM '{inst.vm_id}'s instance "
+            "record was not updated (its guest epoch is stale, so `qmu wait "
+            "--pattern` may match the previous boot). Make the instances "
+            "directory writable and re-check with: qmu status --vm "
+            f"{inst.vm_id}"
+        )
+        if getattr(args, "format", "text") == "text":
+            sys.stderr.write(f"[qmu] Error: {error}\n[qmu] {hint}\n")
+        else:
+            _emit(
+                args,
+                data={
+                    **data,
+                    "ok": False,
+                    "error": error,
+                    "error_type": exc.__class__.__name__,
+                    "guest_mutated": True,
+                    "hint": hint,
+                },
+                text=error,
+                stem=stem,
+            )
+        return 4
+    _emit(args, data=data, text=text, stem=stem)
+    return 0
 
 
 def _handle_qmp(args: argparse.Namespace) -> int:
@@ -957,12 +1074,16 @@ def _handle_qmp(args: argparse.Namespace) -> int:
         raise _qmp_caller_error(method, exc) from exc
     if hmp_line is not None and isinstance(result, str) and hmp_failed(result):
         raise _hmp_error(hmp_line, result)
-    # Text mode passes the raw QMP return (any JSON type) straight to _output;
-    # json mode wraps it so the universal {"ok": ...} contract holds, with the
-    # original payload under "result".
-    _emit(args, data={"ok": True, "result": result}, text=result, stem="qmp")
-    _after_mutation(inst, verb, result if isinstance(result, str) else "", epoch)
-    return 0
+    # Bookkeeping BEFORE the envelope: the epoch persist can fail (unwritable
+    # instance dir), and a success envelope already on stdout cannot be
+    # taken back -- `qmu qmp system_reset` printed `ok:true` followed by a
+    # second `ok:false` object (#88). Text mode passes the raw QMP return
+    # (any JSON type) straight to _output; json mode wraps it so the
+    # universal {"ok": ...} contract holds, with the payload under "result".
+    return _finish_mutation(
+        args, inst, verb, result if isinstance(result, str) else "", epoch,
+        data={"ok": True, "result": result}, text=result, stem="qmp",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1002,11 +1123,9 @@ def _handle_monitor(args: argparse.Namespace) -> int:
         result = qmp.execute_hmp(command)
     if hmp_failed(result):
         raise _hmp_error(command, result)
-    _emit(
-        args,
+    return _finish_mutation(
+        args, inst, verb, result, epoch,
         data={"ok": True, "output": result},
         text=result if result.strip() else "(no output)",
         stem="monitor",
     )
-    _after_mutation(inst, verb, result, epoch)
-    return 0

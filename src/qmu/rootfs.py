@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import posixpath
-import shlex
 import shutil
 import stat as stat_mod
 import subprocess
@@ -11,6 +10,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .instance import QMUError
+
+
+def guestfish_quote(arg: str) -> str:
+    """Quote one argument for a guestfish script line (`guestfish(1)` QUOTING).
+
+    guestfish is not a shell: `shlex.quote` renders `don't.txt` as
+    `'don'"'"'t.txt'`, which its parser rejects with "command arguments not
+    separated by whitespace". Double quotes are the only form with escapes,
+    so every argument is double-quoted with `\\\\`/`\\"` escapes and control
+    characters as three-digit octal (`\\ooo`) — a newline in a name would
+    otherwise end the script line. Non-ASCII passes through verbatim.
+    """
+    out = ['"']
+    for ch in arg:
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ord(ch) < 0x20 or ch == "\x7f":
+            out.append(f"\\{ord(ch):03o}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
 
 
 GUESTFISH_HINT = (
@@ -170,7 +191,7 @@ def _missing_dirs(
     if not wanted:
         return []
 
-    script = "".join(f"is-dir {shlex.quote(d)}\n" for d in wanted)
+    script = "".join(f"is-dir {guestfish_quote(d)}\n" for d in wanted)
     mode = "--ro" if read_only else "--rw"
     cmd = [fish, mode, "-a", image] + _mount_args(partition)
     proc = subprocess.run(cmd, input=script, text=True, capture_output=True)
@@ -340,18 +361,15 @@ def inject(
     guest_dirs = _inject_guest_dirs(mappings)
 
     script_lines: list[str] = []
-    dir_targets: list[str] = []
     for (local, _), guest_dir in zip(mappings, guest_dirs):
         local_path = Path(local).resolve()
         target = posixpath.join(guest_dir, local_path.name)
         if mkdir:
-            script_lines.append(f"-mkdir-p {shlex.quote(guest_dir)}")
+            script_lines.append(f"-mkdir-p {guestfish_quote(guest_dir)}")
         script_lines.append(
-            f"copy-in {shlex.quote(str(local_path))} {shlex.quote(guest_dir)}"
+            f"copy-in {guestfish_quote(str(local_path))} {guestfish_quote(guest_dir)}"
         )
-        script_lines.append(f"chown 0 0 {shlex.quote(target)}")
-        if local_path.is_dir():
-            dir_targets.append(target)
+        script_lines += _ownership_lines(local_path, target)
 
     script = "\n".join(script_lines) + "\n"
     cmd = [fish, "--rw", "-a", str(img_path)] + _mount_args(partition)
@@ -366,25 +384,46 @@ def inject(
             f"guestfish said:\n{out}"
         )
 
-    # guestfish has no recursive chown; a copied-in directory tree needs its
-    # contents enumerated first, then chowned in a second pass. `find` prints
-    # paths relative to its argument (leading `/`), one per line, with nothing
-    # between consecutive lists, so each list is closed with an echo marker.
-    if dir_targets:
-        find_script = "".join(
-            f"find {shlex.quote(t)}\necho {_SEP_MARKER}\n" for t in dir_targets
-        )
-        found = _run_script(image, partition, find_script, "inject")
-        chown_lines: list[str] = []
-        lists = found.split(_SEP_MARKER + "\n")
-        for target, listing in zip(dir_targets, lists):
-            for rel in listing.split("\n"):
-                if rel:
-                    chown_lines.append(
-                        f"chown 0 0 {shlex.quote(target + rel)}"
-                    )
-        if chown_lines:
-            _run_script(image, partition, "".join(l + "\n" for l in chown_lines), "inject")
+
+def _landed_paths(local_path: Path, target: str) -> list[tuple[str, int]]:
+    """`(guest_path, lstat st_mode)` for every path `copy-in` lands.
+
+    Enumerated from the *source* tree, never from the guest: the destination
+    may already hold files from a previous injection or the image's own
+    layout, and a merge must leave those untouched. Sockets are skipped —
+    tar does not archive them, so there is nothing landed to normalize.
+    """
+    landed = [(target, local_path.lstat().st_mode)]
+    if not local_path.is_dir():
+        return landed
+    for root, dirs, files in os.walk(local_path, followlinks=False):
+        rel_root = Path(root).relative_to(local_path)
+        for name in sorted(dirs + files):
+            mode = (Path(root) / name).lstat().st_mode
+            if stat_mod.S_ISSOCK(mode):
+                continue
+            guest = posixpath.join(target, *rel_root.parts, name)
+            landed.append((guest, mode))
+    return landed
+
+
+def _ownership_lines(local_path: Path, target: str) -> list[str]:
+    """Script lines that root-own exactly what this injection copied.
+
+    `copy-in` preserves the host uid/gid, so every landed path is `lchown`ed:
+    `chown` follows symlinks, which fails on a dangling link (a perfectly
+    valid thing to ship in a fixture tree) and re-owns an unrelated referent
+    for a link to an existing guest path. Ownership changes clear setuid/
+    setgid on Linux, so each non-link path then gets its source mode back —
+    a `6755` fixture that lands as `0755` has lost the behavior it tests.
+    Symlinks keep their 0777: `chmod` would follow them.
+    """
+    lines: list[str] = []
+    for guest, mode in _landed_paths(local_path, target):
+        lines.append(f"lchown 0 0 {guestfish_quote(guest)}")
+        if not stat_mod.S_ISLNK(mode):
+            lines.append(f"chmod 0{stat_mod.S_IMODE(mode):o} {guestfish_quote(guest)}")
+    return lines
 
 
 def _run_script(
@@ -489,8 +528,56 @@ def format_entry(entry: dict) -> str:
     return line
 
 
-_LINKS_MARKER = "__QMU_LINKS__"
-_SEP_MARKER = "__QMU_SEP__"
+def _split_tail_stats(out: str, count: int) -> tuple[str, list[dict[str, int]]]:
+    """Split a script's stdout into (prefix, last `count` lstatns records).
+
+    The stat records are the *tail* of the output and each starts with an
+    `st_dev:` line, so the boundary is the `count`-th-last such line. Data
+    printed before them (readlink targets) cannot move that boundary no
+    matter what it contains — a target of `st_dev: 1` only adds lines
+    *before* the real records.
+    """
+    lines = out.split("\n")
+    starts = [i for i, line in enumerate(lines) if line.startswith("st_dev:")]
+    if len(starts) < count:
+        return out, _parse_stat_blocks(out)
+    cut = starts[len(starts) - count] if count else len(lines)
+    prefix = "\n".join(lines[:cut])
+    if cut:
+        prefix += "\n"
+    return prefix, _parse_stat_blocks("\n".join(lines[cut:]))
+
+
+def _parse_readlink_targets(
+    links_out: str, stats: list[dict[str, int]]
+) -> list[str | None] | None:
+    """Per-entry symlink targets from concatenated `readlink` output.
+
+    guestfish prints each target followed by a newline, with nothing else to
+    frame it, so a target containing a newline — or any sentinel a parser
+    might choose — cannot be split on a delimiter. Parsing is positional
+    instead: a symlink's `st_size` is the byte length of its target, so each
+    symlink entry consumes exactly that many bytes plus the newline. Returns
+    None when the output does not fit that shape (a readlink failed, or the
+    link changed between stat and readlink), which the caller reports rather
+    than guesses about.
+    """
+    data = links_out.encode("utf-8", "surrogateescape")
+    pos = 0
+    targets: list[str | None] = []
+    for st in stats:
+        if not stat_mod.S_ISLNK(st.get("st_mode", 0)):
+            targets.append(None)
+            continue
+        size = st.get("st_size", 0)
+        chunk = data[pos : pos + size]
+        if len(chunk) != size or data[pos + size : pos + size + 1] != b"\n":
+            return None
+        targets.append(chunk.decode("utf-8", "surrogateescape"))
+        pos += size + 1
+    if pos != len(data):
+        return None
+    return targets
 
 
 def listdir(image: str, guest_path: str = "/", partition: int = 1) -> list[dict]:
@@ -502,35 +589,44 @@ def listdir(image: str, guest_path: str = "/", partition: int = 1) -> list[dict]
     only for symlinks. Exists so an injection can be *verified*: a silently
     stale rootfs means the next boot re-runs the previous iteration's binary
     while looking fresh.
+
+    Names come from `ls0` (NUL-terminated, so a newline in a name is data,
+    not a record boundary). Link targets are parsed by position from their
+    `st_size`, never by a string delimiter: a sentinel string appearing as
+    a target shifted every later entry's target while still reporting
+    success.
     """
     path = guest_path or "/"
     names_out = _run_script(
-        image, partition, f"ls {shlex.quote(path)}\n", "ls", read_only=True
+        image, partition, f"ls0 {guestfish_quote(path)} -\n", "ls", read_only=True
     )
-    names = [n for n in names_out.split("\n") if n]
+    names = sorted(n for n in names_out.split("\0") if n)
     if not names:
         return []
 
     full = [posixpath.join(path, n) for n in names]
-    script = "".join(f"lstatns {shlex.quote(p)}\n" for p in full)
-    # `-readlink` tolerates the error a non-symlink produces (stderr only);
-    # the separators keep the per-entry answers aligned with `names`.
-    script += f"echo {_LINKS_MARKER}\n"
-    script += "".join(f"-readlink {shlex.quote(p)}\necho {_SEP_MARKER}\n" for p in full)
+    # `-readlink` tolerates the error a non-symlink produces (stderr only)
+    # and prints nothing for it. Targets come first and the stat records
+    # last, so the records can be found from the tail regardless of what
+    # the targets contain.
+    script = "".join(f"-readlink {guestfish_quote(p)}\n" for p in full)
+    script += "".join(f"lstatns {guestfish_quote(p)}\n" for p in full)
     out = _run_script(image, partition, script, "ls", read_only=True)
 
-    stat_part, _, links_part = out.partition(_LINKS_MARKER + "\n")
-    stats = _parse_stat_blocks(stat_part)
-    targets: list[str | None] = []
-    for chunk in links_part.split(_SEP_MARKER + "\n")[: len(names)]:
-        targets.append(chunk.rstrip("\n") or None)
+    links_part, stats = _split_tail_stats(out, len(names))
     if len(stats) != len(names):
         raise QMUError(
             f"guestfish ls returned {len(stats)} stat records for {len(names)} "
             f"entries in {path}; the listing is inconclusive.\n\nguestfish said:\n"
             f"{out.strip()}"
         )
-    targets += [None] * (len(names) - len(targets))
+    targets = _parse_readlink_targets(links_part, stats)
+    if targets is None:
+        raise QMUError(
+            f"guestfish ls could not align readlink output with the symlinks "
+            f"in {path}; the listing is inconclusive.\n\nguestfish said:\n"
+            f"{out.strip()}"
+        )
     return [
         _entry_from_stat(name, st, target)
         for name, st, target in zip(names, stats, targets)
@@ -550,7 +646,7 @@ def read_file(image: str, guest_path: str, partition: int = 1) -> bytes:
         _run_script(
             image,
             partition,
-            f"download {shlex.quote(guest_path)} {shlex.quote(str(tmp_path))}\n",
+            f"download {guestfish_quote(guest_path)} {guestfish_quote(str(tmp_path))}\n",
             "cat",
             read_only=True,
         )
@@ -587,7 +683,7 @@ def remove(
 
     present = list(guest_paths)
     missing: list[str] = []
-    script = "".join(f"exists {shlex.quote(p)}\n" for p in guest_paths)
+    script = "".join(f"exists {guestfish_quote(p)}\n" for p in guest_paths)
     out = _run_script(image, partition, script, "rm")
     answers = out.split()
     if len(answers) == len(guest_paths):
@@ -612,7 +708,7 @@ def remove(
         verb = "rm-f"
     else:
         verb = "rm"
-    script = "".join(f"{verb} {shlex.quote(p)}\n" for p in present)
+    script = "".join(f"{verb} {guestfish_quote(p)}\n" for p in present)
     _run_script(image, partition, script, "rm")
     return {"removed": present, "missing": missing}
 

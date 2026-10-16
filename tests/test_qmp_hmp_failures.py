@@ -36,6 +36,19 @@ def test_hmp_error_forms_are_failures(output):
     assert hmp_failed(output) is True
 
 
+# Result DATA that carries error words: a snapshot tagged `Error:checkpoint`
+# (receipt 089/099 verbatim), tags spelled like error forms, and a table
+# cell that says "not found". None of these is a QEMU diagnostic, and the
+# unanchored substring classifier made `qmu monitor 'info snapshots'` exit 1
+# on the first one while `qmu snapshot list` on the same VM exited 0 (#86).
+ERROR_TAG_TABLE = (
+    "List of snapshots present on all disks:\r\n"
+    "ID        TAG               VM SIZE                DATE     VM CLOCK     ICOUNT\r\n"
+    "--        Error:checkpoint  819 MiB 2026-10-16 16:51:32 00:00:06.409           \r\n"
+    "--        large            1.36 GiB 2026-10-16 16:51:42 00:00:15.084"
+)
+
+
 @pytest.mark.parametrize(
     "output",
     [
@@ -45,6 +58,14 @@ def test_hmp_error_forms_are_failures(output):
         "There is no snapshot available.",
         # "Invalid"/"Parameter" are only error forms at a line start.
         "CPU#0\nRAX=0000000000000000 RBX=... flags Invalid=0\n",
+        ERROR_TAG_TABLE,
+        "List of snapshots present on all disks:\r\n"
+        "ID        TAG               VM SIZE                DATE     VM CLOCK     ICOUNT\r\n"
+        "--        does-not-exist    819 MiB 2026-10-16 16:51:32 00:00:06.409\r\n"
+        "--        invalid-state     819 MiB 2026-10-16 16:51:33 00:00:07.409\r\n"
+        "--        unknown-command   819 MiB 2026-10-16 16:51:34 00:00:08.409",
+        "ide0-hd0 (#block123): /tmp/not found/disk.qcow2 (qcow2)\n"
+        "    Cache mode:       writeback\n",
     ],
 )
 def test_benign_hmp_output_is_not_a_failure(output):
@@ -101,14 +122,61 @@ def test_monitor_benign_output_passes_through(monkeypatch, capsys):
     assert payload == {"ok": True, "output": "VM status: running\r\n"}
 
 
-def test_monitor_loadvm_failure_names_the_paused_guest(monkeypatch, capsys):
+def test_monitor_loadvm_pre_restore_failure_names_the_paused_guest(monkeypatch, capsys):
     """The raw route does not restore the run state the way `snapshot load`
-    does, so it must at least say what loadvm did to the guest."""
+    does, so it must at least say what loadvm did to the guest -- and for a
+    refusal QEMU made before restoring anything, `qmu cont` is the fix."""
     _install(monkeypatch, "Error: Snapshot 'nope' does not exist in one or more devices")
     assert cli.main(["monitor", "loadvm", "nope"]) == 1
     err = capsys.readouterr().err
     assert "does not exist" in err
     assert "qmu cont" in err
+
+
+def test_monitor_loadvm_partial_failure_does_not_offer_cont(monkeypatch, capsys):
+    """#87 on the raw route: past the tag check loadvm has reverted the disks,
+    so `qmu cont` would run an inconsistent machine; the hint must name the
+    recovery (another snapshot / kill) and not the resume."""
+    _install(monkeypatch, "Error: Error -22 while loading VM state")
+    assert cli.main(["--format", "json", "monitor", "loadvm", "clean"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "Error -22 while loading VM state" in payload["error"]
+    assert "resume with `qmu cont`" not in payload["error"]
+    assert "qmu kill" in payload["error"]
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_every_hmp_route_agrees_error_words_in_data_are_not_a_failure(
+    monkeypatch, capsys, output_format
+):
+    """#86: `snapshot list`, `monitor 'info snapshots'` and `qmp
+    human-monitor-command` read the SAME table; one exiting 0 and the others
+    1 on a tag named `Error:checkpoint` is sibling disagreement, and the
+    table is data either way."""
+    _install(monkeypatch, ERROR_TAG_TABLE)
+    argvs = {
+        "snapshot list": ["snapshot", "list"],
+        "monitor": ["monitor", "info", "snapshots"],
+        "qmp human-monitor-command": [
+            "qmp", "human-monitor-command",
+            "--args", '{"command-line": "info snapshots"}',
+        ],
+    }
+    for command, argv in argvs.items():
+        rc = cli.main(["--format", output_format, *argv])
+        captured = capsys.readouterr()
+        assert rc == 0, f"`qmu {command}` exit {rc}: {captured.out}{captured.err}"
+        if output_format == "json":
+            payload = json.loads(captured.out)
+            assert payload["ok"] is True, command
+            if command == "snapshot list":
+                assert [s["tag"] for s in payload["snapshots"]] == ["Error:checkpoint", "large"]
+            else:
+                assert payload.get("output", payload.get("result")) == ERROR_TAG_TABLE
+        else:
+            assert "Error:checkpoint" in captured.out, command
+            assert captured.err == "", command
 
 
 def test_qmp_human_monitor_command_error_text_exits_1(monkeypatch, capsys):
@@ -177,19 +245,54 @@ def test_snapshot_load_failure_reports_the_resume(monkeypatch, capsys):
 def test_snapshot_load_failure_reports_a_stuck_pause_with_the_cont_hint(monkeypatch, capsys):
     err = "Error: Snapshot 'nope' does not exist in one or more devices"
     _snapshot_seams(
-        monkeypatch, "load", SnapshotResult(False, err, guest_paused=True, reason="missing")
+        monkeypatch, "load",
+        SnapshotResult(False, err, guest_paused=True, reason="missing", restore_state="none"),
     )
     rc = cli.main(["--format", "json", "snapshot", "load", "nope", "--vm", "dev"])
     payload = json.loads(capsys.readouterr().out)
     assert rc == 1
     assert payload["resumed"] is False
     assert payload["guest_paused"] is True
+    assert payload["restore_state"] == "none"
     assert payload["hint"].startswith("loadvm left the guest paused")
     assert "qmu cont --vm dev" in payload["hint"]
 
     rc = cli.main(["snapshot", "load", "nope", "--vm", "dev"])
     assert rc == 1
     assert "qmu cont --vm dev" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("restore_state", ["partial", "unknown"])
+def test_snapshot_load_failure_after_restoration_began_never_offers_cont(
+    monkeypatch, capsys, restore_state
+):
+    """#87: the envelope says the guest is paused AND why `cont` is wrong;
+    the recovery it names is another snapshot or a relaunch."""
+    err = "Error: Error -22 while loading VM state"
+    _snapshot_seams(
+        monkeypatch, "load",
+        SnapshotResult(
+            False, err, guest_paused=True, reason="hmp", restore_state=restore_state
+        ),
+    )
+    rc = cli.main(["--format", "json", "snapshot", "load", "clean", "--vm", "dev"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["ok"] is False
+    assert payload["error_type"] == "SnapshotError"
+    assert payload["resumed"] is False
+    assert payload["guest_paused"] is True
+    assert payload["restore_state"] == restore_state
+    assert "Resume with" not in payload["hint"]
+    assert "qmu snapshot load <tag> --vm dev" in payload["hint"]
+    assert "qmu kill --vm dev" in payload["hint"]
+
+    rc = cli.main(["snapshot", "load", "clean", "--vm", "dev"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert "qmu kill --vm dev" in captured.err
+    assert "Resume with" not in captured.err
 
 
 @pytest.mark.parametrize("op", ["load", "delete"])
