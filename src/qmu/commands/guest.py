@@ -21,7 +21,9 @@ import re
 import shlex
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -40,10 +42,11 @@ from ..serial import (
     serial_log_offset,
     tail_log,
 )
-from ..ssh import SSHClient, SSHError, is_transport_failure
+from ..ssh import SSHClient, SSHError, guest_bytes, guest_lossy, is_transport_failure
 from .._cliutil import (
     _add_common_opts,
     _emit,
+    _emit_bytes,
     _make_ssh,
     _preflight_ssh_guest,
     _qmp_stopped_status,
@@ -86,14 +89,13 @@ def _emit_transfer_transport_lost(
 ) -> int:
     """Emit the scp-transport-lost envelope; exit 3 only with a fresh crash.
 
-    This INTENTIONALLY differs from exec's :func:`_emit_ssh_lost`, which returns
-    exit 3 on any transport loss. An scp failure (rc=255 + transport marker) is a
-    weaker guest-death signal than an interactive exec session dropping: it can be
-    a host-side ssh control-master hiccup (issue #10's own repro is a mux "read
-    from master failed: Broken pipe"), so we do not claim a guest crash on the
-    transfer's word alone. A fresh command-scoped serial crash corroborates it →
-    exit 3 (CLAUDE.md "transport-loss"); otherwise it stays exit 4 (infra), per
-    the issue #10 spec. The fresh-crash presence is the discriminator between the
+    The same split :func:`_ssh_lost_payload` applies to `exec`: an scp failure
+    (rc=255 + transport marker) is a weak guest-death signal on its own — it
+    can be a host-side ssh control-master hiccup (issue #10's own repro is a
+    mux "read from master failed: Broken pipe") — so a guest crash is never
+    claimed on the transfer's word alone. A fresh command-scoped serial crash
+    corroborates it → exit 3 (CLAUDE.md "transport-loss"); otherwise it stays
+    exit 4 (infra). The fresh-crash presence is the discriminator between the
     contract's transport-loss (3) and SSH-failure (4) buckets.
     """
     crash = extract_crash(inst.serial_log, start_offset=start_offset)
@@ -168,10 +170,66 @@ class _DeliveryTransportLost(SSHError):
 
     A distinct type, not a bare SSHError: the delivery handler must not treat
     *every* untyped SSH failure as a dropped guest. `push`/`pull` re-raise an
-    SSHError with no returncode (an scp subprocess timeout, a missing local
-    file) rather than calling it transport loss, and the host path has to make
-    the same distinction or it reclassifies ordinary infra failures as crashes.
+    SSHError with no returncode and no fresh panic (an scp subprocess timeout
+    on a live guest) rather than calling it transport loss, and the host path
+    has to make the same distinction or it reclassifies ordinary infra
+    failures as crashes.
     """
+
+
+def _classify_transfer_failure(
+    args: argparse.Namespace,
+    exc: SSHError,
+    *,
+    inst: VMInstance,
+    start_offset: int,
+    operation: str,
+    local: str,
+    remote: str,
+    stem: str,
+) -> int:
+    """Emit the envelope for a transfer `exc` ended and return the exit status;
+    re-raises `exc` when nothing qmu holds explains it (plain infra, exit 4).
+
+    One decision for push, pull and host-build delivery, in the order
+    :func:`_explain_lost_transport` uses for `exec`:
+
+    - a halted vCPU (QMP) is the paused envelope (1);
+    - a terminal panic appended since the transfer started is the outcome of
+      the transfer: exit 3 with the report. This covers the exception the
+      watcher raises (:class:`~qmu.ssh.SSHAborted`, no returncode): a sysrq
+      panic during a 2 GiB push aborted scp within a second, and the handler
+      then re-raised it as a bare `SSHAborted` (4, no report) while the
+      concurrent `exec` and the next `qmu crash` both returned the panic. An
+      scp timeout that coincides with the panic is the same guest outcome
+      (the drain loop checks the deadline before the watcher, so which of the
+      two fires is a race);
+    - otherwise only a confirmed transport loss (rc 255 plus a transport
+      marker, or the probed :class:`_DeliveryTransportLost`) reaches the
+      crash-vs-unreachable split; an ordinary scp timeout or protocol failure
+      with no panic stays infra.
+    """
+    halted = _emit_transfer_halted(
+        args, inst, start_offset, operation=operation, stem=stem
+    )
+    if halted is not None:
+        return halted
+    if isinstance(exc, _DeliveryTransportLost):
+        pass
+    elif exc.returncode is None:
+        if not has_terminal_panic(inst.serial_log, start_offset=start_offset):
+            raise exc
+    elif not is_transport_failure(exc.returncode, exc.stderr):
+        raise exc
+    return _emit_transfer_transport_lost(
+        args,
+        operation=operation,
+        local=local,
+        remote=remote,
+        inst=inst,
+        start_offset=start_offset,
+        stem=stem,
+    )
 
 
 def _add_push(sub: argparse._SubParsersAction) -> None:
@@ -207,22 +265,9 @@ def _handle_push(args: argparse.Namespace) -> int:
             abort_when=_guest_abort_watcher(inst, start_offset=start_offset),
         )
     except SSHError as exc:
-        halted = _emit_transfer_halted(
-            args, inst, start_offset, operation="push", stem="push"
-        )
-        if halted is not None:
-            return halted
-        if exc.returncode is None or not is_transport_failure(
-            exc.returncode, exc.stderr
-        ):
-            raise
-        return _emit_transfer_transport_lost(
-            args,
-            operation="push",
-            local=args.local,
-            remote=args.remote,
-            inst=inst,
-            start_offset=start_offset,
+        return _classify_transfer_failure(
+            args, exc, inst=inst, start_offset=start_offset, operation="push",
+            local=args.local, remote=args.remote, stem="push",
         )
     _emit(
         args,
@@ -255,22 +300,9 @@ def _handle_pull(args: argparse.Namespace) -> int:
             abort_when=_guest_abort_watcher(inst, start_offset=start_offset),
         )
     except SSHError as exc:
-        halted = _emit_transfer_halted(
-            args, inst, start_offset, operation="pull", stem="pull"
-        )
-        if halted is not None:
-            return halted
-        if exc.returncode is None or not is_transport_failure(
-            exc.returncode, exc.stderr
-        ):
-            raise
-        return _emit_transfer_transport_lost(
-            args,
-            operation="pull",
-            local=args.local,
-            remote=args.remote,
-            inst=inst,
-            start_offset=start_offset,
+        return _classify_transfer_failure(
+            args, exc, inst=inst, start_offset=start_offset, operation="pull",
+            local=args.local, remote=args.remote, stem="pull",
         )
     _emit(
         args,
@@ -344,11 +376,11 @@ def _transport_lost(ssh: SSHClient) -> bool:
 def _ssh_lost_hint(crash: str | None) -> str:
     """The SSH-lost hint text, in one place.
 
-    `exec`/`dmesg` (via :func:`_ssh_lost_payload`) and `compile --run` all
-    report the same condition, so the follow-up command a caller is told to run
-    must not differ between them: `compile --run` used to name no follow-up at
-    all, so an agent whose exploit panicked the guest was never pointed at
-    `qmu crash`.
+    `exec`/`dmesg`/`compile --run` (via :func:`_ssh_lost_payload`) and the
+    transfers report the same condition, so the follow-up command a caller is
+    told to run must not differ between them: `compile --run` used to name no
+    follow-up at all, so an agent whose exploit panicked the guest was never
+    pointed at `qmu crash`.
     """
     if crash is not None:
         return (
@@ -379,7 +411,8 @@ def _ssh_lost_payload(
     discrimination `_emit_transfer_transport_lost` already applied to scp, so
     the two siblings no longer disagree about the same condition.
 
-    Split out from :func:`_emit_ssh_lost` so ``qmu run`` reaches the identical
+    A (status, data, text) triple rather than an emitter so ``qmu exec``,
+    ``qmu run``, ``dmesg`` and ``compile --run`` reach the identical
     classification without re-deriving it: a second copy of this decision is
     exactly how ``exec`` and ``push``/``pull`` came to disagree about what a
     dropped connection means.
@@ -417,6 +450,7 @@ def _explain_lost_transport(
     inst: VMInstance,
     *,
     start_offset: int,
+    halted_status: Callable[[], str | None] | None = None,
 ) -> tuple[int, dict[str, Any], list[str]] | None:
     """Explain a dropped/expired SSH session from evidence qmu already holds.
 
@@ -430,10 +464,17 @@ def _explain_lost_transport(
     exactly; probing SSH against a stopped CPU only adds 7 s before a wrong
     "VM may be unreachable" in the transport class. Returns None when neither
     explains it, leaving the probe to decide.
+
+    `halted_status` is how QMP is asked; a command that was watched passes
+    its :class:`_GuestWatcher`'s bounded probe so a socket held by another
+    client does not add the 2 s greeting budget to a `--timeout` that has
+    already expired. The default is the synchronous query.
     """
     if has_terminal_panic(inst.serial_log, start_offset=start_offset):
         return _ssh_lost_payload(command, inst, start_offset=start_offset)
-    qemu_status = _qmp_stopped_status(inst)
+    qemu_status = (
+        halted_status() if halted_status is not None else _qmp_stopped_status(inst)
+    )
     if qemu_status is not None:
         data, text = _stopped_guest_payload(inst, qemu_status)
         data["exit_code"] = None
@@ -442,9 +483,13 @@ def _explain_lost_transport(
     return None
 
 
-def _guest_abort_watcher(
-    inst: VMInstance, *, start_offset: int, qmp_interval: float = 1.0
-):
+# How long a watcher poll may wait for a QMP answer. Bounds the drain loop's
+# stall: the deadline is enforced within this plus the loop's own poll
+# interval, whatever state the QMP socket is in.
+_QMP_PROBE_BUDGET = 0.2
+
+
+class _GuestWatcher:
     """The `abort_when` predicate for a guest command: panic OR halted vCPU.
 
     Every poll reads the serial log for a terminal panic appended since
@@ -457,20 +502,61 @@ def _guest_abort_watcher(
     the watcher can never turn a working guest command into an outage — and
     the stop it detects is re-read by :func:`_explain_lost_transport`, which
     renders the same paused envelope the preflight uses.
-    """
-    next_qmp = time.monotonic() + qmp_interval
 
-    def aborted() -> bool:
-        nonlocal next_qmp
-        if has_terminal_panic(inst.serial_log, start_offset=start_offset):
+    The QMP query runs on a daemon thread. The predicate is called from the
+    single-threaded drain loop in :func:`~qmu.ssh._watch_child`, and a
+    socket held by another client made a synchronous query sit out the 2 s
+    greeting budget on every cadence — during which nothing drained and the
+    deadline was not enforced, so `exec --timeout 2 'sleep 2.5; printf
+    done'` returned 0 after 3.1 s with a sibling holding QMP. A poll now
+    waits at most `_QMP_PROBE_BUDGET` for the answer and otherwise reads the
+    last published one. One query is in flight at a time: a tick that finds
+    the previous one still blocked does not queue another connection behind
+    it, and a thread still waiting on a held socket when the command ends
+    must not keep the process alive (hence daemon).
+    """
+
+    def __init__(
+        self, inst: VMInstance, *, start_offset: int, qmp_interval: float = 1.0
+    ) -> None:
+        self._inst = inst
+        self._start_offset = start_offset
+        self._qmp_interval = qmp_interval
+        self._next_qmp = time.monotonic() + qmp_interval
+        self._thread: threading.Thread | None = None
+        self._status: str | None = None
+
+    def _query(self) -> None:
+        self._status = _qmp_stopped_status(self._inst)
+
+    def halted_status(self) -> str | None:
+        """QEMU's status if it positively says the vCPUs are stopped, waiting
+        at most `_QMP_PROBE_BUDGET` for a fresh answer; None otherwise. A
+        query still blocked from the previous call is not waited on again —
+        the socket is held, and the last published answer is all there is."""
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(
+                target=self._query, name="qmu-qmp-probe", daemon=True
+            )
+            self._thread.start()
+            self._thread.join(_QMP_PROBE_BUDGET)
+        return self._status
+
+    def __call__(self) -> bool:
+        if has_terminal_panic(self._inst.serial_log, start_offset=self._start_offset):
             return True
         now = time.monotonic()
-        if now < next_qmp:
+        if now < self._next_qmp:
             return False
-        next_qmp = now + qmp_interval
-        return _qmp_stopped_status(inst) is not None
+        self._next_qmp = now + self._qmp_interval
+        return self.halted_status() is not None
 
-    return aborted
+
+def _guest_abort_watcher(
+    inst: VMInstance, *, start_offset: int, qmp_interval: float = 1.0
+) -> _GuestWatcher:
+    """See :class:`_GuestWatcher`."""
+    return _GuestWatcher(inst, start_offset=start_offset, qmp_interval=qmp_interval)
 
 
 def _halted_not_panicked(inst: VMInstance, *, start_offset: int) -> str | None:
@@ -483,26 +569,6 @@ def _halted_not_panicked(inst: VMInstance, *, start_offset: int) -> str | None:
     if has_terminal_panic(inst.serial_log, start_offset=start_offset):
         return None
     return _qmp_stopped_status(inst)
-
-
-def _emit_ssh_lost(
-    args: argparse.Namespace,
-    command: str,
-    inst: VMInstance,
-    *,
-    start_offset: int,
-    stem: str = "exec",
-) -> int:
-    """Emit the SSH-lost envelope; exit 3 only with a fresh corroborating crash.
-
-    `stem` names the spill artifact after the subcommand that lost the
-    transport, so `dmesg` reuses this classification instead of carrying its
-    own (which is how `dmesg` came to report a dead guest as exit 1, the
-    "guest command non-zero" class).
-    """
-    status, data, text = _ssh_lost_payload(command, inst, start_offset=start_offset)
-    _emit(args, data=data, text=text, stem=stem)
-    return status
 
 
 def _command_timeout_payload(
@@ -553,24 +619,39 @@ def _join_exec_command(command: list[str]) -> str:
     return command[0] if len(command) == 1 else shlex.join(command)
 
 
+def _stream_fields(stdout: str, stderr: str) -> dict[str, Any]:
+    """The envelope's view of the guest's streams.
+
+    JSON carries the lossy decode (a JSON string cannot hold a bare 0xff);
+    `stdout_lossy`/`stderr_lossy: true` appear only when U+FFFD replaced
+    something, so a consumer knows the string is not the output and can
+    `pull` the artifact or read text mode instead.
+    """
+    fields: dict[str, Any] = {"stdout": stdout, "stderr": stderr}
+    if guest_lossy(stdout):
+        fields["stdout_lossy"] = True
+    if guest_lossy(stderr):
+        fields["stderr_lossy"] = True
+    return fields
+
+
 def _with_guest_output(
     outcome: tuple[int, dict[str, Any], list[str]],
     stdout: str,
     stderr: str,
-) -> tuple[int, dict[str, Any], list[str], list[str]]:
+) -> tuple[int, dict[str, Any], str, list[str], list[str | bytes]]:
     """Attach what the guest printed to a lost/expired/halted outcome.
 
     The stopped child's output is still the guest's output: a long-running
     exploit that prints progress and then panics (or outlives `--timeout`)
     has told the caller where it got to, and dropping that with the
-    classification made every such run look silent. Guest stdout leads the
-    text payload (it is stdout), guest stderr goes to the stderr notes.
+    classification made every such run look silent. Guest stdout leads on
+    stdout (it is stdout) with the classification's text after it; guest
+    stderr goes to the stderr notes, verbatim.
     """
     status, data, text = outcome
-    data["stdout"] = stdout
-    data["stderr"] = stderr
-    lines = [stdout.rstrip("\n")] if stdout else []
-    return status, data, [*lines, *text], [stderr] if stderr else []
+    data.update(_stream_fields(stdout, stderr))
+    return status, data, stdout, text, [guest_bytes(stderr)] if stderr else []
 
 
 def _run_guest_command(
@@ -579,15 +660,16 @@ def _run_guest_command(
     inst: VMInstance,
     *,
     timeout: float,
-) -> tuple[int, dict[str, Any], str | list[str], list[str]]:
+) -> tuple[int, dict[str, Any], str, list[str], list[str | bytes]]:
     """Run `command` in the guest and classify the outcome.
 
-    Returns (exit status, JSON data, stdout text, stderr notes) rather than
-    emitting, so ``qmu exec`` and ``qmu run`` render the same classification
-    under their own ``stem`` instead of maintaining two copies of the
-    crash-vs-transport-loss discrimination. In text mode the third element is
-    what belongs on stdout (the guest's stdout, byte for byte, on the normal
-    path) and the fourth what belongs on stderr (guest stderr, the
+    Returns (exit status, JSON data, guest stdout, trailing stdout text,
+    stderr notes) rather than emitting, so ``qmu exec``, ``qmu run`` and
+    ``compile --run`` render the same classification under their own
+    ``stem`` instead of maintaining copies of the crash-vs-transport-loss
+    discrimination. In text mode the guest stdout goes to stdout byte for
+    byte, followed by the text lines when the command was lost (the crash
+    report); the notes belong on stderr (guest stderr bytes verbatim, the
     `[exit code: N]` trailer, a survived kernel report) — see
     :func:`_emit_guest_result`.
 
@@ -611,7 +693,8 @@ def _run_guest_command(
         # consulted first (instant, and authoritative); only then probe, and
         # only an unreachable guest takes the crash/transport-loss path.
         explained = _explain_lost_transport(
-            command, inst, start_offset=command_start_offset
+            command, inst, start_offset=command_start_offset,
+            halted_status=watcher.halted_status,
         )
         if explained is None:
             if not _transport_lost(ssh):
@@ -644,9 +727,9 @@ def _run_guest_command(
     kernel_warning = extract_crash(
         inst.serial_log, start_offset=command_start_offset
     )
-    notes = []
+    notes: list[str | bytes] = []
     if stderr:
-        notes.append(stderr)
+        notes.append(guest_bytes(stderr))
     if rc != 0:
         notes.append(f"[exit code: {rc}]")
     if kernel_warning is not None:
@@ -660,44 +743,71 @@ def _run_guest_command(
         "ok": rc == 0,
         "vm_id": inst.vm_id,
         "exit_code": rc,
-        "stdout": stdout,
-        "stderr": stderr,
+        **_stream_fields(stdout, stderr),
         "ssh_error": False,
         "crash_detected": False,
         "kernel_warning_detected": kernel_warning is not None,
         "kernel_warning": kernel_warning,
     }
-    return (0 if rc == 0 else 1), data, stdout, notes
+    return (0 if rc == 0 else 1), data, stdout, [], notes
 
 
 def _emit_guest_result(
     args: argparse.Namespace,
     *,
     data: dict[str, Any],
-    text: str | list[str],
-    notes: list[str],
+    stdout: str = "",
+    text: list[str] = (),
+    notes: list[str | bytes] = (),
     stem: str,
 ) -> None:
     """Emit a guest command result; text mode keeps stdout for guest stdout.
 
-    `text` is rendered on stdout through :func:`_emit` (spill/--out apply);
-    an empty text payload prints nothing rather than a blank line, so
-    `qmu exec ... > out.txt` is byte-exact for a silent command. `notes`
-    (guest stderr verbatim, `[exit code: N]`, kernel warnings, follow-up
-    hints) go to stderr in text mode. `exec` used to print all of it on
-    stdout as `[stderr] ...` / `[exit code: N]` lines, so a pipeline or a
-    redirect collected the decorations as if the guest had printed them. JSON
-    modes are unchanged: `data` is the envelope.
+    Text mode writes the guest's `stdout` bytes to stdout exactly as the
+    guest wrote them — no decode, no added newline — through
+    :func:`_emit_bytes` (spill/--out apply). `text` (the crash report or
+    timeout notice when the command was lost) follows on its own lines. An
+    empty payload prints nothing rather than a blank line, so `qmu exec ...
+    > out.txt` is byte-exact for a silent command too. `notes` go to stderr:
+    `bytes` entries are guest stderr, verbatim; `str` entries (`[exit code:
+    N]`, kernel warnings, follow-up hints) are qmu's lines and start on a
+    fresh line. `exec` used to print all of it on stdout as `[stderr] ...` /
+    `[exit code: N]` lines, so a pipeline or a redirect collected the
+    decorations as if the guest had printed them; then it rendered the
+    stdout as text, so `printf x` arrived as `x\\n` and a 0xff byte as
+    U+FFFD. JSON modes: `data` is the envelope.
     """
     if getattr(args, "format", "text") != "text":
-        _emit(args, data=data, text=text, stem=stem)
+        _emit(args, data=data, text="", stem=stem)
         return
-    if text or getattr(args, "out", None):
-        _emit(args, data=data, text=text, stem=stem)
-    if notes:
-        sys.stdout.flush()
-        for note in notes:
-            sys.stderr.write(note if note.endswith("\n") else note + "\n")
+    raw = guest_bytes(stdout)
+    if text:
+        if raw and not raw.endswith(b"\n"):
+            raw += b"\n"
+        raw += "\n".join(text).encode("utf-8")
+        if not raw.endswith(b"\n"):
+            raw += b"\n"
+    if raw or getattr(args, "out", None):
+        _emit_bytes(args, raw, stem=stem)
+    if not notes:
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    err = sys.stderr.buffer
+    at_line_start = True
+    for note in notes:
+        if isinstance(note, bytes):
+            if note:
+                err.write(note)
+                at_line_start = note.endswith(b"\n")
+            continue
+        if not at_line_start:
+            err.write(b"\n")
+        err.write(note.encode("utf-8"))
+        if not note.endswith("\n"):
+            err.write(b"\n")
+        at_line_start = True
+    err.flush()
 
 
 def _handle_exec(args: argparse.Namespace) -> int:
@@ -708,10 +818,12 @@ def _handle_exec(args: argparse.Namespace) -> int:
         return preflight_rc
     ssh = _make_ssh(inst)
     command = _join_exec_command(args.command)
-    status, data, text, notes = _run_guest_command(
+    status, data, stdout, text, notes = _run_guest_command(
         ssh, command, inst, timeout=args.timeout
     )
-    _emit_guest_result(args, data=data, text=text, notes=notes, stem="exec")
+    _emit_guest_result(
+        args, data=data, stdout=stdout, text=text, notes=notes, stem="exec"
+    )
     return status
 
 
@@ -831,40 +943,18 @@ def _handle_compile(args: argparse.Namespace) -> int:
         try:
             rc, result = _compile_on_host(args, inst, ssh, source, remote_bin)
         except SSHError as exc:
-            # A halted vCPU (breakpoint under scp/chmod) is the paused envelope.
-            halted = _emit_transfer_halted(
-                args, inst, delivery_offset, operation="push", stem="compile"
-            )
-            if halted is not None:
-                return halted
-            # Delivering the host-built binary lost the transport. Classify it
-            # exactly as push/pull do — a fresh crash report is the only thing
-            # that justifies the kernel-crash class (3); otherwise the guest is
-            # merely unreachable (4). Without this the panic would surface as
-            # either a bare infra error or a bogus "compilation failed".
-            #
-            # The guard mirrors _handle_push's verbatim: an SSHError carrying no
-            # returncode (scp subprocess timeout, missing local file) is infra,
-            # NOT a dropped guest. Only a confirmed rc=255-plus-marker scp
-            # failure, or our own probed _DeliveryTransportLost, gets here.
-            if not isinstance(exc, _DeliveryTransportLost) and (
-                exc.returncode is None
-                or not is_transport_failure(exc.returncode, exc.stderr)
-            ):
-                raise
-            return _emit_transfer_transport_lost(
-                args,
-                operation="push",
-                # The transferred file is the host-built binary, not the source,
-                # and the loss may have happened in the chmod that follows it.
-                local=f"{source.name} (host-built binary)",
-                remote=remote_bin,
-                inst=inst,
-                start_offset=delivery_offset,
+            # Delivering the host-built binary lost the transport (or the
+            # watcher stopped it): classified exactly as push/pull. The
+            # transferred file is the host-built binary, not the source, and
+            # the loss may have happened in the chmod that follows it.
+            return _classify_transfer_failure(
+                args, exc, inst=inst, start_offset=delivery_offset, operation="push",
+                local=f"{source.name} (host-built binary)", remote=remote_bin,
                 stem="compile",
             )
     else:
-        # Push source (watched: a halted vCPU under scp is the paused envelope).
+        # Push source, watched like every transfer: a halted vCPU under scp
+        # is the paused envelope, a panic appended under it the crash class.
         push_offset = serial_log_offset(inst.serial_log)
         try:
             ssh.push(
@@ -872,13 +962,11 @@ def _handle_compile(args: argparse.Namespace) -> int:
                 remote_src,
                 abort_when=_guest_abort_watcher(inst, start_offset=push_offset),
             )
-        except SSHError:
-            halted = _emit_transfer_halted(
-                args, inst, push_offset, operation="push", stem="compile"
+        except SSHError as exc:
+            return _classify_transfer_failure(
+                args, exc, inst=inst, start_offset=push_offset, operation="push",
+                local=str(source), remote=remote_src, stem="compile",
             )
-            if halted is None:
-                raise
-            return halted
 
         # Compile. The remote paths are quoted (a source name with a space or shell
         # metacharacter must not detonate the root shell); --cflags and --cc are
@@ -891,25 +979,28 @@ def _handle_compile(args: argparse.Namespace) -> int:
         # makes (`uname`) halts the vCPU under gcc, and an unwatched 30 s
         # budget then expired into a bare infra error.
         compile_start_offset = serial_log_offset(inst.serial_log)
+        watcher = _guest_abort_watcher(inst, start_offset=compile_start_offset)
         try:
             rc, stdout, stderr = ssh.run(
-                compile_cmd,
-                timeout=30,
-                abort_when=_guest_abort_watcher(inst, start_offset=compile_start_offset),
+                compile_cmd, timeout=30, abort_when=watcher
             )
-        except SSHError:
-            qemu_status = _halted_not_panicked(inst, start_offset=compile_start_offset)
-            if qemu_status is None:
+        except SSHError as exc:
+            # A halted vCPU (breakpoint under gcc) is the paused envelope, a
+            # terminal panic appended under it the crash class with the
+            # report; a gcc that merely outran its budget stays infra.
+            explained = _explain_lost_transport(
+                compile_cmd, inst, start_offset=compile_start_offset,
+                halted_status=watcher.halted_status,
+            )
+            if explained is None:
                 raise
-            data, text = _stopped_guest_payload(inst, qemu_status)
-            data["command"] = compile_cmd
-            _emit(
-                args,
-                data=data,
-                text=[f"SSH connection lost while running: {compile_cmd}", *text],
-                stem="compile",
+            status, data, stdout, text, notes = _with_guest_output(
+                explained, exc.stdout, exc.stderr
             )
-            return 1
+            _emit_guest_result(
+                args, data=data, stdout=stdout, text=text, notes=notes, stem="compile"
+            )
+            return status
 
         result = {
             "source": str(source),
@@ -951,17 +1042,13 @@ def _handle_compile(args: argparse.Namespace) -> int:
         _emit_guest_result(
             args,
             data=result,
-            text="",
             notes=[f"Compiled {source.name} -> {remote_bin}{built_by}"],
             stem="compile",
         )
         return 0
 
-    # Run (quoted: the binary path is interpolated into a root shell command)
-    run_start_offset = serial_log_offset(inst.serial_log)
-    watcher = _guest_abort_watcher(inst, start_offset=run_start_offset)
-    text_mode = getattr(args, "format", "text") == "text"
-    if text_mode:
+    # Run (quoted: the binary path is interpolated into a root shell command).
+    if getattr(args, "format", "text") == "text":
         # The banner precedes the program's output on a terminal, and lives on
         # stderr so `compile --run ... > out.txt` holds only what the program
         # printed. It used to be a trailing stderr note, so it landed AFTER
@@ -969,109 +1056,37 @@ def _handle_compile(args: argparse.Namespace) -> int:
         sys.stderr.write(f"Compiled and ran {source.name}:\n")
         sys.stderr.flush()
 
-    try:
-        # Watched like `exec`: a terminal panic in the serial log, or a vCPU
-        # QMP reports halted (a breakpoint fired), stops the ssh child at once
-        # instead of after the keepalive window.
-        rc, stdout, stderr = ssh.run(
-            shlex.quote(remote_bin), timeout=args.timeout, abort_when=watcher
-        )
-        # A kernel panic during the run drops the connection and ssh exits 255
-        # (often with empty stderr). rc=255 is also a legal guest exit code, so
-        # the serial log decides first (a terminal panic appended after the run
-        # started is the outcome, even if a `panic=N` guest is already back up
-        # and answering the probe), then a liveness probe (retried once to
-        # avoid a false positive on a busy live guest): if SSH still does not
-        # answer the guest vanished — raise SSHError so the crash-extraction
-        # except-block below handles it uniformly with the timeout case.
-        if rc == 255 and (
-            has_terminal_panic(inst.serial_log, start_offset=run_start_offset)
-            or _qmp_stopped_status(inst) is not None
-            or _transport_lost(ssh)
-        ):
-            raise SSHError(
-                "SSH transport lost (rc=255) — guest likely crashed",
-                stdout=stdout,
-                stderr=stderr,
-            )
-        result.update({
-            "ok": rc == 0,
-            "run_exit": rc,
-            "run_stdout": stdout,
-            "run_stderr": stderr,
-        })
-        # Text mode: the program's stdout is the stdout, byte for byte; its
-        # stderr and a non-zero exit code are stderr notes — the same rule as
-        # `exec`.
-        notes = []
-        if stderr:
-            notes.append(stderr)
-        if rc != 0:
-            notes.append(f"[exit code: {rc}]")
-        _emit_guest_result(args, data=result, text=stdout, notes=notes, stem="compile")
-        return 0 if rc == 0 else 1
+    # The run is `exec`'s classification under the compile envelope: watched
+    # for a panic / halted vCPU, rc 255 disambiguated by serial log, QMP and
+    # the liveness probe, and a `--timeout` overrun on a guest that still
+    # answers reported as 124 with the partial output. `compile --run` kept
+    # its own copy of the lost-transport branch, which treated every SSHError
+    # as transport loss: a program that printed and then slept past
+    # `--timeout 1` came back as 4 `ssh_error` ("VM unreachable") against a
+    # serving guest, while the same program under `exec` was 124.
+    status, data, stdout, text, notes = _run_guest_command(
+        ssh, shlex.quote(remote_bin), inst, timeout=args.timeout
+    )
+    data = {**result, **_as_run_fields(data)}
+    _emit_guest_result(
+        args, data=data, stdout=stdout, text=text, notes=notes, stem="compile"
+    )
+    return status
 
-    except SSHError as exc:
-        # A halted vCPU (breakpoint, `qmu gdb`) explains the loss exactly and is
-        # the same paused envelope the preflight refuses with — exit 1, not the
-        # crash/transport class. A terminal panic in the serial log outranks it
-        # (QEMU reports a panicked guest as running).
-        qemu_status = _halted_not_panicked(inst, start_offset=run_start_offset)
-        if qemu_status is not None:
-            paused, text = _stopped_guest_payload(inst, qemu_status)
-            result.update(paused)
-            result.update({
-                "run_exit": None,
-                "run_stdout": exc.stdout,
-                "run_stderr": exc.stderr,
-            })
-            status, data, lines, notes = _with_guest_output(
-                (1, result, [f"SSH connection lost while running {name}.", *text]),
-                exc.stdout,
-                exc.stderr,
-            )
-            _emit_guest_result(args, data=data, text=lines, notes=notes, stem="compile")
-            return status
-        crash = extract_crash(inst.serial_log, start_offset=run_start_offset)
-        result.update({
-            "ok": False,
-            "ssh_error": True,
-            "crash_detected": crash is not None,
-            "crash": crash,
-            # What the program printed before the transport went: progress
-            # output is the one clue to where an exploit got to.
-            "run_exit": None,
-            "run_stdout": exc.stdout,
-            "run_stderr": exc.stderr,
-            # Same hint exec/dmesg emit: without it this envelope named no
-            # follow-up at all, so the one command that shows the panic
-            # (`qmu crash`) went unmentioned on the path most likely to hit it.
-            "hint": _ssh_lost_hint(crash),
-        })
-        lines = [exc.stdout.rstrip("\n")] if exc.stdout else []
-        lines.append(f"SSH connection lost while running {name}.")
-        # CORR-5: only the strong "Kernel may have crashed" wording when a
-        # crash report was actually extracted; otherwise report unreachable.
-        if crash:
-            lines.append(f"\nKernel may have crashed. Crash from serial log:\n{crash}")
-        else:
-            lines.append(
-                "\nSSH connection lost; VM may be unreachable. "
-                "No crash report in serial log. Check: qmu log --tail 100"
-            )
-        _emit_guest_result(
-            args,
-            data=result,
-            text=lines,
-            notes=[exc.stderr] if exc.stderr else [],
-            stem="compile",
-        )
-        # Exit 3 is reserved for a crash corroborated by a FRESH serial report
-        # (CLAUDE.md exit-code contract); a merely unreachable guest is 4, the
-        # class exec/dmesg/push/pull already report. `compile --run` returned 3
-        # unconditionally, so a dropped transport with no crash report told the
-        # caller their exploit had panicked the kernel when it had not.
-        return 3 if crash else 4
+
+def _as_run_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """Rename exec's stream/exit keys to the compile envelope's `run_*` ones.
+
+    `command` is dropped: the envelope already names what ran
+    (`compile_cmd`, and the binary is `/root/<stem>`).
+    """
+    renamed = dict(data)
+    renamed.pop("command", None)
+    renamed["run_exit"] = renamed.pop("exit_code")
+    for key in ("stdout", "stderr", "stdout_lossy", "stderr_lossy"):
+        if key in renamed:
+            renamed[f"run_{key}"] = renamed.pop(key)
+    return renamed
 
 
 # ---------------------------------------------------------------------------
@@ -1111,7 +1126,8 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
         # (the re-raise -> 4), and an unreachable one takes the shared
         # crash-vs-transport-loss path.
         explained = _explain_lost_transport(
-            cmd, inst, start_offset=command_start_offset
+            cmd, inst, start_offset=command_start_offset,
+            halted_status=watcher.halted_status,
         )
         if explained is None:
             if not _transport_lost(ssh):
@@ -1119,8 +1135,12 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
             explained = _ssh_lost_payload(
                 cmd, inst, start_offset=command_start_offset
             )
-        status, data, text, notes = _with_guest_output(explained, exc.stdout, exc.stderr)
-        _emit_guest_result(args, data=data, text=text, notes=notes, stem="dmesg")
+        status, data, out, text, notes = _with_guest_output(
+            explained, exc.stdout, exc.stderr
+        )
+        _emit_guest_result(
+            args, data=data, stdout=out, text=text, notes=notes, stem="dmesg"
+        )
         return status
 
     # A panic during the read drops the connection and ssh exits 255, often
@@ -1138,33 +1158,36 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
                 cmd, inst, start_offset=command_start_offset
             )
         if explained is not None:
-            status, data, text, notes = _with_guest_output(explained, stdout, stderr)
-            _emit_guest_result(args, data=data, text=text, notes=notes, stem="dmesg")
+            status, data, out, text, notes = _with_guest_output(
+                explained, stdout, stderr
+            )
+            _emit_guest_result(
+                args, data=data, stdout=out, text=text, notes=notes, stem="dmesg"
+            )
             return status
 
     # L3: honor the guest exit code; do not silently render stderr as if it were
     # the kernel log. The kernel log is stdout (byte for byte, so `qmu dmesg |
     # grep` sees only log lines); stderr and a failure trailer are stderr notes.
-    notes = []
+    notes: list[str | bytes] = []
     if rc == 0:
         if not stdout.strip():
             notes.append("(empty dmesg)")
     else:
         err = stderr.rstrip()
         notes.append(f"[dmesg failed, exit {rc}]" + (f" {err}" if err else ""))
-    _emit_guest_result(
-        args,
-        data={
-            "ok": rc == 0,
-            "vm_id": inst.vm_id,
-            "exit_code": rc,
-            "text": stdout,
-            "stderr": stderr,
-        },
-        text=stdout,
-        notes=notes,
-        stem="dmesg",
-    )
+    data: dict[str, Any] = {
+        "ok": rc == 0,
+        "vm_id": inst.vm_id,
+        "exit_code": rc,
+        "text": stdout,
+        "stderr": stderr,
+    }
+    if guest_lossy(stdout):
+        data["text_lossy"] = True
+    if guest_lossy(stderr):
+        data["stderr_lossy"] = True
+    _emit_guest_result(args, data=data, stdout=stdout, notes=notes, stem="dmesg")
     return 0 if rc == 0 else 1
 
 

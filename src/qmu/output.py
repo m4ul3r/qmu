@@ -119,22 +119,40 @@ def _artifact_envelope(payload: dict[str, Any], fmt: str) -> str:
 
 # How much of a spilled text result still reaches stdout, so a human or a
 # `| head` pipeline sees what the output looked like without opening the file.
+# Both bounds apply: a 200 000-character single line (`printf %0200000d`, a
+# leak dump with no newlines) is one "line", and a 40-line preview of it put
+# the whole output on stdout after the pointer claiming it had been spilled.
 TEXT_SPILL_HEAD_LINES = 40
+TEXT_SPILL_HEAD_BYTES = 4096
 
 
 def _text_spill_pointer(payload: dict[str, Any], rendered: str) -> str:
-    """Text-mode stand-in for a spilled result: a one-line pointer plus the head.
+    """Text-mode stand-in for a spilled result: a one-line pointer, a bounded
+    head of the output, and a trailer saying how much was left out.
 
     `--format text` promises text on stdout; the JSON pointer envelope that
     used to appear here broke `qmu exec ... | grep` and read as an error to a
     caller who never asked for JSON. json/ndjson keep their envelopes.
     """
-    head = rendered.splitlines()[:TEXT_SPILL_HEAD_LINES]
+    lines = rendered.splitlines()
+    head = "\n".join(lines[:TEXT_SPILL_HEAD_LINES])
+    encoded = head.encode("utf-8")
+    if len(encoded) > TEXT_SPILL_HEAD_BYTES:
+        # Cut on a character boundary: a multibyte sequence split by the byte
+        # cap is dropped rather than decoded into U+FFFD.
+        head = encoded[:TEXT_SPILL_HEAD_BYTES].decode("utf-8", errors="ignore")
+        encoded = head.encode("utf-8")
+    shown_lines = head.count("\n") + 1 if head else 0
+    total = payload["bytes"]
     pointer = (
         f"[qmu] Output spilled to {payload['artifact_path']} "
         f"(~{payload['token_estimate']} tokens)"
     )
-    return "\n".join([pointer, *head]) + "\n"
+    trailer = (
+        f"[qmu] Preview: first {len(encoded)} of {total} bytes "
+        f"({total - len(encoded)} omitted; {shown_lines} of {len(lines)} lines)"
+    )
+    return "\n".join([pointer, head, trailer]) + "\n"
 
 
 def write_output_result(
@@ -205,6 +223,7 @@ def write_bytes_result(
     out_path: Path | None,
     stem: str,
     spill_token_limit: int = DEFAULT_SPILL_TOKEN_LIMIT,
+    suffix: str = ".bin",
 ) -> OutputWriteResult:
     """Text-mode delivery of a byte payload with NO rendering applied.
 
@@ -212,7 +231,10 @@ def write_bytes_result(
     write that rendered form, so a file read back through them was never
     checksum-comparable with its source. This variant writes `raw` verbatim:
     inline when it fits the spill budget, otherwise to `out_path`/a spill file
-    exactly, with the usual artifact envelope describing the file.
+    (named `<stem>-...<suffix>`) exactly, with the usual artifact envelope
+    describing the file. The inline `rendered` is a lossy decode for callers
+    that can only take text; byte-exact callers write `raw` themselves when
+    `artifact` is None.
     """
     rendered = raw.decode("utf-8", errors="replace")
     token_estimate = _estimate_tokens(rendered)
@@ -223,7 +245,7 @@ def write_bytes_result(
 
     spilled = out_path is None
     if out_path is None:
-        out_path = _spill_path(stem, ".bin")
+        out_path = _spill_path(stem, suffix)
     else:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         invalidate_owned_spill_marker(out_path)

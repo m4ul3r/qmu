@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 from pathlib import Path
 from typing import Any
@@ -25,29 +26,36 @@ class QMPBusyError(QMPError):
 # returns `{"return": "Error: ..."}` with no QMP error reply, so nothing raises
 # and a wrapper that trusts "the call returned" reports success for an op that
 # did nothing (`savevm 'has space'`, `monitor nonsense-cmd`). These are the
-# forms QEMU's HMP layer and the snapshot/block code emit, measured from QEMU
-# 8.2.2 and the captured QEMU 11 transcript. Deliberately NOT included: the
-# benign savevm slirp warning ("warning: Slirp: Save of field ... failed"),
-# which precedes a snapshot that still lists and loads.
-_HMP_ERROR_SUBSTRINGS = (
-    "Error:",                       # error_report via the monitor
-    "unknown command",              # HMP parser: no such verb
-    "extraneous characters",        # HMP parser: `savevm has space`
-    'Try "help',                    # HMP parser usage epilogue
-    "does not exist",               # loadvm: no such snapshot
-    "not found",                    # Device 'x' not found and kin
-    "does not support",             # savevm on a format without snapshots
-    "Could not open",
-    "No block device",
-    "Missing section footer",       # loadvm restore failures
-    "Section footer error",
-)
-# Anchored at a line start: these words are too common to match anywhere
-# (`info registers` could legitimately print "Invalid" inside a flag dump).
-_HMP_ERROR_LINE_PREFIXES = (
-    "Parameter '",                  # QAPI visitor: missing/unexpected member
-    "Invalid ",                     # Invalid parameter / Invalid JSON
-    "invalid ",
+# forms QEMU's HMP layer and the snapshot/block/migration code emit, measured
+# from QEMU 8.2.2 and the captured QEMU 11 transcript. Each is anchored at the
+# start of a line, because every one of them is printed as its own line
+# (`hmp_handle_error` -> `Error: <msg>`, the HMP parser's `monitor_printf`s,
+# migration's `error_report`s) -- while result DATA can carry the same words
+# anywhere else: a snapshot tagged `Error:checkpoint` sits in an `info
+# snapshots` row behind the ID column, and an unanchored substring test made
+# `qmu monitor 'info snapshots'` exit 1 on that perfectly good table (#86).
+# Deliberately NOT included: the benign savevm slirp warning ("warning: Slirp:
+# Save of field ... failed"), which precedes a snapshot that still lists and
+# loads.
+_HMP_ERROR_LINE_RES = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"Error: ",                                  # hmp_handle_error / error_reportf_err
+        r"unknown command: ",                        # HMP parser: no such verb
+        r"\S+: extraneous characters at the end of line",  # HMP parser: `savevm has space`
+        r'Try "help',                                # HMP parser usage epilogue
+        r"Snapshot '.*' does not exist",             # pre-Error:-prefix loadvm/delvm
+        r"[A-Za-z ]+ '[^']*' not found\.?$",         # Device 'x' not found and kin
+        r"Device '[^']*' (is writable but )?does not support snapshots",
+        r"Could not open ",                          # savevm/loadvm vmstate file
+        r"No block device ",                         # no drive can hold a snapshot
+        r"Missing section footer",                   # loadvm restore failures
+        r"Section footer error",
+        r"error while loading state",                # qemu_loadvm_state per-device
+        r"Parameter '",                              # QAPI visitor: missing/unexpected member
+        r"Invalid ",                                 # Invalid parameter / Invalid JSON
+        r"invalid ",
+    )
 )
 
 
@@ -56,13 +64,14 @@ def hmp_failed(output: str) -> bool:
 
     The one classifier for every path that wraps `human-monitor-command`:
     the snapshot handlers, `qmu monitor`, and `qmu qmp human-monitor-command`.
-    Empty output is success (most HMP verbs are silent when they work).
+    Empty output is success (most HMP verbs are silent when they work). A
+    line is a failure report only when it BEGINS with one of QEMU's error
+    frames; the same words inside a table row or a register dump are data.
     """
-    if any(marker in output for marker in _HMP_ERROR_SUBSTRINGS):
-        return True
     return any(
-        line.lstrip().startswith(_HMP_ERROR_LINE_PREFIXES)
+        pattern.match(line.lstrip())
         for line in output.splitlines()
+        for pattern in _HMP_ERROR_LINE_RES
     )
 
 

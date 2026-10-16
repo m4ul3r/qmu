@@ -335,7 +335,7 @@ def test_rm_force_uses_rm_f_so_enoent_is_tolerated(tmp_path, monkeypatch):
 
     result = rootfs_mod.remove(str(image), ["/root/nope"], partition=0, force=True)
 
-    assert scripts[-1] == "rm-f /root/nope\n"
+    assert scripts[-1].split(" ")[0] == "rm-f" and "/root/nope" in scripts[-1]
     assert result == {"removed": ["/root/nope"], "missing": []}
 
 
@@ -414,8 +414,8 @@ def test_cat_also_opens_read_only(tmp_path, monkeypatch):
     def fake_run(cmd, input=None, text=None, capture_output=None):
         seen["cmd"] = cmd
         # `download <guest> <local>`: the fake fills the local file like
-        # guestfish would.
-        local = input.split()[-1]
+        # guestfish would (arguments are guestfish double-quoted).
+        local = input.strip().split(" ")[-1].strip('"')
         Path(local).write_bytes(b"hi\n")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 

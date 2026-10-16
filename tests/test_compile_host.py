@@ -24,7 +24,7 @@ import pytest
 from qmu import cli
 from qmu.commands import guest
 from qmu.instance import QMUError, VMInstance
-from qmu.ssh import SSHError
+from qmu.ssh import SSHAborted, SSHError
 
 
 def _fake_instance(serial_log: str, arch: str | None = "x86_64") -> VMInstance:
@@ -453,20 +453,44 @@ def test_host_build_then_run_propagates_a_non_zero_guest_exit(wired, source):
     assert cli.main(["compile", "--host", "--run", str(source)]) == 1
 
 
-def test_scp_timeout_during_delivery_stays_infra_not_transport_loss(wired, source):
-    """push/pull deliberately re-raise an SSHError carrying NO returncode (an scp
-    subprocess timeout, a missing local file) rather than calling it transport
-    loss. The host-delivery handler must make the same distinction, or it
-    reclassifies ordinary infra failures as guest crashes."""
+def test_scp_timeout_during_delivery_with_a_live_guest_stays_infra(wired, source, capsys):
+    """An scp subprocess timeout carries no returncode and no transport marker:
+    with nothing in the serial log it is an infra failure (4), never a guest
+    crash, exactly as push/pull classify it."""
     install, _state = wired
-    install(
-        push_raises=SSHError("SCP push timed out after 30s: /tmp/x -> /root/x"),
-        append_on_run=PANIC,
-    )
+    install(push_raises=SSHError("SCP push timed out after 30s: /tmp/x -> /root/x"))
 
-    # Exit 4 (infra), NOT 3 — even though a panic sits in the serial log, the
-    # failure carries no evidence that the transport is what dropped.
-    assert cli.main(["compile", "--host", str(source)]) == 4
+    rc = cli.main(["--format", "json", "compile", "--host", str(source)])
+
+    assert rc == 4
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error_type"] == "SSHError"
+    assert "crash_detected" not in payload
+
+
+@pytest.mark.parametrize("failure", [
+    SSHAborted("SCP push aborted by qmu: /tmp/x -> /root/x"),
+    SSHError("SCP push timed out after 30s: /tmp/x -> /root/x"),
+])
+def test_panic_appended_during_delivery_is_the_crash_class(wired, source, capsys, failure):
+    """The watcher stops scp when the serial log shows a terminal panic
+    (`SSHAborted`, no returncode); a timeout that coincides with the panic is
+    the same outcome. Both are the kernel-crash class with the report — the
+    bare `SSHAborted` used to escape as exit 4 with no report while the
+    concurrent `exec` and the next `qmu crash` both returned the panic."""
+    install, _state = wired
+    install(push_raises=failure, append_on_run=PANIC)
+
+    rc = cli.main(["--format", "json", "compile", "--host", str(source)])
+
+    assert rc == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["ssh_error"] is True
+    assert payload["crash_detected"] is True
+    assert "Kernel panic - not syncing" in payload["crash"]
+    assert payload["operation"] == "push"
+    assert "qmu crash" in payload["hint"]
 
 
 def test_compile_cmd_is_rendered_as_a_reusable_command(wired, source, capsys):

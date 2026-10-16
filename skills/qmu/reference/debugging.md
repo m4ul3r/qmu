@@ -121,7 +121,7 @@ anti-pattern in `skill://qmu/reference/cross-arch.md`).
 
 ## Bridge lifecycle on a shared host
 
-Each `qmu gdb` spawns a pry bridge (a gdb process) that outlives the VM.
+Each successful `qmu gdb` spawns a pry bridge (a gdb process) that outlives the VM.
 `pry doctor` lists every bridge on the host — including other agents' — and a
 bare `pry` command with more than one alive errors with `Multiple bridge
 instances running (pids: A, B). Use --instance <pid>`.
@@ -177,8 +177,8 @@ breakpoint.**
 
 | You run | What silently breaks | Recover |
 |---|---|---|
-| `qmu snapshot load` | The bridge's connection survives the rewind but its view is the **pre-load** vCPU state (stale `$rip`/stop reason) and stale breakpoint/memory bookkeeping, presented as current. The stderr warning says exactly this. | Do what the warning says: tear the stale bridge down first (`pry kill --instance qmu-<vm>`), then reconnect with `pry launch --connect localhost:<gdb_port> --symbols "$VMLINUX" --instance-id qmu-<vm>` — **not** a second `qmu gdb`, which would spawn a second bridge against the same stub — and re-arm every breakpoint before trusting a register or memory read. |
-| `qmu snapshot save` (breakpoints armed) | Software breakpoints are `int3` (`0xCC`) bytes; the save **bakes them into the image**. A later `load` + run traps at that address with no live breakpoint → `Oops: int3` at the breakpointed symbol, `Kernel panic - not syncing: Fatal exception in interrupt` — mimicking your PoC crashing the kernel (reproduced live). | Clear breakpoints before saving a clean image; treat a post-load `int3` crash at a breakpointed function as a debugger artifact, not an exploit result. |
+| `qmu snapshot load` | The bridge's connection survives the rewind but its view is the **pre-load** vCPU state (stale `$rip`/stop reason) and stale breakpoint/memory bookkeeping, presented as current. The stderr warning says exactly this. | Do what the warning says: tear the stale bridge down first (`pry kill --instance qmu-<vm>`), then reconnect with `pry launch --connect localhost:<gdb_port> --symbols "$VMLINUX" --instance-id qmu-<vm>` — or a fresh `qmu gdb`, which is refused with exit 1 (`A debugger client is already attached to port N (pry bridge pid P)`) until the stale bridge is gone — and re-arm every breakpoint before trusting a register or memory read. |
+| `qmu snapshot save` (breakpoints armed) | Software breakpoints are `int3` (`0xCC`) bytes; the save **bakes them into the image**. A later `load` + run traps at that address with no live breakpoint → `Oops: int3` at the breakpointed symbol, `Kernel panic - not syncing: Fatal exception in interrupt` — mimicking your PoC crashing the kernel (reproduced live). | Clear breakpoints before saving a clean image; treat a post-load `int3` crash at a breakpointed function as a debugger artifact, not an exploit result. This warning fires on **every** save of a `--gdb` VM, attached client or not (see below) — it is not a bug when no debugger is connected. |
 | `qmu qmp system_reset` / `qmu monitor system_reset` (or a guest reboot) | The gdbstub's breakpoint/watchpoint set is **dropped**; the client still lists them `[enabled]` but they never fire again (`hits=0`). **KASLR re-slides on the reboot**, so the symbols loaded in pry are wrong too — re-arming by symbol name without reloading lands on the old address, silently (`hits=0`, no error). | `qmu kbase` again → `pry load "$VMLINUX" --base "$KBASE"` again → then re-set every breakpoint; confirm with a canary you can prove is hit. |
 | A **hardware watchpoint** doesn't fire on a write you can prove happened | Wrong virtual address (alias), see above. | Watch the VA the write goes through; `--no-kvm` only to rule out a KVM guest-debug limitation. |
 
@@ -189,7 +189,11 @@ otherwise.
 
 These warnings are keyed on the VM having a GDB stub; qmu additionally
 suppresses them when it can positively confirm no client is connected, and errs
-toward warning when it cannot tell. Auto re-sync / auto re-arm is a pry-side
+toward warning when it cannot tell. **Exception: `snapshot save`.** A debugger
+that already detached can have left `int3` bytes in guest memory, and the save
+captures them whether or not anyone is attached now, so the save warning is
+keyed on the stub alone and always fires for a `--gdb` VM (the exit stays 0
+and the stdout envelope is untouched). Auto re-sync / auto re-arm is a pry-side
 capability qmu does not drive — the contract qmu enforces is "invalidate
 loudly," not "fix it for you."
 

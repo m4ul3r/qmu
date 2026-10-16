@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -722,21 +723,52 @@ def test_doctor_libguestfs_honours_a_readable_supermin_kernel(
     assert row["hint"] == "export SUPERMIN_KERNEL=<readable kernel image>"
 
 
-def test_doctor_key_permissions_warning_does_not_fail_the_check(
-    doctor_env, monkeypatch, capsys, tmp_path
+def test_doctor_group_readable_key_is_gating_like_openssh(
+    doctor_env, monkeypatch, capsys
 ):
-    """launch works with a 0644 key (the rootfs decides), so the row is a
-    non-blocking warning — it used to flip exit 1."""
+    """OpenSSH refuses an owner's key with group/other bits (UNPROTECTED
+    PRIVATE KEY FILE) deterministically, so no rootfs can make it usable:
+    the row must gate, with the chmod fix (#94)."""
     _passt_ok(monkeypatch)
-    Path(doctor_env.config.ssh_key).chmod(0o644)
+    key = Path(doctor_env.config.ssh_key)
+    key.chmod(0o644)
+
+    rc, payload = _run_json_doctor(capsys)
+
+    assert rc == 1
+    assert payload["ok"] is False
+    row = _check(payload, "SSH key permissions")
+    assert row["status"] == "fail" and row["blocking"] is True
+    assert row["hint"] == f"chmod 600 {doctor_env.config.ssh_key}"
+    assert cli.main(["doctor"]) == 1
+    assert "[!] SSH key permissions:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mode", [0o400, 0o600, 0o700])
+def test_doctor_key_modes_openssh_accepts_are_ok(
+    doctor_env, monkeypatch, capsys, mode
+):
+    """Stricter-than-0600 modes load fine; only group/other bits are refused."""
+    _passt_ok(monkeypatch)
+    Path(doctor_env.config.ssh_key).chmod(mode)
 
     rc, payload = _run_json_doctor(capsys)
 
     assert rc == 0
+    assert _check(payload, "SSH key permissions")["status"] == "ok"
+
+
+def test_doctor_unreadable_key_is_gating(doctor_env, monkeypatch, capsys):
+    if os.geteuid() == 0:
+        pytest.skip("root reads every mode")
+    _passt_ok(monkeypatch)
+    Path(doctor_env.config.ssh_key).chmod(0o200)
+
+    rc, payload = _run_json_doctor(capsys)
+
+    assert rc == 1
     row = _check(payload, "SSH key permissions")
-    assert row["status"] == "warn" and row["blocking"] is False
-    cli.main(["doctor"])
-    assert "[~] SSH key permissions: mode=644" in capsys.readouterr().out
+    assert row["status"] == "fail" and row["blocking"] is True
 
 
 def test_doctor_forced_kvm_without_dev_kvm_is_gating(

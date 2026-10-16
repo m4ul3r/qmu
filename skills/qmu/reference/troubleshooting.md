@@ -207,7 +207,7 @@ project/`--config` layer loaded). `doctor --config PATH` checks that file.
 | `global config` | `[!]` when `~/.config/qmu/config.toml` exists but is invalid (it was skipped; `qmu config init` writes a *project* file and will not clear it) |
 | `kernel` | `[+]` regular file; `[!]` configured but missing — `<as written> (not found) — resolves to <abs> [<layer>]`, `CHANGE ME placeholder;` when the starter literal is unedited; `[~]` not configured (`--kernel`/`--harness` launches still work) |
 | `rootfs image`, `SSH key` | `[!]` missing/unconfigured only when `[boot] kernel` is set and the boot is not harness-shaped (`initrd` set, no `rootfs`); otherwise `[~] … not needed for --harness boots` |
-| `SSH key permissions` | `[~]` when not `0600` |
+| `SSH key permissions` | `[!]` (blocking, `chmod 600 <key>` hint) when a key you own has any group/other bit (`mode=644 is group/other-accessible — OpenSSH refuses it (UNPROTECTED PRIVATE KEY FILE)`) or is unreadable; `[+]` for `0600`, `0400`, `0700` or a key another user owns |
 | `qemu-system-<arch>`, `KVM` | `[!]` binary missing / `accel=kvm` without `/dev/kvm`; `[i]` disabled by `accel=tcg` |
 | `cross compiler for <arch> (compile --host)`, `gdb-multiarch` | only when `[machine] arch` ≠ host arch; `[~]` when missing, naming `apt install gcc-<triple>` / `apt install gdb-multiarch` |
 | `libguestfs` | `[~]` with the appliance fix (above) |

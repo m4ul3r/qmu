@@ -38,6 +38,41 @@ class SSHAborted(SSHError):
     """`SSHClient.run` stopped the child because `abort_when` fired."""
 
 
+class GuestText(str):
+    """Guest output as text for JSON, carrying the exact bytes for text mode.
+
+    The str value is the lossy UTF-8 decode (U+FFFD for undecodable bytes) so
+    envelopes stay JSON strings and callers can `rstrip`/search it; `raw` is
+    what the guest actually wrote, which text mode copies to stdout verbatim
+    (`exec 'printf "\\xff"'` used to arrive as `ef bf bd 0a`). `lossy` records
+    that the decode replaced something, so a JSON consumer knows the string
+    is not the output.
+    """
+
+    raw: bytes
+    lossy: bool
+
+    def __new__(cls, raw: bytes) -> GuestText:
+        try:
+            decoded, lossy = raw.decode("utf-8"), False
+        except UnicodeDecodeError:
+            decoded, lossy = raw.decode("utf-8", errors="replace"), True
+        self = super().__new__(cls, decoded)
+        self.raw = raw
+        self.lossy = lossy
+        return self
+
+
+def guest_bytes(text: str) -> bytes:
+    """The exact bytes behind guest output; a plain str (a test double, a
+    message qmu composed) is UTF-8."""
+    return text.raw if isinstance(text, GuestText) else text.encode("utf-8")
+
+
+def guest_lossy(text: str) -> bool:
+    return isinstance(text, GuestText) and text.lossy
+
+
 class SCPFileError(QMUError):
     """A transfer the *filesystem* refused — not the transport.
 
@@ -109,20 +144,21 @@ def _watch_child(
     timeout: float,
     abort_when: Callable[[], bool] | None,
     poll_interval: float = 0.5,
-) -> tuple[list[str], bool, bool]:
+) -> tuple[list[bytes], bool, bool]:
     """Drain `pipes` until the child exits, the budget expires or `abort_when`
-    fires. Returns (decoded output per pipe, completed, aborted); a child that
+    fires. Returns (raw output per pipe, completed, aborted); a child that
     did not complete has been killed.
 
-    `abort_when` is polled every `poll_interval` seconds while the child runs.
-    The pipes are drained by a select loop rather than `communicate()`: under
-    ControlMaster the ssh child hands its stdout/stderr to the mux master,
-    which keeps them open until the remote command ends, so a `communicate()`
-    after `kill()` blocked for the rest of the remote command's lifetime (a
-    `--timeout 2` on `sleep 10` returned after 10 s). Output is collected as
-    bytes and decoded lossily at the end: guest output is arbitrary bytes (a
-    leak primitive dumping raw memory is the everyday case), and a strict
-    decode threw the whole result away as an internal error.
+    `abort_when` is polled every `poll_interval` seconds while the child runs;
+    it must return promptly (the loop is single-threaded, so a predicate that
+    blocks also stalls the drain and the deadline). The pipes are drained by a
+    select loop rather than `communicate()`: under ControlMaster the ssh child
+    hands its stdout/stderr to the mux master, which keeps them open until
+    the remote command ends, so a `communicate()` after `kill()` blocked for
+    the rest of the remote command's lifetime (a `--timeout 2` on `sleep 10`
+    returned after 10 s). Output is returned as bytes: guest output is
+    arbitrary bytes (a leak primitive dumping raw memory is the everyday
+    case) and the caller decides how to present them.
     """
     chunks: dict[int, list[bytes]] = {pipe.fileno(): [] for pipe in pipes}
     sel = selectors.DefaultSelector()
@@ -175,9 +211,7 @@ def _watch_child(
             pipe.close()
 
     # `chunks` preserves the order of `pipes`.
-    output = [
-        b"".join(parts).decode("utf-8", errors="replace") for parts in chunks.values()
-    ]
+    output = [b"".join(parts) for parts in chunks.values()]
     return output, completed, aborted
 
 
@@ -255,15 +289,6 @@ class SSHClient:
         except subprocess.TimeoutExpired:
             return False
 
-    def wait_ready(self, timeout: int = 60, poll_interval: float = 1.0) -> bool:
-        """Block until SSH is ready or timeout."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.is_ready(timeout=2):
-                return True
-            time.sleep(poll_interval)
-        return False
-
     def close_control_master(self, timeout: float = 5.0) -> bool:
         """Tear down the multiplexed ControlMaster for this guest, if any.
 
@@ -292,8 +317,11 @@ class SSHClient:
         *,
         abort_when: Callable[[], bool] | None = None,
         poll_interval: float = 0.5,
-    ) -> tuple[int, str, str]:
+    ) -> tuple[int, GuestText, GuestText]:
         """Run a command in the guest. Returns (exit_code, stdout, stderr).
+
+        stdout/stderr are :class:`GuestText`: str for the envelope, with the
+        exact bytes on `.raw` for text mode.
 
         `abort_when` is polled every `poll_interval` seconds while the child
         runs; when it returns True the child is killed and :class:`SSHAborted`
@@ -307,13 +335,14 @@ class SSHClient:
         """
         cmd = self._ssh_base() + [self._target(), command]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        (stdout, stderr), completed, aborted = _watch_child(
+        (stdout_raw, stderr_raw), completed, aborted = _watch_child(
             proc,
             [proc.stdout, proc.stderr],
             timeout=timeout,
             abort_when=abort_when,
             poll_interval=poll_interval,
         )
+        stdout, stderr = GuestText(stdout_raw), GuestText(stderr_raw)
         if aborted:
             raise SSHAborted(
                 f"SSH command aborted by qmu (guest panicked or halted): {command}",
@@ -399,9 +428,10 @@ class SSHClient:
         """
         timeout = self.scp_timeout
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        (stderr,), completed, aborted = _watch_child(
+        (stderr_raw,), completed, aborted = _watch_child(
             proc, [proc.stderr], timeout=timeout, abort_when=abort_when
         )
+        stderr = GuestText(stderr_raw)
         if aborted:
             raise SSHAborted(f"SCP {operation} aborted by qmu: {direction}", stderr=stderr)
         if not completed:

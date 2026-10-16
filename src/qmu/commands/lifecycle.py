@@ -577,9 +577,9 @@ def _serial_log_empty(path: str | None) -> bool:
 def _wait_for_ssh_or_console(ssh: Any, inst: Any, timeout: float) -> str:
     """Block for SSH; returns 'ready', 'timeout', or 'no-console-output'.
 
-    `SSHClient.wait_ready` plus the empty-serial-log check, because the two
-    non-ready outcomes need different explanations: a slow boot may still
-    answer, a silent console never will.
+    Polls `SSHClient.is_ready` alongside the empty-serial-log check, because
+    the two non-ready outcomes need different explanations: a slow boot may
+    still answer, a silent console never will.
     """
     start = time.monotonic()
     deadline = start + timeout
@@ -819,11 +819,6 @@ def _query_qmp(inst: Any) -> _QMPProbe:
     )
 
 
-def _qmp_running(inst: Any) -> bool | None:
-    """True/False from QMP `query-status`, or None when it cannot be asked."""
-    return _query_qmp(inst).running
-
-
 @dataclass
 class _GuestObservation:
     """Everything one look at a running VM's guest learned, for one renderer.
@@ -832,6 +827,14 @@ class _GuestObservation:
     terminal panic in the log needs no second opinion). `ssh_ready` is None
     when there is no endpoint to probe or the probe was skipped; `ssh_probed`
     tells those apart.
+
+    `crash_detected` is evidence, not usability: whether the current boot's
+    console holds a retrievable report, exactly as `qmu crash` would answer.
+    It is independent of `guest` — a paused guest with a report is `paused`
+    on the usability axis and still has `crash_detected: True` — because
+    deriving it from `guest in (panicked, crashed)` made `list`/`status`
+    deny a report `crash` then retrieved, purely because a debugger had
+    halted the vCPU (#93).
     """
     guest: str
     scan_offset: int
@@ -843,6 +846,7 @@ class _GuestObservation:
     # The SSH probe was withheld because a gdb client is attached: its login
     # runs `uname`, which fires a user breakpoint on `__x64_sys_newuname`.
     debugger_attached: bool = False
+    crash_detected: bool = False
 
     @property
     def qmp_state(self) -> str | None:
@@ -921,8 +925,12 @@ def _observe_guest(
     if has_terminal_panic(inst.serial_log, start_offset=start):
         return _GuestObservation(
             GUEST_PANICKED, start, console_bytes, qmp, has_endpoint,
-            ssh_ready=False if has_endpoint else None,
+            ssh_ready=False if has_endpoint else None, crash_detected=True,
         )
+
+    # Read once, before the usability precedence decides anything: the report
+    # is a fact about the log whichever branch below wins.
+    crash_detected = extract_crash(inst.serial_log, start_offset=start) is not None
 
     if qmp is None:
         qmp = _query_qmp(inst)
@@ -930,6 +938,7 @@ def _observe_guest(
         return _GuestObservation(
             GUEST_PAUSED, start, console_bytes, qmp, has_endpoint,
             ssh_ready=False if has_endpoint else None,
+            crash_detected=crash_detected,
         )
 
     # #39-adjacent: the readiness probe logs in, and a login runs `uname`.
@@ -947,7 +956,7 @@ def _observe_guest(
         ssh_ready = bool(_make_ssh(inst).is_ready())
         ssh_probed = True
 
-    if extract_crash(inst.serial_log, start_offset=start):
+    if crash_detected:
         guest = GUEST_CRASHED
     elif ssh_probed:
         guest = GUEST_SERVING if ssh_ready else GUEST_UNKNOWN
@@ -958,6 +967,7 @@ def _observe_guest(
     return _GuestObservation(
         guest, start, console_bytes, qmp, has_endpoint,
         ssh_ready=ssh_ready, ssh_probed=ssh_probed, debugger_attached=attached,
+        crash_detected=crash_detected,
     )
 
 
@@ -1110,7 +1120,16 @@ def _handle_kill(args: argparse.Namespace) -> int:
             # Already what the caller asked for. An error here made every
             # "kill then kill again" cleanup script branch on exit codes for
             # a state it was happy with.
-            retained = _retained_logs(info["instance"])
+            inst = info["instance"]
+            retained = _retained_logs(inst)
+            # #78: QEMU being gone does not take the pry bridge `qmu gdb`
+            # recorded with it — a guest poweroff or an external `qmp quit`
+            # followed by the idempotent `kill` left a `gdb-multiarch` parked
+            # on a dead stub. Same identity-checked reap as the live path;
+            # the logs it preserves are untouched. The ssh master is closed
+            # for the same reason: it is qmu's own, not the guest's.
+            _close_ssh_master(inst)
+            bridge_reaped = _reap_recorded_bridge(inst)
             _emit(
                 args,
                 data={
@@ -1119,6 +1138,7 @@ def _handle_kill(args: argparse.Namespace) -> int:
                     "already_stopped": True,
                     "logs_retained": retained["logs_retained"],
                     "serial_log": retained["serial_log"],
+                    "bridge_reaped": bridge_reaped,
                 },
                 text=(
                     f"VM '{args.vm}' is already stopped; state retained "
@@ -1126,7 +1146,8 @@ def _handle_kill(args: argparse.Namespace) -> int:
                     if retained["logs_retained"]
                     else f"VM '{args.vm}' is already stopped; no logs retained "
                     f"(remove its record with: qmu prune --vm {args.vm})"
-                ),
+                )
+                + (" Reaped its recorded debugger bridge." if bridge_reaped else ""),
                 stem="kill",
             )
             return 0
@@ -1927,6 +1948,40 @@ def _handle_wait(args: argparse.Namespace) -> int:
     scanned = boot_offset
     warned_reset_debug = False
 
+    def scan_console() -> bool:
+        """One incremental console scan; adopts a moved boot boundary.
+
+        A new boot banner is a reboot the guest initiated (panic=N, kexec, a
+        harness calling reboot). It is persisted as the guest epoch exactly as
+        an observed RESET used to be, BEFORE the next liveness check, so a VM
+        that exits right after rebooting is scoped to its last boot. A
+        boundary that moved DOWN means the log itself was replaced (truncated
+        under the loop): the old generation's byte offsets no longer name
+        anything, so the new one is adopted the same way (#103).
+        """
+        nonlocal scanned, boot_offset, last_event, event_data, inst
+        nonlocal warned_reset_debug
+        scanned, banner, panicked = scan_console_growth(
+            inst.serial_log, scanned=scanned, boot_offset=boot_offset
+        )
+        if banner != boot_offset:
+            source = "boot-banner" if banner > boot_offset else "log-replaced"
+            boot_offset = banner
+            last_event = "RESET"
+            event_data = {"source": source, "offset": banner}
+            inst = save_guest_epoch_serial_offset(inst, banner)
+            # #46: a reset drops the gdbstub breakpoint set without telling the
+            # client. `wait` is the one place qmu sees a reset it did not issue.
+            if not warned_reset_debug and debug_session_present(inst):
+                warned_reset_debug = True
+                sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
+        return panicked
+
+    def terminal_panic_report() -> str | None:
+        return _settled_crash(inst, boot_offset) or extract_crash(
+            inst.serial_log, start_offset=boot_offset
+        )
+
     while True:
         # The recorded process identity is the only terminal authority. Checked
         # first so --timeout 0 is "check once, then time out".
@@ -1935,33 +1990,13 @@ def _handle_wait(args: argparse.Namespace) -> int:
             stopped = True
             break
 
-        # A new boot banner is a reboot the guest initiated (panic=N, kexec, a
-        # harness calling reboot). Persist it as the guest epoch exactly as an
-        # observed RESET used to be, BEFORE the next liveness check, so a VM
-        # that exits right after rebooting is scoped to its last boot.
-        scanned, banner, panicked = scan_console_growth(
-            inst.serial_log, scanned=scanned, boot_offset=boot_offset
-        )
-        if banner > boot_offset:
-            boot_offset = banner
-            last_event = "RESET"
-            event_data = {"source": "boot-banner", "offset": banner}
-            inst = save_guest_epoch_serial_offset(inst, banner)
-            # #46: a reset drops the gdbstub breakpoint set without telling the
-            # client. `wait` is the one place qmu sees a reset it did not issue.
-            if not warned_reset_debug and debug_session_present(inst):
-                warned_reset_debug = True
-                sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
-
         # #27: a terminal panic ends the guest even though QEMU keeps running
         # (no -no-reboot, panic=0). Reporting "still running" here contradicted
         # `status` on the same VM and sent the reader back to wait again.
-        if panicked:
+        if scan_console():
             reason = _WAIT_REASON_TERMINAL_PANIC
             guest = GUEST_PANICKED
-            crash = _settled_crash(inst, boot_offset) or extract_crash(
-                inst.serial_log, start_offset=boot_offset
-            )
+            crash = terminal_panic_report()
             break
 
         probe = _query_qmp(inst)
@@ -1993,6 +2028,12 @@ def _handle_wait(args: argparse.Namespace) -> int:
                     "to": probe.status,
                 }
             last_status = probe.status
+        else:
+            # #92: a busy probe observed nothing. `qemu_status` is what the
+            # LATEST probe said, so a value carried over from an earlier
+            # connected tick would present stale state as a current reading.
+            # `last_status` keeps the history for the transition report.
+            qemu_status = "unknown"
 
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -2002,6 +2043,18 @@ def _handle_wait(args: argparse.Namespace) -> int:
             time.sleep(min(_WAIT_POLL_INTERVAL, remaining))
         else:
             time.sleep(_WAIT_POLL_INTERVAL)
+
+    if not stopped and reason == "timeout":
+        # #91: the probe above blocks for its whole connect timeout when a
+        # sibling holds the QMP socket, and the guest can die meanwhile. The
+        # deadline decides WHEN the wait ends, never WHAT the guest did; the
+        # verdict comes from the console as it is now, not as it was before
+        # the probe. A timeout with `crash: null` next to a `console_tail`
+        # showing the panic sent callers back to wait on a dead guest.
+        if scan_console():
+            reason = _WAIT_REASON_TERMINAL_PANIC
+            guest = GUEST_PANICKED
+            crash = terminal_panic_report()
 
     elapsed = time.monotonic() - start
     if stopped:
@@ -2449,7 +2502,10 @@ def _guest_note(obs: _GuestObservation) -> str | None:
     if obs.guest == GUEST_CRASHED:
         return "crash report waiting, run `qmu crash`"
     if obs.guest == GUEST_PAUSED:
-        return "vCPU paused, `qmu cont` resumes"
+        note = "vCPU paused, `qmu cont` resumes"
+        if obs.crash_detected:
+            note += ", crash report waiting, run `qmu crash`"
+        return note
     if obs.guest == GUEST_UNKNOWN:
         return f"guest unknown ({obs.detail()})"
     return None
@@ -2496,11 +2552,17 @@ def _handle_list(args: argparse.Namespace) -> int:
                 "kvm": inst.kvm,
                 "serial_log": inst.serial_log,
                 "logs_retained": True,
-                "crash_detected": obs.guest in (GUEST_PANICKED, GUEST_CRASHED),
+                "crash_detected": obs.crash_detected,
             })
         for inst in stopped:
             orphan_pid = orphan_logs.get(inst.serial_log)
             retained = _retained_logs(inst)
+            # `status` and `prune` call a young log-only remnant `held_back`;
+            # `list` must not present the same artifacts as a plain `stopped`.
+            held_back = (
+                not orphan_pid
+                and classify_vm(inst.vm_id)["state"] == VM_HELD_BACK
+            )
             data.append({
                 "vm_id": inst.vm_id,
                 "status": "orphaned" if orphan_pid else "stopped",
@@ -2523,6 +2585,7 @@ def _handle_list(args: argparse.Namespace) -> int:
                 "serial_log": retained["serial_log"],
                 "logs_retained": retained["logs_retained"],
                 "crash_detected": retained["crash_detected"],
+                "held_back": held_back,
             })
         _output({"ok": True, "vms": data}, args, stem="list")
         return 0
@@ -2564,6 +2627,8 @@ def _handle_list(args: argparse.Namespace) -> int:
             # `kill` kept this report on purpose and said so; a bare
             # [stopped] here hid that from the one command that lists it.
             state = "[stopped — crash report retained]"
+        elif classify_vm(inst.vm_id)["state"] == VM_HELD_BACK:
+            state = "[stopped — held back from prune (younger than 24h; --older-than 0)]"
         else:
             state = "[stopped]"
         lines.append(f"  {inst.vm_id}  {profile_str}  {kernel_str}  {state}")
@@ -2594,11 +2659,15 @@ def _require_running(vm_id: str | None, command: str) -> None:
         raise QMUError(explanation)
 
 
-def _crash_warning(guest: str | None, vm_id: str) -> str:
+def _crash_warning(
+    guest: str | None, vm_id: str, *, crash_detected: bool | None = None
+) -> str:
     """The one sentence that tells the reader a report is waiting.
 
     Shared by `status` and `describe_non_running` so the tracked and orphaned
-    paths cannot say different things about the same fact.
+    paths cannot say different things about the same fact. `crash_detected`
+    covers the guest states whose precedence beats `crashed` — a paused
+    guest can still have a report in its log, and `crash` will find it.
     """
     if guest == GUEST_PANICKED:
         return (
@@ -2609,6 +2678,11 @@ def _crash_warning(guest: str | None, vm_id: str) -> str:
         return (
             " Its guest reported a crash but is STILL RUNNING — pull the report "
             f"with `qmu crash --vm {vm_id}`; do not reap it."
+        )
+    if crash_detected:
+        return (
+            " A crash report from the current boot is waiting in its log — "
+            f"pull it with `qmu crash --vm {vm_id}`."
         )
     return ""
 
@@ -2649,12 +2723,25 @@ def describe_non_running(
             if command in ("exec", "wait")
             else "there is no live state to report"
         )
+        retained = _retained_logs(info["instance"])
+        if retained["logs_retained"]:
+            return (
+                f"VM '{vm_id}' is stopped; only its logs remain, so {verb}. "
+                f"Read them with `qmu log --vm {vm_id}` or "
+                f"`qmu crash --vm {vm_id}`, and remove them with "
+                f"`qmu prune --vm {vm_id}`. "
+                f"Serial log: {retained['serial_log']}"
+            )
+        # A `.qemu.log`/`.qmp.sock`-only remnant (#104): no console to read,
+        # but it is on disk and `prune` is the way to remove it.
+        what = (
+            f"QEMU log: {retained['qemu_log']}"
+            if retained["qemu_log"]
+            else "no logs"
+        )
         return (
-            f"VM '{vm_id}' is stopped; only its logs remain, so {verb}. "
-            f"Read them with `qmu log --vm {vm_id}` or "
-            f"`qmu crash --vm {vm_id}`, and remove them with "
-            f"`qmu prune --vm {vm_id}`. "
-            f"Serial log: {info['serial_log']}"
+            f"VM '{vm_id}' is stopped; no serial log remains, so {verb}. "
+            f"Remove its leftovers with `qmu prune --vm {vm_id}`. {what}"
         )
     return None
 
@@ -2690,7 +2777,12 @@ def _status_non_running(args: argparse.Namespace, info: dict[str, Any]) -> int:
     if state == VM_ORPHANED:
         text = describe_non_running(vm_id, info=info) or f"VM '{vm_id}' is orphaned."
     elif not retained["logs_retained"]:
-        text = f"VM '{vm_id}' is stopped (no logs retained)"
+        text = (
+            f"VM '{vm_id}' is stopped (no serial log retained; QEMU log: "
+            f"{retained['qemu_log']}; remove with: qmu prune --vm {vm_id})"
+            if retained["qemu_log"]
+            else f"VM '{vm_id}' is stopped (no logs retained)"
+        )
     elif retained["crash_detected"]:
         text = (
             f"VM '{vm_id}' is stopped (logs retained; crash report waiting: "
@@ -2761,6 +2853,10 @@ def _handle_status(args: argparse.Namespace) -> int:
         "serial_log": inst.serial_log,
         "qemu_log": str(qemu_log_path(inst.vm_id)),
         "started_at": inst.started_at,
+        # Evidence, not usability: what `qmu crash` would find in the current
+        # boot. Carried on the running row too so `list`/`status`/`crash`
+        # agree for a paused guest with a retained report (#93).
+        "crash_detected": obs.crash_detected,
     }
 
     guest_line = guest if obs.detail() is None else f"{guest} ({obs.detail()})"
@@ -2803,7 +2899,7 @@ def _handle_status(args: argparse.Namespace) -> int:
     ])
     # The crash notice fired only on the orphaned path, which is the RARER of
     # the two — every successful trigger on a tracked VM lands here instead.
-    notice = _crash_warning(guest, inst.vm_id)
+    notice = _crash_warning(guest, inst.vm_id, crash_detected=obs.crash_detected)
     if notice:
         lines.append(notice.strip())
     _emit(args, data=result, text=lines, stem="status")
@@ -2948,6 +3044,43 @@ def _unconfigured_detail(key: str, flag: str, status: str) -> str:
 def _path_hint(key: str, flag: str) -> str:
     """The fix for a missing or unconfigured path field, as a config edit."""
     return f"set {key} in qmu.toml or pass {flag}"
+
+
+def _ssh_key_permissions_row(written: str, key_path: Path) -> dict[str, Any]:
+    """Classify the private key's mode the way OpenSSH will, not by a 0600 ideal.
+
+    `sshkey_perm_ok` refuses a key the caller owns whose group/other bits are
+    set — `UNPROTECTED PRIVATE KEY FILE … This private key will be ignored` —
+    and that refusal is local and deterministic, so no rootfs can make such
+    a key usable: a `fail` (#94). A key the caller cannot read fails for the
+    same reason. A key that is merely stricter than 0600 (0400, 0700, or one
+    owned by another user, which OpenSSH does not police) works and is `ok`;
+    the old row warned on every non-0600 mode and let the unusable case pass
+    as non-blocking.
+    """
+    try:
+        st = key_path.stat()
+    except OSError as exc:
+        return _doctor_row(
+            "SSH key permissions", "fail", f"cannot stat: {exc}",
+            hint=f"chmod 600 {written}",
+        )
+    mode = oct(st.st_mode)[-3:]
+    if not os.access(key_path, os.R_OK):
+        return _doctor_row(
+            "SSH key permissions", "fail",
+            f"mode={mode} is not readable by you, so ssh cannot load the key",
+            hint=f"chmod 600 {written}",
+        )
+    if st.st_uid == os.getuid() and st.st_mode & 0o077:
+        return _doctor_row(
+            "SSH key permissions", "fail",
+            f"mode={mode} is group/other-accessible — OpenSSH refuses it "
+            f"(UNPROTECTED PRIVATE KEY FILE) and every ssh/scp will be denied "
+            f"until `chmod 600 {written}`",
+            hint=f"chmod 600 {written}",
+        )
+    return _doctor_row("SSH key permissions", "ok", f"mode={mode}")
 
 
 # The starter file's `# CHANGE ME` values, as written. A configured path that
@@ -3123,15 +3256,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
         key_path = Path(config.ssh_key).expanduser()
         if key_path.exists():
             checks.append(_doctor_row("SSH key", "ok", config.ssh_key))
-            mode = oct(key_path.stat().st_mode)[-3:]
-            if mode in ("600", "400"):
-                checks.append(_doctor_row("SSH key permissions", "ok", f"mode={mode}"))
-            else:
-                checks.append(_doctor_row(
-                    "SSH key permissions", "warn",
-                    f"mode={mode} (should be 600 — `chmod 600 {config.ssh_key}`)",
-                    hint=f"chmod 600 {config.ssh_key}",
-                ))
+            checks.append(_ssh_key_permissions_row(config.ssh_key, key_path))
         else:
             checks.append(_doctor_row(
                 "SSH key", "fail", _missing_path_detail(config, "ssh_key"),

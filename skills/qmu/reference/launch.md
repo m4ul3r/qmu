@@ -130,7 +130,11 @@ null.
   "skipped"`, text `SSH: port N (not probed: guest panicked)`). `sysrq-c` is
   a direct `panic()` under every profile — it never demonstrates `crashed`.
 - `paused` — QMP `running: false`: `qmu gdb` until `qmu cont`, a debugger
-  stop, an unclean bridge death, `restore-vm`.
+  stop, an unclean bridge death, `restore-vm`, a `snapshot load` that failed
+  mid-restore. `crash_detected` is reported **independently** of `guest`: a
+  guest paused after a survived report is `guest: "paused"`,
+  `crash_detected: true` in `status` and `list`, and `qmu crash --vm X`
+  returns that report — `paused` never hides it.
 - `crashed` — a report is retrievable AND the guest still serves. Under
   `exploit-dev` an Oops KASAN did **not** detect (plain `BUG:`/GPF/null deref
   in an uninstrumented path) kills only the faulting task. Pull the report; do
@@ -150,11 +154,14 @@ boot's panic never labels a healthy rebooted guest as gone.
 **QMP** (`qmp`): `connected` · `busy` (another client holds QEMU's single QMP
 slot — a debugger bridge, a wedged `savevm`; bare `wait` never holds it) ·
 `unreachable` · `"skipped"` (`list` did not consult QMP, e.g. a stopped VM) ·
-null (stopped, in `status`/`wait`). When not `connected`, `qemu_status` is
-`unknown` and nothing QMP-derived is claimed. `kill` under a held socket
-skips the graceful `quit` after 1 s and signals (≈1 s, not 14 s). `list`'s
-concurrent probe may report a held slot as `unreachable` rather than `busy`;
-`status --vm X` is the precise read. With a gdb client attached, `status`/
+null (stopped, in bare `wait` only). A stopped `status` **omits** `qmp`,
+`qemu_status` and `ssh` altogether — they describe a live QEMU — so check for
+the key, not for `null`. When not `connected`, `qemu_status` is `unknown` and
+nothing QMP-derived is claimed. `kill` under a held socket skips the graceful
+`quit` after 1 s and signals (≈1 s, not 14 s). `status --vm X` and `list`
+classify a held slot identically (`busy`, `qemu_status: "unknown"`, each
+spending its ~2 s QMP budget); the still-real caveat is latency, tracked in
+#77. With a gdb client attached, `status`/
 `list` skip the SSH probe (`ssh: "skipped (debugger attached)"`; text `port N
 (not probed: debugger attached; a login would trip breakpoints)`, list
 `ssh=PORT(not probed: debugger attached)`) because the probe's `uname` would
@@ -168,7 +175,7 @@ KASAN-detected bugs are terminal under every profile (`kasan.fault=panic`);
 
 ```bash
 qmu list                                 # existence + guest state; probes SSH (ControlMaster=no), a few seconds on a busy host
-qmu status --vm X                        # < 1 s; exit 0 on a stopped VM (status: "stopped")
+qmu status --vm X                        # typically sub-second; ~2 s under a held QMP slot, ~5 s when the SSH port accepts but never answers (#77); exit 0 on a stopped VM (status: "stopped")
 qmu kill --vm X                          # QMP quit → SIGTERM; `bridge_reaped`, `logs_preserved`; closes the ControlMaster
 qmu kill --vm X --force                  # SIGKILL
 qmu kill --vm X --no-clean               # keep .json + .serial.log
@@ -181,14 +188,22 @@ qmu prune --orphans --dry-run            # would_kill[] with vm_id; drop --dry-r
 `kill` removes metadata and logs by default but keeps `.json`, `.serial.log`
 and `.qemu.log` when the guest is `crashed` or `panicked` (`logs_preserved:
 true`, pointing at `qmu crash --vm X`); it also reaps the pry bridge `qmu gdb`
-spawned. `kill --vm X` on an already-stopped VM is a clean no-op: exit 0,
-`already_stopped: true`, `logs_retained`, text `VM 'X' is already stopped;
-state retained (remove with: qmu prune --vm X)`. `prune --vm X` removes a
+spawned (`bridge_reaped`). `kill --vm X` on an already-stopped VM is a clean
+no-op for QEMU — exit 0, `already_stopped: true`, `logs_retained`, text `VM
+'X' is already stopped; state retained (remove with: qmu prune --vm X)` — but
+it still reaps a recorded bridge whose stub died with QEMU (`bridge_reaped:
+true`, text `Reaped its recorded debugger bridge.`), so a `qmp quit` or a
+guest-side halt no longer strands a pry process. `prune --vm X` removes a
 stopped VM with its record, or a serial-log-only remnant, at any age; only a
 metadata-free `.qemu.log`/`.qmp.sock` remnant is age-gated (`held_back`,
-`--older-than 0`). `list` text marks a stopped VM whose report is still on
-disk `[stopped — crash report retained]`. qmu never recommends `prune --all`.
-Every prune mode, `--dry-run`, `cache du/ls`: `cache.md`.
+`--older-than 0`). Such a remnant is still *visible*: `list` shows it as
+`stopped` (`profile=? kernel=?`, the coarse existence word `list` uses for
+every non-running record), while `status --vm X` (exit 0) and `prune --vm X`
+refine that to `held_back` until `--older-than 0` — `status` never says
+"not found" for a name `list` displays. `list` text marks a stopped VM whose
+report is still on disk `[stopped — crash report retained]`. qmu never
+recommends `prune --all`. Every prune mode, `--dry-run`, `cache du/ls`:
+`cache.md`.
 
 ## Files on disk
 

@@ -260,14 +260,17 @@ def test_snapshot_load_silent_when_not_debugged(monkeypatch, capsys):
     assert capsys.readouterr().err == ""
 
 
-def test_snapshot_load_failure_does_not_warn_stale(monkeypatch, capsys):
-    # A failed load did not rewind, so there is no stale-session divergence to
-    # warn about — only the existing failure hint.
+def test_snapshot_load_pre_restore_refusal_does_not_warn_stale(monkeypatch, capsys):
+    # A load QEMU refused before restoring anything did not rewind, so there
+    # is no stale-session divergence to warn about — only the failure hint.
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
     monkeypatch.setattr(
         qmp_cmds, "load_snapshot",
-        lambda qmp, name: _failed("Error: Snapshot 'clean' does not exist"),
+        lambda qmp, name: SnapshotResult(
+            False, "Error: Snapshot 'clean' does not exist", reason="missing",
+            restore_state="none",
+        ),
     )
     monkeypatch.setattr(qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst)
     monkeypatch.setattr(qmp_cmds, "serial_log_offset", lambda path: 0)
@@ -275,6 +278,30 @@ def test_snapshot_load_failure_does_not_warn_stale(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert rc == 1
     assert "does NOT re-sync" not in err
+    assert "snapshot load failed" in err
+
+
+@pytest.mark.parametrize("restore_state", ["partial", "unknown"])
+def test_snapshot_load_failure_after_restoration_began_warns_stale(
+    monkeypatch, capsys, restore_state
+):
+    # #87 x #44: a load that got past the tag check reverted the disks and
+    # reset the machine before the vmstate load failed, so the attached
+    # debugger's view diverged exactly as it does on a successful load.
+    inst = _gdb_inst(1234)
+    _install_qmp_seams(monkeypatch, inst, present=True)
+    monkeypatch.setattr(
+        qmp_cmds, "load_snapshot",
+        lambda qmp, name: SnapshotResult(
+            False, "Error: Error -22 while loading VM state", reason="hmp",
+            guest_paused=True, restore_state=restore_state,
+        ),
+    )
+    monkeypatch.setattr(qmp_cmds, "serial_log_offset", lambda path: 0)
+    rc = qmp_cmds._handle_snapshot_load(_snap_args())
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "does NOT re-sync" in err
     assert "snapshot load failed" in err
 
 

@@ -139,7 +139,9 @@ def _fake_ssh_on_path(tmp_path, monkeypatch, script: str) -> ssh.SSHClient:
 
 def test_run_delivers_non_utf8_output_with_real_subprocess(tmp_path, monkeypatch):
     """End to end through a real child: bytes that are not UTF-8 come back
-    as text (U+FFFD for the undecodable ones), with the exit code intact."""
+    as text (U+FFFD for the undecodable ones) for the envelope, with the
+    exact bytes on `.raw` for text mode and `.lossy` recording the
+    replacement; the exit code is intact."""
     client = _fake_ssh_on_path(
         tmp_path, monkeypatch, "printf '\\377\\376\\200abc\\n'\necho err >&2\nexit 7\n"
     )
@@ -149,7 +151,15 @@ def test_run_delivers_non_utf8_output_with_real_subprocess(tmp_path, monkeypatch
     assert rc == 7
     assert stdout.endswith("abc\n")
     assert "\ufffd" in stdout
+    assert isinstance(stdout, ssh.GuestText)
+    assert stdout.raw == b"\xff\xfe\x80abc\n"
+    assert stdout.lossy is True
     assert stderr == "err\n"
+    assert stderr.raw == b"err\n"
+    assert stderr.lossy is False
+    assert ssh.guest_bytes(stdout) == stdout.raw
+    assert ssh.guest_bytes("plain") == b"plain"
+    assert ssh.guest_lossy("plain") is False
 
 
 def test_run_timeout_keeps_partial_output_and_does_not_wait_for_the_remote(

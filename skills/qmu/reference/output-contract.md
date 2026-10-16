@@ -37,20 +37,36 @@ object with `"ok": <bool>` — the single, command-agnostic success predicate.
   format emits `{"ok": false, "error": …, "error_type": "UsageError",
   "usage": …}` on stdout. `run --harness` is this class.
 
+Every path emits **exactly one** object. A mutation whose QEMU side succeeded
+but whose qmu bookkeeping then failed (`qmu qmp system_reset` / `qmu monitor
+system_reset` with an unwritable instance directory) is exit 4 with a single
+`{ok: false, error, error_type: "<raw exception class, e.g. PermissionError>",
+result|output: <the QMP reply>, guest_mutated: true, hint}` — never an
+`ok: true` object followed by a failure object; text mode prints nothing on
+stdout and `[qmu] Error: …` on stderr. `guest_mutated: true` is the flag that
+says the reset did happen even though the command failed.
+
 Branch on the exit code and `ok`, never on the presence of `error`.
 
 ## Guest-command text mode
 
-`exec`, `compile --run`, `dmesg`, `run`: stdout is the guest's stdout, byte
-for byte (a trailing newline is added if missing). Guest stderr goes to host
+`exec`, `compile --run`, `dmesg`, `run`: stdout is the guest's stdout, **byte
+for byte** — no decode, no added newline (`printf x` arrives as the single
+byte `78`; a `0xff` byte passes through; `qmu exec … > out.txt` is
+checksum-comparable with what the guest wrote). Guest stderr goes to host
 stderr verbatim, followed by `[exit code: N]` **only when N ≠ 0**; `exec true`
 prints nothing at all. `compile --run`'s `Compiled and ran X:` banner,
 `dmesg`'s `(empty dmesg)` / `[dmesg failed, exit N]`, a survived `Kernel
 warning from command serial output:` block, and `run`'s `VM 'x' stopped (state
 preserved)… / Inspect: … / Clean up: …` lines are all on stderr. The
 ssh-lost / timeout / paused narrative stays on stdout, preceded by whatever
-guest stdout was captured. Guest `\r\n` is not translated. Non-UTF-8 guest
-output arrives with U+FFFD replacement, never a `UnicodeDecodeError`.
+guest stdout was captured (a newline is inserted between the two only then).
+Guest `\r\n` is not translated. JSON cannot hold raw bytes, so its `stdout`/
+`stderr` are a UTF-8 decode with U+FFFD replacement and carry
+`stdout_lossy: true` / `stderr_lossy: true` (`run_stdout_lossy` under
+`compile`; `text_lossy` for `dmesg`, whose stdout key is `text`) exactly when
+something was replaced — read text mode or `--out` for the real bytes (a
+spilled guest-output artifact is `.txt`, bytes verbatim).
 
 ## Exit 3 vs 4
 
@@ -58,8 +74,9 @@ Exit `3` is guest-side and always corroborated by a fresh serial crash report;
 an internal qmu/transport fault is `4`, so a tooling bug is never mistaken for
 a kernel panic. `exec`, `push`, `pull`, `compile`, `dmesg` and `run` apply the
 rule identically: a lost connection is `3` only when a fresh crash corroborates
-it (`crash_detected: true`), otherwise `4`. A guest `exit 255` is reported as
-255, not a crash. A VM running no sshd produces a `4` on every `exec`.
+it (`crash_detected: true`), otherwise `4`. A guest `exit 255` is qmu exit 1
+with `exit_code: 255`, not a crash. A VM running no sshd produces a `4` on
+every `exec`.
 
 ## Output spilling
 
@@ -67,8 +84,10 @@ Results over ~10k estimated tokens (chars/4) are written to a file under the
 spill root — `$QMU_TEMP_DIR/spills`, else `$XDG_RUNTIME_DIR/qmu/spills`, else
 `<platform temp>/qmu/spills` — and stdout is replaced:
 
-- **text**: `[qmu] Output spilled to <path> (~N tokens)` followed by the first
-  40 lines of the text; no JSON envelope.
+- **text**: `[qmu] Output spilled to <path> (~N tokens)`, then a preview
+  bounded by **both** 40 lines and 4096 bytes (so one 200 000-byte line shows
+  4096 bytes, not all of it), then `[qmu] Preview: first A of B bytes (C
+  omitted; L of M lines)`; no JSON envelope.
 - **json/ndjson**: a pointer envelope `{"ok", "artifact_path", "format",
   "bytes", "sha256", "token_estimate", "estimator": "chars/4", "summary"}`.
 

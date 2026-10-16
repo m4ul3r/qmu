@@ -307,11 +307,22 @@ of the contract the protocol doesn't: **invalidate loudly.** It does NOT drive
 pry, so it warns rather than auto re-syncing/re-arming (that is a pry-side
 capability).
 
-- `debug_session_present(inst)` is the single gate: true when `gdb_port` is set
-  AND `gdb_client_attached()` cannot positively rule out a connected client. The
-  attach probe parses `/proc/net/tcp{,6}` for an ESTABLISHED socket on the gdb
-  port; it returns `None` (can't tell → treated as present, fail-safe) rather
-  than `False` on any read failure, because a missed divergence is the whole bug.
+- `debug_session_present(inst)` is the gate for divergences a *live* client
+  would see: true when `gdb_port` is set AND `gdb_client_attached()` cannot
+  positively rule out a connected client. The attach probe parses
+  `/proc/net/tcp{,6}` for an ESTABLISHED socket on the gdb port; it returns
+  `None` (can't tell → treated as present, fail-safe) rather than `False` on
+  any read failure, because a missed divergence is the whole bug. The same
+  probe is what makes `qmu gdb` refuse (exit 1, naming the bridge pid) instead
+  of spawning a second bridge against an occupied stub — on a positive `True`
+  only; `None` falls through so an unreadable `/proc` never locks the debugger
+  out.
+- `snapshot save` deliberately uses the weaker `debug_stub_present(inst)`
+  (`gdb_port` alone): a debugger that already detached can have left `int3`
+  bytes behind, and the save captures them whether or not anyone is attached
+  now. A save on a `--gdb` VM therefore always warns; the skill documents this
+  as the one exception to attached-client suppression — do not "fix" it by
+  switching that call to the session gate.
 - Warnings fire on exactly the mutation events, all to **stderr** so the stdout
   JSON envelope is untouched: `snapshot save` (#45, baked-in `int3`s),
   `snapshot load` (#44, stale vCPU/bookkeeping), `qmp`/`monitor system_reset`
@@ -352,7 +363,41 @@ envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
   `guestfish`; if libguestfs can't build its appliance (e.g. mode-600 `/boot`
   kernels), point it at a fixed appliance via `SUPERMIN_KERNEL` or
   `LIBGUESTFS_PATH`. `qmu doctor` checks both the binary and appliance-kernel
-  readability.
+  readability. Ownership normalization is `lchown` over exactly the paths the
+  injection landed (enumerated from the *source* tree), followed by a `chmod`
+  back to the source mode on every non-link — `chown` follows symlinks and
+  clears setuid/setgid, and a merge must not re-own pre-existing guest files
+  (#95/#96/#97). Generated guestfish scripts quote with
+  `rootfs.guestfish_quote`, never `shlex.quote`: guestfish's tokenizer is not
+  a POSIX shell (#98), and `ls` output is framed so names/targets containing
+  the old separator or newlines come back exact (#99).
+- **A failed `loadvm` is not always resumable.** QEMU reverts the block layer
+  before it loads the vmstate, so a load that fails *after* restoration began
+  (`snapshot.loadvm_restore_state` → `partial`/`unknown`) leaves pre-snapshot
+  devices over post-snapshot disks; `qmu cont` there runs an inconsistent
+  machine (#87). Only a pre-restore refusal (`none`: missing tag, bad name) is
+  resumed; the others are deliberately left paused with `guest_paused: true`
+  and a hint that excludes `cont`. HMP failure detection (`qmp.hmp_failed`)
+  anchors QEMU's error frames to the start of a line, so error words inside
+  data (a tag named `Error:checkpoint`, a register dump) are not failures
+  (#86). Mutation bookkeeping (epoch persist) runs *before* the success
+  envelope is written, so a persistence failure never follows `ok:true` with a
+  second JSON object (#88).
+- **Guest streams are bytes.** `exec`/`run`/`compile --run`/`dmesg` text mode
+  writes guest stdout through `sys.stdout.buffer` exactly as captured (no
+  decode, no added newline); JSON carries the lossy decode plus
+  `stdout_lossy`/`stderr_lossy: true` only when U+FFFD replaced something
+  (#80). The text spill preview is bounded by `TEXT_SPILL_HEAD_LINES` **and**
+  `TEXT_SPILL_HEAD_BYTES` — a single 200 000-byte line is one "line" (#100).
+  `_classify_transfer_failure` routes the SCP watcher's `SSHAborted` through
+  the same panic/paused/transport split as `exec`, so a panic mid-`push` is
+  exit 3 with the report, not 4 (#89).
+- **A stopped `status` omits `qmp`/`qemu_status`/`ssh`** rather than
+  emitting `null` (bare `wait` does emit `qmp: null`); `list` keeps the coarse
+  existence word `stopped` for every non-running record while `status`/`prune`
+  refine a metadata-free `.qemu.log`/`.qmp.sock` remnant to `held_back` —
+  pinned by the matrix, documented in the skill; do not "unify" one side to
+  match the other without changing both and the rows (#104/#106).
 - When editing handlers, keep behavior verbatim-stable unless intentionally
   changing it — the suite pins the exit codes, the JSON envelope keys, and the
   crash/transport wording.

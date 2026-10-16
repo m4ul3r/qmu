@@ -12,13 +12,20 @@ class SnapshotResult:
     """Outcome of one HMP snapshot operation.
 
     `message` is the HMP text verbatim when QEMU printed any, else a
-    synthesized success line. The two run-state flags only ever apply to a
-    FAILED load: QEMU's `hmp_loadvm` stops the guest (`restore-vm`) before it
-    looks for the tag and only restarts it on success, so a typo'd name leaves
-    a previously running guest paused with no error saying so. qmu owns the
-    operation and the pre-load state, so it resumes the guest (`resumed`) or,
-    if that failed too, says the guest is paused (`guest_paused`) instead of
-    letting every later SSH command time out against a stopped vCPU.
+    synthesized success line. The run-state fields only ever apply to a
+    load: QEMU's `hmp_loadvm` stops the guest (`restore-vm`) before it
+    looks for the tag and only restarts it on success -- and then only if it
+    was running before -- so a refused name leaves a previously running guest
+    paused with no error saying so. qmu owns the operation and the pre-load
+    state, so when the failure provably happened before any restoration it
+    resumes the guest (`resumed`) or, if that failed too, says the guest is
+    paused (`guest_paused`). When restoration had already begun
+    (`restore_state` `partial`) or qmu cannot tell (`unknown`), the disks may
+    already be rewound under device state that is not -- QEMU reverts the
+    block layer before it loads the vmstate -- so the guest is deliberately
+    left paused: a `cont` there runs an inconsistent machine and reported
+    `resumed: true` on it (#87). A SUCCESSFUL load that recovers from that
+    pause (`restore-vm`) resumes the now-consistent guest (`resumed`).
     """
 
     ok: bool
@@ -28,18 +35,31 @@ class SnapshotResult:
     # Why a FAILED operation failed, for the CLI's `hint`: `missing` (no such
     # tag), `bad_name` (HMP parse error), `hmp` (any other QEMU refusal).
     reason: str | None = None
+    # How far a FAILED load got: `none` (QEMU refused before touching the
+    # machine), `partial` (QEMU's error text shows restoration had started),
+    # `unknown` (an error form qmu cannot place). None for every other op.
+    restore_state: str | None = None
+
+
+def guest_run_state(qmp: QMPClient) -> tuple[bool | None, str | None]:
+    """QMP `query-status` as (`running`, `status`); None for what cannot be read."""
+    try:
+        status = qmp.execute("query-status")
+    except QMPError:
+        return None, None
+    if not isinstance(status, dict):
+        return None, None
+    running = status.get("running")
+    name = status.get("status")
+    return (
+        running if isinstance(running, bool) else None,
+        name if isinstance(name, str) else None,
+    )
 
 
 def guest_running(qmp: QMPClient) -> bool | None:
     """QMP `query-status` `running` flag; None when it cannot be read."""
-    try:
-        status = qmp.execute("query-status")
-    except QMPError:
-        return None
-    if not isinstance(status, dict):
-        return None
-    running = status.get("running")
-    return running if isinstance(running, bool) else None
+    return guest_run_state(qmp)[0]
 
 
 def resume_guest(qmp: QMPClient) -> bool:
@@ -89,22 +109,117 @@ def save_snapshot(qmp: QMPClient, name: str, timeout: float = 60.0) -> SnapshotR
     return SnapshotResult(True, result or f"Snapshot '{name}' saved.")
 
 
+# What QEMU's `load_snapshot()` prints when it refuses BEFORE touching the
+# machine (tag lookup, vmstate-device lookup, disk-only check, HMP parse) vs.
+# AFTER `bdrv_all_goto_snapshot` has reverted the disks (vmstate open/load,
+# the per-device migration failures that precede its summary line). Anchored
+# at line starts like `qmp.hmp_failed`. A message is `none` only when EVERY
+# line is a pre-restore form; a single post-restore line makes it `partial`;
+# anything else is `unknown` and treated as unsafe to resume.
+_PRE_RESTORE_LINE_RES = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"(Error: )?Snapshot '.*' does not exist",
+        r"(Error: )?This is a disk-only snapshot",
+        r"(Error: )?No block device ",
+        r"(Error: )?Device '[^']*' (is writable but )?does not support snapshots",
+        r"unknown command: ",
+        r"\S+: extraneous characters at the end of line",
+        r'Try "help',
+    )
+)
+_POST_RESTORE_LINE_RES = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"(Error: )?Error -?\d+ while loading VM state",
+        r"(Error: )?Could not open VM state file",
+        r"(Error: )?Could not load snapshot '",
+        r"error while loading state",
+        r"Missing section footer",
+        r"(Error: )?Section footer error",
+        r"Unknown ramblock ",
+        r"(Error: )?load of migration failed",
+        r"(Error: )?duplicate yank instance",
+    )
+)
+
+
+def loadvm_restore_state(message: str) -> str:
+    """How far a FAILED `loadvm` got, from its HMP error text.
+
+    `none`: QEMU refused before any restoration, so the machine is exactly
+    what it was and resuming it is safe. `partial`: the disks were reverted
+    (QEMU does that first) and the vmstate load then failed, so the guest
+    now runs pre-snapshot devices over post-snapshot disks. `unknown`: an
+    error form this table does not place; resuming it is a guess, and the
+    guess that shipped reported `resumed: true` on a machine whose disk had
+    just been rewound under a live kernel (#87).
+    """
+    lines = [line.strip() for line in message.splitlines() if line.strip()]
+    if any(p.match(line) for line in lines for p in _POST_RESTORE_LINE_RES):
+        return "partial"
+    if lines and all(
+        any(p.match(line) for p in _PRE_RESTORE_LINE_RES) for line in lines
+    ):
+        return "none"
+    return "unknown"
+
+
+# QEMU's run state after a `loadvm` that failed past the tag check: qmu leaves
+# the guest there on purpose (see `load_snapshot`), so it is the one stopped
+# state a later SUCCESSFUL load is entitled to undo.
+_FAILED_RESTORE_RUN_STATE = "restore-vm"
+
+
 def load_snapshot(qmp: QMPClient, name: str, timeout: float = 60.0) -> SnapshotResult:
-    """Load a VM snapshot, restoring the pre-load run state if loadvm fails."""
-    was_running = guest_running(qmp)
+    """Load a VM snapshot; resume the guest only when loadvm provably did
+    not start restoring it.
+
+    The tag is checked against `info snapshots` first so the common failure
+    (a typo) never reaches `loadvm` at all -- QEMU would stop the guest
+    before noticing. When `loadvm` itself fails, the error text decides
+    (`loadvm_restore_state`): a pre-restore refusal gets the pre-load run
+    state back; anything that may have reverted the disks is left paused and
+    reported as such, because `cont` on it is not a rollback.
+
+    `hmp_loadvm` restarts the guest after a successful load only if it was
+    running before, so the recovery that failure's hint names -- load a
+    known-good tag -- would otherwise succeed and leave the guest stopped in
+    `restore-vm` with no error saying so. A successful load therefore resumes
+    a guest stopped in exactly that state (`resumed: true`); a guest the
+    operator or a debugger paused (`paused`, `debug`, ...) stays paused.
+    """
+    if name not in snapshot_tags(qmp):
+        return SnapshotResult(
+            False,
+            f"Snapshot '{name}' does not exist",
+            reason="missing",
+            restore_state="none",
+        )
+    was_running, run_state = guest_run_state(qmp)
     result = qmp.execute_hmp(f"loadvm {name}", timeout=timeout).strip()
     if not hmp_failed(result):
-        return SnapshotResult(True, result or f"Snapshot '{name}' loaded.")
+        resumed = False
+        if was_running is False and run_state == _FAILED_RESTORE_RUN_STATE:
+            resumed = resume_guest(qmp)
+        return SnapshotResult(
+            True, result or f"Snapshot '{name}' loaded.", resumed=resumed
+        )
+    restore_state = loadvm_restore_state(result)
     resumed = guest_paused = False
-    if was_running and guest_running(qmp) is False:
-        resumed = resume_guest(qmp)
-        guest_paused = not resumed
+    if restore_state == "none":
+        if was_running and guest_running(qmp) is False:
+            resumed = resume_guest(qmp)
+            guest_paused = not resumed
+    else:
+        guest_paused = guest_running(qmp) is False
     return SnapshotResult(
         False,
         result,
         resumed=resumed,
         guest_paused=guest_paused,
         reason=_classify_hmp_failure(result),
+        restore_state=restore_state,
     )
 
 

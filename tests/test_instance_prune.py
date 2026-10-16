@@ -245,16 +245,65 @@ def test_prune_all_removes_aged_qemu_log_only_bundle(capsys):
     assert "old-log" in capsys.readouterr().out
 
 
-def test_prune_all_skips_young_qemu_log_only_bundle(capsys):
+def test_prune_all_holds_back_young_qemu_log_only_bundle(capsys):
+    """#104: the age gate withholding it is an outcome `prune` must disclose,
+    not silence — the remnant is on disk and `--older-than 0` removes it."""
     qemu = _touch("young-log", ".qemu.log", mtime=1.0)
 
     rc = cli.main(
-        ["prune", "--all", "--older-than", "1e20", "--format", "text"]
+        ["prune", "--all", "--older-than", "1e20", "--format", "json"]
     )
 
     assert rc == 0
     assert qemu.exists()
-    assert capsys.readouterr().out == "No stopped VMs to prune.\n"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pruned"] == [] and payload["held_back"] == ["young-log"]
+
+
+def test_qemu_log_only_remnant_is_seen_by_every_command(capsys):
+    """#104: `prune --older-than 0` removed a `.qemu.log`-only remnant that
+    `list` omitted, `prune --dry-run` called absent, and `status`/`kill`
+    answered with exit 1 "No running VMs". One discovery feeds them all."""
+    qemu = _touch("rev-17", ".qemu.log", mtime=time.time())
+    found = {}
+
+    assert cli.main(["list", "--format", "json"]) == 0
+    rows = json.loads(capsys.readouterr().out)["vms"]
+    found["list"] = [r for r in rows if r["vm_id"] == "rev-17"]
+    assert found["list"] and found["list"][0]["status"] == "stopped"
+    assert found["list"][0]["logs_retained"] is False
+
+    assert cli.main(["status", "--vm", "rev-17", "--format", "json"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["status"] == "held_back"
+    assert status["qemu_log"] == str(qemu) and status["serial_log"] is None
+
+    assert cli.main(["prune", "--vm", "rev-17", "--dry-run", "--format", "json"]) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["found"] is True and preview["held_back"] == ["rev-17"]
+    assert preview["would_prune"] == [] and qemu.exists()
+
+    assert cli.main(["kill", "--vm", "rev-17", "--format", "json"]) == 0
+    killed = json.loads(capsys.readouterr().out)
+    assert killed["already_stopped"] is True and killed["logs_retained"] is False
+    assert qemu.exists(), "kill on a stopped remnant preserves it"
+
+    assert cli.main(
+        ["prune", "--vm", "rev-17", "--dry-run", "--older-than", "0", "--format", "json"]
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["would_prune"] == ["rev-17"]
+    assert cli.main(["prune", "--vm", "rev-17", "--older-than", "0", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["pruned"] == ["rev-17"]
+    assert not qemu.exists()
+
+
+def test_stale_qmp_only_remnant_is_classified_not_absent():
+    _stale_qmp("stale-only", mtime=1.0)
+    info = instance_module.classify_vm("stale-only", older_than_seconds=1e20)
+    assert info["state"] == instance_module.VM_HELD_BACK
+    assert instance_module.classify_vm("stale-only", older_than_seconds=0)["state"] == (
+        instance_module.VM_STOPPED
+    )
 
 
 def test_prune_all_skips_live_qmp_only_bundle(capsys):

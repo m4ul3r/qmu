@@ -104,6 +104,12 @@ from a `--pattern` wait, is the receipt for a successful harness run.
   such as wait/status, or a debugger bridge), so QEMU's status was not
   observed.`); each busy poll costs the 2 s greeting timeout, so `--timeout`
   can overshoot by up to 2 s, and `--timeout 0` under a held slot is 124.
+  The reported `qemu_status` describes the **last** probe: once that probe
+  was busy it is `unknown`, never a `running` carried over from an earlier
+  connected poll. Before returning `timeout`, the wait rescans the serial log
+  once more, so a panic that lands during the final (possibly 2 s busy) probe
+  is still exit 3 `terminal_panic` with `crash`, not 124 with the report
+  buried in `console_tail`.
 - A VM stopped by `qmu kill` while it was being waited on reports the loss as
   exit 1/4 rather than a clean exit 0; treat that as "someone killed it".
 - No command prints the profile-sourced unknown-parameter note; `launch`

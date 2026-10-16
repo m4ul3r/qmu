@@ -185,6 +185,23 @@ RETIRED_CLAIMS = [
      "qmu never recommends prune --all; its hints name prune --vm <id>"),
     (r"auto-selection needs exactly one running VM\)\.",
      "auto-selection is announced on stderr + autoselected: true; QMU_REQUIRE_VM=1 forbids it"),
+    # Review of #65–#69 (#79): qmu exits 0/1 on the guest's status and keeps
+    # the guest's own code in JSON `exit_code`; 2/3/4/124 are reserved.
+    (r"exit code (?:=|is) the guest(?:'s| command's)",
+     "qmu exits 1 for any non-zero guest status; the guest code is JSON exit_code"),
+    (r"`exit 255` is 255",
+     "exit 255 in the guest is qmu exit 1 with exit_code: 255"),
+    # #106: a stopped `status` omits `qmp`; only bare `wait` carries `qmp: null`.
+    (r"null \(stopped, in `status`",
+     "stopped status has no qmp key at all; test for presence, not null"),
+    (r"concurrent probe may report a held slot as `unreachable`",
+     "list and status both classify a held QMP slot as busy (observed agreeing)"),
+    # #77 evidence: the held-QMP budget alone is ~2 s, an unanswering SSH port ~5 s.
+    (r"status --vm X\s+#.*< ?1 s",
+     "status is typically sub-second but up to ~2 s (held QMP) / ~5 s (SSH accepts, never answers)"),
+    # The attach gate refuses a second `qmu gdb` while a client is connected.
+    (r"would spawn a second bridge",
+     "qmu gdb exits 1 naming the attached bridge pid and spawns nothing"),
 ]
 
 
@@ -208,6 +225,18 @@ REQUIRED_CLAIMS = [
     (SKILL, "[stopped — crash report retained]"),
     (SKILL, "skipped (debugger attached)"),
     (SKILL, "--format text --out report.txt"),
+    # #79: the decision rows and the run section must state the 0/1 mapping and
+    # point at `exit_code` for the guest's own code.
+    (SKILL, "exit 0 if the guest command exited 0, else 1"),
+    (SKILL, "Exit 0 when the guest command exited 0, 1 when it exited non-zero"),
+    (REFERENCE_DIR / "guest-commands.md", "qmu's own exit is **not** the guest's"),
+    # #102: the offline-inject row must carry --partition 0 on BOTH steps.
+    (SKILL, "qmu rootfs inject ./rootfs.img ./exploit:/root/ --partition 0"),
+    (SKILL, "qmu rootfs ls ./rootfs.img /root --partition 0"),
+    # #106: stopped status shape; savevm warning exception.
+    (REFERENCE_DIR / "launch.md", "A stopped `status` **omits** `qmp`"),
+    (REFERENCE_DIR / "debugging.md", "**Exception: `snapshot save`.**"),
+    (REFERENCE_DIR / "debugging.md", "A debugger client is already attached to port N"),
     (SKILL, "--partition 0"),
     (SKILL, "10.0.2.15"),
     (SKILL, "pry --instance qmu-"),
@@ -258,6 +287,32 @@ TABLE_DOCUMENTED = [
 )
 def test_table_command_parses(path, lineno, command):
     test_documented_command_parses(path, lineno, command)
+
+
+_PARTITION = re.compile(r"--partition\s+(\S+)")
+
+
+def _rootfs_rows(path: Path) -> list[tuple[int, list[str]]]:
+    """Table rows that chain two or more `qmu rootfs …` commands (inject → ls)."""
+    rows: dict[int, list[str]] = {}
+    for lineno, command in _table_commands(path):
+        if command.startswith("qmu rootfs "):
+            rows.setdefault(lineno, []).append(command)
+    return [(n, cmds) for n, cmds in rows.items() if len(cmds) >= 2]
+
+
+def test_rootfs_decision_rows_select_the_same_partition():
+    """#102: an inject with `--partition 0` verified by an `ls` that defaults to
+    partition 1 exits 1 (`Partition /dev/sda1 was not found`) on the very image
+    the inject just wrote. Every chained rootfs row must name one partition on
+    all of its commands — not merely parse."""
+    rows = _rootfs_rows(SKILL)
+    assert rows, "no decision row chains qmu rootfs commands; the extractor is vacuous"
+    for lineno, cmds in rows:
+        parts = {(_PARTITION.search(c) or [None, None])[1] for c in cmds}
+        assert len(parts) == 1 and None not in parts, (
+            f"SKILL.md:{lineno}: rootfs commands select different partitions {cmds}"
+        )
 
 
 def test_reference_files_exist_and_are_pointed_at():

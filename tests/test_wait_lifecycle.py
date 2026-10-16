@@ -48,9 +48,11 @@ class FakeClock:
 class FakeQMP:
     """One fresh connection per poll, answering `query-status` from a script.
 
-    `statuses` is consumed one entry per connection: a status name, or an
-    exception to raise at connect time (the last entry repeats). `connects`
-    counts how many short-lived connections the wait opened.
+    `statuses` is consumed one entry per connection: a status name, an
+    exception to raise at connect time, or a callable invoked at connect
+    time (a side effect that happens WHILE the probe blocks) returning either
+    of those (the last entry repeats). `connects` counts how many short-lived
+    connections the wait opened.
     """
 
     def __init__(self, statuses=("running",)):
@@ -65,6 +67,8 @@ class FakeQMP:
     def __enter__(self):
         self.connects += 1
         self._status = self._current()
+        if callable(self._status):
+            self._status = self._status()
         if isinstance(self._status, Exception):
             raise self._status
         return self
@@ -467,6 +471,115 @@ def test_wait_busy_timeout_reports_the_unobserved_status(
     # Names the likely holder, as the `status` busy classification does.
     assert "another qmu command such as `wait`/`status`, or a debugger bridge" in captured.out
     assert "still running" in captured.out
+
+
+def test_wait_panic_during_the_final_busy_probe_is_terminal(
+    monkeypatch, capsys, tmp_path
+):
+    """#91 (receipt 140): a sibling holds QMP, so the probe blocks for its
+    whole connect timeout, and the guest panics meanwhile. The deadline
+    decides when the wait ends, not what the guest did: a 124 with
+    `crash: null` beside a console_tail showing the panic sent callers back
+    to wait on a dead guest."""
+    inst = _instance(tmp_path)
+    log = Path(inst.serial_log)
+
+    def blocking_busy_probe():
+        # The probe blocks past the deadline (`lifecycle.time.sleep` is the
+        # fake clock); the panic lands while it does.
+        lifecycle.time.sleep(2.0)
+        with log.open("a") as stream:
+            stream.write(TERMINAL_PANIC)
+        return QMPBusyError("no greeting")
+
+    rc, payload, _, qmp, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        statuses=[blocking_busy_probe], alive=[True], timeout=1.0, inst=inst,
+    )
+
+    assert rc == 3
+    assert payload["reason"] == "terminal_panic"
+    assert payload["guest"] == "panicked"
+    assert payload["crash"] is not None and "Kernel panic" in payload["crash"]
+    assert payload["qmp"] == "busy"
+    assert payload["qemu_status"] == "unknown"
+    assert qmp.connects == 1
+
+
+def test_wait_connected_then_busy_reports_no_current_qemu_status(
+    monkeypatch, capsys, tmp_path
+):
+    """#92 (receipt 174): the busy final probe observed nothing, so a
+    `qemu_status` carried over from the earlier connected tick is a stale
+    value presented as current."""
+    busy = QMPBusyError("no greeting")
+    rc, payload, _, qmp, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        statuses=["running", busy], alive=[True], timeout=1.0,
+    )
+
+    assert rc == 124
+    assert payload["qmp"] == "busy"
+    assert payload["qemu_status"] == "unknown"
+    assert payload["last_event"] is None
+    assert qmp.connects >= 2
+
+
+def test_wait_busy_tick_between_two_connected_ticks_keeps_the_transition(
+    monkeypatch, capsys, tmp_path
+):
+    """History survives a busy tick: the transition is still reported from
+    the last CONNECTED reading, and the final connected probe is current."""
+    busy = QMPBusyError("no greeting")
+    rc, payload, _, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path,
+        statuses=["running", busy, "paused"], alive=[True], timeout=1.0,
+    )
+
+    assert rc == 124
+    assert payload["qmp"] == "connected"
+    assert payload["qemu_status"] == "paused"
+    assert payload["last_event"] == "STOP"
+    assert payload["event_data"] == {
+        "source": "query-status", "from": "running", "to": "paused",
+    }
+
+
+def test_wait_adopts_a_replaced_log_and_sees_its_panic(
+    monkeypatch, capsys, tmp_path
+):
+    """#103 at the consumer: the log is replaced by a shorter generation
+    whose panic sits below the retained boot boundary. The boundary must
+    follow the log, and the persisted epoch with it."""
+    inst = _instance(tmp_path)
+    log = Path(inst.serial_log)
+    checks = 0
+    saved = []
+
+    def alive(selected):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            log.write_text(BOOT + TERMINAL_PANIC)
+        return True
+
+    def save_epoch(record, offset):
+        saved.append(offset)
+        return replace(record, guest_epoch_serial_offset=offset)
+
+    monkeypatch.setattr(lifecycle, "save_guest_epoch_serial_offset", save_epoch)
+    long_first_boot = BOOT + "noise\n" * 400 + BOOT + "login: \n"
+    rc, payload, _, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=alive, inst=inst, timeout=5.0,
+        serial=long_first_boot,
+    )
+
+    assert rc == 3
+    assert payload["reason"] == "terminal_panic"
+    assert payload["crash"] is not None and "Kernel panic" in payload["crash"]
+    assert payload["event_data"] == {"source": "log-replaced", "offset": 0}
+    assert saved[-1] == 0
+    assert payload["console_tail"][-1] in TERMINAL_PANIC
 
 
 @pytest.mark.parametrize("exit_at", [0.1, 1.0])

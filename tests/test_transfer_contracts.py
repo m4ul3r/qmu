@@ -13,7 +13,7 @@ import pytest
 from qmu import cli
 from qmu.commands import guest
 from qmu.instance import VMInstance
-from qmu.ssh import SCPFileError, SSHError
+from qmu.ssh import SCPFileError, SSHAborted, SSHError
 
 
 PANIC_LOG = (
@@ -403,6 +403,88 @@ def test_transfer_transport_loss_ignores_stale_precommand_crash(
     assert payload["crash"] is None
     assert "panic" not in out.lower()
     assert "Fatal exception" not in out
+
+
+@pytest.mark.parametrize("operation", ["push", "pull"])
+@pytest.mark.parametrize("fmt", ["text", "json"])
+def test_watcher_abort_on_a_fresh_panic_is_exit3_with_the_report(
+    monkeypatch, tmp_path, capsys, operation, fmt
+):
+    """Measured live (#89): a sysrq panic 0.8 s into a 2 GiB push aborted scp
+    within a second — and `push` exited 4 `SSHAborted` with no report, while
+    the concurrent `exec` was 3 and `qmu crash` returned the panic. The
+    watcher's exception carries no returncode, and the handler only knew the
+    rc-255-plus-marker shape of a lost transport."""
+    local = str(tmp_path / "payload.bin")
+    remote = "/root/payload.bin"
+    (tmp_path / "payload.bin").write_bytes(b"data")
+    failure = SSHAborted(f"SCP {operation} aborted by qmu: {local} -> {remote}")
+    _install_transfer(
+        monkeypatch, tmp_path, operation=operation, append_text=PANIC_LOG, failure=failure,
+    )
+
+    rc = _run_transfer(operation, fmt, local, remote)
+    captured = capsys.readouterr()
+
+    assert rc == 3
+    if fmt == "text":
+        assert f"SCP transport lost during {operation}" in captured.out
+        assert "Kernel panic - not syncing" in captured.out
+        return
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert payload["ssh_error"] is True
+    assert payload["crash_detected"] is True
+    assert "Kernel panic - not syncing" in payload["crash"]
+    assert payload["operation"] == operation
+    assert payload["vm_id"] == "xfer-vm"
+    assert "qmu crash" in payload["hint"]
+
+
+@pytest.mark.parametrize("operation", ["push", "pull"])
+def test_watcher_abort_on_a_halted_vcpu_is_the_paused_envelope(
+    monkeypatch, tmp_path, capsys, operation
+):
+    local = str(tmp_path / "payload.bin")
+    remote = "/root/payload.bin"
+    (tmp_path / "payload.bin").write_bytes(b"data")
+    failure = SSHAborted(f"SCP {operation} aborted by qmu: {local} -> {remote}")
+    _install_transfer(monkeypatch, tmp_path, operation=operation, failure=failure)
+    monkeypatch.setattr(guest, "_qmp_stopped_status", lambda inst: "debug")
+
+    rc = _run_transfer(operation, "json", local, remote)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["guest_state"] == "paused"
+    assert payload["qemu_status"] == "debug"
+    assert payload["crash_detected"] is False
+    assert payload["ssh_error"] is False
+    assert payload["operation"] == operation
+
+
+@pytest.mark.parametrize("operation", ["push", "pull"])
+def test_watcher_abort_with_a_stale_panic_only_stays_infra(
+    monkeypatch, tmp_path, capsys, operation
+):
+    """No returncode, a vCPU that runs, and no panic since the transfer
+    started: nothing explains the abort, so it is the infra class, not a
+    crash claim built on a pre-transfer report."""
+    local = str(tmp_path / "payload.bin")
+    remote = "/root/payload.bin"
+    (tmp_path / "payload.bin").write_bytes(b"data")
+    failure = SSHAborted(f"SCP {operation} aborted by qmu: {local} -> {remote}")
+    _install_transfer(
+        monkeypatch, tmp_path, operation=operation, initial_serial=PANIC_LOG,
+        failure=failure, forbid_extract=True,
+    )
+
+    rc = _run_transfer(operation, "json", local, remote)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 4
+    assert payload["error_type"] == "SSHAborted"
+    assert "crash_detected" not in payload
 
 
 @pytest.mark.parametrize("operation", ["push", "pull"])

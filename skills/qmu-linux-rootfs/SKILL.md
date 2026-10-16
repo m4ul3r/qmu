@@ -83,12 +83,21 @@ A failed build never leaves a half-written `rootfs.img`: the image is built as
 **Images built before this policy accept root with ANY key** (they ran
 `passwd -d root` + `PermitEmptyPasswords yes`) and have neither the JSON file
 nor an `sshd_policy=` stamp line. The sshd policy and the console-login
-revision are both part of the build key, so:
+revision are both part of the build key, and **where** the rerun lands depends
+on the build's shape: a default-shaped build (no `--packages`/`--size`/
+`--ssh-key`, or an explicit `--outdir`) always uses the same directory, so its
+old stamp is found and the image is rebuilt in place at the same `ROOTFS`
+path; a non-default build is routed to a directory keyed by the digest
+(`rootfs/<release>/<arch>-<digest8>`), so a changed digest selects a **new**
+outdir — the old keyed directory is never consulted, prints no note, and keeps
+its old image. In both cases re-`eval` the script's output: a consumer pinned
+to a previously captured `ROOTFS` path keeps booting the old image.
 
 | Cached image | What a rerun does | Command |
 |---|---|---|
-| stamped, no `sshd_policy=` line (built with non-default options) | prints `note: cached image at … predates the key-only sshd policy (its sshd accepted root with ANY key …); rebuilding so only the qmu key is authorized`, then rebuilds in place | rerun the same `tools/mkrootfs.sh …` invocation |
-| stamped `sshd_policy=key-only` but built before the export fix (key-only, yet `localhost login:` on serial) | prints `note: … was built with different options than requested (requested: … sshd-policy=key-only)` and rebuilds in place | rerun the same invocation |
+| stamped, no `sshd_policy=` line, default shape or `--outdir` | prints `note: cached image at … predates the key-only sshd policy (its sshd accepted root with ANY key …); rebuilding so only the qmu key is authorized`, then rebuilds in place | rerun the same `tools/mkrootfs.sh …` invocation |
+| stamped `sshd_policy=key-only` but built before the export fix (key-only, yet `localhost login:` on serial), default shape or `--outdir` | prints `note: … was built with different options than requested (requested: … sshd-policy=key-only)` and rebuilds in place | rerun the same invocation |
+| either of the above, built with non-default options | silent fresh build into a new keyed outdir; `ROOTFS` changes | rerun the same invocation and re-`eval` its output |
 | unstamped (legacy default build) | serves it with `note: … has no completion stamp, so its --packages/--size/--ssh-key are UNVERIFIED and its sshd most likely accepts root with ANY key …` | `tools/mkrootfs.sh --no-cache` (add `--arch`/`--release` as used) |
 | stamped by the current script | cache hit, no note | nothing |
 

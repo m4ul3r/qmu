@@ -444,6 +444,80 @@ def test_status_names_the_live_pid_for_an_orphan(cache, monkeypatch, capsys):
     assert str(pid) in capsys.readouterr().out
 
 
+# A `.qemu.log`-only remnant (#104): no .json, no .serial.log. `prune
+# --older-than 0` removed it while `list` omitted it, `prune --dry-run` said
+# `found: false`, and `status`/`kill` answered exit 1 "No running VMs" — the
+# canonical matrix defect on the subcommand axis, for a state the classifier
+# had never been taught.
+
+
+def _qemu_log_only_remnant(cache, monkeypatch):
+    idir = cache / "instances"
+    idir.mkdir(parents=True, exist_ok=True)
+    qemu_log = idir / f"{VM}.qemu.log"
+    qemu_log.write_text("Review-owned QEMU-only diagnostic\n")
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
+    return qemu_log
+
+
+def test_qemu_log_only_remnant_is_held_back_not_absent(cache, monkeypatch):
+    _qemu_log_only_remnant(cache, monkeypatch)
+    assert classify_vm(VM)["state"] == VM_HELD_BACK
+    assert classify_vm(VM, older_than_seconds=0)["state"] == VM_STOPPED
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_qemu_log_only_remnant_is_seen_by_list_status_kill_and_prune(
+    fmt, cache, monkeypatch, capsys
+):
+    qemu_log = _qemu_log_only_remnant(cache, monkeypatch)
+    _decoy_running(monkeypatch)
+
+    assert cli.main(["--format", fmt, "list"]) == 0
+    listing = capsys.readouterr().out
+    assert cli.main(["--format", fmt, "status", "--vm", VM]) == 0
+    detail = capsys.readouterr().out
+    assert cli.main(["--format", fmt, "prune", "--vm", VM, "--dry-run"]) == 0
+    preview = capsys.readouterr().out
+    assert qemu_log.exists(), "--dry-run acted"
+    assert cli.main(["--format", fmt, "kill", "--vm", VM]) == 0
+    killed = capsys.readouterr().out
+    assert qemu_log.exists(), "kill on a stopped remnant must preserve it"
+
+    for name, out in (("list", listing), ("status", detail), ("prune", preview), ("kill", killed)):
+        assert VM in out, f"`qmu {name}` omits a remnant on disk"
+        assert "not found" not in out and "No running VMs" not in out, name
+
+    if fmt == "json":
+        row = next(r for r in json.loads(listing)["vms"] if r["vm_id"] == VM)
+        status = json.loads(detail)
+        view = {
+            "list": (row["status"], row["logs_retained"], row["crash_detected"]),
+            "status": (status["status"], status["logs_retained"], status["crash_detected"]),
+            "status_qemu_log": status["qemu_log"],
+            "preview": (json.loads(preview)["found"], json.loads(preview)["held_back"]),
+            "kill": (json.loads(killed)["already_stopped"], json.loads(killed)["logs_retained"]),
+        }
+        assert view == {
+            "list": ("stopped", False, False),
+            "status": (VM_HELD_BACK, False, False),
+            "status_qemu_log": str(qemu_log),
+            "preview": (True, [VM]),
+            "kill": (True, False),
+        }, f"the commands disagree about the remnant: {view}"
+    else:
+        assert "Held back by the --older-than cutoff" in preview
+        assert f"QEMU log: {qemu_log}" in detail
+
+    # The real run with the gate lowered agrees with its own preview.
+    assert cli.main(["--format", "json", "prune", "--vm", VM, "--dry-run", "--older-than", "0"]) == 0
+    assert json.loads(capsys.readouterr().out)["would_prune"] == [VM]
+    assert cli.main(["--format", "json", "prune", "--vm", VM, "--older-than", "0"]) == 0
+    assert json.loads(capsys.readouterr().out)["pruned"] == [VM]
+    assert not qemu_log.exists()
+
+
 def _stopped_with_report(cache, monkeypatch, vm_id=VM):
     """A VM `kill` stopped with its crash report kept, as every triggered
     exploit run ends."""
@@ -961,6 +1035,48 @@ def test_halted_guest_is_paused(cache, monkeypatch):
     _qmp(monkeypatch, False)
 
     assert lifecycle._guest_state(inst) == "paused"
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_paused_guest_with_a_retained_report_agrees_across_list_status_crash(
+    fmt, cache, monkeypatch, capsys
+):
+    """#93 (receipts 129–133): a survived report, then `qmp stop`. `paused`
+    wins the usability axis, but the report is a fact about the log: `list`
+    and `status` said `crash_detected: false` while `crash` retrieved it, so
+    automation skipped a report because a debugger had halted the vCPU."""
+    inst = _vm_with_log(cache, "pzr", "[ 0.0] Linux version 6.12.0\n" + SURVIVED_OOPS)
+    _qmp(monkeypatch, False)
+    _register_running(monkeypatch, inst)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_stopped_instances", lambda: [], raising=False)
+
+    assert cli.main(["--format", fmt, "list"]) == 0
+    listing = capsys.readouterr().out
+    assert cli.main(["--format", fmt, "status", "--vm", "pzr"]) == 0
+    detail = capsys.readouterr().out
+    assert cli.main(["--format", fmt, "crash", "--vm", "pzr"]) == 0
+    report = capsys.readouterr().out
+
+    if fmt == "json":
+        row = json.loads(listing)["vms"][0]
+        status = json.loads(detail)
+        crash = json.loads(report)
+        view = {
+            "list": (row["guest"], row["crash_detected"]),
+            "status": (status["guest"], status["crash_detected"]),
+            "crash": crash["crash_detected"],
+        }
+        assert view == {
+            "list": ("paused", True),
+            "status": ("paused", True),
+            "crash": True,
+        }, f"the three disagree: {view}"
+    else:
+        assert "vCPU paused" in listing and "crash report waiting" in listing
+        assert "Guest:     paused" in detail
+        assert "qmu crash --vm pzr" in detail
+        assert "NULL pointer dereference" in report
 
 
 def test_crashed_vm_is_never_told_to_be_reaped(cache, monkeypatch, capsys):
@@ -1978,6 +2094,83 @@ def test_every_ssh_command_agrees_on_a_vcpu_halted_mid_command(
             assert "crash" not in out.lower(), command
 
 
+class _PanicMidCommandSSH:
+    """A session the watcher aborts on a terminal panic: the serial log gains
+    the report while the command runs, the predicate is honoured like the
+    real client (one poll, then :class:`SSHAborted` carrying no returncode)
+    for commands and transfers alike. `is_ready` is never consulted — the
+    serial log already explains the loss."""
+
+    def __init__(self, serial_path):
+        self._serial_path = serial_path
+
+    def _abort(self, kwargs, what, stdout=""):
+        abort_when = kwargs.get("abort_when")
+        assert abort_when is not None, f"{what} is not watched"
+        with open(self._serial_path, "a") as stream:
+            stream.write(_LOST_PANIC)
+        assert abort_when() is True
+        raise SSHAborted(f"{what} aborted by qmu", stdout=stdout, stderr="")
+
+    def run(self, command, timeout=30.0, check=False, **kwargs):
+        if command.startswith("gcc"):
+            return 0, "", ""  # the compile step succeeds; the panic lands under the run
+        self._abort(kwargs, "SSH command", stdout="pre\n")
+
+    def push(self, local, remote, **kwargs):
+        self._abort(kwargs, "SCP push")
+
+    def pull(self, remote, local, **kwargs):
+        self._abort(kwargs, "SCP pull")
+
+    def is_ready(self, timeout=2):
+        raise AssertionError("SSH probed when the serial log already explains the loss")
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_every_ssh_command_agrees_on_a_panic_mid_command(
+    output_format, cache, monkeypatch, capsys, tmp_path
+):
+    """The watcher stops exec / dmesg / push / pull / compile the moment the
+    serial log shows a terminal panic. Every one of them is the kernel-crash
+    class (3) with the report, in both renderings. Measured live before this
+    row (#89): a sysrq panic during a 2 GiB `push` was exit 4 `SSHAborted`
+    with no report while the concurrent `exec` was 3 and `qmu crash` returned
+    the same panic — the watcher's no-returncode exception bypassed the
+    transfer handlers' rc-255-plus-marker discrimination."""
+    inst = _ssh_capable_instance(cache)
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+    monkeypatch.setattr(guest_mod, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(guest_mod, "_preflight_ssh_guest", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        guest_mod, "_make_ssh", lambda selected: _PanicMidCommandSSH(inst.serial_log)
+    )
+    (Path("/tmp") / "payload.bin").write_bytes(b"x")
+    (tmp_path / "x.c").write_text("int main(void){return 0;}\n")
+    argvs = {**_HALTED_ARGV, "compile": ["compile", "--vm", VM, "--run", str(tmp_path / "x.c")]}
+
+    for command, argv in argvs.items():
+        with open(inst.serial_log, "w") as stream:
+            stream.write("boot ok\n")
+        rc = cli.main(["--format", output_format, *argv])
+        captured = capsys.readouterr()
+        assert rc == 3, f"`qmu {command}`: rc {rc}"
+        if output_format == "json":
+            payload = json.loads(captured.out)
+            assert payload["ok"] is False, command
+            assert payload["ssh_error"] is True, command
+            assert payload["crash_detected"] is True, command
+            assert "Kernel panic - not syncing" in payload["crash"], command
+            assert payload["vm_id"] == VM, command
+            assert "qmu crash" in payload["hint"], command
+            assert "guest_state" not in payload, command
+        else:
+            assert "Kernel panic - not syncing" in captured.out, command
+            assert "vCPU halted" not in captured.out + captured.err, command
+
+
 class _ServingSSH:
     """A guest that answers: fixed exec result, transfers succeed."""
 
@@ -2483,6 +2676,257 @@ def test_gdb_refuses_an_attached_stub_identically_in_text_and_json(
     assert "pry bridge pid 4242" in message
     assert "pry kill --instance 4242" in message
     assert "TimeoutExpired" not in message
+
+
+_RAW_RESET_ARGV = {k: v for k, v in _RESET_ARGV.items() if "system_reset" in k}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+@pytest.mark.parametrize("fmt", ["json", "ndjson", "text"])
+@pytest.mark.parametrize("command", sorted(_RAW_RESET_ARGV))
+def test_raw_reset_with_unwritable_metadata_emits_exactly_one_envelope(
+    command, fmt, cache, monkeypatch, capsys
+):
+    """Axis 2 (branch vs branch) x the cross-product the reviewer named:
+    metadata persistence failure + raw reset (#88). The reset reaches the
+    guest; only the epoch persist fails. That is ONE outcome and must be ONE
+    envelope -- `ok:false`, the QMP result still inside it, exit 4 -- not a
+    success object followed by a failure object, which a consumer reading
+    the first document accepted as the result."""
+    from qmu.commands import qmp_cmds
+    import contextlib
+
+    inst = _vm_with_log(cache, VM, "[ 0.0] Linux version 7.0.0\nlocalhost login:\n")
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+    monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: False)
+    qmp = _MutatingQMP(inst.serial_log)
+    monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(qmp))
+    idir = cache / "instances"
+    before = Path(inst.serial_log).stat().st_size
+
+    idir.chmod(0o500)
+    try:
+        rc = cli.main(["--format", fmt, *_RAW_RESET_ARGV[command]])
+        captured = capsys.readouterr()
+    finally:
+        idir.chmod(0o755)
+
+    assert rc == 4, f"`qmu {command}` exit {rc}: {captured.out}{captured.err}"
+    # The mutation itself landed (the fake grew the log, as a real reset
+    # prints a new banner) and nothing was persisted.
+    assert Path(inst.serial_log).stat().st_size > before
+    assert instance_mod.load_instance(VM) is None
+    if fmt == "text":
+        assert captured.out == "", f"`qmu {command}` wrote a failure to stdout"
+        assert captured.err.startswith("[qmu] Error:"), captured.err
+        return
+    documents = [line for line in captured.out.splitlines() if line.strip()]
+    if fmt == "ndjson":
+        assert len(documents) == 1, captured.out
+        payload = json.loads(documents[0])
+    else:
+        payload = json.loads(captured.out)  # exactly one object or this raises
+    assert payload["ok"] is False
+    assert payload["error_type"] == "PermissionError"
+    assert payload["guest_mutated"] is True
+    assert str(idir) in payload["error"]
+    # The QMP result the reset produced is still in the envelope.
+    assert ("result" in payload) or ("output" in payload), payload
+    assert f"qmu status --vm {VM}" in payload["hint"]
+
+
+# ---------------------------------------------------------------------------
+# A `snapshot load` that failed AFTER restoration began (#87). QEMU reverts
+# the disks before it loads the vmstate, so when the vmstate load fails
+# (a snapshot saved under one NIC model loaded into a boot with another --
+# receipt 165, QEMU 8.2.2) the paused machine is pre-snapshot devices over
+# post-snapshot disks. qmu used to `cont` it and report `resumed: true`;
+# `status` then said `unknown`/SSH down on a machine `exec` happily tried.
+# Now the load leaves it paused and says so, and `status` + every SSH
+# command agree it is paused. The sibling cell -- a refusal QEMU made before
+# touching the machine -- keeps the guest running and `exec` serving.
+# ---------------------------------------------------------------------------
+
+
+_INCOMPATIBLE_DEVICE_LOAD = (
+    'Unknown ramblock "0000:00:03.0/e1000.rom", cannot accept migration\r\n'
+    "error while loading state for instance 0x0 of device 'ram'\r\n"
+    "Error: Error -22 while loading VM state"
+)
+
+
+class _LoadvmQMP:
+    """One QEMU for every authority: `loadvm` answers `failure` and, like
+    `hmp_loadvm`, stops the guest first (`restore-vm`); `cont` is recorded
+    and honoured so a blind resume shows up as a wrong `status`."""
+
+    def __init__(self, failure):
+        self._failure = failure
+        self.running = True
+        self.status = "running"
+        self.cont_sent = 0
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        if command == "query-status":
+            return {"running": self.running, "status": self.status}
+        if command == "cont":
+            self.cont_sent += 1
+            self.running, self.status = True, "running"
+        return {}
+
+    def execute_hmp(self, command_line, timeout=30.0):
+        if command_line == "info snapshots":
+            return (
+                "List of snapshots present on all disks:\n"
+                "ID        TAG               VM SIZE                DATE       VM CLOCK\n"
+                "--        clean             486 MiB 2026-05-28 23:11:52 0000:01:01.992\n"
+                "--        good              486 MiB 2026-05-28 23:20:00 0000:01:30.000\n"
+            )
+        if command_line == "loadvm good":
+            # A compatible tag: QEMU loads it and, as `hmp_loadvm` does,
+            # restarts the guest only if it was running before.
+            return ""
+        if command_line.startswith("loadvm "):
+            self.running, self.status = False, "restore-vm"
+            return self._failure
+        return ""
+
+
+def _loadvm_subject(cache, monkeypatch, failure):
+    from qmu import _cliutil
+    from qmu.commands import qmp_cmds
+    import contextlib
+
+    inst = _ssh_capable_instance(cache)
+    with open(inst.serial_log, "w") as stream:
+        stream.write("[ 0.0] Linux version 6.12.0 (x) #1\nlocalhost login:\n")
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+        monkeypatch.setattr(mod, "find_orphan_qemus", lambda: [], raising=False)
+    for mod in (lifecycle, guest_mod, qmp_cmds):
+        monkeypatch.setattr(mod, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+    monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: False)
+    qmp = _LoadvmQMP(failure)
+    for mod in (lifecycle, _cliutil, qmp_cmds):
+        monkeypatch.setattr(mod, "_qmp_ctx", lambda inst: contextlib.nullcontext(qmp))
+    monkeypatch.setattr(guest_mod.time, "sleep", lambda _: None)
+    return inst, qmp
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_status_and_ssh_commands_agree_a_partially_restored_guest_is_paused(
+    fmt, cache, monkeypatch, capsys
+):
+    inst, qmp = _loadvm_subject(cache, monkeypatch, _INCOMPATIBLE_DEVICE_LOAD)
+    monkeypatch.setattr(
+        lifecycle, "_make_ssh",
+        lambda i: (_ for _ in ()).throw(AssertionError("SSH probed on a paused guest")),
+    )
+    monkeypatch.setattr(
+        guest_mod, "_make_ssh",
+        lambda selected: (_ for _ in ()).throw(AssertionError("SSH attempted")),
+    )
+
+    rc = cli.main(["--format", "json", "snapshot", "load", "clean", "--vm", VM])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert {
+        "ok": payload["ok"],
+        "resumed": payload["resumed"],
+        "guest_paused": payload["guest_paused"],
+        "restore_state": payload["restore_state"],
+    } == {"ok": False, "resumed": False, "guest_paused": True, "restore_state": "partial"}
+    assert qmp.cont_sent == 0
+    assert qmp.running is False
+    assert f"qmu kill --vm {VM}" in payload["hint"]
+    assert "Resume with" not in payload["hint"]
+
+    rc = cli.main(["--format", fmt, "status", "--vm", VM])
+    out = capsys.readouterr().out
+    assert rc == 0
+    if fmt == "json":
+        status = json.loads(out)
+        assert status["guest"] == "paused"
+        assert status["qemu_status"] == "restore-vm"
+    else:
+        assert "Guest:     paused" in out
+
+    for command, argv in _PANICKED_ARGV.items():
+        rc = cli.main(["--format", fmt, *argv])
+        captured = capsys.readouterr()
+        assert rc == 1, f"`qmu {command}` rc={rc}"
+        if fmt == "json":
+            refusal = json.loads(captured.out)
+            assert refusal["ok"] is False, command
+            assert refusal["guest_state"] == "paused", command
+            assert refusal["qemu_status"] == "restore-vm", command
+            assert refusal["ssh_error"] is False, command
+            assert refusal["crash_detected"] is False, command
+        else:
+            assert captured.out == "", f"`qmu {command}` wrote a refusal to stdout"
+            assert captured.err.startswith("[qmu] Error:"), f"`qmu {command}`"
+            assert "restore-vm" in captured.err, f"`qmu {command}`"
+    assert qmp.cont_sent == 0
+
+    # The recovery the hint names: a known-good load succeeds AND resumes
+    # the guest (QEMU alone restarts only a guest that was running before),
+    # so `status` and `exec` go straight back to serving.
+    monkeypatch.setattr(lifecycle, "_make_ssh", lambda i: _ServingSSH())
+    monkeypatch.setattr(guest_mod, "_make_ssh", lambda selected: _ServingSSH(0, "up\n"))
+    rc = cli.main(["--format", "json", "snapshot", "load", "good", "--vm", VM])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["ok"] is True
+    assert payload["resumed"] is True
+    assert qmp.cont_sent == 1
+    assert qmp.running is True
+    rc = cli.main(["--format", "json", "status", "--vm", VM])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["guest"] == "serving"
+    rc = cli.main(["--format", "json", "exec", "--vm", VM, "true"])
+    result = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert result["stdout"] == "up\n"
+
+
+def test_pre_restore_refusal_keeps_the_guest_serving(cache, monkeypatch, capsys):
+    """The sibling cell: QEMU said no before restoring anything (the tag is
+    listed -- a partial snapshot passes the listing pre-check -- but loadvm
+    refuses it), so the guest is exactly what it was and is resumed; `status`
+    says serving and `exec` runs."""
+    inst, qmp = _loadvm_subject(
+        cache, monkeypatch, "Error: Snapshot 'clean' does not exist in one or more devices"
+    )
+    monkeypatch.setattr(lifecycle, "_make_ssh", lambda i: _ServingSSH())
+    monkeypatch.setattr(guest_mod, "_make_ssh", lambda selected: _ServingSSH(0, "up\n"))
+
+    rc = cli.main(["--format", "json", "snapshot", "load", "clean", "--vm", VM])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert {
+        "ok": payload["ok"],
+        "resumed": payload["resumed"],
+        "guest_paused": payload["guest_paused"],
+        "restore_state": payload["restore_state"],
+    } == {"ok": False, "resumed": True, "guest_paused": False, "restore_state": "none"}
+    assert qmp.cont_sent == 1
+    assert qmp.running is True
+
+    rc = cli.main(["--format", "json", "status", "--vm", VM])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["guest"] == "serving"
+
+    rc = cli.main(["--format", "json", "exec", "--vm", VM, "true"])
+    result = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert result["ok"] is True
+    assert result["stdout"] == "up\n"
 
 
 # ---------------------------------------------------------------------------

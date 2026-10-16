@@ -610,7 +610,8 @@ def test_rm_force_removes_only_the_present_paths(tmp_path, monkeypatch):
     assert result == {"removed": ["/root/here.txt"], "missing": ["/root/nope.txt"]}
     # `rm-f` so ENOENT is genuinely tolerated — plain `rm` errors on a missing
     # path — and only the path that exists is handed to it.
-    assert scripts[-1] == "rm-f /root/here.txt\n"
+    assert scripts[-1].split(" ")[0] == "rm-f"
+    assert "/root/here.txt" in scripts[-1] and "/root/nope.txt" not in scripts[-1]
 
 
 def test_rm_recursive_uses_rm_rf(tmp_path, monkeypatch):
@@ -625,7 +626,7 @@ def test_rm_recursive_uses_rm_rf(tmp_path, monkeypatch):
 
     rootfs_mod.remove(str(image), ["/rooot"], partition=0, recursive=True)
 
-    assert "rm-rf /rooot" in scripts[-1]
+    assert scripts[-1].split(" ")[0] == "rm-rf" and "/rooot" in scripts[-1]
 
 
 # ---------------------------------------------------------------------------

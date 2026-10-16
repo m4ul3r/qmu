@@ -9,13 +9,13 @@ rounds kept surfacing, relocated to commands that had not been fixed yet.
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import pytest
 
 from qmu import cli
 from qmu.commands import lifecycle
 from qmu.instance import VMInstance
+from qmu.ssh import SSHError
 
 
 def _instance(**over) -> VMInstance:
@@ -251,36 +251,81 @@ def test_dropped_rw_explains_the_read_only_root(tmp_path, monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_exec_and_scp_agree_on_transport_loss_without_a_crash(tmp_path, monkeypatch):
+class _DroppedSSH:
+    """One lost transport as `exec` and `push` each observe it: `run` returns
+    ssh's 255 with the liveness probe failing; `scp` raises rc 255 plus a
+    transport marker. `serial_text` lands in the log while the command runs,
+    which is the only placement that counts as fresh for the command."""
+
+    def __init__(self, serial, serial_text):
+        self._serial, self._text = serial, serial_text
+
+    def _drop(self):
+        with open(self._serial, "a") as stream:
+            stream.write(self._text)
+
+    def run(self, command, timeout=30.0, check=False, **kwargs):
+        self._drop()
+        return 255, "", ""
+
+    def push(self, local, remote, **kwargs):
+        self._drop()
+        raise SSHError(
+            "SCP push failed: mux failed: Broken pipe",
+            returncode=255,
+            stderr="mux failed: Broken pipe",
+        )
+
+    def is_ready(self, timeout=2):
+        return False
+
+
+def _lost_transport_rcs(tmp_path, monkeypatch, capsys, *, serial_text):
+    from qmu.commands import guest as guest_mod
+
+    serial = tmp_path / "vm.serial.log"
+    inst = _instance(serial_log=str(serial), ssh_port=10022, ssh_key="/tmp/k", harness=False)
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"x")
+    monkeypatch.setattr(guest_mod, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(
+        guest_mod, "_make_ssh", lambda selected: _DroppedSSH(serial, serial_text)
+    )
+    monkeypatch.setattr(guest_mod, "_preflight_ssh_guest", lambda *a, **kw: None)
+    monkeypatch.setattr(guest_mod, "_require_running_vm", lambda vm, command: None)
+    monkeypatch.setattr(guest_mod.time, "sleep", lambda _: None)
+
+    rcs = {}
+    for command, argv in (
+        ("exec", ["exec", "--vm", "r6-vm", "true"]),
+        ("push", ["push", "--vm", "r6-vm", str(payload), "/root/payload.bin"]),
+    ):
+        serial.write_text("ordinary boot log\n")
+        rcs[command] = cli.main(["--format", "json", *argv])
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["ssh_error"] is True, command
+        assert envelope["crash_detected"] is (envelope["crash"] is not None), command
+    return rcs
+
+
+def test_exec_and_scp_agree_on_transport_loss_without_a_crash(tmp_path, monkeypatch, capsys):
     """Sibling commands disagreeing about one condition is the recurring class.
 
     scp returned 4 for "connection dropped, no crash in the log" while exec
     returned 3, so a guest with no sshd reported a kernel panic on every exec.
     """
-    from qmu.commands import guest as guest_mod
+    rcs = _lost_transport_rcs(tmp_path, monkeypatch, capsys, serial_text="")
 
-    serial = tmp_path / "vm.serial.log"
-    serial.write_text("ordinary boot log\n")
-    inst = _instance(serial_log=str(serial))
+    assert rcs == {"exec": 4, "push": 4}
 
-    args = SimpleNamespace(format="text", out=None, vm=None)
-    exec_rc = guest_mod._emit_ssh_lost(args, "true", inst, start_offset=0)
-    scp_rc = guest_mod._emit_transfer_transport_lost(
-        args, operation="push", local="a", remote="b", inst=inst, start_offset=0
+
+def test_exec_and_scp_still_report_3_when_a_crash_corroborates(tmp_path, monkeypatch, capsys):
+    rcs = _lost_transport_rcs(
+        tmp_path, monkeypatch, capsys,
+        serial_text=(
+            "[ 1.1] Kernel panic - not syncing: Fatal exception\n"
+            "[ 1.1] ---[ end Kernel panic - not syncing: Fatal exception ]---\n"
+        ),
     )
 
-    assert exec_rc == scp_rc == 4
-
-
-def test_exec_still_reports_3_when_a_crash_corroborates(tmp_path):
-    from qmu.commands import guest as guest_mod
-
-    serial = tmp_path / "vm.serial.log"
-    serial.write_text(
-        "[ 1.1] Kernel panic - not syncing: Fatal exception\n"
-        "[ 1.1] ---[ end Kernel panic - not syncing: Fatal exception ]---\n"
-    )
-    inst = _instance(serial_log=str(serial))
-    args = SimpleNamespace(format="text", out=None, vm=None)
-
-    assert guest_mod._emit_ssh_lost(args, "true", inst, start_offset=0) == 3
+    assert rcs == {"exec": 3, "push": 3}

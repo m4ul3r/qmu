@@ -28,7 +28,7 @@ from .instance import (
     is_pid_alive,
     remove_instance,
 )
-from .output import write_output_result
+from .output import write_bytes_result, write_output_result
 from .qmp import QMPBusyError, QMPClient, QMPError
 from .serial import current_boot_offset, has_terminal_panic
 from .ssh import SSHClient
@@ -177,6 +177,31 @@ def _emit(
         _output(data, args, stem=stem, source_ok=source_ok)
 
 
+def _emit_bytes(args: argparse.Namespace, raw: bytes, *, stem: str) -> None:
+    """Text-mode delivery of a byte payload on stdout, verbatim.
+
+    `_emit` renders through `render_value`, which decodes and appends a
+    newline, so guest stdout came out as `x\\n` for `printf x` and as U+FFFD
+    for a 0xff byte — against the byte-for-byte promise `exec`/`run` make.
+    Inline output goes to `sys.stdout.buffer` untouched; a payload over the
+    spill budget, or `--out`, is written to the file exactly and described by
+    the usual pointer/envelope, so the artifact is checksum-comparable with
+    what the guest wrote.
+    """
+    out = getattr(args, "out", None)
+    result = write_bytes_result(
+        raw, out_path=Path(out) if out else None, stem=stem, suffix=".txt"
+    )
+    if result.artifact is None:
+        sys.stdout.flush()
+        sys.stdout.buffer.write(raw)
+        sys.stdout.buffer.flush()
+        return
+    sys.stdout.write(result.rendered)
+    if result.spilled:
+        sys.stderr.write(f"[qmu] Output spilled to {result.artifact['artifact_path']}\n")
+
+
 def _emit_refusal(
     args: argparse.Namespace,
     *,
@@ -242,12 +267,40 @@ def _stopped_guest_payload(
     Used before an SSH command starts (preflight) and after one lost its
     transport mid-flight (a breakpoint fired while `exec` was running), so
     both tell the same story and name the same recovery.
+
+    `restore-vm` is the one halt `qmu cont` must NOT be the answer to: QEMU
+    is left in it by a `snapshot load` that failed mid-restore (#87), with
+    the disk rewound and the devices not, and continuing that machine is
+    the inconsistent resume the failed load refused to perform. The recovery
+    is another load of a known-good snapshot, or kill and relaunch.
     """
-    hint = (
-        f"VM '{inst.vm_id}' is {qemu_status}. "
-        f"Resume with: qmu cont --vm {inst.vm_id}. "
-        "If a debugger halted the vCPU, use: pry continue."
-    )
+    if qemu_status == "restore-vm":
+        recovery = (
+            f"qmu snapshot load <known-good> --vm {inst.vm_id}, or "
+            f"qmu kill --vm {inst.vm_id} and relaunch"
+        )
+        hint = (
+            f"VM '{inst.vm_id}' is restore-vm: the last snapshot load failed "
+            "mid-restore, so the machine state is inconsistent. Do not resume it. "
+            f"Recover with: {recovery}."
+        )
+        text = [
+            f"VM '{inst.vm_id}' is restore-vm (vCPU halted): the last snapshot "
+            "load failed mid-restore; the machine state is inconsistent.",
+            f"Recover with: {recovery}",
+            "Do not: qmu cont (resumes a rewound disk under un-restored devices)",
+        ]
+    else:
+        hint = (
+            f"VM '{inst.vm_id}' is {qemu_status}. "
+            f"Resume with: qmu cont --vm {inst.vm_id}. "
+            "If a debugger halted the vCPU, use: pry continue."
+        )
+        text = [
+            f"VM '{inst.vm_id}' is {qemu_status} (vCPU halted).",
+            f"Resume with: qmu cont --vm {inst.vm_id}",
+            "Debugger alternative: pry continue",
+        ]
     data: dict[str, Any] = {
         "ok": False,
         "vm_id": inst.vm_id,
@@ -257,11 +310,6 @@ def _stopped_guest_payload(
         "crash_detected": False,
         "hint": hint,
     }
-    text = [
-        f"VM '{inst.vm_id}' is {qemu_status} (vCPU halted).",
-        f"Resume with: qmu cont --vm {inst.vm_id}",
-        "Debugger alternative: pry continue",
-    ]
     return data, text
 
 

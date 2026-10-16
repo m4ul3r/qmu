@@ -40,9 +40,14 @@ Exit codes you will branch on (full contract: `qmu --help`, `skill://qmu/referen
 | `qmu wait --vm X` (bare) | `0` | QEMU exited — now, or before the wait began | `reason` (`already_stopped` when it was already gone), `guest` |
 | | `3` | terminal panic while QEMU still runs; `qmu kill --vm X` keeps the report | `reason: "terminal_panic"`, `crash` |
 | | `124` / `4` | timeout / QMP unreachable with the pid alive | `reason`, `qmp` |
-| `qmu exec` | `0`/`N` | guest command's status | `exit_code` |
-| | `4` | SSH transport lost or refused, no fresh crash report | `error_type` |
-| | `3` | SSH dropped **and** a fresh serial crash report exists | `crash` |
+| `qmu exec` | `0` / `1` | guest command exited 0 / non-zero; the guest's own status is only in the JSON, never qmu's exit | `exit_code` (e.g. guest `exit 255` → qmu `1`, `exit_code: 255`) |
+| | `4` | SSH transport lost or refused, no fresh crash report — a **result** envelope, not an exception | `ok: false`, `ssh_error: true`, `crash_detected: false`, `exit_code: null`, `hint` |
+| | `3` | SSH dropped **and** a fresh serial crash report exists | `ssh_error: true`, `crash_detected: true`, `crash` |
+| | `1` | preflight refused to start the command: terminal panic earlier in this boot, or vCPU halted (debugger) | `guest_state: "panicked"` \| `"paused"`, `ssh_error: false`, `hint` |
+
+`error_type` exists only in top-level exception envelopes (`{"ok": false,
+"error": …, "error_type": …}` — usage errors, or an infra failure raised before
+a result was built); never branch on it for transport loss.
 
 ## Goal and fidelity boundary
 
@@ -175,12 +180,21 @@ and creates it if missing. Fetched files are owned by root on the host
 skills/firmware-over-qmu/fetch-hosttools.sh --arch <arm64|amd64|arm/v7|386> \
    --release <bionic|focal|jammy|noble> --out ./fw-tools
 ```
-It fetches `dropbear`, `dropbearkey`, `gdbserver`, `sftp-server` and selected
-non-glibc libraries, **not shells or application utilities**; its library filter
-is not a complete compatibility check. Source any missing prerequisites
-separately, record their provenance, and verify required symbols even when a
-same-named library already exists. Keep helper libraries scoped to the access
-tools rather than globally replacing vendor libraries.
+It fetches `dropbear`, `dropbearkey`, `gdbserver`, `sftp-server` and every
+library the container's loader resolves for them **except the glibc base set**
+(`libc`, `libdl`, `libpthread`, `libm`, `librt`, `libcrypt`, `libutil`,
+`libresolv`, `ld-linux`), matched on the basename with its version delimiter —
+so `libcrypt.so.1` is base, `libcrypto.so.3` (OpenSSL, needed by jammy's
+`sftp-server`) is copied into `libs/`. Before reporting success it re-walks
+every copied binary and library and fails, listing the gaps, if any dependency
+is neither in `libs/` nor base. That proves the *container's* closure is
+shipped, **not** firmware compatibility: still verify the loader path, symbol
+versions, and the base set against the firmware's own libc, source any missing
+prerequisites separately, and record their provenance. Keep helper libraries
+scoped to the access tools rather than globally replacing vendor libraries.
+On an EOL release the fetcher rewrites every apt source — including the ARM
+`ports.ubuntu.com/ubuntu-ports` tree — to `old-releases.ubuntu.com/ubuntu`,
+which serves all architectures under that one path.
 Inject offline into the private image with `debugfs`:
 ```bash
 # fw-tools -> /opt/qmu-tools/{bin,lib}; sftp-server -> its verified compiled path
@@ -212,15 +226,21 @@ original decision path for convergence, rather than bypassing its unmet
 dependencies. A unit file being present, a unit being enabled, a running process,
 service readiness, and a successful benign exchange are distinct evidence levels.
 
-Templates: `templates/qmu-net-init.sh` configures networking then attempts
-foreground dropbear; `templates/qmu-probe-init.sh` inspects dependency resolution.
-Copy, replace the probe's synthetic `/usr/lib/libexample.so` with an identified
-library or binary, adjust other firmware-specific paths, and inject. Both bypass
-vendor init: they provide intermediate evidence, not vendor init/service convergence.
-The templates require Bash. If a private adapter instead uses BusyBox ash,
-`exec daemon; fail` does not preserve PID1 when execution fails. Keep ash as PID1,
-start the foreground-mode daemon as a child, wait for it, and park with its exit
-status on failure. Exercise that failure path with the actual guest shell.
+Templates: `templates/qmu-net-init.sh` configures networking then runs foreground
+dropbear as a **supervised child** of PID 1; `templates/qmu-probe-init.sh`
+inspects dependency resolution. Copy, replace the probe's synthetic
+`/usr/lib/libexample.so` with an identified library or binary, adjust other
+firmware-specific paths, and inject. Both bypass vendor init: they provide
+intermediate evidence, not vendor init/service convergence.
+Never `exec` the daemon from PID 1: an exec that *succeeds* and then exits
+(loader refusal, missing library, startup error) takes init with it and the
+kernel panics with `Attempted to kill init!` — `qmu wait` reports exit `3` and
+no parked marker survives. The template instead starts the daemon with `&`,
+`wait`s on it, prints `=== QMU-HELPER-EXITED code=<status> ===` plus
+`QMU-NET-FAILED: dropbear-exited <status>` when it returns, and parks.
+The templates require Bash; a private BusyBox-ash adapter must keep the same
+shape (ash as PID 1, daemon as a child, `wait`, marker, park) and exercise
+that failure path with the actual guest shell.
 
 
 ### 5. Boot
@@ -293,11 +313,12 @@ before attributing failure to hardware or inventing a replacement provider.
 | `QMU-BOOT-DONE` | `ldd` exited 0 with non-whitespace output and no `=> not found` dependency; not functional loading/init |
 | `QMU-PROBE-FAILED: <diagnostic>` | Dependency command failure (with status), unresolved dependencies, or empty evidence; PID1 parks without success/shutdown |
 | `QMU-NET-CONFIGURED <observation>` | Required loopback/interface/address/route commands succeeded and `eth0` was observed with `inet 10.0.2.15/24`; not SSH readiness |
-| `QMU-NET-FAILED: <stage>` | Required setup, address query/observation, or daemon exec failed; PID1 parks |
+| `QMU-NET-FAILED: <stage>` | Required setup or address query/observation failed, or the daemon returned (`dropbear-exited <status>`); PID1 parks |
+| `=== QMU-HELPER-EXITED code=<status> ===` | The supervised daemon returned with that status — exec failure (`126`/`127`), loader refusal, or a daemon that exited (even `0`); PID1 is parked, QEMU still runs. `qmu wait --vm fw-access --pattern '^=== QMU-HELPER-EXITED' --timeout 60` waits for it; an `Attempted to kill init!` panic instead means the init in the image is not this template |
 
 The network template uses strict one-shot address/route `add`: an existing
 address or route reported as an error is failure, not silently repaired.
-Network configuration can succeed before `dropbear-exec` fails; the earlier
+Network configuration can succeed before the daemon stage fails; the earlier
 configuration observation remains true but does not prove SSH access.
 SSH readiness is qmu's actual **host-side connection check**, not a serial
 marker. When it times out, `launch` exits `4` with `ok: false` and
@@ -388,7 +409,9 @@ userspace.) Stripped binaries: load symbols from your BNDB/IDA analysis or a `.s
 |---|---|---|
 | `qmu exec`/`log` says no such VM, but `launch --name fw` worked | `--name` names the instance at `launch`; every other verb selects with the global `--vm` | `qmu --vm fw exec -- '…'` (or `qmu exec --vm fw …`) |
 | `launch` exit 4, `ssh_status: "no-console-output"` | wrong `console=` or machine type for the arch; the guest never wrote to serial | arm64: `console=ttyAMA0` + `extra_args = ["-M", "virt"]`; x86: `console=ttyS0`, no `-M virt` |
-| `launch` exit 4, `ssh_status: "timeout (VM may still be booting)"`, serial shows `QMU-NET-CONFIGURED` | dropbear did not start or rejected the key: missing loader/library, bad `authorized_keys` perms, key algorithm | `qmu log --vm fw-access --grep 'QMU-NET|dropbear'`; see the key and permission rows below |
+| `launch` exit 4, `ssh_status: "timeout (VM may still be booting)"`, serial shows `QMU-NET-CONFIGURED` and no `QMU-HELPER-EXITED` | dropbear is running but rejected the key, or listens elsewhere: bad `authorized_keys` perms, key algorithm, port | `qmu log --vm fw-access --grep 'QMU-NET|QMU-HELPER|dropbear'`; see the key and permission rows below |
+| same, serial shows `=== QMU-HELPER-EXITED code=N ===` | dropbear exited: `127`/`126` = not found/not executable (loader path, ELF interpreter), other = missing library, ABI mismatch, or a startup error printed just above the marker | `qmu log --vm fw-access --tail 40`; phase 4 checks on the helper, `libs/` completeness, `LD_LIBRARY_PATH=/opt/qmu-tools/lib` |
+| same, serial shows `Attempted to kill init!` (wait exit 3) | the image's init is not this template: a hand-written `exec daemon` init lost PID 1 when the daemon returned | use the template's child+`wait` shape; the panic hides the daemon's exit status |
 | same, serial shows `QMU-NET-FAILED: <stage>` | `ip` link/address/route step failed, or the address already existed (strict one-shot `add`) | fix the template for this firmware's `ip`/interface; check `VIRTIO_NET`/`VIRTIO_PCI`/`PCI_HOST_GENERIC` are `=y` in `$CONFIG` |
 | same, serial empty after the kernel banner | kernel reached init but init could not exec (`/bin/bash` missing, wrong ELF interpreter) | phase 4 inventory; the templates require Bash |
 | `No matching algo hostkey` / client key rejected | sourced dropbear predates ed25519 (bionic 2017.75) | ecdsa-nistp256 for both host keys (`dropbear -R` makes rsa+ecdsa) and the client key (`ssh-keygen -t ecdsa`); ≥2018.76 can use ed25519 |
@@ -400,5 +423,6 @@ userspace.) Stripped binaries: load symbols from your BNDB/IDA analysis or a `.s
 | `qmu wait --pattern` exit 1 right after launch | QEMU exited before the marker (init crashed, PID1 parked then powered off) | `qmu log --vm fw-probe`; `reason: "process_exited"` + `crash` in JSON |
 | `qmu wait --pattern` exit 4 | serial log missing/unreadable — inconclusive | `inconclusive: true`; check `serial_log` path, rerun |
 | helper binary `Exec format error` / `not found` with the file present | ELF machine/ABI/interpreter mismatch; musl vs glibc | phase 4 checks (machine, class, interpreter path, symbol versions); use a compatible sysroot or verified static helpers — static linking removes shared-libc lookup, not kernel ABI, shell, account or runtime-file requirements |
-| `fetch-hosttools.sh` fails to run the container | no binfmt for a cross-arch container, or EOL release | `docker run --rm --privileged tonistiigi/binfmt:latest --install all`; the script already falls back to `old-releases.ubuntu.com` |
+| `fetch-hosttools.sh` fails to run the container | no binfmt for a cross-arch container, or EOL release | `docker run --rm --privileged tonistiigi/binfmt:latest --install all`; on apt failure the script rewrites the sources (ARM `ubuntu-ports` included) to `old-releases.ubuntu.com/ubuntu` and retries |
+| `fetch-hosttools.sh` exits non-zero after `ERROR: fetched helpers need libraries …` | a copied helper or library needs a non-glibc library the copy step missed | the listed `<file>: <lib>` pairs are the gap; fetch them from the same container release and record provenance — do not ship the partial `libs/` |
 | injected files are root-owned/unexpected on the host | the fetcher writes through a container | `sudo chown` or copy; ownership inside the image is set by your `debugfs` commands, not by the host files |

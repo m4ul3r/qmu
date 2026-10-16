@@ -63,14 +63,46 @@ command after a load stalls 15–20 s on the stale master's keepalive expiry
 that symptom, `ssh -O exit` on the control socket under `$QMU_TEMP_DIR/ssh`
 (or a second `qmu exec`) clears it.
 
-A `load` whose HMP `loadvm` fails (typo'd name, incompatible device state)
-**resumes the guest** instead of leaving it silently paused (`resumed: true`
-in JSON; `guest_paused: true` with a `qmu cont` hint if the resume itself
-failed). HMP error replies on `save`/`load`/`delete` are failures — exit 1,
-`ok:false` with `error`, `error_type: "SnapshotError"` and `hint` (`qmu
-snapshot list --vm X`) — and `save` confirms the tag in `info snapshots`
-before reporting success. The success envelope of `load` is `{ok, message,
-name}`; it carries no `resumed`/`ssh` key.
+A `load` whose HMP `loadvm` fails is exit 1, `ok:false` with `error`,
+`error_type: "SnapshotError"`, `hint`, and three load-only keys: `resumed`,
+`guest_paused`, `restore_state`. What qmu does next depends on how far
+`loadvm` got (`restore_state`):
+
+- `none` — nothing was restored. A tag absent from `info snapshots` is
+  caught **before** `loadvm`, so the guest never stops (`resumed: false`,
+  `guest_paused: false`, hint `Snapshot 'X' is not in the image of VM 'Y'.
+  List what exists: qmu snapshot list --vm Y`). Only when QEMU itself refuses
+  a *listed* tag pre-restore (a partial snapshot) does `loadvm` pause the
+  guest first; qmu then resumes it (`resumed: true`; `guest_paused: true`
+  with a `qmu cont` hint only if that resume itself failed).
+- `partial` / `unknown` — restoration had begun (an incompatible device set,
+  e.g. an e1000 snapshot loaded into a virtio-net boot; `Missing section
+  footer`, `error while loading state`). QEMU reverts the **disks before** it
+  loads the vmstate, so the machine is now pre-snapshot devices over
+  post-snapshot disks. qmu deliberately leaves it **paused**
+  (`guest_paused: true`; `status` shows `guest: "paused"`, QEMU status
+  `restore-vm`; `exec`/`push`/`pull`/`compile`/`dmesg` refuse with
+  `guest_state: "paused"`) and the hint says `Do not resume it blindly with
+  qmu cont`: recover with a known-good `qmu snapshot load <tag> --vm X` or
+  `qmu kill --vm X` + `qmu launch`. The recovery load needs no `qmu cont`:
+  QEMU alone would leave a `restore-vm` guest stopped (`loadvm` only restarts
+  a guest that was running), so qmu issues `cont` in exactly that case and
+  the success envelope says so (`resumed: true`, text `Guest resumed (it was
+  stopped by a previous failed load).`); afterwards `status` is `serving` and
+  `exec` works. A raw `qmu monitor 'loadvm X'` that fails
+  the same way carries the same no-`cont` hint; with a debugger attached the
+  stale-session warning (#44) fires too, because a partial restore did rewind.
+
+HMP error replies on `save`/`load`/`delete` are failures (same envelope), and
+`save` confirms the tag in `info snapshots` before reporting success. The
+success envelope of `load` is `{ok, message, name, resumed}` — `resumed` is
+true only for the recovery case above; a guest the operator or a debugger
+paused (`paused`/`debug`) stays paused after a successful load, as before. It
+carries no `ssh` key. HMP error detection is anchored to the **start** of a
+reply line (`Error: `, `unknown command: `, `Snapshot '…' does not exist`,
+…), so a tag such as `Error:checkpoint` saves, lists and loads normally and
+`qmu monitor 'info snapshots'` / `qmu qmp human-monitor-command` return 0
+with it in the table.
 
 ## Debugger interaction
 

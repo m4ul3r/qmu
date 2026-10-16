@@ -122,9 +122,9 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
 def _wait_for_guest(ssh: SSHClient, inst: VMInstance, timeout: float) -> str:
     """Block until the guest answers SSH. Returns 'ready' / 'died' / 'timeout'.
 
-    This is ``SSHClient.wait_ready`` plus a liveness check, because the two
-    failures need different exit codes and a VM that died on boot must not burn
-    the whole ``--ssh-timeout`` before saying so: a kernel that panics three
+    An SSH readiness loop plus a liveness check, because the two failures
+    need different exit codes and a VM that died on boot must not burn the
+    whole ``--ssh-timeout`` before saying so: a kernel that panics three
     seconds in would otherwise cost a full minute of wall clock per attempt.
     """
     deadline = time.monotonic() + timeout
@@ -273,9 +273,10 @@ def _handle_run(args: argparse.Namespace) -> int:
             status, data, text = _boot_failure_payload(
                 inst, outcome, float(args.ssh_timeout)
             )
-            notes: list[str] = []
+            stdout = ""
+            notes: list[str | bytes] = []
         else:
-            status, data, text, notes = _run_guest_command(
+            status, data, stdout, text, notes = _run_guest_command(
                 ssh, command, inst, timeout=args.timeout
             )
             # The ssh ControlMaster (`ControlPersist=60`) outlives the command;
@@ -337,5 +338,7 @@ def _handle_run(args: argparse.Namespace) -> int:
         if not args.keep:
             notes.append(f"Clean up: qmu prune --vm {inst.vm_id}")
 
-    _emit_guest_result(args, data=data, text=text, notes=notes, stem="run")
+    _emit_guest_result(
+        args, data=data, stdout=stdout, text=text, notes=notes, stem="run"
+    )
     return status
