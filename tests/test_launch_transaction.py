@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fcntl
+import os
 import subprocess
 from pathlib import Path
 
@@ -10,6 +12,22 @@ from qmu.config import QMUConfig
 from qmu.instance import load_instance, list_stopped_instances
 from qmu.paths import instances_dir, qmp_socket_path, qemu_log_path, serial_log_path
 from qmu.vm import launch_vm
+
+
+def _lock_held(path: Path) -> bool:
+    """True when another open file description still holds `path` (flock)."""
+    if not path.exists():
+        return False
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
 
 
 class FakeProcess:
@@ -278,6 +296,8 @@ def test_launch_bind_race_retry_rolls_back_before_next_spawn(tmp_path, monkeypat
     assert inst.vm_id == "vm-22023"
     assert load_instance("vm-22023") is not None
     assert ("terminate", None) not in second.calls
+    # The lock is released once QMP answered; a sibling can allocate now.
+    assert not _lock_held(instances_dir() / "ports.lock")
 
 
 def test_launch_bind_retry_exhaustion_reaps_every_child_and_removes_every_attempt(
@@ -328,6 +348,11 @@ def test_launch_bind_retry_exhaustion_reaps_every_child_and_removes_every_attemp
         assert not serial_log_path(vm_id).exists()
         assert not (instances_dir() / f"{vm_id}.json").exists()
     assert "attempt 3" in str(exc.value)
+    # Three losses under the allocation lock: concurrent qmu launches are
+    # excluded, so the error names the lock and blames a foreign listener.
+    assert f"while holding {instances_dir() / 'ports.lock'}" in str(exc.value)
+    assert "foreign listener" in str(exc.value)
+    assert not _lock_held(instances_dir() / "ports.lock")
 
 
 def test_launch_qmp_appearance_timeout_terminates_waits_and_cleans(

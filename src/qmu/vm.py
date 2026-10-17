@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import os
 import shutil
 import socket
@@ -35,13 +36,22 @@ def _resolve_boot_file(value: str, label: str, source: str = "") -> Path:
         path = path.resolve()
         mode = path.stat().st_mode
     except (FileNotFoundError, NotADirectoryError):
-        raise QMUError(f"{label} not found: {path}{source}") from None
+        raise QMUError(
+            f"{label} not found: {path}{source}",
+            hint=f"ls -l {path}; qmu config show names the file that set it",
+        ) from None
     except OSError as exc:
-        raise QMUError(f"{label} not accessible: {path} ({exc.strerror}){source}") from None
+        raise QMUError(
+            f"{label} not accessible: {path} ({exc.strerror}){source}",
+            hint=f"ls -l {path}; check its permissions",
+        ) from None
     except RuntimeError as exc:
         raise QMUError(f"{label} not accessible: {path} ({exc}){source}") from None
     if not stat.S_ISREG(mode):
-        raise QMUError(f"{label} is not a regular file: {path}{source}")
+        raise QMUError(
+            f"{label} is not a regular file: {path}{source}",
+            hint=f"ls -l {path}; point at the image file itself",
+        )
     return path
 
 
@@ -223,14 +233,67 @@ class _LaunchAttempt:
         self.committed = True
 
 
+PORT_LOCK_NAME = "ports.lock"
+# Below this the lock wait is normal contention; above it, name it so an
+# agent timing 8 parallel launches sees where the seconds went.
+PORT_LOCK_WAIT_NOTE_SECONDS = 1.0
+
+
+class PortAllocationLock:
+    """`flock` serialising the probe→bind window of concurrent launches (#113).
+
+    `find_free_port` closes its probe socket before QEMU binds, so N launchers
+    probing from the same `ssh_port_start` all pick the same first free port
+    and N-1 of them lose the bind race (`Could not set up host forwarding
+    rule`). The retry loop re-runs the same deterministic search and loses
+    again. Holding this lock from allocation until QEMU has bound — the first
+    QMP connect succeeding proves it, QEMU sets up hostfwd before it serves
+    QMP — makes the next launcher's probe see the port as taken. Only the
+    ~1 s allocation window is serialised; flock releases on process death, so a
+    launcher killed mid-window cannot wedge its siblings.
+    """
+
+    def __init__(self, home: Path) -> None:
+        self.path = home / PORT_LOCK_NAME
+        self._fd: int | None = None
+        self.waited: float = 0.0
+
+    @property
+    def held(self) -> bool:
+        return self._fd is not None
+
+    def acquire(self) -> None:
+        if self._fd is not None:
+            return
+        # Same mode as the instance records (mkstemp → 0600).
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        started = time.monotonic()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(fd)
+            raise
+        self.waited += time.monotonic() - started
+        self._fd = fd
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def find_free_port(start: int, max_tries: int = 100) -> int:
     """Find a free TCP port starting from `start`.
 
-    TOCTOU note: the probe socket is closed before QEMU binds, so under
-    concurrent launches another process (or VM) can claim the returned port in
-    the window between this check and QEMU's bind. QEMU will then fail to bind;
-    callers should be prepared for a launch-time bind failure rather than
-    treating a returned port as a hard reservation.
+    The probe socket is closed before QEMU binds, so the returned port is not
+    a reservation: a foreign listener can still take it in between. Against
+    *concurrent qmu launches* that window is closed by `PortAllocationLock`,
+    which `launch_vm` holds from this probe until QEMU has bound; callers
+    outside the lock must be prepared for a launch-time bind failure.
     """
     for offset in range(max_tries):
         port = start + offset
@@ -263,7 +326,8 @@ def _preflight_native_passt(
         raise QMUError(
             "net_backend=passt requires the 'passt' binary on PATH "
             "(e.g. 'apt install passt' / 'pacman -S passt'). "
-            "Use the default 'user' backend, or --no-net, if passt is unavailable."
+            "Use the default 'user' backend, or --no-net, if passt is unavailable.",
+            hint="apt install passt; or set [machine] net_backend = \"user\"",
         )
 
     assert caps.path is not None
@@ -495,7 +559,10 @@ def resolve_cmdline(
     """
     if profile not in config.profiles:
         valid = ", ".join(config.profiles.keys())
-        raise QMUError(f"Unknown profile '{profile}'. Valid: {valid}")
+        raise QMUError(
+            f"Unknown profile '{profile}'. Valid: {valid}",
+            hint=f"pass one of --profile {valid}, or define [profiles] in qmu.toml",
+        )
 
     resolved = config.profiles[profile] if cmdline is None else cmdline
     if append:
@@ -554,13 +621,16 @@ def launch_vm(
                 "No rootfs configured. Set [drive] rootfs in qmu.toml or pass --rootfs. "
                 "For a boot-and-die kernel (initramfs-only, kernelCTF, syzkaller repro) "
                 "pass --harness instead: it needs no rootfs or SSH key and implies "
-                "--no-wait-ssh + --no-net."
+                "--no-wait-ssh + --no-net.",
+                hint="pass --rootfs <image> (or --harness for initramfs-only kernels); "
+                     "tools/mkrootfs.sh builds one",
             )
         rootfs_path = Path(config.rootfs).expanduser().resolve()
         if not rootfs_path.exists():
             raise QMUError(
                 f"Rootfs image not found: {rootfs_path}"
-                f"{config.describe_path_source('rootfs')}"
+                f"{config.describe_path_source('rootfs')}",
+                hint=f"ls -l {rootfs_path}; qmu config show names the file that set it",
             )
     elif config.rootfs is not None:
         candidate = Path(config.rootfs).expanduser().resolve()
@@ -571,12 +641,14 @@ def launch_vm(
     if not harness:
         if config.ssh_key is None:
             raise QMUError(
-                "No SSH key configured. Set [ssh] key in qmu.toml or pass --ssh-key"
+                "No SSH key configured. Set [ssh] key in qmu.toml or pass --ssh-key",
+                hint="qmu config init (writes a starter [ssh] key); or pass --ssh-key <key>",
             )
         key_path = Path(config.ssh_key).expanduser().resolve()
         if not key_path.exists():
             raise QMUError(
-                f"SSH key not found: {key_path}{config.describe_path_source('ssh_key')}"
+                f"SSH key not found: {key_path}{config.describe_path_source('ssh_key')}",
+                hint=f"ls -l {key_path}; qmu config show names the file that set it",
             )
 
     initrd_path: Path | None = None
@@ -608,10 +680,11 @@ def launch_vm(
     # later handed that port would answer `qmu exec --vm <this>` as if it were
     # this guest (the readiness probe is a bare TCP connect). Only a port the
     # caller pinned (to match their own hostfwd in the extra QEMU args) is kept.
-    # Otherwise auto-allocate any port the caller did not pin. Auto-allocated
-    # ports have a TOCTOU window (find_free_port closes its probe before QEMU
-    # binds), so a concurrent launch can steal one; QEMU then exits with a bind
-    # error and we retry with fresh ports. Pinned ports are never re-allocated.
+    # Otherwise auto-allocate any port the caller did not pin. find_free_port
+    # closes its probe before QEMU binds, so `port_lock` is held from the probe
+    # until QEMU has bound (first QMP connect) to keep concurrent launches from
+    # picking the same port (#113). The retry below stays as a backstop for a
+    # foreign listener taking the port. Pinned ports are never re-allocated.
     if harness:
         ssh_port = None
     auto_ssh = (not harness) and (not no_net) and (ssh_port is None)
@@ -621,99 +694,113 @@ def launch_vm(
     attempt: _LaunchAttempt | None = None
     pid_start: str | None = None
     cmd: list[str] = []
+    port_lock = PortAllocationLock(idir)
     for attempt_idx in range(3):
-        if auto_ssh:
-            ssh_port = find_free_port(config.ssh_port_start)
-        if auto_gdb:
-            gdb_port = find_free_port(config.gdb_port_start)
-
-        if name:
-            vm_id = name
-        elif ssh_port is not None:
-            vm_id = f"vm-{ssh_port}"
-        else:
-            # uuid suffix: timestamp-based ids collide when two harness VMs
-            # launch within the same second (parallel agent workflows).
-            # 'h' = harness, 'n' = --no-net without a pinned SSH port.
-            vm_id = f"vm-{'h' if harness else 'n'}{uuid.uuid4().hex[:8]}"
-        qmp_path = qmp_socket_path(vm_id)
-        serial_path = serial_log_path(vm_id)
-        qemu_log = qemu_log_path(vm_id)
-        qmp_path.unlink(missing_ok=True)  # remove stale socket if present
-
-        cmd = build_qemu_command(
-            config=config,
-            kernel=str(kernel_path),
-            rootfs=str(rootfs_path) if rootfs_path else None,
-            ssh_port=ssh_port,
-            gdb_port=gdb_port,
-            qmp_socket=str(qmp_path),
-            serial_log=str(serial_path),
-            cmdline=cmdline,
-            initrd=str(initrd_path) if initrd_path else None,
-            drives=drives,
-            no_net=no_net,
-            nic_model=nic_model,
-            net_backend=net_backend,
-            qemu_binary=resolved_qemu,
-            extra_args=extra_args,
-        )
-
         try:
-            with qemu_log.open("w") as log_fd:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=log_fd,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-        except BaseException:
-            qemu_log.unlink(missing_ok=True)
-            raise
+            if auto_ssh or auto_gdb:
+                port_lock.acquire()
+            if auto_ssh:
+                ssh_port = find_free_port(config.ssh_port_start)
+            if auto_gdb:
+                gdb_port = find_free_port(config.gdb_port_start)
 
-        attempt = _LaunchAttempt(
-            proc=proc,
-            vm_id=vm_id,
-            qmp_socket=qmp_path,
-            serial_log=serial_path,
-            qemu_log=qemu_log,
-        )
-        # Record the kernel start-time of the child immediately so liveness
-        # checks can detect PID recycling across host reboots. None on
-        # platforms without /proc (pid-only fallback applies there).
-        pid_start = proc_pid_start(proc.pid)
+            if name:
+                vm_id = name
+            elif ssh_port is not None:
+                vm_id = f"vm-{ssh_port}"
+            else:
+                # uuid suffix: timestamp-based ids collide when two harness VMs
+                # launch within the same second (parallel agent workflows).
+                # 'h' = harness, 'n' = --no-net without a pinned SSH port.
+                vm_id = f"vm-{'h' if harness else 'n'}{uuid.uuid4().hex[:8]}"
+            qmp_path = qmp_socket_path(vm_id)
+            serial_path = serial_log_path(vm_id)
+            qemu_log = qemu_log_path(vm_id)
+            qmp_path.unlink(missing_ok=True)  # remove stale socket if present
 
-        # Wait for the QMP socket to appear (or QEMU to exit immediately).
-        deadline = time.monotonic() + 10
-        exited = False
-        while time.monotonic() < deadline:
-            if qmp_path.exists():
-                break
-            if proc.poll() is not None:
-                exited = True
-                break
-            time.sleep(0.2)
-        else:
-            primary = QMUError("Timed out waiting for QMP socket to appear")
+            cmd = build_qemu_command(
+                config=config,
+                kernel=str(kernel_path),
+                rootfs=str(rootfs_path) if rootfs_path else None,
+                ssh_port=ssh_port,
+                gdb_port=gdb_port,
+                qmp_socket=str(qmp_path),
+                serial_log=str(serial_path),
+                cmdline=cmdline,
+                initrd=str(initrd_path) if initrd_path else None,
+                drives=drives,
+                no_net=no_net,
+                nic_model=nic_model,
+                net_backend=net_backend,
+                qemu_binary=resolved_qemu,
+                extra_args=extra_args,
+            )
+
             try:
-                log_text = attempt.rollback(capture_output=True)
-            except QMUError as cleanup_exc:
-                raise cleanup_exc from primary
-            if log_text:
-                primary = QMUError(
-                    f"{primary}\nCommand: {' '.join(cmd)}\nQEMU output:\n{log_text}"
-                )
-            raise primary
+                with qemu_log.open("w") as log_fd:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=log_fd,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+            except BaseException:
+                qemu_log.unlink(missing_ok=True)
+                raise
 
-        qmp_error: Exception | None = None
-        if not exited:
-            # QMP socket appeared — verify connectivity. A transient reset or
-            # refusal on this first connect is retried while QEMU lives; a
-            # QEMU that dies meanwhile is reported from its own log.
-            exited, qmp_error, qmp_note = _validate_qmp_with_retry(qmp_path, proc)
-            if qmp_note is not None and notes is not None:
-                notes.append(qmp_note)
+            attempt = _LaunchAttempt(
+                proc=proc,
+                vm_id=vm_id,
+                qmp_socket=qmp_path,
+                serial_log=serial_path,
+                qemu_log=qemu_log,
+            )
+            # Record the kernel start-time of the child immediately so liveness
+            # checks can detect PID recycling across host reboots. None on
+            # platforms without /proc (pid-only fallback applies there).
+            pid_start = proc_pid_start(proc.pid)
+
+            # Wait for the QMP socket to appear (or QEMU to exit immediately).
+            deadline = time.monotonic() + 10
+            exited = False
+            while time.monotonic() < deadline:
+                if qmp_path.exists():
+                    break
+                if proc.poll() is not None:
+                    exited = True
+                    break
+                time.sleep(0.2)
+            else:
+                primary = QMUError("Timed out waiting for QMP socket to appear")
+                try:
+                    log_text = attempt.rollback(capture_output=True)
+                except QMUError as cleanup_exc:
+                    raise cleanup_exc from primary
+                if log_text:
+                    primary = QMUError(
+                        f"{primary}\nCommand: {' '.join(cmd)}\nQEMU output:\n{log_text}"
+                    )
+                raise primary
+
+            qmp_error: Exception | None = None
+            if not exited:
+                # QMP socket appeared — verify connectivity. A transient reset or
+                # refusal on this first connect is retried while QEMU lives; a
+                # QEMU that dies meanwhile is reported from its own log.
+                exited, qmp_error, qmp_note = _validate_qmp_with_retry(qmp_path, proc)
+                if qmp_note is not None and notes is not None:
+                    notes.append(qmp_note)
+        finally:
+            # QEMU has bound its ports (QMP answered) or is gone: either way a
+            # sibling's probe now sees the truth, so stop serialising it.
+            port_lock.release()
+        if port_lock.waited >= PORT_LOCK_WAIT_NOTE_SECONDS and notes is not None:
+            notes.append(
+                f"Waited {port_lock.waited:.1f}s for the port-allocation lock "
+                f"({port_lock.path}) held by a concurrent launch"
+            )
+            port_lock.waited = 0.0
 
         if exited:
             # Reap before reading diagnostics so the log is fully flushed.
@@ -726,17 +813,25 @@ def launch_vm(
                 log_text = qemu_log.read_text(errors="replace")
             except OSError:
                 log_text = ""
-            retryable = (
-                any(m in log_text for m in bind_markers)
-                and (auto_ssh or auto_gdb)
-                and attempt_idx < 2
-            )
+            bind_failed = any(m in log_text for m in bind_markers)
+            retryable = bind_failed and (auto_ssh or auto_gdb) and attempt_idx < 2
             if retryable:
                 attempt.rollback()
                 attempt = None
                 continue  # lost a port race — retry with freshly allocated ports
+            lock_note = ""
+            if bind_failed and (auto_ssh or auto_gdb):
+                # Three allocations under the lock all lost: concurrent qmu
+                # launches are excluded, so something outside qmu owns the port.
+                lock_note = (
+                    f"\nPort bind failed on all 3 attempts while holding "
+                    f"{port_lock.path}; concurrent qmu launches are serialised by "
+                    "that lock, so a foreign listener (not qmu) holds the port. "
+                    "Check `ss -ltnp` or pass --ssh-port/--gdb-port."
+                )
             primary = QMUError(
-                f"QEMU exited immediately (code {proc.returncode}).\n"
+                f"QEMU exited immediately (code {proc.returncode})."
+                f"{lock_note}\n"
                 f"Command: {' '.join(cmd)}\n"
                 f"Output:\n{log_text[-2000:]}"
             )
