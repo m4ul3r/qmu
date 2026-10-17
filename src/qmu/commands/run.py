@@ -46,6 +46,7 @@ from ..serial import extract_crash, has_terminal_panic
 from ..ssh import SSHClient
 from ..vm import launch_vm
 from .._cliutil import (
+    Result,
     _add_common_opts,
     _add_launch_opts,
     _kill_vm,
@@ -53,7 +54,7 @@ from .._cliutil import (
 )
 from .guest import (
     GUEST_COMMAND_HELP,
-    _emit_guest_result,
+    _guest_result,
     _join_exec_command,
     _run_guest_command,
 )
@@ -232,7 +233,7 @@ def _boot_failure_payload(
     )
 
 
-def _handle_run(args: argparse.Namespace) -> int:
+def _handle_run(args: argparse.Namespace) -> Result:
     # Same preparation `launch` runs: config layering, the [boot] kernel
     # fallback, the profile-vs-cmdline warnings, namesake replacement and
     # --inject. `run` registers the same flags, so it must apply them the same
@@ -337,7 +338,7 @@ def _handle_run(args: argparse.Namespace) -> int:
         if not args.keep:
             notes.append(f"Clean up: qmu prune --vm {inst.vm_id}")
 
-    _emit_guest_result(
-        args, data=data, stdout=stdout, text=text, notes=notes, stem="run"
+    return _guest_result(
+        data=data, stdout=stdout, text=text, notes=notes, stem="run",
+        exit_code=status,
     )
-    return status

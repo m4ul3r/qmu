@@ -11,6 +11,12 @@ from qmu.commands import qmp_cmds
 from qmu.instance import VMInstance
 from qmu.qmp import QMPError
 from qmu.snapshot import SnapshotResult
+from qmu._cliutil import render
+
+
+def _run(handler, args):
+    """Call a handler as `cli.main` would: render its Result, return the exit code."""
+    return render(args, handler(args))
 
 
 @pytest.fixture(autouse=True)
@@ -61,9 +67,6 @@ def test_snapshot_load_captures_before_load_and_saves_before_success_emit(
         calls.append(("save", offset))
         return replace(record, guest_epoch_serial_offset=offset)
 
-    def emit(*args, **kwargs):
-        calls.append(("emit", kwargs["data"]["ok"]))
-
     monkeypatch.setattr(qmp_cmds, "serial_log_offset", capture, raising=False)
     monkeypatch.setattr(qmp_cmds, "load_snapshot", load)
     monkeypatch.setattr(
@@ -72,9 +75,12 @@ def test_snapshot_load_captures_before_load_and_saves_before_success_emit(
         save_epoch,
         raising=False,
     )
-    monkeypatch.setattr(qmp_cmds, "_emit", emit)
 
-    assert qmp_cmds._handle_snapshot_load(_load_args()) == 0
+    # The success Result is produced only after the epoch is saved: the
+    # handler's return is the "emit" of the old emit-in-handler flow.
+    result = qmp_cmds._handle_snapshot_load(_load_args())
+    calls.append(("emit", result.data["ok"]))
+    assert render(_load_args(), result) == 0
     assert calls == ["capture", "load", ("save", len(old)), ("emit", True)]
 
 
@@ -98,7 +104,7 @@ def test_snapshot_load_hmp_failure_preserves_epoch(message, tmp_path, monkeypatc
         raising=False,
     )
 
-    assert qmp_cmds._handle_snapshot_load(_load_args()) == 1
+    assert _run(qmp_cmds._handle_snapshot_load, _load_args()) == 1
     assert saved == []
 
 
@@ -120,15 +126,14 @@ def test_snapshot_load_qmp_exception_does_not_save(tmp_path, monkeypatch):
     )
 
     with pytest.raises(QMPError, match="load failed"):
-        qmp_cmds._handle_snapshot_load(_load_args())
+        _run(qmp_cmds._handle_snapshot_load, _load_args())
     assert saved == []
 
 
-def test_snapshot_load_metadata_failure_emits_no_success(tmp_path, monkeypatch):
+def test_snapshot_load_metadata_failure_emits_no_success(tmp_path, monkeypatch, capsys):
     log = tmp_path / "snap.serial.log"
     log.write_text("old\n")
     inst = _inst(str(log), offset=11)
-    emitted = []
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(object()))
     monkeypatch.setattr(
@@ -140,11 +145,12 @@ def test_snapshot_load_metadata_failure_emits_no_success(tmp_path, monkeypatch):
         lambda record, offset: (_ for _ in ()).throw(OSError("metadata failed")),
         raising=False,
     )
-    monkeypatch.setattr(qmp_cmds, "_emit", lambda *a, **kw: emitted.append(kw))
 
     with pytest.raises(OSError, match="metadata failed"):
-        qmp_cmds._handle_snapshot_load(_load_args())
-    assert emitted == []
+        _run(qmp_cmds._handle_snapshot_load, _load_args())
+    # The failure escaped before the handler produced a Result: nothing was
+    # rendered, so no success envelope reached stdout.
+    assert capsys.readouterr().out == ""
 
 
 def test_snapshot_save_does_not_advance_epoch(tmp_path, monkeypatch):
@@ -165,5 +171,5 @@ def test_snapshot_save_does_not_advance_epoch(tmp_path, monkeypatch):
     )
 
     args = argparse.Namespace(vm=None, name="clean", format="text", out=None)
-    assert qmp_cmds._handle_snapshot_save(args) == 0
+    assert _run(qmp_cmds._handle_snapshot_save, args) == 0
     assert saved == []

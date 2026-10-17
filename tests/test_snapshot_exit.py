@@ -68,6 +68,12 @@ import argparse
 import contextlib
 
 from qmu.snapshot import SnapshotResult
+from qmu._cliutil import render
+
+
+def _run(handler, args):
+    """Call a handler as `cli.main` would: render its Result, return the exit code."""
+    return render(args, handler(args))
 
 
 class _FakeInst:
@@ -99,7 +105,7 @@ def _save_args():
 
 def test_snapshot_save_failure_hint_distinguishes_temporary_and_durable(monkeypatch, capsys):
     _patch_save(monkeypatch, "Error: Could not open 'savevm' section")
-    rc = qmp_cmds._handle_snapshot_save(_save_args())
+    rc = _run(qmp_cmds._handle_snapshot_save, _save_args())
     assert rc == 1
     err = capsys.readouterr().err
     assert "Could not open 'savevm' section" in err
@@ -119,7 +125,7 @@ def test_snapshot_save_failure_hint_distinguishes_temporary_and_durable(monkeypa
 def test_snapshot_save_success_emits_no_hint(monkeypatch, capsys):
     # A clean save must not print the failure hint or exit non-zero.
     _patch_save(monkeypatch, "Snapshot 'clean' saved.")
-    rc = qmp_cmds._handle_snapshot_save(_save_args())
+    rc = _run(qmp_cmds._handle_snapshot_save, _save_args())
     assert rc == 0
     captured = capsys.readouterr()
     assert "qcow2" not in captured.err
@@ -139,7 +145,7 @@ def _load_args():
 def test_snapshot_load_slirp_error_has_conditional_compatibility_guidance(monkeypatch, capsys):
     msg = "Missing section footer for slirp\nError: Section footer error, section_id: 1"
     _patch_load(monkeypatch, msg)
-    rc = qmp_cmds._handle_snapshot_load(_load_args())
+    rc = _run(qmp_cmds._handle_snapshot_load, _load_args())
     assert rc == 1
     err = capsys.readouterr().err
     assert msg in err
@@ -158,7 +164,7 @@ def test_snapshot_load_slirp_error_has_conditional_compatibility_guidance(monkey
 def test_snapshot_load_slirp_detection_is_case_insensitive(monkeypatch, capsys):
     msg = "Missing section footer for SLIRP"
     _patch_load(monkeypatch, msg)
-    rc = qmp_cmds._handle_snapshot_load(_load_args())
+    rc = _run(qmp_cmds._handle_snapshot_load, _load_args())
     assert rc == 1
     err = capsys.readouterr().err
     assert msg in err
@@ -169,7 +175,7 @@ def test_snapshot_load_slirp_detection_is_case_insensitive(monkeypatch, capsys):
 def test_snapshot_load_non_slirp_error_does_not_diagnose_network(monkeypatch, capsys):
     msg = "Error: Snapshot 'missing' does not exist"
     _patch_load(monkeypatch, msg)
-    rc = qmp_cmds._handle_snapshot_load(_load_args())
+    rc = _run(qmp_cmds._handle_snapshot_load, _load_args())
     assert rc == 1
     err = capsys.readouterr().err
     assert "snapshot load failed" in err

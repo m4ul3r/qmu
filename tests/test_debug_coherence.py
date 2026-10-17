@@ -29,6 +29,12 @@ from qmu.config import ConfigError, QMUConfig, load_config_file
 from qmu.instance import QMUError, VMInstance
 from qmu.snapshot import SnapshotResult
 from qmu.vm import build_qemu_command
+from qmu._cliutil import render
+
+
+def _run(handler, args):
+    """Call a handler as `cli.main` would: render its Result, return the exit code."""
+    return render(args, handler(args))
 
 
 def _ok(message):
@@ -182,7 +188,7 @@ def test_snapshot_save_warns_int3_when_debugged(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
     monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'clean' saved."))
-    rc = qmp_cmds._handle_snapshot_save(_snap_args())
+    rc = _run(qmp_cmds._handle_snapshot_save, _snap_args())
     err = capsys.readouterr().err
     assert rc == 0
     assert "int3" in err
@@ -194,7 +200,7 @@ def test_snapshot_save_silent_when_not_debugged(monkeypatch, capsys):
     inst = _gdb_inst(None)
     _install_qmp_seams(monkeypatch, inst, present=False)
     monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'clean' saved."))
-    rc = qmp_cmds._handle_snapshot_save(_snap_args())
+    rc = _run(qmp_cmds._handle_snapshot_save, _snap_args())
     err = capsys.readouterr().err
     assert rc == 0
     assert "int3" not in err
@@ -210,7 +216,7 @@ def test_snapshot_save_warns_even_when_client_detached(monkeypatch, capsys):
     _install_qmp_seams(monkeypatch, inst, present=False)
     monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: False)
     monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'clean' saved."))
-    rc = qmp_cmds._handle_snapshot_save(_snap_args())
+    rc = _run(qmp_cmds._handle_snapshot_save, _snap_args())
     err = capsys.readouterr().err
     assert rc == 0
     assert "int3" in err
@@ -225,7 +231,7 @@ def test_snapshot_save_failure_does_not_add_int3_warning(monkeypatch, capsys):
         qmp_cmds, "save_snapshot",
         lambda qmp, name, **kw: _failed("Error: Could not open 'savevm' section"),
     )
-    rc = qmp_cmds._handle_snapshot_save(_snap_args())
+    rc = _run(qmp_cmds._handle_snapshot_save, _snap_args())
     err = capsys.readouterr().err
     assert rc == 1
     assert "int3" not in err
@@ -240,7 +246,7 @@ def test_snapshot_load_warns_stale_session_when_debugged(monkeypatch, capsys):
     # that returns the instance so the handler proceeds offline.
     monkeypatch.setattr(qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst)
     monkeypatch.setattr(qmp_cmds, "serial_log_offset", lambda path: 0)
-    rc = qmp_cmds._handle_snapshot_load(_snap_args())
+    rc = _run(qmp_cmds._handle_snapshot_load, _snap_args())
     err = capsys.readouterr().err
     assert rc == 0
     assert "does NOT re-sync" in err
@@ -255,7 +261,7 @@ def test_snapshot_load_silent_when_not_debugged(monkeypatch, capsys):
     monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name: _ok("Snapshot 'clean' loaded."))
     monkeypatch.setattr(qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst)
     monkeypatch.setattr(qmp_cmds, "serial_log_offset", lambda path: 0)
-    rc = qmp_cmds._handle_snapshot_load(_snap_args())
+    rc = _run(qmp_cmds._handle_snapshot_load, _snap_args())
     assert rc == 0
     assert capsys.readouterr().err == ""
 
@@ -274,7 +280,7 @@ def test_snapshot_load_pre_restore_refusal_does_not_warn_stale(monkeypatch, caps
     )
     monkeypatch.setattr(qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst)
     monkeypatch.setattr(qmp_cmds, "serial_log_offset", lambda path: 0)
-    rc = qmp_cmds._handle_snapshot_load(_snap_args())
+    rc = _run(qmp_cmds._handle_snapshot_load, _snap_args())
     err = capsys.readouterr().err
     assert rc == 1
     assert "does NOT re-sync" not in err
@@ -298,7 +304,7 @@ def test_snapshot_load_failure_after_restoration_began_warns_stale(
         ),
     )
     monkeypatch.setattr(qmp_cmds, "serial_log_offset", lambda path: 0)
-    rc = qmp_cmds._handle_snapshot_load(_snap_args())
+    rc = _run(qmp_cmds._handle_snapshot_load, _snap_args())
     err = capsys.readouterr().err
     assert rc == 1
     assert "does NOT re-sync" in err
@@ -315,7 +321,7 @@ def _qmp_args(command, cmd_args=None):
 def test_qmp_system_reset_warns_when_debugged(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
-    rc = qmp_cmds._handle_qmp(_qmp_args("system_reset"))
+    rc = _run(qmp_cmds._handle_qmp, _qmp_args("system_reset"))
     err = capsys.readouterr().err
     assert rc == 0
     assert "drops the gdbstub's breakpoint" in err
@@ -325,7 +331,7 @@ def test_qmp_system_reset_warns_when_debugged(monkeypatch, capsys):
 def test_qmp_non_reset_command_never_warns(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
-    rc = qmp_cmds._handle_qmp(_qmp_args("query-status"))
+    rc = _run(qmp_cmds._handle_qmp, _qmp_args("query-status"))
     assert rc == 0
     assert capsys.readouterr().err == ""
 
@@ -333,7 +339,7 @@ def test_qmp_non_reset_command_never_warns(monkeypatch, capsys):
 def test_qmp_system_reset_silent_when_not_debugged(monkeypatch, capsys):
     inst = _gdb_inst(None)
     _install_qmp_seams(monkeypatch, inst, present=False)
-    rc = qmp_cmds._handle_qmp(_qmp_args("system_reset"))
+    rc = _run(qmp_cmds._handle_qmp, _qmp_args("system_reset"))
     assert rc == 0
     assert capsys.readouterr().err == ""
 
@@ -345,7 +351,7 @@ def _monitor_args(tokens):
 def test_monitor_system_reset_warns_when_debugged(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
-    rc = qmp_cmds._handle_monitor(_monitor_args(["system_reset"]))
+    rc = _run(qmp_cmds._handle_monitor, _monitor_args(["system_reset"]))
     err = capsys.readouterr().err
     assert rc == 0
     assert "drops the gdbstub's breakpoint" in err
@@ -354,7 +360,7 @@ def test_monitor_system_reset_warns_when_debugged(monkeypatch, capsys):
 def test_monitor_unrelated_command_does_not_warn(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
-    rc = qmp_cmds._handle_monitor(_monitor_args(["info", "registers"]))
+    rc = _run(qmp_cmds._handle_monitor, _monitor_args(["info", "registers"]))
     assert rc == 0
     assert capsys.readouterr().err == ""
 
@@ -364,7 +370,7 @@ def test_monitor_help_system_reset_does_not_warn(monkeypatch, capsys):
     # nothing, so the reset warning must not fire (the superstring case).
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
-    rc = qmp_cmds._handle_monitor(_monitor_args(["help", "system_reset"]))
+    rc = _run(qmp_cmds._handle_monitor, _monitor_args(["help", "system_reset"]))
     assert rc == 0
     assert capsys.readouterr().err == ""
 
@@ -374,7 +380,7 @@ def test_monitor_savevm_warns_int3_when_stub_present(monkeypatch, capsys):
     # it must carry the #45 warning too. Gated on the stub, not a live client.
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=False)  # no live client
-    rc = qmp_cmds._handle_monitor(_monitor_args(["savevm", "clean"]))
+    rc = _run(qmp_cmds._handle_monitor, _monitor_args(["savevm", "clean"]))
     err = capsys.readouterr().err
     assert rc == 0
     assert "int3" in err
@@ -383,7 +389,7 @@ def test_monitor_savevm_warns_int3_when_stub_present(monkeypatch, capsys):
 def test_monitor_loadvm_warns_stale_when_debugged(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
-    rc = qmp_cmds._handle_monitor(_monitor_args(["loadvm", "clean"]))
+    rc = _run(qmp_cmds._handle_monitor, _monitor_args(["loadvm", "clean"]))
     err = capsys.readouterr().err
     assert rc == 0
     assert "does NOT re-sync" in err
@@ -399,7 +405,7 @@ def test_monitor_savevm_failure_is_an_error_without_warning(monkeypatch, capsys)
         lambda inst: contextlib.nullcontext(_HmpQMP("Error: Could not open 'savevm' section")),
     )
     with pytest.raises(QMUError, match="Could not open 'savevm' section"):
-        qmp_cmds._handle_monitor(_monitor_args(["savevm", "clean"]))
+        _run(qmp_cmds._handle_monitor, _monitor_args(["savevm", "clean"]))
     assert "int3" not in capsys.readouterr().err
 
 
@@ -441,7 +447,7 @@ def _hmp_qmp_args(command_line):
 def test_qmp_hmp_system_reset_warns_when_debugged(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_hmp_via_qmp(monkeypatch, inst, present=True)
-    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("system_reset"))
+    rc = _run(qmp_cmds._handle_qmp, _hmp_qmp_args("system_reset"))
     err = capsys.readouterr().err
     assert rc == 0
     assert "drops the gdbstub's breakpoint" in err
@@ -451,7 +457,7 @@ def test_qmp_hmp_help_system_reset_does_not_warn(monkeypatch, capsys):
     # Same first-token rule as `monitor`: `help system_reset` resets nothing.
     inst = _gdb_inst(1234)
     _install_hmp_via_qmp(monkeypatch, inst, present=True)
-    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("help system_reset"))
+    rc = _run(qmp_cmds._handle_qmp, _hmp_qmp_args("help system_reset"))
     assert rc == 0
     assert capsys.readouterr().err == ""
 
@@ -459,7 +465,7 @@ def test_qmp_hmp_help_system_reset_does_not_warn(monkeypatch, capsys):
 def test_qmp_hmp_unrelated_verb_does_not_warn(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_hmp_via_qmp(monkeypatch, inst, present=True, result="VM status: running")
-    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("info status"))
+    rc = _run(qmp_cmds._handle_qmp, _hmp_qmp_args("info status"))
     assert rc == 0
     assert capsys.readouterr().err == ""
 
@@ -467,7 +473,7 @@ def test_qmp_hmp_unrelated_verb_does_not_warn(monkeypatch, capsys):
 def test_qmp_hmp_system_reset_silent_when_not_debugged(monkeypatch, capsys):
     inst = _gdb_inst(None)
     _install_hmp_via_qmp(monkeypatch, inst, present=False)
-    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("system_reset"))
+    rc = _run(qmp_cmds._handle_qmp, _hmp_qmp_args("system_reset"))
     assert rc == 0
     assert capsys.readouterr().err == ""
 
@@ -475,7 +481,7 @@ def test_qmp_hmp_system_reset_silent_when_not_debugged(monkeypatch, capsys):
 def test_qmp_hmp_savevm_warns_int3_when_stub_present(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_hmp_via_qmp(monkeypatch, inst, present=False)  # no live client
-    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("savevm clean"))
+    rc = _run(qmp_cmds._handle_qmp, _hmp_qmp_args("savevm clean"))
     err = capsys.readouterr().err
     assert rc == 0
     assert "int3" in err
@@ -484,7 +490,7 @@ def test_qmp_hmp_savevm_warns_int3_when_stub_present(monkeypatch, capsys):
 def test_qmp_hmp_loadvm_warns_stale_when_debugged(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_hmp_via_qmp(monkeypatch, inst, present=True)
-    rc = qmp_cmds._handle_qmp(_hmp_qmp_args("loadvm clean"))
+    rc = _run(qmp_cmds._handle_qmp, _hmp_qmp_args("loadvm clean"))
     err = capsys.readouterr().err
     assert rc == 0
     assert "does NOT re-sync" in err
@@ -500,7 +506,7 @@ def test_qmp_hmp_savevm_failure_is_an_error_without_warning(monkeypatch, capsys)
         result="Error: Could not open 'savevm' section",
     )
     with pytest.raises(QMUError, match="Could not open 'savevm' section"):
-        qmp_cmds._handle_qmp(_hmp_qmp_args("savevm clean"))
+        _run(qmp_cmds._handle_qmp, _hmp_qmp_args("savevm clean"))
     assert "int3" not in capsys.readouterr().err
 
 
@@ -639,7 +645,7 @@ def test_kill_warns_about_stranded_pry_bridge(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(lifecycle, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(lifecycle, "_kill_vm", lambda inst, force=False, clean=True: None)
     monkeypatch.setattr(lifecycle, "debug_session_present", lambda inst: True)
-    rc = lifecycle._handle_kill(_kill_args())
+    rc = _run(lifecycle._handle_kill, _kill_args())
     err = capsys.readouterr().err
     assert rc == 0
     assert "Multiple bridge instances" in err
@@ -652,7 +658,7 @@ def test_kill_no_bridge_note_when_no_client(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(lifecycle, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(lifecycle, "_kill_vm", lambda inst, force=False, clean=True: None)
     monkeypatch.setattr(lifecycle, "debug_session_present", lambda inst: False)
-    rc = lifecycle._handle_kill(_kill_args())
+    rc = _run(lifecycle._handle_kill, _kill_args())
     assert rc == 0
     assert "Multiple bridge instances" not in capsys.readouterr().err
 
@@ -666,7 +672,7 @@ def test_kill_does_not_probe_for_non_gdb_vm(monkeypatch, capsys):
         lifecycle, "debug_session_present",
         lambda inst: pytest.fail("must not probe a non-gdb VM"),
     )
-    rc = lifecycle._handle_kill(_kill_args())
+    rc = _run(lifecycle._handle_kill, _kill_args())
     assert rc == 0
     assert "Multiple bridge instances" not in capsys.readouterr().err
 
@@ -726,7 +732,7 @@ def test_wait_warns_on_observed_reset_when_debugged(monkeypatch, tmp_path, capsy
     inst = _gdb_vm(tmp_path, kvm=None)  # gdb_port=1234, harness=False
     args = _wire_wait_reset(monkeypatch, inst, debugged=True)
 
-    rc = lifecycle._handle_wait(args)
+    rc = _run(lifecycle._handle_wait, args)
     captured = capsys.readouterr()
     assert rc == 0
     assert json.loads(captured.out)["last_event"] == "RESET"
@@ -738,7 +744,7 @@ def test_wait_reset_no_warning_without_debugger(monkeypatch, tmp_path, capsys):
     inst = _gdb_vm(tmp_path, kvm=None)
     args = _wire_wait_reset(monkeypatch, inst, debugged=False)
 
-    rc = lifecycle._handle_wait(args)
+    rc = _run(lifecycle._handle_wait, args)
     captured = capsys.readouterr()
     assert rc == 0
     assert json.loads(captured.out)["last_event"] == "RESET"

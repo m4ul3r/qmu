@@ -49,9 +49,9 @@ from ..debug import (
     savevm_breakpoint_warning,
 )
 from .._cliutil import (
+    Result,
     _add_common_opts,
-    _emit,
-    _emit_refusal,
+    _refusal,
     _make_group_help_handler,
     _make_ssh,
     _preflight_ssh_guest,
@@ -145,9 +145,9 @@ SNAPSHOT_TIMEOUT_EXIT = 124
 SNAPSHOT_LIST_TIMEOUT = 30.0
 
 
-def _emit_snapshot_save_timeout(
+def _snapshot_save_timeout(
     args: argparse.Namespace, inst: VMInstance, timeout: float
-) -> int:
+) -> Result:
     """`snapshot save` outlived its budget: the result is UNKNOWN, not failed.
 
     HMP `savevm` runs synchronously on QEMU's main loop, so a save that was
@@ -179,13 +179,17 @@ def _emit_snapshot_save_timeout(
         "may_have_landed": True,
         "hint": hint,
     }
-    if getattr(args, "format", "text") == "text":
-        sys.stderr.write(f"[qmu] Error: {error}\n")
-        sys.stderr.write("[qmu] The snapshot may have landed (may_have_landed: true).\n")
-        sys.stderr.write(f"[qmu] {hint}\n")
-    else:
-        _emit(args, data=data, text=error, stem="snapshot-save")
-    return SNAPSHOT_TIMEOUT_EXIT
+    return Result(
+        data=data,
+        text=[
+            error,
+            "The snapshot may have landed (may_have_landed: true).",
+            hint,
+        ],
+        stem="snapshot-save",
+        exit_code=SNAPSHOT_TIMEOUT_EXIT,
+        refusal=True,
+    )
 
 
 def _snapshot_failure_hint(name: str, vm_id: str, reason: str | None) -> str:
@@ -239,13 +243,13 @@ def _inconsistent_restore_hint(vm_id: str, result: SnapshotResult) -> str:
     )
 
 
-def _emit_snapshot_result(
+def _snapshot_result(
     args: argparse.Namespace,
     op: str,
     inst: VMInstance,
     result: SnapshotResult,
-) -> int:
-    """Render one snapshot outcome. A failure carries `error` + `error_type`
+) -> Result:
+    """One snapshot outcome. A failure carries `error` + `error_type`
     like every other error envelope (not a bare `message`) plus a `hint`
     naming the fix, and in text mode goes to stderr under the `[qmu] Error:`
     prefix the skill promises, so an `eval "$(...)"`-style consumer never
@@ -260,8 +264,7 @@ def _emit_snapshot_result(
             data["resumed"] = result.resumed
             if result.resumed:
                 text = f"{text} Guest resumed (it was stopped by a previous failed load)."
-        _emit(args, data=data, text=text, stem=stem)
-        return 0
+        return Result(data=data, text=text, stem=stem)
     error = f"snapshot {op} failed: {result.message}"
     hint = _snapshot_failure_hint(args.name, inst.vm_id, result.reason)
     notes: list[str] = []
@@ -297,19 +300,12 @@ def _emit_snapshot_result(
     elif op == "save":
         # Proven: `save_snapshot` cross-checks `info snapshots`. The one save
         # outcome that is NOT proven — the budget expired — is exit 124 with
-        # `may_have_landed: true` (`_emit_snapshot_save_timeout`).
+        # `may_have_landed: true` (`_snapshot_save_timeout`).
         data["may_have_landed"] = False
-    if getattr(args, "format", "text") == "text":
-        sys.stderr.write(f"[qmu] Error: {error}\n")
-        for note in notes:
-            sys.stderr.write(f"[qmu] {note}\n")
-        sys.stderr.write(f"[qmu] {hint}\n")
-    else:
-        _emit(args, data=data, text=error, stem=stem)
-    return 1
+    return _refusal(data=data, text=[error, *notes, hint], stem=stem)
 
 
-def _handle_snapshot_save(args: argparse.Namespace) -> int:
+def _handle_snapshot_save(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     timeout = getattr(args, "timeout", None)
     if timeout is None:
@@ -325,11 +321,11 @@ def _handle_snapshot_save(args: argparse.Namespace) -> int:
         # The client has already closed its socket (`QMPClient.execute`), so
         # the next command connects fresh instead of reading savevm's late
         # reply as its own answer.
-        return _emit_snapshot_save_timeout(args, inst, timeout)
-    rc = _emit_snapshot_result(args, "save", inst, result)
-    if rc != 0:
+        return _snapshot_save_timeout(args, inst, timeout)
+    res = _snapshot_result(args, "save", inst, result)
+    if res.exit_code != 0:
         if result.reason != "bad_name":
-            sys.stderr.write(
+            res = res.warn(
                 "[qmu] qmu's implicit rootfs uses a temporary snapshot=on overlay; "
                 "that overlay can hold in-session checkpoints with a raw or qcow2 base, "
                 "and those checkpoints disappear when QEMU exits. For durable internal "
@@ -337,7 +333,7 @@ def _handle_snapshot_save(args: argparse.Namespace) -> int:
                 "`--drive 'file=./rootfs.qcow2,format=qcow2'`. Changing [drive] format "
                 "alone remains temporary because qmu still adds snapshot=on.\n"
             )
-        return rc
+        return res
     # #45: a snapshot of a debugged guest freezes any armed software-breakpoint
     # int3s into the image, so a later `snapshot load` + run Oopses at the
     # breakpointed address and reads as the PoC crashing the kernel. Warn only
@@ -346,15 +342,15 @@ def _handle_snapshot_save(args: argparse.Namespace) -> int:
     # uncleanly-detached bridge (the #40 case), so requiring a live client would
     # suppress the very save where the risk is highest.
     if debug_stub_present(inst):
-        sys.stderr.write(savevm_breakpoint_warning(inst.vm_id) + "\n")
-    return 0
+        res = res.warn(savevm_breakpoint_warning(inst.vm_id) + "\n")
+    return res
 
 
 def _snapshot_load_mentions_slirp(msg: str) -> bool:
     return "slirp" in msg.lower()
 
 
-def _handle_snapshot_load(args: argparse.Namespace) -> int:
+def _handle_snapshot_load(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     epoch_offset = serial_log_offset(inst.serial_log)
     _drop_ssh_master(inst)
@@ -363,10 +359,10 @@ def _handle_snapshot_load(args: argparse.Namespace) -> int:
     if result.ok:
         inst = save_guest_epoch_serial_offset(inst, epoch_offset)
         _drop_ssh_master(inst)
-    rc = _emit_snapshot_result(args, "load", inst, result)
-    if rc != 0:
+    res = _snapshot_result(args, "load", inst, result)
+    if res.exit_code != 0:
         if _snapshot_load_mentions_slirp(result.message):
-            sys.stderr.write(
+            res = res.warn(
                 "[qmu] This loadvm error names slirp. The user backend often works for "
                 "in-session restore, but this QEMU/build/device combination could not "
                 "restore its network state. Use native passt networking only with a selected "
@@ -378,17 +374,17 @@ def _handle_snapshot_load(args: argparse.Namespace) -> int:
         # machine (`qemu_system_reset(SHUTDOWN_CAUSE_SNAPSHOT_LOAD)` precedes
         # the vmstate load), so the #44 divergence applies to it as well.
         if result.restore_state != "none" and debug_session_present(inst):
-            sys.stderr.write(loadvm_stale_session_warning(inst.vm_id) + "\n")
-        return rc
+            res = res.warn(loadvm_stale_session_warning(inst.vm_id) + "\n")
+        return res
     # #44: loadvm rewound the guest, but an attached debugger keeps its pre-load
     # vCPU state and never re-syncs — a silent divergence in the rewind-iterate
     # fast path. A pre-restore refusal (`restore_state: none`) did not rewind.
     if debug_session_present(inst):
-        sys.stderr.write(loadvm_stale_session_warning(inst.vm_id) + "\n")
-    return 0
+        res = res.warn(loadvm_stale_session_warning(inst.vm_id) + "\n")
+    return res
 
 
-def _handle_snapshot_list(args: argparse.Namespace) -> int:
+def _handle_snapshot_list(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     timeout = getattr(args, "timeout", None)
     if timeout is None:
@@ -406,15 +402,14 @@ def _handle_snapshot_list(args: argparse.Namespace) -> int:
         for s in snaps:
             lines.append(f"  {s['id']}  {s['tag']}  size={s['vm_size']}  {s['date']} {s['time']}")
         text = lines
-    _emit(args, data={"ok": True, "snapshots": snaps}, text=text, stem="snapshot-list")
-    return 0
+    return Result(data={"ok": True, "snapshots": snaps}, text=text, stem="snapshot-list")
 
 
-def _handle_snapshot_delete(args: argparse.Namespace) -> int:
+def _handle_snapshot_delete(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     with _qmp_ctx(inst) as qmp:
         result = delete_snapshot(qmp, args.name)
-    return _emit_snapshot_result(args, "delete", inst, result)
+    return _snapshot_result(args, "delete", inst, result)
 
 
 # ---------------------------------------------------------------------------
@@ -517,14 +512,12 @@ def _add_kbase(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_kbase)
 
 
-def _handle_kbase(args: argparse.Namespace) -> int:
+def _handle_kbase(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
 
-    if (preflight_rc := _preflight_ssh_guest(
-        args, inst, stem="kbase"
-    )) is not None:
-        return preflight_rc
+    if (refused := _preflight_ssh_guest(inst, stem="kbase")) is not None:
+        return refused
 
     if inst.arch is None:
         raise QMUError(
@@ -557,8 +550,7 @@ def _handle_kbase(args: argparse.Namespace) -> int:
         "link_base": _format_hex(link_base),
         "slide": _format_hex(slide),
     }
-    _emit(
-        args,
+    return Result(
         data=data,
         text=(
             f"KBASE={data['kbase']}\n"
@@ -567,7 +559,6 @@ def _handle_kbase(args: argparse.Namespace) -> int:
         ),
         stem="kbase",
     )
-    return 0
 
 
 def _add_gdb(sub: argparse._SubParsersAction) -> None:
@@ -614,7 +605,7 @@ def _pry_launch_pid(result: subprocess.CompletedProcess) -> int | None:
     return pid if isinstance(pid, int) and pid > 0 else None
 
 
-def _handle_gdb(args: argparse.Namespace) -> int:
+def _handle_gdb(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     if inst.gdb_port is None:
         raise QMUError(
@@ -754,13 +745,7 @@ def _handle_gdb(args: argparse.Namespace) -> int:
         data["kvm"] = True
         data["kvm_watchpoint_warning"] = kvm_warning
         text = f"{text}\n{kvm_warning}"
-    _emit(
-        args,
-        data=data,
-        text=text,
-        stem="gdb",
-    )
-    return 0
+    return Result(data=data, text=text, stem="gdb")
 
 
 # ---------------------------------------------------------------------------
@@ -784,7 +769,7 @@ def _add_cont(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_cont)
 
 
-def _handle_cont(args: argparse.Namespace) -> int:
+def _handle_cont(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     with _qmp_ctx(inst) as qmp:
         before = qmp.execute("query-status")
@@ -800,8 +785,7 @@ def _handle_cont(args: argparse.Namespace) -> int:
             data, text = _stopped_guest_payload(inst, "restore-vm")
             data["hint"] += " To resume anyway: qmu cont --vm " + inst.vm_id + " --force."
             text.append(f"Override: qmu cont --vm {inst.vm_id} --force")
-            _emit_refusal(args, data=data, text=text, stem="cont")
-            return 1
+            return _refusal(data=data, text=text, stem="cont")
         # Resume the guest. QMP "cont" returns {} on success; if the VM is
         # already running QEMU raises an error, which surfaces as QMPError.
         qmp.execute("cont")
@@ -814,8 +798,7 @@ def _handle_cont(args: argparse.Namespace) -> int:
     if before_state == "restore-vm":
         data["forced"] = True
         text += " — forced out of restore-vm; the machine state may be inconsistent"
-    _emit(args, data=data, text=text, stem="cont")
-    return 0
+    return Result(data=data, text=text, stem="cont")
 
 
 # ---------------------------------------------------------------------------
@@ -1100,7 +1083,6 @@ def _after_mutation(
 
 
 def _finish_mutation(
-    args: argparse.Namespace,
     inst: VMInstance,
     verb: str,
     output: str,
@@ -1109,7 +1091,7 @@ def _finish_mutation(
     data: dict[str, object],
     text: object,
     stem: str,
-) -> int:
+) -> Result:
     """Post-mutation bookkeeping, THEN exactly one envelope.
 
     `_after_mutation` persists the guest epoch, and that write can fail
@@ -1135,28 +1117,24 @@ def _finish_mutation(
             "directory writable and re-check with: qmu status --vm "
             f"{inst.vm_id}"
         )
-        if getattr(args, "format", "text") == "text":
-            sys.stderr.write(f"[qmu] Error: {error}\n[qmu] {hint}\n")
-        else:
-            _emit(
-                args,
-                data={
-                    **data,
-                    "ok": False,
-                    "error": error,
-                    "error_type": exc.__class__.__name__,
-                    "guest_mutated": True,
-                    "hint": hint,
-                },
-                text=error,
-                stem=stem,
-            )
-        return 4
-    _emit(args, data=data, text=text, stem=stem)
-    return 0
+        return Result(
+            data={
+                **data,
+                "ok": False,
+                "error": error,
+                "error_type": exc.__class__.__name__,
+                "guest_mutated": True,
+                "hint": hint,
+            },
+            text=[error, hint],
+            stem=stem,
+            exit_code=4,
+            refusal=True,
+        )
+    return Result(data=data, text=text, stem=stem)
 
 
-def _handle_qmp(args: argparse.Namespace) -> int:
+def _handle_qmp(args: argparse.Namespace) -> Result:
     # M3: pre-validate --args JSON with a friendly QMUError instead of letting a
     # raw JSONDecodeError escape as a traceback. Both this and the command-form
     # normalization run before the VM is selected or connected, so a caller-input
@@ -1198,7 +1176,7 @@ def _handle_qmp(args: argparse.Namespace) -> int:
     # (any JSON type) straight to _output; json mode wraps it so the
     # universal {"ok": ...} contract holds, with the payload under "result".
     return _finish_mutation(
-        args, inst, verb, result if isinstance(result, str) else "", epoch,
+        inst, verb, result if isinstance(result, str) else "", epoch,
         data={"ok": True, "result": result}, text=result, stem="qmp",
     )
 
@@ -1226,7 +1204,7 @@ def _add_monitor(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_monitor)
 
 
-def _handle_monitor(args: argparse.Namespace) -> int:
+def _handle_monitor(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     command = " ".join(args.command)
     # HMP is a raw escape hatch, so `qmu monitor {system_reset,savevm,loadvm}`
@@ -1241,7 +1219,7 @@ def _handle_monitor(args: argparse.Namespace) -> int:
     if hmp_failed(result):
         raise _hmp_error(command, result)
     return _finish_mutation(
-        args, inst, verb, result, epoch,
+        inst, verb, result, epoch,
         data={"ok": True, "output": result},
         text=result if result.strip() else "(no output)",
         stem="monitor",
