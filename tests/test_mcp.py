@@ -3,7 +3,7 @@
 Everything here runs in-process over the SDK's memory transport
 (`mcp.Client(server)`), with the daemon off (the autouse fixture), so what is
 pinned is the façade's own contract: tool derivation from the real parser,
-kwargs -> argv, the envelope + `exit_code` rule, errors as results, the two
+kwargs -> argv, the envelope + `qmu_exit` rule, errors as results, the two
 resources, and the progress relay.
 """
 
@@ -49,10 +49,10 @@ def test_tool_list_contains_the_expected_tools():
         assert name not in names, name
 
 
-def _leaf_paths(parser, path=()):
+def _leaves(parser, path=()):
     subs = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
     if not subs:
-        yield path
+        yield path, parser
         return
     for action in subs:
         seen = set()
@@ -60,7 +60,11 @@ def _leaf_paths(parser, path=()):
             if id(sub) in seen:
                 continue
             seen.add(id(sub))
-            yield from _leaf_paths(sub, path + (name,))
+            yield from _leaves(sub, path + (name,))
+
+
+def _leaf_paths(parser):
+    return (path for path, _ in _leaves(parser))
 
 
 def test_every_argparse_leaf_has_a_tool():
@@ -101,14 +105,48 @@ def test_schema_maps_flags_choices_and_repeatables():
 def test_argv_for_keeps_the_guest_command_as_one_token():
     tools = {t.name: t for t in mcp_server.build_tools(build_parser())}
     assert mcp_server.argv_for(tools["qmu_exec"], {"command": "uname -a", "timeout": 5, "vm": "x"}) == [
-        "exec", "--timeout", "5", "--vm", "x", "--", "uname -a",
+        "exec", "--timeout=5", "--vm=x", "--", "uname -a",
     ]
     assert mcp_server.argv_for(tools["qmu_launch"], {
         "name": "v", "no_replace": True, "gdb": False, "injects": ["a:/b", "c:/d"],
-    }) == ["launch", "--name", "v", "--inject", "a:/b", "--inject", "c:/d", "--no-replace"]
+    }) == ["launch", "--name=v", "--inject=a:/b", "--inject=c:/d", "--no-replace"]
     assert mcp_server.argv_for(tools["qmu_rootfs_ls"], {"image": "r.img", "path": "/root"}) == [
         "rootfs", "ls", "--", "r.img", "/root",
     ]
+
+
+def test_argv_for_encodes_dash_leading_option_values(tmp_path):
+    """#125: `--qemu-arg=-M` is one token, so the value is never read as a flag."""
+    tools = {t.name: t for t in mcp_server.build_tools(build_parser())}
+    argv = mcp_server.argv_for(tools["qmu_run"], {"extra": ["-M", "pc"], "command": "true"})
+    assert argv == ["run", "--qemu-arg=-M", "--qemu-arg=pc", "--", "true"]
+    args = build_parser().parse_args(argv)
+    assert args.extra == ["-M", "pc"] and args.command == ["true"]
+    env = _call("qmu_run", {
+        "name": "x", "no_replace": True, "kernel": str(tmp_path / "missing-bzImage"),
+        "command": "true", "extra": ["-M", "pc"],
+    }).structured_content
+    assert env["qmu_exit"] == 1 and env["error_type"] != "UsageError", env
+
+
+def test_required_sets_match_the_parser_for_every_tool():
+    """#124: `required` covers required options (`kbase --symbols`), not only
+    positionals, for every tool."""
+    by_name = {t.name: t.input_schema for t in _tools().tools}
+    checked = 0
+    for path, leaf in _leaves(build_parser()):
+        name = "qmu_" + "_".join(path)
+        if name not in by_name:
+            continue
+        expected = [
+            a.dest for a in leaf._actions
+            if not isinstance(a, argparse._HelpAction) and a.help != argparse.SUPPRESS
+            and (a.required if a.option_strings else a.nargs not in ("?", "*"))
+        ]
+        assert by_name[name].get("required", []) == expected, name
+        checked += 1
+    assert checked > 30
+    assert by_name["qmu_kbase"]["required"] == ["symbols"]
 
 
 def test_schema_cost_stays_under_budget():
@@ -127,15 +165,15 @@ def _call(name, arguments=None, progress_callback=None):
 def test_version_returns_the_envelope_with_exit_code():
     result = _call("qmu_version")
     assert result.is_error is False
-    assert result.structured_content == {"ok": True, "version": VERSION, "exit_code": 0}
-    assert result.content[0].text.startswith("ok=true exit_code=0\n")
+    assert result.structured_content == {"ok": True, "version": VERSION, "qmu_exit": 0}
+    assert result.content[0].text.startswith("ok=true qmu_exit=0\n")
 
 
 def test_operational_error_is_a_result_not_a_protocol_error():
     result = _call("qmu_status", {"vm": "nope"})
     env = result.structured_content
     assert result.is_error is True
-    assert env["ok"] is False and env["exit_code"] == 1
+    assert env["ok"] is False and env["qmu_exit"] == 1
     assert env["error_type"] == "QMUError"
     assert env["error"] and env["hint"]
     assert "QMUError" in result.content[0].text and "hint:" in result.content[0].text
@@ -145,27 +183,79 @@ def test_argv_bad_flag_is_a_usage_error_result():
     env = _call("qmu_argv", {"argv": ["status", "--bogus"]}).structured_content
     assert env["ok"] is False
     assert env["error_type"] == "UsageError"
-    assert env["exit_code"] == 2
+    assert env["qmu_exit"] == 2
     assert "unrecognized arguments: --bogus" in env["error"]
     assert env["hint"] == "qmu status --help"
     assert env["usage"].startswith("usage: qmu")
 
 
-def test_argv_refuses_the_managed_flags():
-    env = _call("qmu_argv", {"argv": ["version", "--format", "text"]}).structured_content
-    assert env["error_type"] == "UsageError" and env["exit_code"] == 2
-    assert "--format is managed" in env["error"]
+def test_argv_managed_options_are_forced_after_parsing(tmp_path):
+    """#123: `--format`/`--out` are overridden on the parsed namespace, so
+    argparse abbreviations cannot switch the renderer or write a file."""
+    out = tmp_path / "bypass.txt"
+    for argv in (
+        ["version", "--format", "text"],
+        ["version", "--for=text"],
+        ["version", "--ou", str(out)],
+        ["version", "--out=" + str(out)],
+    ):
+        env = _call("qmu_argv", {"argv": argv}).structured_content
+        assert env == {"ok": True, "version": VERSION, "qmu_exit": 0}, argv
+    assert not out.exists()
+
+
+def test_argv_abbreviations_of_other_options_still_work():
+    short = _call("qmu_argv", {"argv": ["status", "--v", "nope"]}).structured_content
+    full = _call("qmu_argv", {"argv": ["status", "--vm", "nope"]}).structured_content
+    assert short == full and short["error_type"] == "QMUError" and short["qmu_exit"] == 1
+
+
+def test_argv_help_is_a_success_with_stdout_and_no_error_fields():
+    """#126: `--help` exits 0 with text; that is a success, not a NoEnvelope error."""
+    env = _call("qmu_argv", {"argv": ["--help"]}).structured_content
+    assert set(env) == {"ok", "qmu_exit", "stdout"}
+    assert env["ok"] is True and env["qmu_exit"] == 0
+    assert env["stdout"].startswith("usage: qmu")
+
+
+def test_non_envelope_nonzero_output_keeps_the_error_fallback():
+    env = mcp_server.envelope_from("garbage\n", 4, ["x"])
+    assert env["ok"] is False and env["qmu_exit"] == 4
+    assert env["error_type"] == "NoEnvelope" and env["stdout"] == "garbage\n"
+    assert "exit_code" not in env
+    env = mcp_server.envelope_from("", 2, ["x"])
+    assert env["error_type"] == "UsageError" and "stdout" not in env
+
+
+def test_guest_exit_code_is_never_overwritten(monkeypatch):
+    """#122: `exit_code` is the guest command's (37 here, null on a guest
+    timeout); the qmu process code rides separately as `qmu_exit`."""
+    from qmu.commands import guest
+
+    def fake_exec(args):
+        return Result(data={"ok": False, "exit_code": 37, "stdout": "x"}, text="x", exit_code=1)
+
+    monkeypatch.setattr(guest, "_handle_exec", fake_exec)
+    env = _call("qmu_exec", {"vm": "v", "command": "exit 37"}).structured_content
+    assert env["exit_code"] == 37 and env["qmu_exit"] == 1 and env["ok"] is False
+
+    def fake_timeout(args):
+        return Result(data={"ok": False, "exit_code": None, "timed_out": True}, text="x", exit_code=124)
+
+    monkeypatch.setattr(guest, "_handle_exec", fake_timeout)
+    env = _call("qmu_exec", {"vm": "v", "command": "sleep 9"}).structured_content
+    assert env["exit_code"] is None and env["timed_out"] is True and env["qmu_exit"] == 124
 
 
 def test_argv_group_without_subcommand_is_a_usage_error():
     env = _call("qmu_argv", {"argv": ["snapshot"]}).structured_content
-    assert env["ok"] is False and env["exit_code"] == 2
+    assert env["ok"] is False and env["qmu_exit"] == 2
     assert env["error_type"] == "UsageError"
 
 
 def test_unknown_tool_is_a_usage_error_result():
     env = _call("qmu_nope").structured_content
-    assert env["error_type"] == "UsageError" and env["exit_code"] == 2
+    assert env["error_type"] == "UsageError" and env["qmu_exit"] == 2
 
 
 def test_version_via_argv_matches_the_tool():
@@ -178,13 +268,13 @@ def test_version_via_argv_matches_the_tool():
 def test_vms_resource_is_the_list_envelope():
     result = run(lambda c: c.read_resource("qmu://vms"))
     env = json.loads(result.contents[0].text)
-    assert env == {"ok": True, "vms": [], "exit_code": 0}
+    assert env == {"ok": True, "vms": [], "qmu_exit": 0}
     assert result.contents[0].mime_type == "application/json"
 
 
 def test_vm_log_resource_routes_through_the_log_handler():
     env = json.loads(run(lambda c: c.read_resource("qmu://vm/nope/log")).contents[0].text)
-    assert env["ok"] is False and env["error_type"] == "QMUError" and env["exit_code"] == 1
+    assert env["ok"] is False and env["error_type"] == "QMUError" and env["qmu_exit"] == 1
     assert "'nope' not found" in env["error"]
 
 
@@ -219,7 +309,7 @@ def test_wait_progress_reaches_the_mcp_client(monkeypatch):
         seen.append((progress, total, message))
 
     env = _call("qmu_wait", {"vm": "v", "timeout": 1}, progress_callback=on_progress).structured_content
-    assert env == {"ok": True, "vm_id": "v", "stopped": False, "exit_code": 0}
+    assert env == {"ok": True, "vm_id": "v", "stopped": False, "qmu_exit": 0}
     assert seen == [
         (0.5, None, "waiting on v (100 B scanned)"),
         (1.5, None, "waiting on v (250 B scanned)"),

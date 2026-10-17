@@ -149,12 +149,16 @@ def test_crash_no_current_crash_json_exit_1(monkeypatch, tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
 
     assert rc == 1
-    assert set(payload) == EXPECTED_KEYS
+    # A failed envelope carries a hint (#120); the success envelope does not.
+    assert set(payload) == EXPECTED_KEYS | {"hint"}
     assert payload["ok"] is False
     assert payload["crash_detected"] is False
     assert payload["scope"] == "current"
     assert payload["crash"] is None
     assert payload["reason"] == "no crash markers found in current guest epoch"
+    assert "qmu log --vm crash-vm --tail 200" in payload["hint"]
+    assert "qmu crash --vm crash-vm --full-history" in payload["hint"]
+    assert "doctor" not in payload["hint"]
 
 
 def test_crash_ndjson_is_one_scope_aware_object(monkeypatch, tmp_path, capsys):

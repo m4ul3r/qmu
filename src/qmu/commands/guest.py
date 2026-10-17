@@ -1029,7 +1029,29 @@ def _run_guest_command(
         "kernel_warning_detected": kernel_warning is not None,
         "kernel_warning": kernel_warning,
     }
+    if rc != 0:
+        data["hint"] = _guest_exit_hint(inst, rc, kernel_warning is not None)
     return (0 if rc == 0 else 1), data, stdout, [], notes
+
+
+def _guest_exit_hint(inst: VMInstance, rc: int, kernel_report: bool) -> str:
+    """The recovery for a guest command that ran to completion and failed.
+
+    The guest already said why on stderr, so the hint points there first and
+    never at `qmu doctor` (a host check that cannot see a guest exit code).
+    A kernel report captured during the command is the more likely cause and
+    leads when present.
+    """
+    if kernel_report:
+        return (
+            f"The guest command exited {rc} and the kernel printed a report "
+            f"during it (kernel_warning); read it in full with: qmu crash --vm "
+            f"{inst.vm_id}, or qmu log --vm {inst.vm_id} --tail 100"
+        )
+    return (
+        f"The guest command exited {rc} — see stderr; if a kernel message is "
+        f"expected: qmu exec --vm {inst.vm_id} 'dmesg | tail -n 30'"
+    )
 
 
 def _guest_result(
@@ -1310,6 +1332,15 @@ def _handle_compile(args: argparse.Namespace) -> Result:
     if rc != 0:
         result["ok"] = False
         where = "on the host" if args.host_build else "in the guest"
+        result["hint"] = (
+            f"The compiler exited {rc} {where} — fix the errors in "
+            "compile_stderr; pass --cflags/--cc to change the build line"
+            + (
+                ""
+                if args.host_build
+                else f", or --host-build to compile on the host and push the binary"
+            )
+        )
         return Result(
             data=result,
             text=f"Compilation failed {where}:\n{str(result['compile_stderr']).strip()}",
@@ -1472,6 +1503,12 @@ def _handle_dmesg(args: argparse.Namespace) -> Result:
         "text": stdout,
         "stderr": stderr,
     }
+    if rc != 0:
+        data["hint"] = (
+            f"dmesg exited {rc} in the guest — see stderr (a non-root SSH user "
+            "needs kernel.dmesg_restrict=0); the serial console has the same "
+            f"kernel log: qmu log --vm {inst.vm_id} --tail 100"
+        )
     if guest_lossy(stdout):
         data["text_lossy"] = True
     if guest_lossy(stderr):
@@ -1528,15 +1565,33 @@ def _handle_crash(args: argparse.Namespace) -> Result:
         else "current guest epoch"
     )
     detected = crash is not None
+    hint: str | None = None
     if detected:
         reason = f"crash report extracted from {scope_reason}"
         text = f"Crash detected in {scope_text}:\n{crash}"
     elif not log_exists:
         reason = "serial log not found"
         text = f"No crash detected in {scope_text}: {reason}."
+        hint = (
+            f"The serial log {inst.serial_log} is gone (pruned, or the cache "
+            f"dir changed); qmu status --vm {inst.vm_id} shows what qmu still "
+            "knows. Next time keep it with: qmu kill --no-clean"
+        )
     else:
         reason = f"no crash markers found in {scope_reason}"
         text = f"No crash detected in {scope_text}: {reason}."
+        if history:
+            hint = (
+                "No Oops/BUG/panic anywhere in the retained log; see what the "
+                f"guest did print: qmu log --vm {inst.vm_id} --tail 200"
+            )
+        else:
+            hint = (
+                "No report since the current boot. Read the console: qmu log "
+                f"--vm {inst.vm_id} --tail 200; a report from an earlier boot "
+                f"is still retrievable with: qmu crash --vm {inst.vm_id} "
+                "--full-history"
+            )
 
     crash_data = {
         "ok": detected,
@@ -1547,6 +1602,8 @@ def _handle_crash(args: argparse.Namespace) -> Result:
         "serial_log": inst.serial_log,
         "crash": crash,
     }
+    if hint is not None:
+        crash_data["hint"] = hint
     return Result(
         data=crash_data, text=text, stem="crash", exit_code=0 if detected else 1
     )

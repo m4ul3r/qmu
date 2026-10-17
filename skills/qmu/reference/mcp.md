@@ -43,7 +43,9 @@ argparse name with `-` as `_` and the leading `--` dropped:
 | `--timeout 30` (`float`/`int`) | `timeout: 30` (number / integer) |
 | `--net-backend passt` (choices) | `net_backend: "passt"` (enum) |
 | `--inject A:/b --inject C:/d` (repeatable) | `injects: ["A:/b", "C:/d"]` |
+| `--qemu-arg -M --qemu-arg pc` (dash-leading values) | `extra: ["-M", "pc"]` — every valued option is sent as one `--flag=value` token, so a value starting with `-` is never read as a flag |
 | positional `name` | `name: "clean"` (required unless the CLI makes it optional) |
+| `--symbols F` (argparse `required=True`) | `symbols: "F"`, listed in the schema's `required` like a positional |
 | `exec`/`run`/`monitor` command | `command: "uname -a"` — **one string is one guest token**, exactly the CLI rule; a list is spread |
 
 `--format` and `--out` are not arguments: the façade always runs
@@ -52,26 +54,41 @@ sentence of each `--help` line; `qmu <sub> --help` and this skill remain
 the full reference.
 
 `qmu_argv` takes `argv: [...]` (everything after `qmu`) for anything the
-derived tools do not express, or when you already know the CLI syntax. It
-refuses `--format`/`--out` (a `UsageError` result) for the same reason.
+derived tools do not express, or when you already know the CLI syntax.
+`--format`/`--out` are **managed** there too, at parse level rather than
+by spelling: the argv goes through the real parser (argparse
+abbreviations such as `--for=text` or `--ou PATH` are accepted exactly as
+on the CLI), then `format` is forced to `json` and `out` to none before
+dispatch, so no spelling switches the renderer or writes a file — the
+managed envelope comes back regardless.
 
-## Result: the envelope plus `exit_code`
+## Result: the envelope plus `qmu_exit`
 
 Each call returns the CLI's JSON envelope as `structuredContent`, with
-`exit_code` added because MCP has no exit codes; the text content is a
-status line (`ok=true exit_code=0`, or the `error_type: error` and `hint` on
-failure) followed by the compact JSON. `isError` mirrors `ok`. Branch on
-`ok` and `exit_code` exactly as the *Exit codes* table says — never on a
-transport error, because there is none:
+**`qmu_exit`** added — the process exit code `qmu` would have returned,
+because MCP has no exit codes. Domain keys are never touched: `exit_code`
+is still the **guest command's** code on `exec`/`run` (`37` for `exit 37`,
+`null` when `--timeout` expired with `timed_out: true` and `qmu_exit: 124`),
+and absent where the CLI has none. The text content is a status line
+(`ok=true qmu_exit=0`, or the `error_type: error` and `hint` on failure)
+followed by the compact JSON. `isError` mirrors `ok`. Branch on `ok` and
+`qmu_exit` exactly as the *Exit codes* table says — never on a transport
+error, because there is none:
 
 - an operational failure is `{"ok": false, "error": …, "error_type": …,
-  "hint": …, "exit_code": 1}` (`QMPError`/`SSHError`/internal: `4`; a
+  "hint": …, "qmu_exit": 1}` (`QMPError`/`SSHError`/internal: `4`; a
   corroborated kernel crash: `3`; a timeout: `124`), the same keys
   `qmu --format json` prints;
-- a bad or missing argument is `error_type: "UsageError"`, `exit_code: 2`,
+- a bad or missing argument is `error_type: "UsageError"`, `qmu_exit: 2`,
   with `usage` and the CLI's `hint` (`qmu <sub> --help`);
-- `warnings[]`, `autoselected`, `crash`, `stdout`/`stderr` and every other
-  domain key are untouched.
+- `warnings[]`, `autoselected`, `crash`, `exit_code`, `stdout`/`stderr` and
+  every other domain key are untouched;
+- output that is not an envelope (only reachable via `qmu_argv`: `--help`,
+  a group's help) is `{"ok": true, "qmu_exit": 0, "stdout": "<text>"}`
+  when the exit was 0, and `{"ok": false, "error_type": "NoEnvelope"
+  (or "UsageError" on 2), "error", "hint", "qmu_exit", "stdout"?}`
+  otherwise.
+
 
 A result larger than the spill threshold comes back as the same **pointer
 envelope** the CLI prints (`spilled: true`, `artifact_path`, a preview):

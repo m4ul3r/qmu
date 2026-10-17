@@ -2,9 +2,10 @@
 
 The façade is a *renderer substitute*, not a second command layer. A tool
 call becomes an argv (`qmu --format json <group> <sub> --flag value -- POS`),
-runs through :func:`qmu.cli.main` with stdout captured, and hands back the
-JSON envelope the CLI would have printed, plus ``exit_code`` (MCP has no
-exit codes). That is the whole contract:
+runs through the real parser and :func:`qmu.cli.run_parsed` with stdout
+captured, and hands back the JSON envelope the CLI would have printed, plus
+``qmu_exit`` — the qmu process exit code (MCP has no exit codes). That is
+the whole contract:
 
 - the tool list is derived from :func:`qmu.cli.build_parser` at startup —
   the same ``_add_*`` registrars the CLI uses, so a new subcommand is a new
@@ -13,9 +14,11 @@ exit codes). That is the whole contract:
   ``ok``/``error``/``error_type``/``hint``/``warnings[]`` keys, the spill
   pointer when a result is large, the ``UsageError`` envelope for a bad
   argument — because it IS that output, parsed back;
-- the exit-code contract (``cli.py`` epilog) rides as ``exit_code``; errors
-  are results, never protocol errors, so an agent branches on ``ok`` exactly
-  as it does on the CLI.
+- the exit-code contract (``cli.py`` epilog) rides as ``qmu_exit``; domain
+  keys are never touched, so ``exit_code`` stays the GUEST command's code
+  (``exec``/``run``) exactly as the CLI reports it (#122); errors are
+  results, never protocol errors, so an agent branches on ``ok`` exactly as
+  it does on the CLI.
 
 ``qmu_argv`` passes a raw argv through for anything the derived tools do not
 express (or for agents that already know the CLI from the skill). Two
@@ -55,8 +58,11 @@ LOG_RESOURCE_TAIL = 200
 EXCLUDED: frozenset[tuple[str, ...]] = frozenset({
     ("mcp",), ("daemon", "run"), ("skill", "install"), ("rootfs", "shell"),
 })
-# Flags the façade owns: it always runs `--format json` and never writes a file.
+# Options the façade owns: it always runs `--format json` and never writes a
+# file. Enforced on the parsed namespace (see `call_cli`), so abbreviations
+# argparse accepts (`--for=text`, `--ou PATH`) cannot bypass it (#123).
 OMITTED_OPTIONS = frozenset({"format", "out"})
+MANAGED_VALUES: dict[str, Any] = {"format": "json", "out": None}
 
 # Tool/argument descriptions are the first sentence of the argparse help:
 # the full help lives in `qmu <sub> --help` and the skill, and the listing is
@@ -159,6 +165,8 @@ def build_tools(parser: argparse.ArgumentParser) -> list[ToolSpec]:
             props[action.dest] = _property(action)
             if action.option_strings:
                 options.append(action)
+                if action.required:
+                    required.append(action.dest)
             else:
                 positionals.append(action)
                 if action.nargs not in ("?", "*"):
@@ -183,13 +191,19 @@ def _tokens(value: Any) -> list[str]:
     return [str(value)]
 
 
+def _long_flag(option_strings: list[str]) -> str:
+    return next((o for o in option_strings if o.startswith("--")), option_strings[0])
+
+
 def argv_for(spec: ToolSpec, arguments: dict[str, Any]) -> list[str]:
     """`arguments` (validated against `spec.schema` by shape only) → argv.
 
     Options first, then `--`, then positionals in declaration order, so a
     positional that starts with `-` (a guest command such as `-- 'ls -la'`)
-    is never read as a qmu flag. Unknown keys are passed as `--key value` so
-    the CLI's own usage error names them, rather than a façade message.
+    is never read as a qmu flag. Every valued option is one `--flag=value`
+    token (#125): a dash-leading value (`--qemu-arg=-M`) would otherwise be
+    read as the next option. Unknown keys are passed as `--key=value` so the
+    CLI's own usage error names them, rather than a façade message.
     """
     argv: list[str] = list(spec.path)
     known = {a.dest for a in spec.positionals} | {a.dest for a in spec.options}
@@ -197,18 +211,16 @@ def argv_for(spec: ToolSpec, arguments: dict[str, Any]) -> list[str]:
         value = arguments.get(action.dest)
         if value is None:
             continue
-        flag = action.option_strings[0]
+        flag = _long_flag(action.option_strings)
         if isinstance(action, argparse._StoreTrueAction):
             if value:
                 argv.append(flag)
-        elif isinstance(action, argparse._AppendAction):
-            for item in _tokens(value):
-                argv += [flag, item]
         else:
-            argv += [flag, str(value)]
+            argv += [f"{flag}={item}" for item in _tokens(value)]
     for key, value in arguments.items():
         if key not in known and value is not None:
-            argv += ["--" + key.replace("_", "-"), *_tokens(value)]
+            flag = "--" + key.replace("_", "-")
+            argv += [f"{flag}={item}" for item in _tokens(value)]
     tail: list[str] = []
     for action in spec.positionals:
         value = arguments.get(action.dest)
@@ -263,12 +275,18 @@ def _capturing_stdout() -> _ThreadStdout:
 
 
 def call_cli(argv: list[str], progress: ProgressFn | None = None) -> dict[str, Any]:
-    """Run `qmu --format json <argv>` in this thread; return its envelope + `exit_code`.
+    """Run `qmu --format json <argv>` in this thread; return its envelope + `qmu_exit`.
 
     Everything the CLI prints to stdout is captured and parsed back; stderr
     is left alone (the host shows it as server log). A usage error's
     ``SystemExit(2)`` is caught after the CLI wrote its ``UsageError``
     envelope, so it comes back as a result too.
+
+    The managed options are enforced on the PARSED namespace, not by
+    inspecting argv (#123): argparse accepts abbreviations (``--for=text``,
+    ``--ou PATH``), so no spelling of ``--format``/``--out`` can switch the
+    renderer or write a file — ``args.format`` is forced to ``json`` and
+    ``args.out`` to ``None`` before anything is dispatched or rendered.
     """
     from . import cli  # local: the CLI imports every command module
 
@@ -279,7 +297,13 @@ def call_cli(argv: list[str], progress: ProgressFn | None = None) -> dict[str, A
     out.capture(buf)
     try:
         try:
-            code = cli.main(["--format", "json", *argv])
+            args = cli._parse(["--format", "json", *argv])
+            if args is None:
+                code = 2
+            else:
+                for dest in OMITTED_OPTIONS:
+                    setattr(args, dest, MANAGED_VALUES[dest])
+                code = cli.run_parsed(args)
         except SystemExit as exc:
             code = exc.code if isinstance(exc.code, int) else 1
     finally:
@@ -288,34 +312,46 @@ def call_cli(argv: list[str], progress: ProgressFn | None = None) -> dict[str, A
 
 
 def envelope_from(stdout: str, code: int, argv: list[str]) -> dict[str, Any]:
+    """The CLI's envelope with the qmu process exit code under ``qmu_exit``.
+
+    Domain keys are never touched: ``exit_code`` stays the guest command's
+    code (``exec``/``run``), and is absent where the CLI has none (#122).
+
+    Output that is not an envelope — ``--help`` text, a group's help, a
+    silent handler — is only reachable through ``qmu_argv``. With exit 0 it
+    is a success carrying ``stdout`` and no error fields (#126); otherwise
+    the error-shaped fallback names the argv and the code.
+    """
     text = stdout.strip()
     try:
         data = json.loads(text) if text else None
     except ValueError:
         data = None
-    if not isinstance(data, dict):
-        # A leaf that renders nothing in json mode (a group's help, a silent
-        # handler) — only reachable through `qmu_argv`.
-        data = {
-            "ok": code == 0,
-            "error": f"`qmu {' '.join(argv)}` produced no JSON envelope (exit {code})",
-            "error_type": "UsageError" if code == 2 else "NoEnvelope",
-            "hint": "qmu --help",
-        }
-        if text:
-            data["stdout"] = stdout
-    return {**data, "exit_code": code}
+    if isinstance(data, dict):
+        return {**data, "qmu_exit": code}
+    if code == 0:
+        return {"ok": True, "qmu_exit": 0, "stdout": stdout}
+    data = {
+        "ok": False,
+        "error": f"`qmu {' '.join(argv)}` produced no JSON envelope (exit {code})",
+        "error_type": "UsageError" if code == 2 else "NoEnvelope",
+        "hint": "qmu --help",
+        "qmu_exit": code,
+    }
+    if text:
+        data["stdout"] = stdout
+    return data
 
 
 def usage_error(message: str, hint: str) -> dict[str, Any]:
-    return {"ok": False, "error": message, "error_type": "UsageError", "hint": hint, "exit_code": 2}
+    return {"ok": False, "error": message, "error_type": "UsageError", "hint": hint, "qmu_exit": 2}
 
 
 def summary_text(envelope: dict[str, Any]) -> str:
     """The compact text block beside the structured result: status line, then
     the envelope minus its bulkiest member, for hosts that show text only."""
     ok = envelope.get("ok")
-    head = f"ok={str(ok).lower()} exit_code={envelope.get('exit_code')}"
+    head = f"ok={str(ok).lower()} qmu_exit={envelope.get('qmu_exit')}"
     if not ok and envelope.get("error"):
         head += f" {envelope.get('error_type', 'Error')}: {envelope['error']}"
         if envelope.get("hint"):
@@ -352,19 +388,10 @@ def tool_listing(tools: list[ToolSpec]) -> list[dict[str, Any]]:
     ]
     listing.append({
         "name": ARGV_TOOL,
-        "description": "Run any qmu command from a raw argv; same envelope + exit_code as the other tools.",
+        "description": "Run any qmu command from a raw argv; same envelope + qmu_exit as the other tools (--format/--out are managed and overridden).",
         "inputSchema": ARGV_SCHEMA,
     })
     return listing
-
-
-def _managed_flags(argv: list[str]) -> str | None:
-    for token in argv:
-        if token in ("--format", "--out") or token.startswith(("--format=", "--out=")):
-            return token
-        if token == "--":
-            break
-    return None
 
 
 def build_server():
@@ -406,15 +433,7 @@ def build_server():
     async def on_call_tool(ctx, params: types.CallToolRequestParams):
         arguments = dict(params.arguments or {})
         if params.name == ARGV_TOOL:
-            argv = [str(a) for a in arguments.get("argv") or []]
-            managed = _managed_flags(argv)
-            if managed:
-                return _result(usage_error(
-                    f"{managed} is managed by the MCP façade (every tool runs --format json "
-                    "and returns the envelope inline)", "drop the flag; large results spill "
-                    "to a file and come back as a pointer envelope",
-                ))
-            return await run_tool(ctx, argv)
+            return await run_tool(ctx, [str(a) for a in arguments.get("argv") or []])
         spec = by_name.get(params.name)
         if spec is None:
             return _result(usage_error(
@@ -462,7 +481,8 @@ def build_server():
         version=VERSION,
         instructions=(
             "Each tool is one qmu subcommand (qmu_<group>_<sub>) and returns the CLI's "
-            "JSON envelope with exit_code added; branch on ok/exit_code, never on "
+            "JSON envelope with qmu_exit (the qmu process exit code) added; exit_code is "
+            "the guest command's own code. Branch on ok/qmu_exit, never on "
             "transport errors. qmu_argv runs a raw argv. The qmu skill documents the "
             "commands and the envelope."
         ),

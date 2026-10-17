@@ -311,9 +311,10 @@ def test_run_deadline_wins_over_a_child_that_finished_during_a_slow_predicate(
 
 def test_is_ready_subprocess_cap_is_connect_timeout_plus_a_small_grace(monkeypatch):
     """#77: ssh's ConnectTimeout already bounds the banner exchange, so the
-    subprocess cap is a backstop (timeout + 0.5 s), not a second budget. The
+    subprocess cap is a backstop (timeout + 0.25 s), not a second budget. The
     old timeout + 3 s made a port that accepts but never speaks cost
-    `list`/`status` 5 s per VM."""
+    `list`/`status` 5 s per VM; + 0.5 s left `status` at 2.62 s wall against
+    the 2.6 s end-to-end budget."""
     client = ssh.SSHClient(port=2222, key_path="test-key")
     seen: dict[str, object] = {}
 
@@ -324,10 +325,10 @@ def test_is_ready_subprocess_cap_is_connect_timeout_plus_a_small_grace(monkeypat
 
     monkeypatch.setattr(ssh.subprocess, "run", fake_run)
     assert client.is_ready() is False
-    assert ssh.PROBE_GRACE_SECONDS == 0.5
-    assert seen["timeout"] == 2.5
+    assert ssh.PROBE_GRACE_SECONDS == 0.25
+    assert seen["timeout"] == 2.25
     assert "ConnectTimeout=2" in _options(seen["cmd"])
 
     assert client.is_ready(timeout=3) is False
-    assert seen["timeout"] == 3.5
+    assert seen["timeout"] == 3.25
     assert "ConnectTimeout=3" in _options(seen["cmd"])

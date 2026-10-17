@@ -32,6 +32,19 @@ n, "ok": false, "error": ..., "error_type": ...}`; a streaming op emits
 
 Two state axes, as everywhere in qmu: `exited` is the existence axis (the
 recorded process is gone); `running`/`panicked` describe the guest.
+
+Ownership rule (#118, #119)
+---------------------------
+A subscribed `wait` is never stranded. The daemon keeps a watch until the
+recorded process is positively gone — `kill` sends `quit` THROUGH the
+daemon's connection and the EOF-then-PID check marks the watch `exited`, so
+every subscriber gets `process_exited`. QMP `SHUTDOWN` alone never counts
+as death. When ownership ends while the process lives — an explicit
+`unwatch`, or the daemon itself stopping — every subscriber is answered
+with `reason: "released"` (after a `{"kind": "released"}` event) and
+finishes standalone on PID liveness; `unwatch` answers `released: true`
+only after the QMP reader is shut down and joined, so QEMU's slot is free
+the moment the client reads the reply.
 """
 
 from __future__ import annotations
@@ -97,6 +110,12 @@ FRAGMENT_IDLE_SECONDS = 0.25
 # Budget for the daemon's own QMP connect when adopting a VM. Short: a slot
 # held by a standalone command is a fact to report, not to wait out.
 ADOPT_GREETING_TIMEOUT = 1.0
+# How long `close()` waits for the reader thread to notice the shutdown. A
+# shutdown wakes it immediately; the bound only guards against a wedged host.
+READER_JOIN_SECONDS = 2.0
+# How long a stopping daemon waits for its in-flight `wait` ops to answer
+# `released` before cutting their connections.
+SHUTDOWN_RELEASE_SECONDS = 1.0
 
 QMP_EVENT_SOURCE = "qmp"
 
@@ -234,8 +253,19 @@ class _EventQMP:
         return reply.get("return")
 
     def close(self) -> None:
+        """Drop the connection and return only once the reader has let go.
+
+        `QMPClient.close()` shuts the socket down, which wakes the reader
+        with EOF; joining it (bounded) is what makes `released: true` mean
+        the slot is free — a client that connected on that answer while the
+        reader was still parked in `recv` got no greeting (#119). Never
+        joins from the reader itself (`_mark_exited` runs on it after EOF).
+        """
         self.closed = True
         self._client.close()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(READER_JOIN_SECONDS)
 
 
 # --- per-VM state --------------------------------------------------------------
@@ -260,6 +290,10 @@ class VMWatch:
     exit_reason: str | None = None
     exited_at: float | None = None
     qmp_lost: bool = False
+    # ownership: an explicit `unwatch` ended the daemon's supervision while
+    # the process lives on. Every subscribed wait is told (`released`) and
+    # finishes standalone; the watch itself is already out of `watches`.
+    released: bool = False
     # console scan
     epoch_offset: int = 0
     epoch_source: str | None = None
@@ -306,6 +340,8 @@ class Daemon:
         self.stop = threading.Event()
         self._idle_since: float | None = None
         self._listener: socket.socket | None = None
+        # `wait` ops between dispatch and reply; `_cleanup` drains it.
+        self._waits_in_flight = 0
 
     # --- lifecycle -------------------------------------------------------------
 
@@ -402,8 +438,21 @@ class Daemon:
                 self._listener.close()
             except OSError:
                 pass
+        # A stopping daemon no longer owns any VM: every subscribed wait gets
+        # its `released` transition and answers before its connection is cut,
+        # so a build-id respawn mid-wait is a hand-off, not an exit 4.
         with self.cond:
             watches = list(self.watches.values())
+            for watch in watches:
+                if not watch.exited:
+                    watch.released = True
+            self.cond.notify_all()
+            deadline = time.monotonic() + SHUTDOWN_RELEASE_SECONDS
+            while self._waits_in_flight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.cond.wait(remaining)
             clients = list(self.clients)
         for watch in watches:
             if watch.qmp is not None:
@@ -486,14 +535,25 @@ class Daemon:
         return watch.state()
 
     def unwatch(self, vm_id: str) -> bool:
+        """End the daemon's ownership of `vm_id` while its process lives on.
+
+        Two promises make `released: true` mean what it says (#118, #119):
+        every wait subscribed to the watch is woken with a terminal
+        `released` transition (it then finishes standalone on PID liveness),
+        and the QMP reader has been shut down and joined, so QEMU's one slot
+        is free for whoever asked. A VM that already exited is simply
+        forgotten — its waiters got `exited` first.
+        """
         with self.cond:
             watch = self.watches.pop(vm_id, None)
+            if watch is not None and not watch.exited:
+                watch.released = True
             self.cond.notify_all()
         if watch is None:
             return False
         if watch.qmp is not None:
             watch.qmp.close()
-        _log(f"released {vm_id}")
+        _log(f"released {vm_id}" + (" (subscribers told)" if watch.released else ""))
         return True
 
     def vm_state(self, vm_id: str) -> dict[str, Any]:
@@ -822,6 +882,9 @@ class Daemon:
                 if watch.panicked:
                     reason = "terminal_panic"
                     break
+                if watch.released:
+                    reason = "released"
+                    break
                 if watch.qmp_lost:
                     raise _OpError(
                         f"QMP error during wait: connection to '{watch.vm_id}' closed "
@@ -839,6 +902,10 @@ class Daemon:
             stream(event)
             progress(watch.scanned)
         stream(event)
+        if reason == "released":
+            # The terminal transition an explicit `unwatch` owes every
+            # subscriber: the client finishes standalone (#118).
+            stream({"kind": "released"})
         return {
             "stopped": stopped,
             "reason": reason,
@@ -894,6 +961,9 @@ class Daemon:
             if final:
                 reason = "process_exited"
                 break
+            if watch.released:
+                reason = "released"
+                break
             now = time.monotonic()
             if deadline is not None and now >= deadline:
                 reason = "timeout"
@@ -904,12 +974,14 @@ class Daemon:
             with self.cond:
                 while (
                     watch.log_size == seen_size and not watch.exited
-                    and not session.closed.is_set()
+                    and not watch.released and not session.closed.is_set()
                 ):
                     remaining = wake - time.monotonic()
                     if remaining <= 0:
                         break
                     self.cond.wait(remaining)
+        if reason == "released":
+            stream({"kind": "released"})
         return {
             "matched_line": matched,
             "reason": reason,
@@ -997,6 +1069,21 @@ class _ClientSession(threading.Thread):
     def _handle(self, request: dict[str, Any]) -> None:
         request_id = request.get("id")
         op = request.get("op")
+        # A `wait` is counted until its reply is on the wire: shutdown waits
+        # for that count so the `released` verdict reaches the client before
+        # its connection is cut.
+        if op == "wait":
+            with self.daemon.cond:
+                self.daemon._waits_in_flight += 1
+        try:
+            self._reply(request_id, op, request)
+        finally:
+            if op == "wait":
+                with self.daemon.cond:
+                    self.daemon._waits_in_flight -= 1
+                    self.daemon.cond.notify_all()
+
+    def _reply(self, request_id: Any, op: Any, request: dict[str, Any]) -> None:
         try:
             result = self._run_op(request_id, op, request)
         except _ClientGone:

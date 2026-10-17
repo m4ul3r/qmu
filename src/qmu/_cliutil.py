@@ -322,6 +322,25 @@ def render(args: argparse.Namespace, result: Result) -> int:
     return result.exit_code
 
 
+# Every `{"ok": false}` envelope carries a `hint` (#74, #120). Handlers set a
+# result-specific one in `data` at the producer; this is the backstop for a
+# producer that did not, so a reader is never left with no recovery at all.
+# It is deliberately neutral (no `qmu doctor`: most failed Results are guest/
+# caller conditions doctor does not check) and a test pins that the known
+# producers do NOT rely on it.
+_BACKSTOP_HINT = "qmu status --vm {vm}; qmu log --vm {vm} --tail 50"
+
+
+def _with_backstop_hint(data: Any, args: argparse.Namespace) -> Any:
+    if (
+        isinstance(data, dict)
+        and data.get("ok") is False
+        and not data.get("hint")
+    ):
+        return {**data, "hint": _BACKSTOP_HINT.format(vm=_vm_for_hint(args))}
+    return data
+
+
 def _write_result(args: argparse.Namespace, result: Result) -> None:
     data = result.data
     source_ok = (
@@ -330,7 +349,9 @@ def _write_result(args: argparse.Namespace, result: Result) -> None:
         else None
     )
     if getattr(args, "format", "text") != "text":
-        data = _with_envelope_warnings(data, result.warnings)
+        data = _with_backstop_hint(
+            _with_envelope_warnings(data, result.warnings), args
+        )
         _output(data, args, stem=result.stem, source_ok=source_ok)
         return
     if result.refusal:

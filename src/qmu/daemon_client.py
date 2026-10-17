@@ -407,7 +407,8 @@ def _shutdown_and_wait(conn: DaemonConnection, cache_dir: Path | None, pid: int 
 # Per-process memory of failures that would otherwise repeat their cost on
 # every `_qmp_ctx`/`_observe_guest` in one command: a spawn that did not come
 # up (2 s each) and a VM the daemon could not adopt (a busy greeting budget
-# each). `reset()` clears both; the test suite's own daemon tests call it.
+# each) — or released mid-wait (`mark_released`). `reset()` clears both; the
+# test suite's own daemon tests call it.
 _spawn_failed = False
 _unwatchable: set[str] = set()
 
@@ -488,16 +489,31 @@ def watch(vm_id: str, *, autostart: bool | None = None) -> dict[str, Any] | None
 
 
 def unwatch(vm_id: str) -> bool:
-    """Release `vm_id`'s QMP connection ahead of a kill; False when no daemon."""
+    """End the daemon's ownership of `vm_id`; False when no daemon answers.
+
+    True means the hand-off is complete: the daemon has shut down and joined
+    its QMP reader (a fresh client gets QEMU's greeting at once, #119) and
+    every `wait` subscribed to the VM has been answered `released` (#118).
+    Not the way `kill` frees the slot — `kill` quits THROUGH the daemon so
+    the watch sees the exit; this is for callers that take the VM over
+    while it lives (a `--replace` launch).
+    """
     conn = connect(autostart=False)
     if conn is None:
         return False
     with conn:
         try:
-            conn.request("unwatch", vm_id=vm_id, budget=5.0)
+            result = conn.request("unwatch", vm_id=vm_id, budget=5.0)
         except (DaemonError, DaemonUnavailable):
             return False
-    return True
+    return bool(result.get("released", True))
+
+
+def mark_released(vm_id: str) -> None:
+    """Stop this process from re-adopting `vm_id` — the daemon ended a wait's
+    subscription (`released`), so the rest of that wait runs standalone and
+    must not hand the VM straight back."""
+    _unwatchable.add(vm_id)
 
 
 def vm_state(vm_id: str, *, adopt: bool = True) -> dict[str, Any] | None:
@@ -605,13 +621,19 @@ class DaemonQMP:
         return getattr(self._direct, name)
 
     def connect(self) -> dict:
-        conn = connect()
+        # A VM the daemon refused or released in this process (`_unwatchable`)
+        # is served direct, without a round trip the answer to is known.
+        conn = None if self._inst.vm_id in _unwatchable else connect()
         if conn is not None:
             try:
                 state = conn.request("vm_state", vm_id=self._inst.vm_id)
             except (DaemonError, DaemonUnavailable):
                 state = {}
-            if state.get("watched") and not state.get("exited"):
+            # A watch whose connection QEMU closed under a live process
+            # (`qmp_lost`) can proxy nothing; the direct path is what the
+            # standalone command would do, and `kill`'s `quit` must reach
+            # QEMU, not a dead socket.
+            if state.get("watched") and not state.get("exited") and not state.get("qmp_lost"):
                 self._conn = conn
                 self.via_daemon = True
                 return {"QMP": {"daemon": True}}

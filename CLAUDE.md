@@ -412,8 +412,9 @@ nobody was connected long enough to see events. `qmu daemon run` is a
 per-cache-dir supervisor: one QMP connection + reader thread per watched VM
 (`RESET` → persist the observed epoch through a re-read record,
 `guest_epoch_source: "observed"`, drop the SSH ControlMaster; `STOP`/`RESUME`
-→ cached `running`; `SHUTDOWN`/EOF → `exited` + `debug.reap_bridge_on_exit`;
-`GUEST_PANICKED` → `panicked`), one 100 ms serial tick that scans only on
+→ cached `running`; socket EOF confirmed by PID identity → `exited` +
+`debug.reap_bridge_on_exit`; `GUEST_PANICKED` → `panicked`), one 100 ms serial
+tick that scans only on
 growth and wakes `wait` subscribers, and a newline-JSON protocol (`ping`,
 `watch`, `unwatch`, `vm_state`, `qmp`, `wait`, `shutdown`; streaming ops send
 `{"id", "event"}` lines first). The client (`daemon_client.connect`) discovers
@@ -425,11 +426,38 @@ that is the contract, and `tests/test_state_agreement_matrix.py` pins that
 `QMU_DAEMON=off` output carries none of the daemon-only keys.
 
 - `_cliutil._qmp_ctx` returns a `DaemonQMP` whose `connect()` proxies through
-  the daemon when it watches the VM and is a plain `QMPClient` otherwise; tests
-  that patch `_qmp_ctx` are unaffected. `lifecycle._daemon_state` is the one
-  seam `status`/`list`/`wait` read cached state through (`qmp: "daemon"`,
-  `_QMPProbe.daemon`); `kill` calls `_release_from_daemon` before `_kill_vm`;
-  `launch` calls `_watch_in_daemon` after `launch_vm`.
+  the daemon when it watches the VM (and that watch is not `qmp_lost`) and is
+  a plain `QMPClient` otherwise; tests that patch `_qmp_ctx` are unaffected.
+  `lifecycle._daemon_state` is the one seam `status`/`list`/`wait` read cached
+  state through (`qmp: "daemon"`, `_QMPProbe.daemon`); `launch` calls
+  `_watch_in_daemon` after `launch_vm`.
+- **Ownership rule (#118, #119): a subscribed `wait` is never stranded, and
+  release is complete when answered.** The daemon keeps a watch until the
+  recorded PID identity is gone — `instance_alive` is the only authority for
+  `exited`; a QMP `SHUTDOWN` alone never is. `kill` therefore does **not**
+  unwatch first: `_kill_vm`'s `quit` rides the daemon's connection via
+  `_qmp_ctx`, the EOF-then-PID check in `_on_qmp_closed` marks the watch
+  `exited`, and every in-flight bare/pattern wait gets `process_exited`
+  (0 / 1). `kill` once released the watch before signalling and both
+  waiters burned their whole timeout (124) on a dead VM. When ownership ends
+  while the process lives — `unwatch` (`_release_from_daemon`, used by the
+  `--replace` launch) or the daemon stopping (`_cleanup` drains
+  `_waits_in_flight` for `SHUTDOWN_RELEASE_SECONDS`) — the watch is marked
+  `released`, each `wait` op answers `reason: "released"` after a
+  `{"kind": "released"}` event, and the client (`_daemon_wait_request` raises
+  `_WaitReleased`) finishes the wait in `_wait_standalone` /
+  `_pattern_wait_standalone` with the original `start`/`deadline`, after
+  `daemon_client.mark_released` so the same process cannot re-adopt the VM.
+  `unwatch` answers only after `_EventQMP.close()` has `shutdown(SHUT_RDWR)`
+  + joined the reader (`QMPClient.close()` shuts down too): a `close()` while
+  a reader is parked in `recv` keeps the fd — and QEMU's one slot — open until
+  the reader wakes, so a fresh client got no greeting for 2 s (`QMPBusyError`).
+- **Warnings observed mid-wait ride the Result (#121).** The RESET
+  debugger-coherence warning seen by `_daemon_wait_request.on_event` or the
+  standalone `scan_console` is appended once to a `warnings` list and
+  attached via `_finish_wait(..., warnings=)` → `Result.warn`, so `render`
+  writes it to stderr exactly once and the json/ndjson envelope carries it in
+  `warnings[]`; never `sys.stderr.write` from inside a wait loop.
 - **Build id respawn**: the daemon reports `sha256(package dir + newest *.py
   mtime)[:16]`; a client that sees a different id sends `shutdown` and
   respawns, because editable installs change under a long-lived process.

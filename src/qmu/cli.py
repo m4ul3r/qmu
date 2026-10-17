@@ -337,6 +337,16 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
     if args is None:
         return 2
+    return run_parsed(args)
+
+
+def run_parsed(args: argparse.Namespace) -> int:
+    """Dispatch an already-parsed namespace, render, map exceptions to exit codes.
+
+    The second half of :func:`main`, exposed so the MCP façade can run the
+    real parser and then force ``args.format``/``args.out`` (#123) before
+    anything is dispatched or rendered.
+    """
     try:
         return render(args, _dispatch(args))
     except QMUError as exc:

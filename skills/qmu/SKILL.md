@@ -38,11 +38,11 @@ Branch on the exit code and `ok`, never on the presence of `error`.
 | Code | Meaning | JSON key to read | Next command |
 |---|---|---|---|
 | `0` | success; for `wait --pattern` the regex matched, for bare `wait` QEMU exited | `ok: true`; `matched_line`, `reason` | continue |
-| `1` | operation failed: guest command non-zero, no/bad `--vm` (or `--vm` omitted under `QMU_REQUIRE_VM=1`), `doctor` unhealthy, `SnapshotError`, `SCPFileError`, `ConfigError`, paused/panicked guest refusal, `wait --pattern` outlived the VM, `crash` found nothing | `error_type` (exception paths) or domain keys (`exit_code`, `guest_state`, `crash_detected`, `reason`) | run the `hint` (every `error_type` envelope has one); for a refusal, `qmu crash --vm X` / `qmu cont --vm X` |
+| `1` | operation failed: guest command non-zero, no/bad `--vm` (or `--vm` omitted under `QMU_REQUIRE_VM=1`), `doctor` unhealthy, `SnapshotError`, `SCPFileError`, `ConfigError`, paused/panicked guest refusal, `wait --pattern` outlived the VM, `crash` found nothing | `error_type` (exception paths) or domain keys (`exit_code`, `guest_state`, `crash_detected`, `reason`) | run the `hint` (every `ok: false` envelope has one, result-specific: guest exit N → its `stderr`, `qmu exec --vm X 'dmesg \| tail -n 30'`; `crash` none → `qmu log --vm X --tail 200` / `--full-history`; `doctor` → fix the `[!]` rows, each `checks[]` row carries its own `hint`); for a refusal, `qmu crash --vm X` / `qmu cont --vm X` |
 | `2` | usage error (argparse) ONLY; `error_type: "UsageError"` under JSON | `usage`, `hint` | fix the flags — e.g. quote the guest command |
 | `3` | guest kernel crash, always corroborated by a fresh serial crash report | `crash`, `crash_detected: true`, `guest: "panicked"` | `qmu crash --vm X` → `qmu kill --vm X` |
 | `4` | transport/infra: `SSHError`/`QMPError`, `no-console-output`, dropped SSH with NO fresh crash, `wait --pattern` `inconclusive`, internal error | `error_type` + `hint` (exception paths); a guest-command envelope has **no** `error_type` — read `ssh_error: true`, `crash_detected: false`, `hint`; `inconclusive`, `ssh_status` | `qmu status --vm X`, `qmu log --vm X --tail 200` |
-| `124` | timeout: `wait` elapsed, `launch`/`run` `--ssh-timeout` expired before SSH answered (`launch` keeps the VM, `ssh_status: "timeout"`), `exec`/`run`/`compile --run` outran `--timeout` on a reachable guest, `snapshot save` outran its budget (result **unknown**, not failed) | `timed_out: true`, `error_type: "TimeoutError"` + `hint` on an SSH timeout, `reason: "timeout"`, partial `stdout`/`stderr`; `may_have_landed: true` + `hint` on a save | raise `--timeout`/`--ssh-timeout`; `qmu log --vm X --tail 50` after a launch timeout; check `crash` on a bare `wait`; after a save, `qmu snapshot list --vm X --timeout 300` |
+| `124` | timeout: `wait` elapsed, `launch`/`run` `--ssh-timeout` expired before SSH answered (`launch` keeps the VM, `ssh_status: "timeout"`), `exec`/`run`/`compile --run` outran `--timeout` on a reachable guest, `snapshot save` outran its budget (result **unknown**, not failed) | `timed_out: true`, `error_type: "TimeoutError"` + `hint` on an SSH timeout, `reason: "timeout"`, partial `stdout`/`stderr`; `may_have_landed: true` + `hint` on a save; `hint` on every one | raise `--timeout`/`--ssh-timeout` (the `hint` names which); `qmu log --vm X --tail 50` after a launch or `wait` timeout; check `crash` on a bare `wait`; after a save, `qmu snapshot list --vm X --timeout 300` |
 
 Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `--out`): `reference/output-contract.md`.
 
@@ -110,7 +110,7 @@ qmu launch --name X --no-replace --gdb --memory 8G --cpus 4 --cpu host
 qmu launch --name X --no-replace --inject ./exploit:/root/ --partition 0   # bake a file in first
 qmu launch --name X --no-replace --no-reboot                        # panic exits QEMU instead of rebooting
 qmu list                                   # existence + guest state for every VM (a snapshot, not a diff base)
-qmu status --vm X                          # typically sub-second (~2 s under a held QMP slot, ≤ 2.5 s when the SSH port accepts but never answers — `ssh_probe_ms` says); `qmu show` is an alias; exit 0 on a stopped VM too
+qmu status --vm X                          # typically sub-second (~2 s under a held QMP slot, ≤ 2.4 s wall when the SSH port accepts but never answers (probe capped at 2.25 s) — `ssh_probe_ms` says); `qmu show` is an alias; exit 0 on a stopped VM too
 qmu kill --vm X                            # QMP quit, then SIGTERM; keeps .json + logs when a report is waiting
 qmu kill --vm X --no-clean                 # keep .json + .serial.log for forensics
 qmu prune --vm X --dry-run                 # preview; then drop --dry-run (kill-preserved logs go at any age)
@@ -377,7 +377,7 @@ or `--no-clean` (then `prune --vm X`). Prune modes: `reference/cache.md`.
 A per-user **daemon** (`<cache>/daemon.sock`, autostarted, idles out after 600 s) owns each running VM's one QMP connection: it observes
 RESET/STOP/SHUTDOWN (`status`: `qmp: daemon`, `guest_epoch_source: observed`), proxies QMP so concurrent commands never see `busy`, and
 wakes `wait` without polling; `QMU_DAEMON=off` disables it per process: `reference/daemon.md`. `qmu mcp serve` exposes every subcommand as an
-MCP tool (`qmu_<sub>` / `qmu_<group>_<sub>`, plus `qmu_argv` for a raw argv) returning this same envelope with `exit_code` added — register once with `claude mcp add qmu -- qmu mcp serve`: `reference/mcp.md`.
+MCP tool (`qmu_<sub>` / `qmu_<group>_<sub>`, plus `qmu_argv` for a raw argv) returning this same envelope with `qmu_exit` (the qmu process exit code) added, guest `exit_code` untouched — register once with `claude mcp add qmu -- qmu mcp serve`: `reference/mcp.md`.
 
 ## Reference files
 
@@ -397,4 +397,4 @@ Read on demand with `read skill://qmu/reference/<file>.md`:
 | `reference/cross-arch.md` | aarch64/arm32 guests, `compile --host` toolchains, multiarch gdb |
 | `reference/cache.md` | cache layout, `prune` modes, `cache du/ls` |
 | `reference/daemon.md` | the per-user daemon: what it owns, autostart/`QMU_DAEMON`, `daemon status/stop`, stale socket |
-| `reference/mcp.md` | `qmu mcp serve`: registration, tool naming, envelope + `exit_code`, resources, progress, limits |
+| `reference/mcp.md` | `qmu mcp serve`: registration, tool naming, envelope + `qmu_exit`, resources, progress, limits |

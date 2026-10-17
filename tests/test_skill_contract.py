@@ -211,7 +211,8 @@ def test_mcp_reference_claims_match_the_code():
     assert "reference/mcp.md" in skill
     for text, name in ((page, "mcp.md"), (skill, "SKILL.md"), (readme, "README.md")):
         assert REGISTRATION in text, name
-        assert "`exit_code` added" in text, name
+        assert "`qmu_exit`" in text, name
+        assert "`exit_code` added" not in text, name
     assert STDIO_CONFIG in page and STDIO_CONFIG in readme
     assert "`qmu_<group>_<sub>`" in page and "`qmu_argv`" in page
     assert "`qmu://vms`" in page
@@ -220,7 +221,9 @@ def test_mcp_reference_claims_match_the_code():
     for path in sorted(mcp_server.EXCLUDED):
         assert f"`{' '.join(path)}" in page, path
     for phrase in (
-        "error_type: \"UsageError\"", "exit_code: 2", "`notifications/progress`",
+        "error_type: \"UsageError\"", "qmu_exit: 2", "`--flag=value`", "--for=text",
+        "parse level", "NoEnvelope", "\"stdout\": \"<text>\"", "`notifications/progress`",
+        "`exit_code`\nis still the **guest command's** code",
         "no byte streaming", "pointer", "CWD determines `qmu.toml`",
     ):
         assert phrase in page, phrase
@@ -257,9 +260,9 @@ RETIRED_CLAIMS = [
      "list and status both classify a held QMP slot as busy (observed agreeing)"),
     # #77: the probe cap is ConnectTimeout + 0.5 s now; the 5 s figure is retired.
     (r"status --vm X\s+#.*< ?1 s",
-     "status is typically sub-second but up to ~2 s (held QMP) / ~2.5 s (SSH accepts, never answers)"),
+     "status is typically sub-second but up to ~2 s (held QMP) / ~2.4 s wall (SSH accepts, never answers)"),
     (r"~5 s when the SSH port accepts but never answers",
-     "the probe is capped at ConnectTimeout + 0.5 s (~2.5 s); status/list report ssh_probe_ms"),
+     "the probe is capped at ConnectTimeout + 0.25 s (2.25 s, ~2.4 s wall); status/list report ssh_probe_ms"),
     (r"tracked in #77",
      "#77 is closed: list/status report the probe's wall time as ssh_probe_ms"),
     # The attach gate refuses a second `qmu gdb` while a client is connected.
@@ -344,20 +347,26 @@ REQUIRED_CLAIMS = [
     # #77: the probe's cost is an observable on status and list rows.
     (SKILL, "`ssh_probe_ms` says"),
     (REFERENCE_DIR / "launch.md", "`ssh_probe_ms` (the probe's wall time in ms; null when no\nprobe was sent"),
-    (REFERENCE_DIR / "launch.md", "≤ 2.5 s when the SSH port accepts but never answers"),
+    (REFERENCE_DIR / "launch.md", "≤ 2.4 s wall when the SSH port accepts but never answers (probe capped at 2.25 s"),
     # #76: the first-QMP-connect retry is observable and field-evidenced.
     (REFERENCE_DIR / "launch.md", "`warnings[]` gains `QMP connect retried N× (ECONNRESET)`"),
     (REFERENCE_DIR / "launch.md", "`~/qmu-audit/crashpaths` receipt 2"),
     # #113: concurrent launches serialise port allocation; the lock is named.
     (REFERENCE_DIR / "launch.md", "holds `flock` on `<cache>/instances/ports.lock`"),
     (REFERENCE_DIR / "launch.md", "Waited N.Ns for the port-allocation lock"),
-    # #74: every exception-path envelope carries `hint`; warnings ride in `warnings[]`.
-    (SKILL, "run the `hint` (every `error_type` envelope has one)"),
-    (REFERENCE_DIR / "output-contract.md", "**Every exception-path `ok: false` envelope carries `hint`**"),
+    # #74/#120: every `ok: false` envelope carries `hint` — exception paths AND
+    # result-style failures, each at its producer; render's generic is a backstop.
+    (SKILL, "run the `hint` (every `ok: false` envelope has one, result-specific:"),
+    (SKILL, "`crash` none → `qmu log --vm X --tail 200` / `--full-history`"),
+    (SKILL, "`doctor` → fix the `[!]` rows, each `checks[]` row carries its own `hint`"),
+    (REFERENCE_DIR / "output-contract.md", "**Every `ok: false` envelope carries `hint`**, whichever of the three shapes"),
+    (REFERENCE_DIR / "output-contract.md", "A result-style failure sets its hint at the producer"),
+    (REFERENCE_DIR / "output-contract.md", "The renderer backstops any `ok: false` that reached it\nwithout a hint with the neutral `qmu status --vm X; qmu log --vm X --tail 50`"),
+    (REFERENCE_DIR / "output-contract.md", "never the intended answer"),
     (REFERENCE_DIR / "output-contract.md", "`SSHError` → `qmu status --vm X; qmu log --vm X --tail 50`"),
     (REFERENCE_DIR / "output-contract.md", "**`warnings: [str]`** rides in every json/ndjson envelope"),
     (REFERENCE_DIR / "output-contract.md", "the `ignoring global config` notice"),
-    (REFERENCE_DIR / "output-contract.md", "only for a site-specific hint, never for a type default"),
+    (REFERENCE_DIR / "output-contract.md", "only for a site-specific exception hint,\nnever for a type default"),
     # #72: launch and run agree that an expired --ssh-timeout is 124.
     (SKILL, "`launch`/`run` `--ssh-timeout` expired before SSH answered (`launch` keeps the VM, `ssh_status: \"timeout\"`)"),
     (SKILL, "| `ssh_status: \"timeout\"`, `timed_out: true` (launch exit 124) |"),
@@ -377,6 +386,16 @@ REQUIRED_CLAIMS = [
     (REFERENCE_DIR / "output-contract.md", "UTF-8 with `surrogateescape`"),
     (REFERENCE_DIR / "output-contract.md", "streamed above` — pointer *after* the preview"),
     (REFERENCE_DIR / "output-contract.md", "`compile --run` streams only the program's run"),
+    # #118/#119/#121: kill/unwatch never strand a waiter; release is complete
+    # when answered; the RESET coherence warning rides the wait's Result.
+    (REFERENCE_DIR / "daemon.md", "## Ownership rule: a subscribed `wait` is never stranded"),
+    (REFERENCE_DIR / "daemon.md", "**`kill` quits *through* the daemon**"),
+    (REFERENCE_DIR / "daemon.md", "**Release is complete when answered.**"),
+    (REFERENCE_DIR / "daemon.md", "`Note: the daemon released VM 'X' mid-wait (an explicit unwatch or a\n  daemon shutdown); the wait finished standalone on PID liveness.`"),
+    (REFERENCE_DIR / "daemon.md", "stderr once, `warnings[]` once"),
+    (REFERENCE_DIR / "wait.md", "**A VM killed while it is being waited on is a process exit, whoever owns\n  the wait**"),
+    (REFERENCE_DIR / "wait.md", "bare `wait` returns **0 / `process_exited`** and\n  `--pattern` **1 / `process_exited`**"),
+    (REFERENCE_DIR / "wait.md", "adds the debugger-coherence warning to the **wait's own\n  result**"),
 ]
 
 
