@@ -257,7 +257,6 @@ def _handle_run(args: argparse.Namespace) -> int:
         nic_model=args.nic_model,
         net_backend=args.net_backend,
         harness=False,
-        no_reboot=args.no_reboot,
     )
 
     # Everything after a successful launch runs under this guard: an exception

@@ -32,6 +32,12 @@ def doctor_env(tmp_path, monkeypatch):
     monkeypatch.setattr(lifecycle, "resolve_config", lambda **kwargs: config)
     monkeypatch.setattr(lifecycle, "list_instances", lambda: [])
     monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    # The sshd-policy row reads the image through guestfish; the fixture's
+    # image is an empty file, so stub the read (tests override it).
+    monkeypatch.setattr(
+        lifecycle.rootfs_mod, "read_stamp",
+        lambda image, partition=0: b'{"sshd_policy": "key-only"}\n',
+    )
 
     skill_source = tmp_path / "skill-source" / "qmu"
     skill_source.mkdir(parents=True)
@@ -502,6 +508,162 @@ def test_doctor_stays_healthy_when_only_libguestfs_cannot_build(
 
     cli.main(["doctor"])
     assert "[~] libguestfs" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# #75: a cached mkrootfs image built before key-only sshd accepts root with
+# ANY key. doctor reads the stamp read-only when libguestfs works.
+# ---------------------------------------------------------------------------
+
+
+def _libguestfs_ok(doctor_env, monkeypatch, tmp_path):
+    doctor_env.executables["guestfish"] = "/usr/bin/guestfish"
+    kernel = tmp_path / "vmlinuz"
+    kernel.write_bytes(b"")
+    monkeypatch.setenv("SUPERMIN_KERNEL", str(kernel))
+
+
+def test_doctor_sshd_policy_key_only_is_ok(doctor_env, monkeypatch, capsys, tmp_path):
+    _passt_ok(monkeypatch)
+    _libguestfs_ok(doctor_env, monkeypatch, tmp_path)
+    seen = {}
+
+    def read_stamp(image, partition=0):
+        seen["image"] = image
+        return b'{"schema": 1, "sshd_policy": "key-only"}\n'
+
+    monkeypatch.setattr(lifecycle.rootfs_mod, "read_stamp", read_stamp)
+    rc, payload = _run_json_doctor(capsys)
+    assert rc == 0
+    assert _check(payload, "rootfs sshd policy") == {
+        "check": "rootfs sshd policy", "status": "ok", "detail": "key-only",
+        "blocking": False, "hint": "", "sshd_policy": "key-only",
+    }
+    assert seen["image"] == doctor_env.config.rootfs
+    cli.main(["doctor"])
+    assert "[+] rootfs sshd policy: key-only" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("stamp", [None, b"{}\n", b'{"sshd_policy": "any-key"}\n', b"not json"])
+def test_doctor_sshd_policy_without_key_only_stamp_warns_not_blocks(
+    doctor_env, monkeypatch, capsys, tmp_path, stamp
+):
+    _passt_ok(monkeypatch)
+    _libguestfs_ok(doctor_env, monkeypatch, tmp_path)
+    monkeypatch.setattr(lifecycle.rootfs_mod, "read_stamp", lambda image, partition=0: stamp)
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "rootfs sshd policy")
+    assert rc == 0 and payload["ok"] is True
+    assert row["status"] == "warn" and row["blocking"] is False
+    assert row["detail"].startswith(
+        "permissive (image predates key-only sshd; rebuild with tools/mkrootfs.sh)"
+    )
+    assert "ANY key" in row["detail"]
+    assert row["hint"] == "rebuild the image with tools/mkrootfs.sh"
+    assert row["sshd_policy"] == "permissive"
+    cli.main(["doctor"])
+    assert "[~] rootfs sshd policy: permissive (image predates key-only sshd" in capsys.readouterr().out
+
+
+def test_doctor_sshd_policy_is_not_checked_without_a_working_libguestfs(
+    doctor_env, monkeypatch, capsys
+):
+    """guestfish absent: the row says so instead of guessing either way."""
+    _passt_ok(monkeypatch)
+    monkeypatch.setattr(
+        lifecycle.rootfs_mod, "read_stamp",
+        lambda image, partition=0: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "rootfs sshd policy")
+    assert rc == 0
+    assert row["status"] == "info" and row["sshd_policy"] is None
+    assert row["detail"].startswith("not checked (libguestfs is not usable here")
+    cli.main(["doctor"])
+    assert "[i] rootfs sshd policy: not checked (" in capsys.readouterr().out
+
+
+def test_doctor_sshd_policy_guestfish_failure_is_not_checked(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    """A partitioned or foreign image the whole-disk mount cannot open."""
+    from qmu.instance import QMUError
+
+    _passt_ok(monkeypatch)
+    _libguestfs_ok(doctor_env, monkeypatch, tmp_path)
+
+    def boom(image, partition=0):
+        raise QMUError("guestfish stamp failed (exit 1).\nTry `qmu rootfs shell`")
+
+    monkeypatch.setattr(lifecycle.rootfs_mod, "read_stamp", boom)
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "rootfs sshd policy")
+    assert rc == 0
+    assert row["status"] == "info"
+    assert row["detail"] == "not checked (guestfish stamp failed (exit 1).)"
+
+
+def test_doctor_sshd_policy_row_absent_without_a_usable_rootfs(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    _libguestfs_ok(doctor_env, monkeypatch, tmp_path)
+    for rootfs in (None, str(tmp_path / "missing.img")):
+        doctor_env.config.rootfs = rootfs
+        _, payload = _run_json_doctor(capsys)
+        assert not [c for c in payload["checks"] if c["check"] == "rootfs sshd policy"]
+
+
+# ---------------------------------------------------------------------------
+# #75: the initrd row, shaped like the kernel row.
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_initrd_not_configured_is_informational(doctor_env, monkeypatch, capsys):
+    _passt_ok(monkeypatch)
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "initrd")
+    assert rc == 0
+    assert row["status"] == "info" and row["blocking"] is False and row["hint"] == ""
+    cli.main(["doctor"])
+    assert "[i] initrd: not configured" in capsys.readouterr().out
+
+
+def test_doctor_blocks_on_a_configured_initrd_that_is_missing(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    cfg = doctor_env.config
+    cfg.initrd = str(tmp_path / "initramfs.cpio.gz")
+    cfg._written_paths["initrd"] = "./initramfs.cpio.gz"
+    cfg._field_sources["initrd"] = f"project: {tmp_path / 'qmu.toml'}"
+
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "initrd")
+    assert rc == 1 and payload["ok"] is False
+    assert row["status"] == "fail" and row["blocking"] is True
+    assert row["detail"].startswith("./initramfs.cpio.gz (not found) — resolves to ")
+    assert "launch will fail with `Initrd not found`" in row["detail"]
+    assert row["hint"] == "set [boot] initrd in qmu.toml or pass --initrd"
+    cli.main(["doctor"])
+    assert "[!] initrd: ./initramfs.cpio.gz (not found)" in capsys.readouterr().out
+
+
+def test_doctor_passes_a_configured_initrd_that_exists(
+    doctor_env, monkeypatch, capsys, tmp_path
+):
+    _passt_ok(monkeypatch)
+    initrd = tmp_path / "initramfs.cpio.gz"
+    initrd.write_bytes(b"\x00")
+    doctor_env.config.initrd = str(initrd)
+    rc, payload = _run_json_doctor(capsys)
+    assert rc == 0
+    assert _check(payload, "initrd") == {
+        "check": "initrd", "status": "ok", "detail": str(initrd),
+        "blocking": False, "hint": "",
+    }
+    cli.main(["doctor"])
+    assert f"[+] initrd: {initrd}" in capsys.readouterr().out
 
 
 def test_every_doctor_check_carries_a_boolean_blocking_verdict(

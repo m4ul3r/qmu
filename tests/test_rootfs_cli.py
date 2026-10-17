@@ -221,15 +221,57 @@ def _b(s: str | bytes) -> bytes:
     return s if isinstance(s, bytes) else s.encode("utf-8", "surrogateescape")
 
 
+class _FakeSession:
+    """A `subprocess.Popen` double for the ONE guestfish session `listdir`
+    runs (#76): commands are interpreted as they are written to stdin, so the
+    `echo` marker only shows up on stdout after the `ls0` host file exists —
+    the same ordering the real appliance gives. Like the real guestfish it
+    reads and writes raw bytes, so a `\\r` in a name survives only if the
+    caller never puts the pipe in text mode."""
+
+    def __init__(self, interpret, cmd, *, stdin, stdout, stderr):
+        self._interpret = interpret
+        self.cmd = cmd
+        self.returncode = None
+        self._out = bytearray()
+        self.stdin = self
+        self.stdout = self
+
+    # stdin side
+    def write(self, data: bytes) -> None:
+        assert isinstance(data, bytes), "guestfish transport must be byte-exact"
+        self._out += self._interpret(data)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    # stdout side
+    def read1(self, n: int) -> bytes:
+        chunk = bytes(self._out[:n])
+        del self._out[:n]
+        return chunk
+
+    def wait(self) -> int:
+        self.returncode = 0
+        return 0
+
+    def communicate(self, input: bytes) -> tuple[bytes, bytes]:
+        self.write(input)
+        self.returncode = 0
+        return bytes(self._out), b""
+
+
 def _fake_guestfish(tree: dict[str, dict[str | bytes, tuple]]):
-    """A subprocess.run double that behaves like guestfish for the commands
-    `listdir` emits: `ls0 DIR -` (NUL-terminated names), `-readlink P`
-    (target + newline for symlinks, nothing otherwise) and `lstatns P`.
-    `tree` is {dir: {name: (st_mode, size, uid, gid, target)}}; names and
-    targets may be bytes to model a guest that is not UTF-8. Like the real
-    guestfish it reads and writes raw bytes, so a `\\r` in a name survives
-    only if the caller never puts the pipe in text mode."""
+    """A Popen factory that behaves like guestfish for the commands `listdir`
+    emits: `ls0 DIR HOSTFILE` (NUL-terminated names into HOSTFILE), `echo`,
+    `-readlink P` (target + newline for symlinks, nothing otherwise) and
+    `lstatns P`. `tree` is {dir: {name: (st_mode, size, uid, gid, target)}};
+    names and targets may be bytes to model a guest that is not UTF-8."""
     import posixpath
+    from pathlib import Path
 
     btree = {d: {_b(n): v for n, v in entries.items()} for d, entries in tree.items()}
 
@@ -237,17 +279,18 @@ def _fake_guestfish(tree: dict[str, dict[str | bytes, tuple]]):
         d, n = posixpath.split(path)
         return btree[d][_b(n)]
 
-    def run(cmd, input=None, capture_output=None):
-        assert isinstance(input, bytes), "guestfish transport must be byte-exact"
+    def interpret(script: bytes) -> bytes:
         out = []
-        for line in input.decode("utf-8", "surrogateescape").split("\n"):
+        for line in script.decode("utf-8", "surrogateescape").split("\n"):
             if not line:
                 continue
             verb, _, rest = line.partition(" ")
             if verb == "ls0":
-                arg = _guestfish_unquote(rest[: rest.rindex('"') + 1])
-                assert rest.endswith(" -")
-                out.append(b"".join(n + b"\0" for n in btree[arg]))
+                arg = _guestfish_unquote(rest[: rest.index('" ') + 1])
+                dest = _guestfish_unquote(rest[rest.index('" ') + 2:])
+                Path(dest).write_bytes(b"".join(n + b"\0" for n in btree[arg]))
+            elif verb == "echo":
+                out.append(rest.encode() + b"\n")
             elif verb == "-readlink":
                 mode, size, uid, gid, target = lookup(_guestfish_unquote(rest))
                 if rootfs_mod.stat_mod.S_ISLNK(mode):
@@ -257,9 +300,9 @@ def _fake_guestfish(tree: dict[str, dict[str | bytes, tuple]]):
                 out.append(_stat_block(mode, size, uid, gid))
             else:
                 raise AssertionError(f"unexpected guestfish command: {line}")
-        return mock.Mock(returncode=0, stderr=b"", stdout=b"".join(out))
+        return b"".join(out)
 
-    return run
+    return lambda cmd, **kw: _FakeSession(interpret, cmd, **kw)
 
 
 _REG = 0o100755
@@ -271,7 +314,7 @@ def test_listdir_returns_structured_entries(tmp_path, monkeypatch):
     image = tmp_path / "rootfs.img"
     image.write_text("disk")
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
-    monkeypatch.setattr(rootfs_mod.subprocess, "run", _fake_guestfish({
+    monkeypatch.setattr(rootfs_mod.subprocess, "Popen", _fake_guestfish({
         "/etc": {
             "run.sh": (_REG, 74, 1005, 1000, None),
             "localtime": (_LNK, 27, 0, 0, "/usr/share/zoneinfo/Etc/UTC"),
@@ -303,7 +346,7 @@ def test_listdir_targets_and_names_are_data_not_framing(tmp_path, monkeypatch):
     image = tmp_path / "rootfs.img"
     image.write_text("disk")
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
-    monkeypatch.setattr(rootfs_mod.subprocess, "run", _fake_guestfish({
+    monkeypatch.setattr(rootfs_mod.subprocess, "Popen", _fake_guestfish({
         "/root/links": {
             "a": (_LNK, 11, 0, 0, "__QMU_SEP__"),
             "b": (_LNK, 11, 0, 0, "/etc/passwd"),
@@ -331,7 +374,7 @@ def test_listdir_misaligned_readlink_output_is_an_error_not_a_guess(tmp_path, mo
     image = tmp_path / "rootfs.img"
     image.write_text("disk")
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
-    monkeypatch.setattr(rootfs_mod.subprocess, "run", _fake_guestfish({
+    monkeypatch.setattr(rootfs_mod.subprocess, "Popen", _fake_guestfish({
         "/x": {"a": (_LNK, 5, 0, 0, "/etc/passwd")},
     }))
     with pytest.raises(QMUError, match="inconclusive"):
@@ -343,14 +386,87 @@ def test_listdir_short_stat_read_is_an_error_not_a_guess(tmp_path, monkeypatch):
     image.write_text("disk")
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
 
-    def fake_run(cmd, input=None, capture_output=None):
-        if input.startswith(b"ls0 "):
-            return mock.Mock(returncode=0, stderr=b"", stdout=b"a\0b\0")
-        return mock.Mock(returncode=0, stderr=b"", stdout=_stat_block(_REG, 1))
+    from pathlib import Path
 
-    monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
+    def interpret(script: bytes) -> bytes:
+        if script.startswith(b"ls0 "):
+            dest = _guestfish_unquote(script.split(b" ", 2)[2].split(b"\n")[0].decode())
+            Path(dest).write_bytes(b"a\0b\0")
+            return b"qmu-phase-done\n"
+        return _stat_block(_REG, 1)
+
+    monkeypatch.setattr(
+        rootfs_mod.subprocess, "Popen", lambda cmd, **kw: _FakeSession(interpret, cmd, **kw)
+    )
     with pytest.raises(QMUError, match="inconclusive"):
         rootfs_mod.listdir(str(image), "/x", partition=0)
+
+
+def test_listdir_costs_one_guestfish_session(tmp_path, monkeypatch):
+    """#76: the appliance boot is the whole cost of a guestfish run, and
+    `ls` used to pay it twice (names, then stats)."""
+    image = tmp_path / "rootfs.img"
+    image.write_text("disk")
+    monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
+    factory = _fake_guestfish({"/d": {"a": (_REG, 1, 0, 0, None)}})
+    sessions = []
+
+    def counting(cmd, **kw):
+        sessions.append(cmd)
+        return factory(cmd, **kw)
+
+    monkeypatch.setattr(rootfs_mod.subprocess, "Popen", counting)
+    assert [e["name"] for e in rootfs_mod.listdir(str(image), "/d", partition=0)] == ["a"]
+    assert len(sessions) == 1
+    assert sessions[0][1:2] == ["--ro"]
+
+
+def test_listdir_guestfish_exit_before_names_is_the_guestfish_error(tmp_path, monkeypatch):
+    """`ls0` on a missing or non-directory path kills the session before the
+    phase marker; the reader gets guestfish's own words, not a parse error."""
+    image = tmp_path / "rootfs.img"
+    image.write_text("disk")
+    monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
+
+    class Dead(_FakeSession):
+        def __init__(self, cmd, *, stdin, stdout, stderr):
+            super().__init__(lambda _script: b"", cmd, stdin=stdin, stdout=stdout, stderr=stderr)
+            stderr.write(b"*stdin*:1: libguestfs: error: ls0: opendir: /nope: No such file or directory\n")
+
+        def wait(self):
+            self.returncode = 1
+            return 1
+
+    monkeypatch.setattr(rootfs_mod.subprocess, "Popen", Dead)
+    with pytest.raises(QMUError) as excinfo:
+        rootfs_mod.listdir(str(image), "/nope", partition=0)
+    msg = str(excinfo.value)
+    assert msg.startswith("guestfish ls failed (exit 1).")
+    assert "That path does not exist inside" in msg
+    assert "opendir: /nope" in msg
+
+
+@pytest.mark.parametrize(("stdout", "expected"), [
+    (b'true\n{"sshd_policy": "key-only"}\n', b'{"sshd_policy": "key-only"}\n'),
+    (b"false\n", None),
+])
+def test_read_stamp_is_read_only_whole_disk_and_tolerates_a_missing_file(
+    tmp_path, monkeypatch, stdout, expected
+):
+    image = tmp_path / "rootfs.img"
+    image.write_text("disk")
+    monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
+    seen = {}
+
+    def fake_run(cmd, input=None, capture_output=None):
+        seen["cmd"], seen["script"] = cmd, input
+        return mock.Mock(returncode=0, stderr=b"", stdout=stdout)
+
+    monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
+    assert rootfs_mod.read_stamp(str(image)) == expected
+    assert seen["cmd"][1:2] == ["--ro"] and seen["cmd"][-2:] == ["-m", "/dev/sda"]
+    # `-cat`: a missing stamp must not abort the script before `exists` answers.
+    assert seen["script"] == b"exists /etc/qmu-rootfs.json\n-cat /etc/qmu-rootfs.json\n"
 
 
 def _fake_download(payload: bytes):
@@ -423,7 +539,7 @@ def _listdir(tmp_path, monkeypatch, entries: dict[str | bytes, tuple]) -> list[d
     image = tmp_path / "rootfs.img"
     image.write_text("disk")
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
-    monkeypatch.setattr(rootfs_mod.subprocess, "run", _fake_guestfish({"/d": entries}))
+    monkeypatch.setattr(rootfs_mod.subprocess, "Popen", _fake_guestfish({"/d": entries}))
     return rootfs_mod.listdir(str(image), "/d", partition=0)
 
 

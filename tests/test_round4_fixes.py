@@ -389,11 +389,34 @@ def test_ls_opens_read_only_and_skips_the_busy_guard(tmp_path, monkeypatch):
     )
     seen: dict = {}
 
-    def fake_run(cmd, input=None, text=None, capture_output=None):
-        seen["cmd"] = cmd
-        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+    class FakeSession:
+        """The one guestfish session `ls` runs (#76): `ls0` to a host file,
+        then the `echo` marker; an empty directory needs nothing more."""
 
-    monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
+        def __init__(self, cmd, *, stdin, stdout, stderr):
+            seen["cmd"] = cmd
+            self.stdin = self.stdout = self
+            self.returncode = 0
+            self._out = b""
+
+        def write(self, data):
+            for line in data.decode().splitlines():
+                if line.startswith("ls0 "):
+                    Path(line.split('" ', 1)[1].strip('"')).write_bytes(b"")
+                elif line.startswith("echo "):
+                    self._out += line[5:].encode() + b"\n"
+
+        def flush(self):
+            pass
+
+        def read1(self, n):
+            chunk, self._out = self._out[:n], self._out[n:]
+            return chunk
+
+        def communicate(self, input):
+            return b"", b""
+
+    monkeypatch.setattr(rootfs_mod.subprocess, "Popen", FakeSession)
 
     assert rootfs_mod.listdir(str(image), "/root", partition=0) == []
 
