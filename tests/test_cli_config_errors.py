@@ -286,20 +286,31 @@ def test_parse_error_envelope_has_no_key_but_still_lists_the_problem(
 
     assert rc == 1
     assert payload["source"] == str(source)
-    assert payload["key"] is None and payload["hint"] is None
+    assert payload["key"] is None
+    # No key-level hint, so the envelope carries the ConfigError default (#74).
+    assert payload["hint"] == (
+        "qmu config show names the file and key; qmu doctor checks the "
+        "resolved config"
+    )
+    assert payload["errors"][0]["hint"] is None
     assert len(payload["errors"]) == 1
     assert payload["errors"][0]["message"].startswith("failed to parse TOML")
 
 
-def test_non_config_errors_keep_the_three_key_envelope(config_cli_env, capsys):
+def test_non_config_errors_keep_the_plain_envelope(config_cli_env, capsys):
     """The envelope hook is additive: an error without structured detail
-    renders exactly as before."""
+    renders as the three keys plus the #74 `hint`. With no kernel configured
+    the launch preflight refuses first, and that raise site names the fix."""
     config_cli_env["project"].write_text('[machine]\nmemory = "1G"\n')
     rc = cli.main(["--format", "json", "launch", "--profile", "bogus"])
     payload = json.loads(capsys.readouterr().out)
 
     assert rc == 1
-    assert set(payload) == {"ok", "error", "error_type"}
+    assert set(payload) == {"ok", "error", "error_type", "hint"}
+    assert payload["error"].startswith("No kernel configured.")
+    assert payload["hint"] == (
+        "qmu launch --kernel <bzImage>; or qmu config init and set [boot] kernel"
+    )
 
 
 def test_harness_launch_accepts_machine_only_config(
@@ -503,14 +514,17 @@ def test_status_config_error_emits_exactly_one_false_record(
     assert UNKNOWN_KEY in payload["error"]
 
 
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
 def test_broken_global_config_warns_and_status_continues(
-    config_cli_env, running_instance, capsys
+    config_cli_env, running_instance, capsys, fmt
 ):
     """A broken GLOBAL config is never fatal — not even for status. It warns
-    and answers on defaults, exactly like every other command."""
+    and answers on defaults, exactly like every other command. The warning
+    fires in the dispatch gate, before the handler, and still reaches the
+    envelope's `warnings[]` as well as stderr (#74)."""
     config_cli_env["global"].write_text("broken = [\n")
 
-    rc = cli.main(["--format", "json", "status"])
+    rc = cli.main(["--format", fmt, "status"])
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
@@ -518,6 +532,28 @@ def test_broken_global_config_warns_and_status_continues(
     assert "[qmu] Warning: ignoring global config" in captured.err
     assert payload["ok"] is True
     assert payload["vm_id"] == "live"
+    (warning,) = payload["warnings"]
+    assert warning.startswith("ignoring global config: Invalid config ")
+    assert str(config_cli_env["global"].resolve()) in warning
+
+
+def test_broken_global_config_warning_rides_on_the_error_envelope(
+    config_cli_env, capsys
+):
+    """A command that then FAILS still carries the gate's warning: the
+    `ok:false` envelope has `warnings[]`, and stderr has the line."""
+    config_cli_env["global"].write_text("broken = [\n")
+
+    rc = cli.main(["--format", "json", "status", "--vm", "nope"])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert rc == 1
+    assert payload["ok"] is False
+    assert payload["hint"]
+    assert len(payload["warnings"]) == 1
+    assert payload["warnings"][0].startswith("ignoring global config")
+    assert captured.err.count("ignoring global config") == 1
 
 
 def test_valid_project_config_keeps_status_working(
@@ -599,6 +635,9 @@ MINIMAL_ARGV = {
     # argparse before ever reaching the dispatch gate under test.
     "kbase": ["kbase", "--symbols", "System.map"],
     "qmp": ["qmp", "query-status"], "monitor": ["monitor", "info", "status"],
+    # Gated like every VM verb: a daemon spawned from a broken project would
+    # inherit the same refusal, so the client's 2 s spawn wait is not spent.
+    "daemon": ["daemon", "status"],
 }
 
 

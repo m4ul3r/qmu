@@ -57,7 +57,12 @@ def test_invoke_raises_the_qmuerror_main_maps_to_exit_1(monkeypatch, capsys):
 
     assert cli.main(["status", "--vm", "nope"]) == 1
     err = capsys.readouterr().err
-    assert err == f"[qmu] Error: {raised.value}\n"
+    # main() renders the same exception plus its specific recovery hint;
+    # invoke() (above) wrote nothing and left both to the caller.
+    assert err == (
+        f"[qmu] Error: {raised.value}\n"
+        "[qmu] Hint: qmu list; qmu launch --name <name> --no-replace\n"
+    )
 
 
 def test_invoke_usage_error_is_argparse_systemexit_2(capsys):

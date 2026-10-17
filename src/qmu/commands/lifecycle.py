@@ -76,10 +76,11 @@ from ..paths import (
 )
 from ..qemu import native_passt_problem, probe_qemu_netdevs
 from ..qmp import QMPBusyError, QMPError
+from .. import daemon_client
 from ..serial import (
     SerialTail,
     current_boot_offset,
-    is_terminal_panic_start,
+    scan_for_pattern,
     extract_crash,
     has_terminal_panic,
     extract_unknown_params,
@@ -156,12 +157,14 @@ def _replace_existing_named_vm(name: str | None, no_replace: bool) -> Any:
                 f"VM '{name}' is already running (pid={existing.pid}) and "
                 "--no-replace was given, so it was left alone and nothing was "
                 f"launched. Use a different --name, drop --no-replace to "
-                f"replace it, or stop it first: qmu kill --vm {name}"
+                f"replace it, or stop it first: qmu kill --vm {name}",
+                hint=f"qmu kill --vm {name}; or relaunch with another --name",
             )
         return
     existing = load_instance(name)
     if existing is not None and instance_alive(existing):
         sys.stderr.write(f"[qmu] Replacing existing VM '{name}' (pid={existing.pid})\n")
+        _release_from_daemon(existing)
         _kill_vm(existing)
         return existing
     elif existing is not None:
@@ -506,7 +509,8 @@ def _prepare_boot(
     if config.kernel is None:
         raise QMUError(
             "No kernel configured. Pass --kernel or set [boot] kernel in qmu.toml "
-            "(run `qmu config init` for a starter file)."
+            "(run `qmu config init` for a starter file).",
+            hint="qmu launch --kernel <bzImage>; or qmu config init and set [boot] kernel",
         )
 
     # An explicit CLI --profile must beat a project `[boot] cmdline`. Layering
@@ -648,9 +652,17 @@ def _handle_launch(args: argparse.Namespace) -> Result:
     for note in launch_notes:
         sys.stderr.write(f"[qmu] {note}\n")
         prep.warnings.append(note)
+    # Hand the new VM to the daemon now that its first QMP connect succeeded
+    # (inside `launch_vm`): from here on every RESET/STOP/SHUTDOWN is observed
+    # rather than inferred, and sibling commands read cached state instead of
+    # contending for the QMP slot. Best-effort — a VM nobody watches is
+    # exactly today's standalone VM.
+    _watch_in_daemon(inst)
 
     exit_code = 0
     error: str | None = None
+    error_type = "SSHError"
+    hint: str | None = None
     if inst.harness:
         ssh_status = "n/a (harness)"
     elif inst.ssh_port is None:
@@ -667,13 +679,28 @@ def _handle_launch(args: argparse.Namespace) -> Result:
             ssh_status = "no-console-output"
             exit_code = 4
             error = _no_console_output_error(inst, config.arch)
+            expected = _expected_console(config.arch)
+            hint = (
+                f"qmu log --vm {inst.vm_id} --tail 50; then relaunch with "
+                + (f"console={expected} " if expected else "the console= ")
+                + "and -M/-cpu matching the kernel's arch"
+            )
         else:
-            ssh_status = "timeout (VM may still be booting)"
-            exit_code = 4
+            # The window closed with the guest still booting: the timeout
+            # code (124), the same `run` exits for the same condition, not
+            # the transport class (4) — nothing broke, the VM is retained
+            # and the SSH may still come up (#72).
+            ssh_status = "timeout"
+            exit_code = 124
+            error_type = "TimeoutError"
             error = (
-                f"SSH did not become ready within {args.ssh_timeout}s. "
-                f"VM state retained; inspect with `qmu log --vm {inst.vm_id}` "
-                f"or `qmu status --vm {inst.vm_id}`."
+                f"SSH did not become ready within {args.ssh_timeout}s; the VM "
+                "may still be booting. VM state retained."
+            )
+            hint = (
+                f"qmu log --vm {inst.vm_id} --tail 50 shows how far the boot "
+                f"got; qmu status --vm {inst.vm_id} re-probes SSH; or relaunch "
+                "with a longer --ssh-timeout."
             )
     else:
         ssh_status = "skipped"
@@ -745,12 +772,19 @@ def _handle_launch(args: argparse.Namespace) -> Result:
     lines.append(f"  Kernel:  {inst.kernel}")
     lines.append(f"  Profile: {_profile_label(inst)}")
     lines.append(f"  Serial:  {inst.serial_log}")
+    notes: tuple[str, ...] = ()
     if error is not None:
-        result["error_type"] = "SSHError"
+        result["error_type"] = error_type
         result["error"] = error
-        if args.format == "text":
-            sys.stderr.write(f"[qmu] Error: {error}\n")
-    return Result(data=result, text=lines, stem="launch", exit_code=exit_code)
+        result["hint"] = hint
+        if exit_code == 124:
+            result["timed_out"] = True
+            result["ssh_error"] = True
+        # Text-mode stderr trailer, after the launch block it qualifies.
+        notes = (f"[qmu] Error: {error}", f"[qmu] Hint: {hint}")
+    return Result(
+        data=result, text=lines, stem="launch", exit_code=exit_code, notes=notes
+    )
 
 
 def _orphan_serial_logs() -> dict[str, int]:
@@ -779,9 +813,12 @@ GUEST_UNKNOWN = "unknown"
 # contention case: QEMU accepted the connection and never greeted it because
 # another client (a `wait`, a debugger bridge) holds the socket. It is neither
 # `connected` (nothing was learned) nor `unreachable` (the VM is fine).
+# `daemon` means no round trip happened at all: the qmu daemon holds the
+# VM's one connection and answered from the state its event stream keeps.
 QMP_CONNECTED = "connected"
 QMP_BUSY = "busy"
 QMP_UNREACHABLE = "unreachable"
+QMP_DAEMON = "daemon"
 
 
 @dataclass
@@ -790,14 +827,48 @@ class _QMPProbe:
     status: str = "unknown"
     running: bool | None = None
     error: str | None = None
+    # The daemon's `vm_state` when `state == QMP_DAEMON`: carries the observed
+    # epoch (`epoch_offset`/`epoch_source`) the guest scope is anchored on.
+    daemon: dict[str, Any] | None = None
+
+
+def _daemon_state(inst: Any, *, adopt: bool = True) -> dict[str, Any] | None:
+    """The daemon's cached view of a running VM, adopting it on first sight.
+
+    None whenever the standalone path must be taken: the layer is off
+    (`QMU_DAEMON=off`), no daemon could be reached or spawned, the VM has no
+    record to supervise (an orphan), or the daemon already saw it exit. The
+    module-level name is the patch point; the tests run with the layer off.
+    """
+    if not daemon_client.enabled() or not getattr(inst, "qmp_socket", None):
+        return None
+    state = daemon_client.vm_state(inst.vm_id, adopt=adopt)
+    if state is None or state.get("exited"):
+        return None
+    return state
+
+
+def _probe_from_daemon(state: dict[str, Any]) -> _QMPProbe:
+    running = state.get("running")
+    status = state.get("qemu_status")
+    return _QMPProbe(
+        QMP_DAEMON,
+        status=status if isinstance(status, str) else "unknown",
+        running=running if isinstance(running, bool) else None,
+        daemon=state,
+    )
 
 
 def _query_qmp(inst: Any) -> _QMPProbe:
-    """One short-lived `query-status`: connect, ask, disconnect.
+    """One `query-status` — from the daemon's cache when it watches the VM,
+    else one short-lived connection: connect, ask, disconnect.
 
     Never raises — a probe that cannot be answered is a reportable fact, not a
     failure of the command asking.
     """
+    state = _daemon_state(inst)
+    if state is not None:
+        return _probe_from_daemon(state)
     socket_path = inst.qmp_socket
     if not socket_path:
         # A synthesized orphan carries no recorded socket, but the file sits at
@@ -857,10 +928,14 @@ class _GuestObservation:
     # runs `uname`, which fires a user breakpoint on `__x64_sys_newuname`.
     debugger_attached: bool = False
     crash_detected: bool = False
+    # How the boot boundary `scan_offset` was learned when the daemon serves
+    # the VM: "observed" (a RESET it witnessed) or "banner" (inferred from
+    # the log). None on the standalone path, where only the banner exists.
+    epoch_source: str | None = None
 
     @property
     def qmp_state(self) -> str | None:
-        """`connected`/`busy`/`unreachable`, or None when QMP was not asked."""
+        """`connected`/`busy`/`unreachable`/`daemon`, or None when QMP was not asked."""
         return self.qmp.state if self.qmp is not None else None
 
     def ssh_state(self) -> str:
@@ -923,12 +998,29 @@ def _observe_guest(
     `probe_ssh` asks sshd only when that could change the answer — never for
     a panicked or paused guest, which can only time out.
     """
-    # Scope BOTH crash reads to the current boot. The recorded guest epoch only
-    # advances on an observed QMP RESET, so a guest-initiated reboot between two
-    # commands leaves it pointing at a guest that no longer exists — and a panic
-    # from the previous boot would then label a demonstrably healthy VM as gone
-    # and instruct the operator to reap it.
-    start = current_boot_offset(inst.serial_log, inst.guest_epoch_serial_offset)
+    # Scope BOTH crash reads to the current boot. On the standalone path the
+    # recorded guest epoch only advances on a RESET some qmu command happened
+    # to witness, so a guest-initiated reboot between two commands leaves it
+    # pointing at a guest that no longer exists — and a panic from the
+    # previous boot would then label a demonstrably healthy VM as gone and
+    # instruct the operator to reap it; the log's newest boot banner is the
+    # fallback. When the daemon watches the VM, its event stream saw every
+    # RESET: the epoch it persisted is the anchor and the banner can only
+    # refine it forward within the same boot, never decide against it.
+    if qmp is None:
+        state = _daemon_state(inst)
+        if state is not None:
+            qmp = _probe_from_daemon(state)
+    daemon = qmp.daemon if qmp is not None else None
+    epoch_source: str | None = None
+    if daemon is not None:
+        epoch = daemon.get("epoch_offset")
+        start = current_boot_offset(
+            inst.serial_log, epoch if isinstance(epoch, int) else inst.guest_epoch_serial_offset
+        )
+        epoch_source = daemon.get("epoch_source") if isinstance(daemon.get("epoch_source"), str) else "banner"
+    else:
+        start = current_boot_offset(inst.serial_log, inst.guest_epoch_serial_offset)
     console_bytes = max(0, serial_log_offset(inst.serial_log) - start)
     has_endpoint = not inst.harness and inst.ssh_port is not None
 
@@ -936,6 +1028,7 @@ def _observe_guest(
         return _GuestObservation(
             GUEST_PANICKED, start, console_bytes, qmp, has_endpoint,
             ssh_ready=False if has_endpoint else None, crash_detected=True,
+            epoch_source=epoch_source,
         )
 
     # Read once, before the usability precedence decides anything: the report
@@ -948,7 +1041,7 @@ def _observe_guest(
         return _GuestObservation(
             GUEST_PAUSED, start, console_bytes, qmp, has_endpoint,
             ssh_ready=False if has_endpoint else None,
-            crash_detected=crash_detected,
+            crash_detected=crash_detected, epoch_source=epoch_source,
         )
 
     # #39-adjacent: the readiness probe logs in, and a login runs `uname`.
@@ -981,6 +1074,7 @@ def _observe_guest(
         guest, start, console_bytes, qmp, has_endpoint,
         ssh_ready=ssh_ready, ssh_probed=ssh_probed, ssh_probe_ms=ssh_probe_ms,
         debugger_attached=attached, crash_detected=crash_detected,
+        epoch_source=epoch_source,
     )
 
 
@@ -1149,6 +1243,24 @@ def _close_ssh_master(inst: Any) -> bool:
     return bool(_make_ssh(inst).close_control_master())
 
 
+def _release_from_daemon(inst: Any) -> bool:
+    """Ask the daemon to drop `inst`'s watch (and its QMP connection) before
+    a kill. Never spawns a daemon; False when none is running or the layer
+    is off. Also the patch point for tests."""
+    if not daemon_client.enabled():
+        return False
+    return daemon_client.unwatch(inst.vm_id)
+
+
+def _watch_in_daemon(inst: Any) -> dict[str, Any] | None:
+    """Hand a freshly launched VM to the daemon (spawning one if `[daemon]
+    autostart` allows). None when the layer is off or no daemon came up;
+    the launch is unaffected either way. Patch point for tests."""
+    if not daemon_client.enabled():
+        return None
+    return daemon_client.watch(inst.vm_id)
+
+
 def _handle_kill(args: argparse.Namespace) -> Result:
     orphan_result = _kill_orphan_if_named(args)
     if orphan_result is not None:
@@ -1214,6 +1326,10 @@ def _handle_kill(args: argparse.Namespace) -> Result:
     # later surprise. qmu still does not manage the pry lifecycle.
     had_bridge = debug_session_present(inst) if inst.gdb_port is not None else False
     _close_ssh_master(inst)
+    # The daemon holds the VM's QMP connection; release it so the graceful
+    # `quit` below reaches QEMU directly instead of queueing behind a slot
+    # the daemon would otherwise keep until it noticed the exit.
+    _release_from_daemon(inst)
     _kill_vm(inst, force=args.force, clean=clean)
     bridge_reaped = _reap_recorded_bridge(inst)
     if preserve_crash:
@@ -1767,7 +1883,8 @@ def _handle_prune(args: argparse.Namespace) -> Result:
     if vm is not None:
         if vm in running_ids:
             raise QMUError(
-                f"VM '{vm}' is running. Use 'qmu kill --vm {vm}' first."
+                f"VM '{vm}' is running. Use 'qmu kill --vm {vm}' first.",
+                hint=f"qmu kill --vm {vm}; then qmu prune --vm {vm}",
             )
         found = True
         refused: list[dict[str, Any]] = []
@@ -1983,6 +2100,10 @@ def _handle_wait(args: argparse.Namespace) -> Result:
             _require_running(args.vm, "wait")
     inst = choose_instance(args.vm)
 
+    daemon = _daemon_state(inst)
+    if daemon is not None:
+        return _wait_via_daemon(args, inst, daemon)
+
     start = time.monotonic()
     deadline: float | None = (
         start + args.timeout if args.timeout is not None else None
@@ -2133,6 +2254,104 @@ def _handle_wait(args: argparse.Namespace) -> Result:
         crash=crash, qmp_state=probe.state if probe is not None else None,
         qemu_status=qemu_status,
         last_event=last_event, event_data=event_data,
+        console_tail=_console_tail(inst.serial_log, boot_offset),
+    )
+
+
+def _daemon_wait_request(
+    args: argparse.Namespace,
+    inst: Any,
+    *,
+    pattern: str | None = None,
+    start_offset: int | None = None,
+) -> dict[str, Any]:
+    """Block on the daemon's `wait` op until it answers; no polling here.
+
+    QMP events the daemon observes meanwhile stream back as they happen and
+    are relayed the way the standalone loop reports them: a RESET under an
+    attached debugger gets the #46 warning (the breakpoint set is gone) at
+    the moment it is seen, not when the wait ends.
+    """
+    warned_reset_debug = False
+
+    def on_event(event: dict[str, Any]) -> None:
+        nonlocal warned_reset_debug
+        if (
+            event.get("kind") == "qmp_event" and event.get("name") == "RESET"
+            and not warned_reset_debug and debug_session_present(inst)
+        ):
+            warned_reset_debug = True
+            sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
+
+    conn = daemon_client.connect()
+    if conn is None:
+        raise QMPError(f"daemon went away before the wait on '{inst.vm_id}' started")
+    deadline = None if args.timeout is None else float(args.timeout)
+    with conn:
+        try:
+            return conn.request(
+                "wait",
+                # The daemon enforces the deadline; the socket budget only
+                # guards against a daemon that died with the wait in flight.
+                budget=None if deadline is None else deadline + 5.0,
+                on_event=on_event,
+                vm_id=inst.vm_id,
+                pattern=pattern,
+                timeout=deadline,
+                start_offset=start_offset,
+                ignore_crash=bool(getattr(args, "ignore_crash", False)),
+            )
+        except daemon_client.DaemonUnavailable as exc:
+            raise QMPError(f"daemon connection lost during wait on '{inst.vm_id}': {exc}") from exc
+
+
+def _wait_via_daemon(args: argparse.Namespace, inst: Any, state: dict[str, Any]) -> Result:
+    """Bare `wait` served by the daemon's event stream instead of a poll loop.
+
+    Same verdicts and the same renderer as the standalone loop: the daemon
+    returns WHEN the wait ended and what it observed; the crash report, the
+    console tail and the guest axis are read here, from the log as it is
+    now, exactly as the standalone path does after its loop.
+    """
+    try:
+        reply = _daemon_wait_request(args, inst)
+    except daemon_client.DaemonError as exc:
+        raise QMPError(str(exc)) from exc
+    stopped = bool(reply.get("stopped"))
+    reason = str(reply.get("reason", "timeout"))
+    elapsed = float(reply.get("elapsed", 0.0))
+    boot_offset = reply.get("boot_offset")
+    if not isinstance(boot_offset, int):
+        boot_offset = current_boot_offset(inst.serial_log, inst.guest_epoch_serial_offset)
+    qemu_status = reply.get("qemu_status")
+    qemu_status = qemu_status if isinstance(qemu_status, str) else "unknown"
+    last_event = reply.get("last_event")
+    event_data = reply.get("event_data")
+
+    crash: str | None = None
+    guest: str | None = None
+    guest_detail: str | None = None
+    if reason == _WAIT_REASON_TERMINAL_PANIC:
+        guest = GUEST_PANICKED
+        crash = _settled_crash(inst, boot_offset) or extract_crash(
+            inst.serial_log, start_offset=boot_offset
+        )
+    if stopped:
+        boot_offset = last_boot_offset(inst.serial_log, start_offset=boot_offset)
+        crash = extract_crash(inst.serial_log, start_offset=boot_offset)
+        guest = None
+    elif guest is None:
+        probe = _probe_from_daemon({**state, **{
+            k: reply[k] for k in ("running", "qemu_status", "boot_offset") if k in reply
+        }})
+        observation = _observe_guest(inst, qmp=probe)
+        guest = observation.guest
+        guest_detail = observation.detail()
+    return _finish_wait(
+        args, inst,
+        stopped=stopped, reason=reason, elapsed=elapsed, guest=guest,
+        guest_detail=guest_detail, crash=crash, qmp_state=QMP_DAEMON,
+        qemu_status=qemu_status, last_event=last_event, event_data=event_data,
         console_tail=_console_tail(inst.serial_log, boot_offset),
     )
 
@@ -2334,16 +2553,26 @@ def _wait_for_pattern(args: argparse.Namespace) -> Result:
     start = time.monotonic()
     deadline = start + args.timeout if args.timeout is not None else None
     # Use the recorded RESET boundary and the log's latest boot banner. A
-    # guest-initiated reboot can occur while no qmu command is observing QMP.
-    # The chosen boundary is reported back (`scan_offset`/`scan_scope`) so a
-    # marker that fell outside it is never a silent miss: a `dmesg` replay
-    # echoed to the console reproduces the banner and moves this boundary.
+    # guest-initiated reboot can occur while no qmu command is observing QMP
+    # — unless the daemon watches the VM, whose observed epoch then anchors
+    # the scope. The chosen boundary is reported back (`scan_offset`/
+    # `scan_scope`) so a marker that fell outside it is never a silent miss:
+    # a `dmesg` replay echoed to the console reproduces the banner and moves
+    # this boundary.
+    daemon = _daemon_state(inst)
     epoch_offset = inst.guest_epoch_serial_offset or 0
+    if daemon is not None and isinstance(daemon.get("epoch_offset"), int):
+        epoch_offset = daemon["epoch_offset"]
     banner_offset = last_boot_offset(inst.serial_log, start_offset=epoch_offset)
     start_offset = max(epoch_offset, banner_offset)
     scan_scope = "boot-banner" if banner_offset > epoch_offset else "epoch"
-    tail = SerialTail(inst.serial_log, offset=start_offset)
 
+    if daemon is not None:
+        return _pattern_wait_via_daemon(
+            args, inst, start_offset=start_offset, scan_scope=scan_scope
+        )
+
+    tail = SerialTail(inst.serial_log, offset=start_offset)
     matched_line: str | None = None
     reason = "timeout"
     crash: str | None = None
@@ -2351,60 +2580,17 @@ def _wait_for_pattern(args: argparse.Namespace) -> Result:
     terminal_panic_seen = False
 
     while True:
-        read_from = tail.offset
         try:
-            lines = tail.read_lines(missing_ok=not saw_dead)
+            scan = scan_for_pattern(
+                tail, matcher, final=saw_dead, stop_at_panic=not args.ignore_crash
+            )
         except OSError as exc:
-            # Evidence that cannot be read is NOT a negative result. Exit 1 is
-            # "the marker did not appear"; an agent branching on it would
-            # record a missing log as a failed experiment. Infra class (4),
-            # with the envelope saying so.
-            message = (
-                f"Cannot inspect serial log for '{inst.vm_id}': {exc}. "
-                "Pattern result is inconclusive."
-            )
-            return Result(
-                data={
-                    "ok": False,
-                    "error": message,
-                    "error_type": type(exc).__name__,
-                    "inconclusive": True,
-                    "vm_id": inst.vm_id,
-                    "pattern": args.pattern,
-                    "serial_log": inst.serial_log,
-                },
-                text=[message],
-                stem="wait",
-                exit_code=4,
-                refusal=True,
-            )
-        if saw_dead:
-            # The process is already gone, so nothing more will be appended.
-            # Release the withheld fragment: the marker may be the final,
-            # newline-less line QEMU wrote.
-            lines.extend(tail.flush())
-        for line in lines:
-            if matcher.search(line):
-                matched_line = line
-                reason = "pattern_matched"
-                break
-            if is_terminal_panic_start(line):
-                terminal_panic_seen = True
-                if not args.ignore_crash:
-                    break
-        if matched_line is None and not saw_dead and tail.offset == read_from:
-            # The console went quiet with an unterminated line pending — a
-            # `login:` prompt, a shell prompt, anything that waits for input.
-            # Withholding it until the VM died meant such a marker could never
-            # match on a running guest and the whole timeout burned. Idle for
-            # a full poll is the signal that the line is finished being
-            # written; it is tested in place, never consumed, so a line that
-            # does grow later is still matched whole.
-            fragment = tail.peek_fragment()
-            if fragment is not None and matcher.search(fragment):
-                matched_line = fragment
-                reason = "pattern_matched"
-        if matched_line is not None:
+            return _pattern_inconclusive(args, inst, exc)
+        if scan.terminal_panic:
+            terminal_panic_seen = True
+        if scan.matched_line is not None:
+            matched_line = scan.matched_line
+            reason = "pattern_matched"
             break
 
         if terminal_panic_seen and not args.ignore_crash:
@@ -2446,7 +2632,88 @@ def _wait_for_pattern(args: argparse.Namespace) -> Result:
     if reason == "process_exited" and crash is None:
         crash = extract_crash(inst.serial_log, start_offset=start_offset)
 
-    elapsed = time.monotonic() - start
+    return _finish_pattern_wait(
+        args, inst,
+        matched_line=matched_line, reason=reason, crash=crash,
+        terminal_panic_seen=terminal_panic_seen, start_offset=start_offset,
+        scan_scope=scan_scope, elapsed=time.monotonic() - start,
+    )
+
+
+def _pattern_inconclusive(args: argparse.Namespace, inst: Any, exc: BaseException) -> Result:
+    """The serial log could not be read: infra class (4), never "no match".
+
+    Evidence that cannot be read is NOT a negative result. Exit 1 is "the
+    marker did not appear"; an agent branching on it would record a missing
+    log as a failed experiment. The envelope says so.
+    """
+    message = (
+        f"Cannot inspect serial log for '{inst.vm_id}': {exc}. "
+        "Pattern result is inconclusive."
+    )
+    return Result(
+        data={
+            "ok": False,
+            "error": message,
+            "error_type": type(exc).__name__,
+            "inconclusive": True,
+            "vm_id": inst.vm_id,
+            "pattern": args.pattern,
+            "serial_log": inst.serial_log,
+        },
+        text=[message],
+        stem="wait",
+        exit_code=4,
+        refusal=True,
+    )
+
+
+def _pattern_wait_via_daemon(
+    args: argparse.Namespace, inst: Any, *, start_offset: int, scan_scope: str
+) -> Result:
+    """`wait --pattern` served by the daemon: it runs the same per-tick scan
+    (`serial.scan_for_pattern`) woken by its 100 ms serial tick, and this
+    process blocks on the socket until the verdict. The crash report is read
+    here afterwards, exactly as the standalone loop reads it."""
+    try:
+        reply = _daemon_wait_request(args, inst, pattern=args.pattern, start_offset=start_offset)
+    except daemon_client.DaemonError as exc:
+        if exc.fields.get("inconclusive"):
+            return _pattern_inconclusive(args, inst, OSError(str(exc)))
+        raise QMPError(str(exc)) from exc
+    matched_line = reply.get("matched_line")
+    matched_line = matched_line if isinstance(matched_line, str) else None
+    reason = str(reply.get("reason", "timeout"))
+    terminal_panic_seen = bool(reply.get("terminal_panic_seen"))
+    crash: str | None = None
+    if reason == "crash":
+        crash = _settled_crash(inst, start_offset) or extract_crash(
+            inst.serial_log, start_offset=start_offset
+        )
+    elif reason == "process_exited":
+        crash = extract_crash(inst.serial_log, start_offset=start_offset)
+    return _finish_pattern_wait(
+        args, inst,
+        matched_line=matched_line, reason=reason, crash=crash,
+        terminal_panic_seen=terminal_panic_seen, start_offset=start_offset,
+        scan_scope=scan_scope, elapsed=float(reply.get("elapsed", 0.0)),
+    )
+
+
+def _finish_pattern_wait(
+    args: argparse.Namespace,
+    inst: Any,
+    *,
+    matched_line: str | None,
+    reason: str,
+    crash: str | None,
+    terminal_panic_seen: bool,
+    start_offset: int,
+    scan_scope: str,
+    elapsed: float,
+) -> Result:
+    """Render one `--pattern` outcome: 0 match, 3 terminal panic, 1 exit
+    without a match, 124 timeout."""
     matched = matched_line is not None
     _unknown_params = _warn_unknown_kernel_params(inst)
     result = {
@@ -2616,6 +2883,10 @@ def _handle_list(args: argparse.Namespace) -> Result:
                 "serial_log": inst.serial_log,
                 "logs_retained": True,
                 "crash_detected": obs.crash_detected,
+                # Only when the daemon serves the VM (`qmp: "daemon"`): how
+                # the boot scope was learned. Absent on the standalone path,
+                # whose output shape is unchanged (#70).
+                **({"guest_epoch_source": obs.epoch_source} if obs.epoch_source else {}),
             })
         for inst in stopped:
             orphan_pid = orphan_logs.get(inst.serial_log)
@@ -2670,7 +2941,7 @@ def _handle_list(args: argparse.Namespace) -> Result:
         gdb_str = f" gdb={inst.gdb_port}" if inst.gdb_port else ""
         qmp_str = (
             f" qmp={obs.qmp_state}"
-            if obs.qmp_state not in (None, QMP_CONNECTED)
+            if obs.qmp_state not in (None, QMP_CONNECTED, QMP_DAEMON)
             else ""
         )
         kernel_str = f"kernel={Path(inst.kernel).name}" if inst.kernel else ""
@@ -2728,7 +2999,10 @@ def _require_running(vm_id: str | None, command: str) -> None:
         return
     explanation = describe_non_running(vm_id, command=command)
     if explanation is not None:
-        raise QMUError(explanation)
+        raise QMUError(
+            explanation,
+            hint=f"qmu status --vm {vm_id} describes it; qmu launch --name {vm_id} --no-replace starts a fresh one",
+        )
 
 
 def _crash_warning(
@@ -2954,13 +3228,23 @@ def _handle_status(args: argparse.Namespace) -> Result:
         # agree for a paused guest with a retained report (#93).
         "crash_detected": obs.crash_detected,
     }
+    if obs.epoch_source and qmp.daemon is not None:
+        # Daemon-served only: "observed" means a RESET was witnessed and the
+        # scope is anchored on it; "banner" means the newest kernel boot
+        # banner decided (standalone has nothing else and reports no key).
+        result["guest_epoch_source"] = obs.epoch_source
+        result["guest_epoch_serial_offset"] = qmp.daemon.get("epoch_offset")
+        result["boot_offset"] = obs.scan_offset
 
     guest_line = guest if obs.detail() is None else f"{guest} ({obs.detail()})"
     lines = [
         f"VM '{inst.vm_id}'",
         f"  PID:       {inst.pid}",
         f"  Guest:     {guest_line}",
-        f"  QMP:       {qmp.state}",
+        f"  QMP:       {qmp.state}" + (
+            f" (boot scope: {obs.epoch_source} epoch, byte {obs.scan_offset})"
+            if obs.epoch_source else ""
+        ),
         f"  QEMU:      {qmp.status}",
     ]
     if inst.harness:
@@ -3516,6 +3800,33 @@ def _handle_doctor(args: argparse.Namespace) -> Result:
         "running VMs", "info", vm_detail,
         hint="qmu prune --orphans --dry-run" if orphans else "",
         running=len(instances), orphaned=len(orphans),
+    ))
+
+    # The daemon (#70) — informational: it autostarts on demand, so "not
+    # running" is the normal idle state, not a fault. `doctor` never spawns
+    # it. `unavailable` (a record names a dead pid, or a socket that will
+    # not answer) is the one case worth a glance at daemon.log.
+    probe = daemon_client.probe()
+    if probe["running"]:
+        stale = "" if probe.get("build_current", True) else " (stale build; respawns on next command)"
+        daemon_detail = (
+            f"running (pid {probe['pid']}, watching {len(probe['vms'])} VM(s), "
+            f"idle exit {probe['idle_exit']:g}s){stale}"
+        )
+        daemon_status = "ok"
+    elif probe["mode"] == daemon_client.MODE_OFF:
+        daemon_detail = "disabled (QMU_DAEMON=off); every command takes the standalone QMP path"
+        daemon_status = "info"
+    elif str(probe["reason"]).startswith(("stale", "unresponsive")):
+        daemon_detail = f"unavailable: {probe['reason']}; see {daemon_client.log_path()}"
+        daemon_status = "warn"
+    else:
+        daemon_detail = "not running (autostarts on the next VM command; `qmu daemon start` to pre-start)"
+        daemon_status = "info"
+    checks.append(_doctor_row(
+        "daemon", daemon_status, daemon_detail,
+        hint="qmu daemon status" if daemon_status == "warn" else "",
+        running=probe["running"], mode=probe["mode"],
     ))
 
     # Skills installed — informational: a missing skill symlink changes what

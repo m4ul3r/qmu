@@ -155,7 +155,8 @@ def resolve_host_cc(arch: str | None, override: str | None = None) -> list[str]:
         if shutil.which(parts[0]) is None:
             raise QMUError(
                 f"Compiler not found on PATH: {parts[0]} (from --cc). "
-                "Give an absolute path or install it."
+                "Give an absolute path or install it.",
+                hint=f"which {parts[0]}; pass --cc /abs/path/to/{parts[0]} or install it",
             )
         return parts
 
@@ -178,7 +179,8 @@ def resolve_host_cc(arch: str | None, override: str | None = None) -> list[str]:
     install = f" Try: apt install {pkg}." if pkg else ""
     raise QMUError(
         f"No host compiler found for guest arch '{target}'. Tried: {tried}."
-        f"{install} Override with: qmu compile --host --cc <compiler>"
+        f"{install} Override with: qmu compile --host --cc <compiler>",
+        hint=f"apt install {pkg}" if pkg else "qmu compile --host --cc <cross compiler>",
     )
 
 

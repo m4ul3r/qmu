@@ -21,7 +21,7 @@ import argparse
 import sys
 from typing import NoReturn
 
-from .config import reset_global_config_warnings
+from .config import global_config_warnings, reset_global_config_warnings
 from .instance import QMUError, reset_autoselection
 from .output import render_value
 from .qmp import QMPError
@@ -35,7 +35,7 @@ from ._cliutil import (
     _resolve_config_from_args,
     render,
 )
-from .commands import guest, lifecycle, meta, qmp_cmds, run
+from .commands import daemon_cmds, guest, lifecycle, meta, qmp_cmds, run
 
 # Re-exported solely so test_snapshot_exit can reach it as ``cli._snapshot_failed``.
 from .commands.qmp_cmds import _snapshot_failed  # noqa: F401
@@ -123,16 +123,18 @@ def build_parser() -> argparse.ArgumentParser:
             "  4    infrastructure / internal error (QMP or SSH layer failures,\n"
             "       unexpected qmu errors, infra-subprocess failures such as a\n"
             "       pry/gdb hang)\n"
-            "  124  wait timeout (also: 'run' gave up waiting for the guest;\n"
-            "       'snapshot save' budget expired — result unknown,\n"
-            "       may_have_landed: true)\n"
+            "  124  timeout: 'wait' deadline, 'launch'/'run' --ssh-timeout expired\n"
+            "       before the guest answered SSH (VM retained, timed_out: true),\n"
+            "       'run'/'exec' COMMAND outlived --timeout, 'snapshot save'\n"
+            "       budget expired (result unknown, may_have_landed: true)\n"
             "\n"
             "json contract:\n"
             "  With --format json|ndjson every result is a JSON object carrying\n"
             "  \"ok\": <bool>. Every error path emits\n"
-            "  {\"ok\": false, \"error\": ..., \"error_type\": ...} to stdout —\n"
-            "  usage errors (exit 2) included, as error_type \"UsageError\"\n"
-            "  with a \"usage\" field."
+            "  {\"ok\": false, \"error\": ..., \"error_type\": ..., \"hint\": ...}\n"
+            "  to stdout — usage errors (exit 2) included, as error_type\n"
+            "  \"UsageError\" with a \"usage\" field. Warnings that also went to\n"
+            "  stderr ride in the envelope as \"warnings\": [...]."
         ),
     )
     # Register --vm/--format/--out on the top-level parser so they may be given
@@ -170,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     qmp_cmds._add_qmp(sub)
     qmp_cmds._add_monitor(sub)
     meta._add_rootfs(sub)
+    daemon_cmds._add_daemon(sub)
     meta._add_skill(sub)
     meta._add_version(sub)
     return parser
@@ -241,7 +244,10 @@ def _emit_usage_error(exc: _UsageError, argv: list[str]) -> NoReturn:
     an agent branching on the envelope is never handed an empty stdout. The
     exit is still `parser.exit(2)` (a SystemExit), so callers that treated
     argparse errors as SystemExit keep seeing one. A :func:`_usage_hint`
-    follows the message in text mode and rides as `hint` in the envelope.
+    follows the message in text mode and rides as `hint` in the envelope;
+    without one the envelope's `hint` is `qmu <sub> --help` (#74: every
+    `ok: false` envelope carries a hint) and text mode stays as argparse
+    prints it.
     """
     fmt = _requested_format(argv)
     usage = exc.parser.format_usage()
@@ -250,14 +256,16 @@ def _emit_usage_error(exc: _UsageError, argv: list[str]) -> NoReturn:
         sys.stderr.write(usage)
         trailer = f"\n{hint}\n" if hint else "\n"
         exc.parser.exit(2, f"{exc.parser.prog}: error: {exc.message}{trailer}")
+    if hint is None:
+        sub = _invoked_subcommand(argv)
+        hint = f"qmu {sub} --help" if sub else "qmu --help"
     payload = {
         "ok": False,
         "error": exc.message,
         "error_type": "UsageError",
         "usage": usage.strip(),
+        "hint": hint,
     }
-    if hint:
-        payload["hint"] = hint
     sys.stdout.write(render_value(payload, fmt))
     exc.parser.exit(2)
 
@@ -291,10 +299,17 @@ def _parse(argv: list[str]) -> argparse.Namespace | None:
 
 
 def _dispatch(args: argparse.Namespace) -> Result:
-    """Apply the project-config gate, then run the handler; nothing rendered."""
+    """Apply the project-config gate, then run the handler; nothing rendered.
+
+    Warnings the gate (or the handler's own config resolution) recorded — a
+    broken global config is skipped with a warning, never fatal — are
+    attached to the Result so they reach stderr and the envelope's
+    `warnings[]` through the same rendering as every other warning (#74).
+    """
     if args.subcommand not in _CONFIG_EXEMPT_SUBCOMMANDS:
         _resolve_config_from_args(args)
-    return args.handler(args)
+    result = args.handler(args)
+    return result.warn(*global_config_warnings())
 
 
 def invoke(argv: list[str]) -> Result:

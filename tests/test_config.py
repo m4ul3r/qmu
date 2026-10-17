@@ -27,6 +27,7 @@ from qmu.config import (
     CONFIG_FILENAME,
     DEFAULT_PROFILES,
     ConfigError,
+    global_config_warnings,
     resolve_config,
 )
 
@@ -375,8 +376,12 @@ def test_schema_invalid_toml_is_fatal_for_every_source(
 
 def test_broken_global_config_is_skipped(isolate_config, monkeypatch, capsys):
     """A malformed global config must NOT be fatal: resolve_config falls back to
-    lower layers, records no global source, and warns once on stderr. A single
-    stale ~/.config/qmu/config.toml must never brick every command."""
+    lower layers, records no global source, and records one warning for the
+    CLI layer to print. A single stale ~/.config/qmu/config.toml must never
+    brick every command. (resolve_config writes nothing itself: cli._dispatch
+    attaches `global_config_warnings()` to the Result so the line reaches
+    stderr AND the JSON `warnings[]` — see
+    tests/test_cli_config_errors.py::test_broken_global_config_warning_rides_on_the_error_envelope.)"""
     gpath = _global_config(isolate_config, "this is = = not valid toml [[[\n")
     project_dir = isolate_config / "discovered"
     project_dir.mkdir(exist_ok=True)
@@ -387,23 +392,28 @@ def test_broken_global_config_is_skipped(isolate_config, monkeypatch, capsys):
 
     assert cfg.memory == "16G"
     assert not any(s.startswith("global:") for s in cfg._sources)
-    err = capsys.readouterr().err
-    assert "Warning" in err
-    assert str(gpath.resolve()) in err
+    assert capsys.readouterr() == ("", "")
+    warnings = global_config_warnings()
+    assert len(warnings) == 1
+    assert warnings[0].startswith("[qmu] Warning: ignoring global config:")
+    assert str(gpath.resolve()) in warnings[0]
 
 
 def test_schema_invalid_global_config_is_skipped(isolate_config, capsys):
     """A schema-invalid global config (flat migration key) is also non-fatal:
-    it warns and falls through to built-in defaults rather than raising."""
+    it records the warning and falls through to built-in defaults rather than
+    raising."""
     gpath = _global_config(isolate_config, 'rootfs = "/tmp/rootfs.img"\n')
 
     cfg = resolve_config()  # must not raise
 
     assert cfg.rootfs is None
     assert cfg._sources == ["built-in defaults"]
-    err = capsys.readouterr().err
-    assert "Warning" in err
-    assert str(gpath.resolve()) in err
+    assert capsys.readouterr() == ("", "")
+    warnings = global_config_warnings()
+    assert len(warnings) == 1
+    assert warnings[0].startswith("[qmu] Warning: ignoring global config:")
+    assert str(gpath.resolve()) in warnings[0]
 
 
 def test_invalid_layer_is_not_applied_before_validation(

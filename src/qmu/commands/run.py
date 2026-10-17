@@ -57,6 +57,7 @@ from .guest import (
     _guest_result,
     _join_exec_command,
     _run_guest_command,
+    _stream_sink,
 )
 from .lifecycle import _prepare_boot
 
@@ -213,10 +214,19 @@ def _boot_failure_payload(
                 "command line may be wrong.",
             ],
         )
+    # Same shape as `launch --ssh-timeout` expiring (#72): both exit 124 and
+    # carry `timed_out`/`error_type: TimeoutError`, so a caller branches once.
+    error = (
+        f"SSH did not become ready within {timeout:g}s; the VM may still be "
+        "booting. VM state retained."
+    )
     return (
         124,
         {
             "ok": False,
+            "error": error,
+            "error_type": "TimeoutError",
+            "timed_out": True,
             "ssh_error": True,
             "crash_detected": False,
             "crash": None,
@@ -269,6 +279,7 @@ def _handle_run(args: argparse.Namespace) -> Result:
         ssh = _make_ssh(inst)
         outcome = _wait_for_guest(ssh, inst, float(args.ssh_timeout))
         command = _join_exec_command(args.command)
+        sink = _stream_sink(args, stem="run")
         if outcome != "ready":
             status, data, text = _boot_failure_payload(
                 inst, outcome, float(args.ssh_timeout)
@@ -277,7 +288,7 @@ def _handle_run(args: argparse.Namespace) -> Result:
             notes: list[str | bytes] = []
         else:
             status, data, stdout, text, notes = _run_guest_command(
-                ssh, command, inst, timeout=args.timeout
+                ssh, command, inst, timeout=args.timeout, sink=sink
             )
             # The ssh ControlMaster (`ControlPersist=60`) outlives the command;
             # the VM is about to be stopped under it, so close it now rather
@@ -339,6 +350,6 @@ def _handle_run(args: argparse.Namespace) -> Result:
             notes.append(f"Clean up: qmu prune --vm {inst.vm_id}")
 
     return _guest_result(
-        data=data, stdout=stdout, text=text, notes=notes, stem="run",
-        exit_code=status,
+        data=data, stdout=stdout, stderr=data.get("stderr", ""), text=text,
+        notes=notes, stem="run", exit_code=status, sink=sink,
     )

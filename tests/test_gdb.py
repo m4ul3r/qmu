@@ -245,10 +245,18 @@ def test_gdb_failed_pry_is_an_operational_error(
         "ok": False,
         "error": "pry launch failed: bridge startup failed",
         "error_type": "QMUError",
+        "hint": (
+            "pry doctor; qmu log --vm debug-vm --tail 50; then re-run "
+            "qmu gdb --vm debug-vm"
+        ),
     }
     assert text_rc == 1
     assert captured.out == ""
-    assert captured.err == "[qmu] Error: pry launch failed: bridge startup failed\n"
+    assert captured.err == (
+        "[qmu] Error: pry launch failed: bridge startup failed\n"
+        "[qmu] Hint: pry doctor; qmu log --vm debug-vm --tail 50; then re-run "
+        "qmu gdb --vm debug-vm\n"
+    )
     assert calls[0][0] == _symbols_argv(symbols)
     assert calls[1][0] == _symbols_argv(symbols)
 

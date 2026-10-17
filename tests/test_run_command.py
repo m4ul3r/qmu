@@ -240,6 +240,31 @@ def test_unreachable_guest_exits_124(harness, capsys):
     assert "did not become reachable" in out
 
 
+# The keys `launch --ssh-timeout` and `run --ssh-timeout` share when the window
+# closes with the guest still booting (#72): one shape, one exit code (124).
+SSH_TIMEOUT_ENVELOPE_KEYS = {"ok", "error", "error_type", "timed_out", "ssh_error", "hint"}
+
+
+def test_unreachable_guest_envelope_matches_launch_timeout_shape(harness, capsys):
+    """#72: `run` and `launch` exit 124 for an expired --ssh-timeout and
+    describe it identically: `timed_out: true`, `ssh_error: true`,
+    `error_type: TimeoutError`, an `error` and a `hint`."""
+    install, _ = harness
+    install(serial_text="[0.0] Linux\n", ready=False, alive=True)
+
+    rc = cli.main(_argv("--format", "json", "--ssh-timeout", "0", "./exploit"))
+
+    assert rc == 124
+    payload = json.loads(capsys.readouterr().out)
+    assert SSH_TIMEOUT_ENVELOPE_KEYS <= set(payload)
+    assert payload["ok"] is False
+    assert payload["timed_out"] is True
+    assert payload["ssh_error"] is True
+    assert payload["error_type"] == "TimeoutError"
+    assert "SSH did not become ready" in payload["error"]
+    assert "--ssh-timeout" in payload["hint"]
+
+
 WARNING = (
     "[    1.500] ------------[ cut here ]------------\n"
     "[    1.501] WARNING: CPU: 0 PID: 1 at drivers/thing.c:42 thing_init+0x10/0x20\n"

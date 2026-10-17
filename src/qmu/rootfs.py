@@ -47,7 +47,7 @@ GUESTFISH_HINT = (
 def _require_guestfish() -> str:
     path = shutil.which("guestfish")
     if path is None:
-        raise QMUError(GUESTFISH_HINT)
+        raise QMUError(GUESTFISH_HINT, hint="apt install libguestfs-tools")
     return path
 
 
@@ -138,7 +138,8 @@ def require_image_free(image: str) -> None:
         )
         raise QMUError(
             f"Cannot write to {image}: it is still held by: {listed}. "
-            f"Stop them first:  {fix}"
+            f"Stop them first:  {fix}",
+            hint=fix,
         )
 
 
@@ -323,7 +324,8 @@ def preflight_inject(
             f"Guest directory not found in {image}: {listed}. "
             f"Injecting would have created it and reported success, hiding a "
             f"typo. Pass --mkdir to create it on purpose, or check the path "
-            f"with `qmu rootfs ls {image} / --partition {partition}`."
+            f"with `qmu rootfs ls {image} / --partition {partition}`.",
+            hint=f"qmu rootfs ls {image} / --partition {partition}; or re-run with --mkdir",
         )
 
 

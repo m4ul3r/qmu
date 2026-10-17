@@ -328,6 +328,40 @@ def test_qmp_system_reset_warns_when_debugged(monkeypatch, capsys):
     assert "hits stay 0" in err
 
 
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_qmp_system_reset_warning_rides_in_the_envelope(monkeypatch, capsys, fmt):
+    """#74: the coherence warning is stderr in every mode AND `warnings[]` in
+    the json/ndjson envelope, so an agent reading only stdout learns that
+    its breakpoint set was dropped."""
+    inst = _gdb_inst(1234)
+    _install_qmp_seams(monkeypatch, inst, present=True)
+    args = _qmp_args("system_reset")
+    args.format = fmt
+    rc = _run(qmp_cmds._handle_qmp, args)
+    captured = capsys.readouterr()
+    assert rc == 0
+    payload = json.loads(captured.out)
+    assert payload["ok"] is True
+    (warning,) = payload["warnings"]
+    assert warning.startswith("VM 'dg' has a GDB stub and was just reset")
+    assert "drops the gdbstub's breakpoint" in captured.err
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_snapshot_save_warning_rides_in_the_envelope(monkeypatch, capsys, fmt):
+    inst = _gdb_inst(1234)
+    _install_qmp_seams(monkeypatch, inst, present=True)
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'clean' saved."))
+    args = _snap_args()
+    args.format = fmt
+    rc = _run(qmp_cmds._handle_snapshot_save, args)
+    captured = capsys.readouterr()
+    assert rc == 0
+    payload = json.loads(captured.out)
+    assert any("int3" in w for w in payload["warnings"])
+    assert "int3" in captured.err
+
+
 def test_qmp_non_reset_command_never_warns(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
