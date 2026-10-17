@@ -26,6 +26,42 @@ an integer byte count. Fractional sizes remain visible to `list` and usable
 by `save`/`delete`. Each checkpoint stores that image in the overlay under
 `/var/tmp` — the cost of a `save` on a shared host.
 
+## `snapshot save --timeout` and the unknown result
+
+HMP `savevm` writes every non-zero guest page synchronously on QEMU's main
+loop, so its cost is the guest's dirty RAM and the host's disk. Measured on
+QEMU 8.2.2/NVMe with RAM fully dirtied: 1 GiB 4.9 s idle, ≈4 s under four
+`dd oflag=direct` writers + ten CPU burners; 4 GiB 15.6 s idle, 22.2 s
+loaded; a 4 GiB save into a 19 GB qcow2 that already held five snapshots
+took ≈60 s. The default budget is therefore **60 s + 20 s per GiB of guest
+RAM** (`-m 4G` → 140 s, `1G` → 80 s; unreadable size → 140 s), ≥ 3× the
+loaded measurement; `qmu snapshot save X --vm V --timeout SECONDS` overrides
+it.
+
+When the budget expires the save has **not failed — its result is unknown**:
+QEMU is still inside `savevm`, the tag usually lands later, and every QMP
+command queues behind it until then. qmu reports exactly that: exit **124**
+(the `wait` timeout code; not 4, the transport did not break), `ok: false`,
+`error_type: "SnapshotError"`, `may_have_landed: true`, `timeout`, and a
+`hint` naming the one command that settles it: `qmu snapshot list --vm V
+--timeout 300` (twice the budget, ≥ 300 s), which waits for QEMU to answer
+instead of dying at the 30 s `list` default while QEMU is still writing.
+Text mode says the same on stderr (`[qmu] Error: snapshot save 'X' … did not
+finish within Ns …`, `may_have_landed: true`, the hint). Do not retry the
+save until the list answers; pass the longer `--timeout` next time. A proven
+HMP failure (exit 1) carries `may_have_landed: false` — `save` cross-checks
+`info snapshots` before it reports either way.
+
+The qmu-side mechanics that make the follow-up safe: a client whose command
+timed out closes its socket at once (the late reply would otherwise be read
+as the answer to its next command), every command carries a client-unique
+`id`, and a reply tagged with another client's `id` is dropped — QEMU hands
+the abandoned `savevm` reply to whichever client holds the socket when it
+finishes, which made `query-status` return `{}` and `snapshot list` say "No
+snapshots." for a tag that was there. While QEMU is still saving, `status`
+and `list` report `qmp: "busy"` (QEMU greets the connection but does not
+answer `qmp_capabilities` within its 10 s floor).
+
 ## Durable internal snapshots
 
 To keep snapshots across `kill`/relaunch, attach a writable qcow2 drive without

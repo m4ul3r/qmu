@@ -89,13 +89,66 @@ def _classify_hmp_failure(message: str) -> str:
     return "hmp"
 
 
-def save_snapshot(qmp: QMPClient, name: str, timeout: float = 60.0) -> SnapshotResult:
+# Default `snapshot save` budget: SAVEVM_BASE_SECONDS + SAVEVM_SECONDS_PER_GIB
+# per GiB of guest RAM. HMP `savevm` writes every non-zero guest page into the
+# qcow2 synchronously on QEMU's main loop, so its cost is the guest's dirty RAM
+# and the host's disk, not a constant. Measured on QEMU 8.2.2 / NVMe with RAM
+# fully dirtied (random pages, the worst case): 1 GiB 4.9 s idle host, 3.8-4.1 s
+# under 4 concurrent `dd oflag=direct` writers + 10 CPU burners (load 12);
+# 4 GiB 15.6 s idle, 22.2 s under that load — i.e. ~5.5 s/GiB loaded. The
+# formula keeps >= 3x headroom over the loaded figure at every size (4 GiB:
+# 140 s vs 22 s) and starts at the old flat 60 s, which a loaded 4 GiB save
+# overran in the field (#73). `--timeout` overrides it.
+SAVEVM_BASE_SECONDS = 60.0
+SAVEVM_SECONDS_PER_GIB = 20.0
+
+_MEMORY_SIZE_RE = re.compile(
+    r"^\s*(?:size=)?(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[kKmMgGtT])?(?:i?[bB])?\s*(?:,.*)?$"
+)
+
+
+def memory_gib(memory: str | None) -> float | None:
+    """Guest RAM in GiB from a QEMU `-m` value (`4G`, `4096M`, `4096`, `size=4G,...`).
+
+    A bare number is MiB, as QEMU reads it. None when the value is not a size
+    qmu can read.
+    """
+    if not memory:
+        return None
+    m = _MEMORY_SIZE_RE.match(memory)
+    if m is None:
+        return None
+    num = float(m.group("num"))
+    unit = (m.group("unit") or "M").upper()
+    scale = {"K": 1 / 1024 ** 2, "M": 1 / 1024, "G": 1.0, "T": 1024.0}[unit]
+    return num * scale
+
+
+def savevm_timeout(memory: str | None) -> float:
+    """The default `snapshot save` budget for a guest with `memory` of RAM.
+
+    An unreadable size is budgeted as the built-in default of 4 GiB rather
+    than as zero: a budget too short reports an unknown result (#73), a
+    budget too long only waits.
+    """
+    gib = memory_gib(memory)
+    if gib is None:
+        gib = 4.0
+    return SAVEVM_BASE_SECONDS + SAVEVM_SECONDS_PER_GIB * gib
+
+
+def save_snapshot(qmp: QMPClient, name: str, timeout: float = SAVEVM_BASE_SECONDS) -> SnapshotResult:
     """Save a VM snapshot and confirm it is listed afterwards.
 
     HMP parse errors (`savevm: extraneous characters at the end of line` for
     a name with whitespace) come back as result text with no snapshot written,
     so the result is cross-checked against `info snapshots` rather than
     trusting a reply that merely arrived.
+
+    `timeout` bounds the `savevm` itself (see `savevm_timeout`); when it
+    expires `QMPTimeoutError` propagates with the socket closed, and QEMU is
+    most likely still writing the snapshot — the caller reports that as an
+    unknown result, not as a failure.
     """
     result = qmp.execute_hmp(f"savevm {name}", timeout=timeout).strip()
     if hmp_failed(result):
@@ -234,9 +287,15 @@ def delete_snapshot(qmp: QMPClient, name: str, timeout: float = 30.0) -> Snapsho
     return SnapshotResult(True, result or f"Snapshot '{name}' deleted.")
 
 
-def list_snapshots(qmp: QMPClient) -> list[dict[str, Any]]:
-    """List VM snapshots. Returns parsed list."""
-    raw = qmp.execute_hmp("info snapshots")
+def list_snapshots(qmp: QMPClient, timeout: float = 30.0) -> list[dict[str, Any]]:
+    """List VM snapshots. Returns parsed list.
+
+    `timeout` bounds the `info snapshots` reply; QEMU answers it in
+    microseconds unless its main loop is still inside a `savevm` that
+    outlived `snapshot save --timeout`, which is exactly when a caller passes
+    a long one.
+    """
+    raw = qmp.execute_hmp("info snapshots", timeout=timeout)
     return parse_snapshot_list(raw)
 
 

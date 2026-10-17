@@ -349,3 +349,58 @@ def test_delete_missing_tag_is_a_failure_and_sends_no_delvm():
     assert "does not exist" in result.message
     assert result.reason == "missing"
     assert qmp.calls == ["info snapshots"]
+
+
+# --- savevm budget (#73) ---
+
+
+@pytest.mark.parametrize(
+    "memory, gib",
+    [
+        ("4G", 4.0), ("1G", 1.0), ("4096M", 4.0), ("512M", 0.5), ("2048", 2.0),
+        ("1.5G", 1.5), ("4GiB", 4.0), ("size=4G,slots=2,maxmem=8G", 4.0),
+        ("1T", 1024.0), ("", None), (None, None), ("lots", None),
+    ],
+)
+def test_memory_gib_reads_qemu_m_values(memory, gib):
+    from qmu.snapshot import memory_gib
+
+    assert memory_gib(memory) == gib
+
+
+@pytest.mark.parametrize(
+    "memory, budget",
+    [("1G", 80.0), ("4G", 140.0), ("16G", 380.0), ("512M", 70.0), ("lots", 140.0), (None, 140.0)],
+)
+def test_savevm_timeout_is_base_plus_per_gib_with_a_4gib_fallback(memory, budget):
+    """60 s + 20 s/GiB: >= 3x the loaded measurement at every size (4 GiB
+    dirty RAM under 4 dd writers + 10 CPU burners took 22.2 s), and never a
+    zero budget for a size qmu cannot read."""
+    from qmu.snapshot import SAVEVM_BASE_SECONDS, SAVEVM_SECONDS_PER_GIB, savevm_timeout
+
+    assert (SAVEVM_BASE_SECONDS, SAVEVM_SECONDS_PER_GIB) == (60.0, 20.0)
+    assert savevm_timeout(memory) == budget
+
+
+def test_save_passes_its_budget_to_savevm_and_timeout_propagates():
+    from qmu.qmp import QMPTimeoutError
+    from qmu.snapshot import list_snapshots
+
+    class BudgetQMP(FakeQMP):
+        def __init__(self):
+            super().__init__("", listing=_LISTED_CLEAN)
+            self.timeouts = []
+
+        def execute_hmp(self, command_line, timeout=30.0):
+            self.timeouts.append((command_line, timeout))
+            if command_line.startswith("savevm") and timeout < 1:
+                raise QMPTimeoutError(command_line, timeout)
+            return super().execute_hmp(command_line)
+
+    qmp = BudgetQMP()
+    assert save_snapshot(qmp, "clean", timeout=140.0).ok is True
+    assert qmp.timeouts[0] == ("savevm clean", 140.0)
+    with pytest.raises(QMPTimeoutError):
+        save_snapshot(qmp, "clean", timeout=0.5)
+    list_snapshots(qmp, timeout=300.0)
+    assert qmp.timeouts[-1] == ("info snapshots", 300.0)

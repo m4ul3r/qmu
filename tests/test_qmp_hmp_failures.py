@@ -79,6 +79,7 @@ class _Inst:
     guest_epoch_serial_offset = 0
     gdb_port = None
     ssh_port = None
+    memory = "4G"
 
 
 class _HmpQMP:
@@ -198,7 +199,7 @@ def _snapshot_seams(monkeypatch, op, result):
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: _Inst())
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(None))
     monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
-    monkeypatch.setattr(qmp_cmds, f"{op}_snapshot", lambda qmp, name: result)
+    monkeypatch.setattr(qmp_cmds, f"{op}_snapshot", lambda qmp, name, **kw: result)
 
 
 @pytest.mark.parametrize("op", ["save", "load", "delete"])

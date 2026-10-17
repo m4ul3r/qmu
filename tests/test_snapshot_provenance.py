@@ -156,7 +156,7 @@ def test_snapshot_save_does_not_advance_epoch(tmp_path, monkeypatch):
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(object()))
     monkeypatch.setattr(
         qmp_cmds, "save_snapshot",
-        lambda qmp, name: SnapshotResult(True, "Snapshot 'clean' saved."),
+        lambda qmp, name, **kw: SnapshotResult(True, "Snapshot 'clean' saved."),
     )
     monkeypatch.setattr(
         qmp_cmds, "save_guest_epoch_serial_offset",
