@@ -43,7 +43,8 @@ claude mcp add qmu -- qmu mcp serve
 subcommand (`qmu_launch`, `qmu_exec`, `qmu_snapshot_save`, … — derived from
 the argparse tree, so a new subcommand is a new tool) plus `qmu_argv` for a
 raw argv. Every tool returns the `--format json` envelope with
-`exit_code` added, errors included (`ok: false`, `error_type`, `hint`), never a protocol
+`qmu_exit` (the qmu process exit code) added — domain keys such as the guest's
+`exit_code` are untouched — errors included (`ok: false`, `error_type`, `hint`), never a protocol
 error; `qmu://vms` and `qmu://vm/{vm_id}/log` are resources; `qmu_wait`
 streams progress. Generic stdio config:
 `{"mcpServers": {"qmu": {"command": "qmu", "args": ["mcp", "serve"]}}}`.

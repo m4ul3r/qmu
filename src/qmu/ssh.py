@@ -254,8 +254,10 @@ def _watch_child(
 # SSH_TRANSPORT_ERROR_MARKERS), so the client itself gives up at `timeout`;
 # this only covers process start and teardown. It used to be 3 s, which made a
 # port that accepts TCP but never speaks (a half-booted guest, a foreign
-# listener) cost `list`/`status` 5 s per VM (#77).
-PROBE_GRACE_SECONDS = 0.5
+# listener) cost `list`/`status` 5 s per VM (#77); 0.5 s put the whole
+# `status` command at 2.62 s wall (probe 2.5 s + CLI/daemon overhead) against
+# a 2.6 s end-to-end budget, so the probe itself is capped at 2.25 s.
+PROBE_GRACE_SECONDS = 0.25
 
 
 class SSHClient:

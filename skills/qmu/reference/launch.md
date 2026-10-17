@@ -205,7 +205,7 @@ KASAN-detected bugs are terminal under every profile (`kasan.fault=panic`);
 
 ```bash
 qmu list                                 # existence + guest state; probes SSH (ControlMaster=no), a few seconds on a busy host
-qmu status --vm X                        # typically sub-second; ~2 s under a held QMP slot, ≤ 2.5 s when the SSH port accepts but never answers (`ssh_probe_ms` says how long the probe took); exit 0 on a stopped VM (status: "stopped")
+qmu status --vm X                        # typically sub-second; ~2 s under a held QMP slot, ≤ 2.4 s wall when the SSH port accepts but never answers (probe capped at 2.25 s; `ssh_probe_ms` says how long the probe took); exit 0 on a stopped VM (status: "stopped")
 qmu kill --vm X                          # QMP quit → SIGTERM; `bridge_reaped`, `logs_preserved`; closes the ControlMaster
 qmu kill --vm X --force                  # SIGKILL
 qmu kill --vm X --no-clean               # keep .json + .serial.log
