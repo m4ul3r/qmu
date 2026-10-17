@@ -208,6 +208,70 @@ def test_run_abort_when_stops_the_child_with_its_output(tmp_path, monkeypatch):
     assert excinfo.value.stdout == "pre\n"
 
 
+def test_run_relays_chunks_as_they_arrive_and_returns_the_same_bytes(
+    tmp_path, monkeypatch
+):
+    """#71(a): a long-running exploit's progress reaches `on_chunk` while the
+    child still runs — at least two separate reads before exit, stdout and
+    stderr told apart — and the returned output is those bytes joined."""
+    client = _fake_ssh_on_path(
+        tmp_path, monkeypatch,
+        "printf 'one\\n'\nsleep 0.3\nprintf 'err\\n' >&2\nsleep 0.3\nprintf 'two\\377'\n",
+    )
+    seen: list[tuple[str, bytes, float]] = []
+
+    rc, stdout, stderr = client.run(
+        "progress", on_chunk=lambda s, d: seen.append((s, d, time.monotonic()))
+    )
+
+    assert rc == 0
+    out_chunks = [d for s, d, _ in seen if s == "stdout"]
+    assert len(out_chunks) >= 2
+    assert b"".join(out_chunks) == stdout.raw == b"one\ntwo\xff"
+    assert b"".join(d for s, d, _ in seen if s == "stderr") == stderr.raw == b"err\n"
+    first, last = seen[0][2], seen[-1][2]
+    assert last - first >= 0.4  # relayed live, not drained after exit
+
+
+def test_run_timeout_relays_the_partial_output_before_raising(tmp_path, monkeypatch):
+    client = _fake_ssh_on_path(
+        tmp_path, monkeypatch, "echo partial\n(sleep 20) &\nsleep 20\n"
+    )
+    seen: list[bytes] = []
+
+    with pytest.raises(ssh.SSHError) as excinfo:
+        client.run("x", timeout=0.5, on_chunk=lambda s, d: seen.append(d))
+
+    assert b"".join(seen) == b"partial\n"
+    assert excinfo.value.stdout == "partial\n"
+
+
+def test_run_kills_the_child_when_the_chunk_callback_raises(tmp_path, monkeypatch):
+    """A reader that closed the pipe (`| head`) must not leave the ssh child
+    running: the drain loop is the only thing reaping it."""
+    client = _fake_ssh_on_path(
+        tmp_path, monkeypatch, "echo $$ > \"$0.pid\"\necho go\nsleep 20\n"
+    )
+
+    def boom(stream: str, data: bytes) -> None:
+        raise BrokenPipeError("reader gone")
+
+    started = time.monotonic()
+    with pytest.raises(BrokenPipeError):
+        client.run("x", timeout=30, on_chunk=boom)
+    assert time.monotonic() - started < 5
+    pid = int((tmp_path / "ssh.pid").read_text())
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            __import__("os").kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("ssh child survived the callback failure")
+
+
 def test_run_completed_child_is_never_reported_as_timed_out(tmp_path, monkeypatch):
     """A child that finishes inside the budget returns normally even when the
     watcher is armed, and the predicate is not consulted after it exits."""

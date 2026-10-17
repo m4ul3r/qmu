@@ -18,6 +18,7 @@ host cross-compiler. So the contract these tests pin is:
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -416,6 +417,37 @@ def test_run_text_mode_stdout_is_the_program_output_only(wired, source, capsys):
     assert rc == 1
     assert captured.out == "sizeof(void*)=8\n"
     assert captured.err == "Compiled and ran exploit.c:\nwarn\n[exit code: 3]\n"
+
+
+def test_run_phase_streams_the_program_output_but_not_compile_diagnostics(
+    wired, source, capsys
+):
+    """#71(a): only the program-run phase relays output live (`on_chunk`);
+    the compile/chmod step gets no callback, so its diagnostics stay in the
+    envelope. A chunk relayed by the run step is on stdout before the step
+    returns, and is not printed again afterwards."""
+    install, _state = wired
+    ssh = install(run_results=[(0, "", ""), (0, "sizeof(void*)=8\n", "")])
+    callbacks: dict[str, object] = {}
+    original = ssh.run
+
+    def run(command, timeout=None, **kwargs):
+        callbacks[command] = kwargs.get("on_chunk")
+        if command == "/root/exploit":
+            kwargs["on_chunk"]("stdout", b"sizeof(void*)=8\n")
+            callbacks["seen_live"] = sys.stdout.getvalue()
+        return original(command, timeout, **kwargs)
+
+    ssh.run = run
+
+    rc = cli.main(["compile", "--host", "--run", str(source)])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert callbacks["chmod +x /root/exploit"] is None
+    assert callbacks["seen_live"] == "sizeof(void*)=8\n"
+    assert captured.out == "sizeof(void*)=8\n"
+    assert captured.err == "Compiled and ran exploit.c:\n"
 
 
 def test_compile_without_run_keeps_stdout_empty_in_text_mode(wired, source, capsys):
