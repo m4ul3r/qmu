@@ -72,11 +72,18 @@ running: `qmu kill --vm X` (report kept) then `qmu prune --vm X`; a
 
 ## `qmu wait` without `--pattern`
 
-Bare `wait` holds no QMP connection: it polls every 0.5 s with one
-short-lived `query-status` plus a PID-liveness check, so it never occupies
-QEMU's single QMP slot. Every result carries `vm_id`, `reason`, `stopped`,
+When the daemon watches the VM (the default — `reference/daemon.md`), bare
+`wait` and `--pattern` both block on the daemon's socket: the daemon's event
+stream ends a bare wait on the real `SHUTDOWN`/EOF/panic (`qmp: "daemon"`,
+`last_event` is the QMP event name, `event_data.source: "qmp"`) and its
+100 ms serial tick wakes a `--pattern` wait — the client never polls, and a
+marker is matched ~0.1 s after it lands instead of ~0.25 s. Standalone
+(`QMU_DAEMON=off`, or no daemon reachable), bare `wait` holds no QMP
+connection: it polls every 0.5 s with one short-lived `query-status` plus a
+PID-liveness check, so it never occupies QEMU's single QMP slot. Every
+result carries `vm_id`, `reason`, `stopped`,
 `crash`, `console_tail` (the last 20 lines of the scanned scope, on every
-outcome), `guest`, `guest_detail`, `qmp` (`connected` · `busy` ·
+outcome), `guest`, `guest_detail`, `qmp` (`daemon` · `connected` · `busy` ·
 `unreachable` · null once stopped), `qemu_status`, `last_event`,
 `event_data`, `elapsed`, `cleaned`. `guest` is `serving` while a running
 harness guest has console output in this boot and `null` once QEMU has
@@ -106,8 +113,9 @@ from a `--pattern` wait, is the receipt for a successful harness run.
   can overshoot by up to 2 s, and `--timeout 0` under a held slot is 124.
   A `savevm` still running after `snapshot save` exited 124 is the other
   source of `busy` (QEMU greets, then holds `qmp_capabilities` for up to the
-  10 s floor); `124` means the same thing on both commands — the window
-  closed, the operation is not disproved (`snapshots.md`).
+  10 s floor); `124` means the same thing on every command — the window
+  closed, the operation is not disproved (`snapshots.md`; `launch`/`run`
+  `--ssh-timeout` expiring is the same class, `launch.md`).
   The reported `qemu_status` describes the **last** probe: once that probe
   was busy it is `unknown`, never a `running` carried over from an earlier
   connected poll. Before returning `timeout`, the wait rescans the serial log

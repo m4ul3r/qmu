@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .config import QMUConfig, resolve_config
+from .config import QMUConfig, global_config_warnings, resolve_config
 from .instance import (
     QMUError,
     VMInstance,
@@ -31,6 +31,7 @@ from .instance import (
 )
 from .output import write_bytes_result, write_output_result
 from .qmp import QMPBusyError, QMPClient, QMPError
+from . import daemon_client
 from .serial import current_boot_offset, has_terminal_panic
 from .ssh import SSHClient
 
@@ -41,10 +42,15 @@ def _make_ssh(inst: VMInstance) -> SSHClient:
 
 def _require_ssh(inst: VMInstance) -> None:
     """Raise QMUError if `inst` has no SSH (harness mode, --no-net, unconfigured)."""
+    serial_only = (
+        f"qmu log --vm {inst.vm_id} --tail 50; qmu wait --vm {inst.vm_id}; "
+        f"qmu crash --vm {inst.vm_id}"
+    )
     if inst.harness:
         raise QMUError(
             f"VM '{inst.vm_id}' is harness-mode (no SSH). "
-            f"Use 'qmu log', 'qmu crash', 'qmu qmp', or 'qmu wait' instead."
+            f"Use 'qmu log', 'qmu crash', 'qmu qmp', or 'qmu wait' instead.",
+            hint=serial_only,
         )
     if inst.ssh_port is None:
         # A non-harness VM with no port was launched with --no-net and no
@@ -52,17 +58,31 @@ def _require_ssh(inst: VMInstance) -> None:
         raise QMUError(
             f"VM '{inst.vm_id}' was launched with --no-net and no --ssh-port; "
             "it has no SSH endpoint. Relaunch with --ssh-port N and a matching "
-            "hostfwd, or without --no-net."
+            "hostfwd, or without --no-net.",
+            hint=f"{serial_only}; or relaunch with --ssh-port N",
         )
     if inst.ssh_key is None:
         raise QMUError(
             f"VM '{inst.vm_id}' has no SSH key recorded (no SSH). "
-            f"Use 'qmu log', 'qmu crash', 'qmu qmp', or 'qmu wait' instead."
+            f"Use 'qmu log', 'qmu crash', 'qmu qmp', or 'qmu wait' instead.",
+            hint=f"{serial_only}; or relaunch with --ssh-key <key>",
         )
 
 
-def _qmp_ctx(inst: VMInstance) -> QMPClient:
-    return QMPClient(inst.qmp_socket)
+def _qmp_ctx(inst: VMInstance) -> Any:
+    """The QMP client every handler opens with `with _qmp_ctx(inst) as qmp:`.
+
+    With the daemon layer enabled (`QMU_DAEMON` not `off`) this is a
+    :class:`daemon_client.DaemonQMP`: on connect it proxies through the
+    daemon's single per-VM connection when the daemon watches the VM, and is
+    a plain :class:`QMPClient` on the VM's socket otherwise — same `execute`/
+    `execute_hmp`/`greeting_timeout` surface either way, so handlers and the
+    tests that patch this name never see the difference. With the layer off
+    it is the bare `QMPClient` it always was.
+    """
+    if not daemon_client.enabled():
+        return QMPClient(inst.qmp_socket)
+    return daemon_client.DaemonQMP(inst, QMPClient)
 
 
 def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
@@ -132,10 +152,16 @@ class Result:
     line. `warnings` are stderr text written verbatim after everything else
     in every mode — the follow-up hints and debugger-coherence warnings that
     trail a command's output (so a terminal shows them after the result they
-    qualify, and a JSON envelope is never interleaved with them). A `silent`
-    Result renders nothing in any mode: the handler already wrote what it had
+    qualify, and a JSON envelope is never interleaved with them). In json/
+    ndjson mode the same lines also ride in the envelope as `warnings: [str]`
+    (#74), one list merged with any `warnings` the handler already put in
+    `data` (launch's), prefix-stripped and deduplicated. A `silent` Result
+    renders nothing in any mode: the handler already wrote what it had
     to (a group's help, an interactive shell, the print-as-you-go skill
-    install) and only the exit code remains. Handlers never write stdout
+    install) and only the exit code remains. A `streamed` Result's text-mode
+    stdout payload was already written by the handler as the guest produced
+    it (`exec`/`run`/`compile --run` relay output live); render then skips
+    stdout and still writes `notes`/`warnings`. Handlers never write stdout
     themselves otherwise: `cli.invoke` returns the Result unrendered (the seam
     for in-process callers) and `cli.main` renders.
     """
@@ -150,6 +176,7 @@ class Result:
     warnings: tuple[str, ...] = ()
     refusal: bool = False
     silent: bool = False
+    streamed: bool = False
 
     @classmethod
     def silent_exit(cls, exit_code: int) -> Result:
@@ -245,6 +272,39 @@ def _write_notes(notes: tuple[str | bytes, ...]) -> None:
     err.flush()
 
 
+_WARNING_PREFIXES = ("[qmu] WARNING: ", "[qmu] Warning: ", "[qmu] ")
+
+
+def envelope_warning(line: str) -> str:
+    """A stderr warning line as it appears in the envelope's `warnings[]`.
+
+    The `[qmu] Warning:` dressing is for a terminal; the envelope entry is
+    the message itself, which is what launch already recorded in its own
+    `data["warnings"]` before this list existed.
+    """
+    text = line.rstrip("\n")
+    for prefix in _WARNING_PREFIXES:
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
+
+
+def _with_envelope_warnings(data: Any, warnings: tuple[str, ...]) -> Any:
+    """`data` with `warnings[]` merged: the handler's own list, then the
+    Result's stderr lines, in order, without duplicates."""
+    if not isinstance(data, dict):
+        return data
+    existing = data.get("warnings")
+    merged: list[str] = list(existing) if isinstance(existing, list) else []
+    for line in warnings:
+        entry = envelope_warning(line)
+        if entry not in merged:
+            merged.append(entry)
+    if not merged and existing is None:
+        return data
+    return {**data, "warnings": merged}
+
+
 def render(args: argparse.Namespace, result: Result) -> int:
     """Write a handler's :class:`Result` through the one ``--format`` fork.
 
@@ -270,6 +330,7 @@ def _write_result(args: argparse.Namespace, result: Result) -> None:
         else None
     )
     if getattr(args, "format", "text") != "text":
+        data = _with_envelope_warnings(data, result.warnings)
         _output(data, args, stem=result.stem, source_ok=source_ok)
         return
     if result.refusal:
@@ -277,6 +338,8 @@ def _write_result(args: argparse.Namespace, result: Result) -> None:
         sys.stderr.write(f"[qmu] Error: {first}\n")
         for line in rest:
             sys.stderr.write(f"[qmu] {line}\n")
+    elif result.streamed:
+        pass  # stdout already written as the guest produced it
     elif result.raw is not None:
         _write_bytes(args, result)
     else:
@@ -454,18 +517,80 @@ def _preflight_ssh_guest(
     return _refusal(data=data, text=text, stem=stem)
 
 
+# Per-`error_type` recovery hints for `{"ok": false}` envelopes whose exception
+# carries no specific `hint` (#74). Keyed on the class name as it appears in
+# `error_type`; subclasses fall back through their MRO, and anything else gets
+# the catch-all. `{vm}` is the VM the command addressed. The catch-all must
+# not promise that `qmu doctor` resolves an operational error — doctor checks
+# the host environment, not the guest path or VM state most QMUErrors are
+# about — so it names both and says which is which.
+_DEFAULT_HINTS: dict[str, str] = {
+    "SSHError": (
+        "Check the guest: qmu status --vm {vm}; qmu log --vm {vm} --tail 50"
+    ),
+    "QMPBusyError": (
+        "Another client holds QMP (a running `qmu wait`, `qmu gdb` or snapshot "
+        "op); retry when it finishes, or check with qmu status --vm {vm}"
+    ),
+    "QMPTimeoutError": (
+        "QEMU did not answer within the budget; check qmu status --vm {vm}, "
+        "then retry with a larger --timeout"
+    ),
+    "QMPError": (
+        "Check that the VM is running: qmu status --vm {vm}; if its QMP socket "
+        "is gone, qmu prune --vm {vm}"
+    ),
+    "ConfigError": (
+        "qmu config show names the file and key; qmu doctor checks the "
+        "resolved config"
+    ),
+}
+_CATCH_ALL_HINT = (
+    "qmu status --vm {vm} for VM state; qmu doctor for the host environment"
+)
+
+
+def _vm_for_hint(args: argparse.Namespace) -> str:
+    return getattr(args, "vm", None) or autoselected_vm() or "<vm_id>"
+
+
+def default_hint(error_type: type, args: argparse.Namespace) -> str:
+    """The type-default recovery hint for exception class `error_type`."""
+    template = next(
+        (
+            _DEFAULT_HINTS[klass.__name__]
+            for klass in error_type.__mro__
+            if klass.__name__ in _DEFAULT_HINTS
+        ),
+        _CATCH_ALL_HINT,
+    )
+    return template.format(vm=_vm_for_hint(args))
+
+
 def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) -> None:
     """Emit an error honoring --format (ERG-1).
 
-    Text mode keeps the existing "[qmu] <prefix> ..." line on stderr. When the
-    format is not "text", emit the universal error envelope
-    {"ok": false, "error": ..., "error_type": ...} as JSON to stdout. ``args``
-    may be partially populated (e.g. if argparse failed before defaults were
+    Text mode keeps the existing "[qmu] <prefix> ..." line on stderr, followed
+    by `[qmu] Hint: …` only when the exception carries a *specific* hint (and
+    the message does not already contain it), so text output stays quiet. When
+    the format is not "text", emit the universal error envelope
+    {"ok": false, "error": ..., "error_type": ..., "hint": ...} as JSON to
+    stdout — `hint` is the exception's own or the `error_type` default, never
+    absent. Warnings collected before the failure (a broken global config in
+    the dispatch gate) trail on stderr in every mode and ride in the envelope
+    as `warnings[]`, exactly as they do on a successful Result. ``args`` may
+    be partially populated (e.g. if argparse failed before defaults were
     applied), so the format is read defensively with getattr().
     """
     fmt = getattr(args, "format", "text") or "text"
+    specific = getattr(exc, "hint", None)
+    warnings = global_config_warnings()
     if fmt == "text":
         sys.stderr.write(f"{text_prefix} {exc}\n")
+        if specific and specific not in str(exc):
+            sys.stderr.write(f"[qmu] Hint: {specific}\n")
+        for line in warnings:
+            sys.stderr.write(line)
         return
     # Route the error envelope through _output so ndjson renders as one object
     # (output.py), spill/--out handling applies, and source_ok=False stamps the
@@ -479,7 +604,12 @@ def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) 
     # hint/errors[]) merges it into the envelope; every other error is the
     # three-key shape above.
     payload.update(getattr(exc, "envelope_fields", dict)())
+    if payload.get("hint") is None:
+        payload["hint"] = specific or default_hint(type(exc), args)
+    payload = _with_envelope_warnings(payload, warnings)
     _output(payload, args, stem="error", source_ok=False)
+    for line in warnings:
+        sys.stderr.write(line)
 
 
 def _wait_pid_exit(pid: int, timeout: float) -> bool:

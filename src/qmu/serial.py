@@ -204,6 +204,64 @@ class SerialTail:
         return [remainder]
 
 
+class PatternScan:
+    """One tick of a `--pattern` wait over a :class:`SerialTail`.
+
+    `matched_line` is the first line (or, on an idle tick, the withheld
+    fragment) the matcher hit; `terminal_panic` whether a terminal panic
+    start line was seen in the lines examined; `grew` whether the tail
+    advanced. The daemon's `wait` op and the standalone `_wait_for_pattern`
+    loop both run this exact step, so the two can never disagree about what
+    counts as a match.
+    """
+
+    __slots__ = ("matched_line", "terminal_panic", "grew")
+
+    def __init__(self, matched_line: str | None, terminal_panic: bool, grew: bool):
+        self.matched_line = matched_line
+        self.terminal_panic = terminal_panic
+        self.grew = grew
+
+
+def scan_for_pattern(
+    tail: SerialTail,
+    matcher: re.Pattern[str],
+    *,
+    final: bool = False,
+    stop_at_panic: bool = True,
+) -> PatternScan:
+    """Advance `tail` once and look for `matcher` and a terminal panic.
+
+    `final` is the pass after the process is known gone: the log must exist
+    (OSError propagates) and the withheld trailing fragment is released, since
+    the marker may be the last newline-less line QEMU wrote. On a non-final
+    tick where nothing arrived, the fragment is tested in place (never
+    consumed) so a prompt that waits for input can still match whole.
+    `stop_at_panic` stops examining lines at a terminal panic start, as a wait
+    without `--ignore-crash` does; with it False, a later line can still match.
+    """
+    read_from = tail.offset
+    lines = tail.read_lines(missing_ok=not final)
+    if final:
+        lines.extend(tail.flush())
+    matched: str | None = None
+    panic = False
+    for line in lines:
+        if matcher.search(line):
+            matched = line
+            break
+        if is_terminal_panic_start(line):
+            panic = True
+            if stop_at_panic:
+                break
+    grew = tail.offset != read_from
+    if matched is None and not final and not grew:
+        fragment = tail.peek_fragment()
+        if fragment is not None and matcher.search(fragment):
+            matched = fragment
+    return PatternScan(matched, panic, grew)
+
+
 def extract_crash(
     log_path: str | Path,
     *,
@@ -445,6 +503,32 @@ def last_boot_offset(log_path: str | Path, *, start_offset: int = 0) -> int:
     for match in _BOOT_BANNER.finditer(chunk):
         last = match
     return offset + last.start() if last is not None else offset
+
+
+def count_boot_banners(
+    log_path: str | Path, *, start_offset: int = 0, end_offset: int | None = None
+) -> int:
+    """How many kernel boot banners appear in `[start_offset, end_offset)`
+    (`end_offset` None = EOF).
+
+    The daemon uses this to tell an epoch it *observed* from one the banner
+    heuristic would have to infer: a RESET it saw is followed by exactly one
+    banner (the boot it started); a second banner after the recorded epoch
+    means a reboot nobody witnessed, and the record's `observed` label no
+    longer describes the current boot. The incremental caller bounds the
+    range at its line-aligned scan mark so a banner split across two reads
+    is counted once.
+    """
+    try:
+        with Path(log_path).open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            offset = start_offset if 0 <= start_offset <= size else 0
+            stream.seek(offset)
+            length = -1 if end_offset is None else max(0, end_offset - offset)
+            chunk = stream.read(length)
+    except OSError:
+        return 0
+    return sum(1 for _ in _BOOT_BANNER.finditer(chunk))
 
 
 def current_boot_offset(log_path: str | Path, epoch_offset: int | None) -> int:

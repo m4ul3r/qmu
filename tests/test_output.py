@@ -619,6 +619,8 @@ def test_forced_out_preserves_false_source_ok(tmp_path, fmt):
 
 
 def test_text_forced_out_uses_explicit_false_source_ok(tmp_path):
+    """#71(b): `--format text --out f` prints ONE text pointer line, never the
+    JSON envelope; the artifact dict still carries the source's `ok`."""
     out = tmp_path / "failed.txt"
 
     result = write_output_result(
@@ -629,8 +631,29 @@ def test_text_forced_out_uses_explicit_false_source_ok(tmp_path):
         source_ok=False,
     )
 
-    assert json.loads(result.rendered)["ok"] is False
+    assert result.artifact["ok"] is False
+    assert result.rendered == f"[qmu] Output written to {out} (15 bytes, failed)\n"
     assert out.read_text() == "[exit code: 7]\n"
+
+
+def test_text_forced_out_bytes_pointer_names_the_exit_code(tmp_path):
+    out = tmp_path / "failed.bin"
+
+    result = write_bytes_result(
+        b"nope", out_path=out, stem="exec", source_ok=False, exit_code=7
+    )
+
+    assert result.rendered == f"[qmu] Output written to {out} (4 bytes, exit 7)\n"
+    assert result.artifact["exit_code"] == 7
+    assert out.read_bytes() == b"nope"
+
+
+def test_text_forced_out_pointer_is_quiet_on_success(tmp_path):
+    out = tmp_path / "ok.txt"
+
+    result = write_output_result("fine", fmt="text", out_path=out, stem="status")
+
+    assert result.rendered == f"[qmu] Output written to {out} (5 bytes)\n"
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])

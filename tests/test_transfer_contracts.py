@@ -139,7 +139,10 @@ def test_transfer_local_validation_is_exit1_without_crash_claim(
     agent reads as "guest unreachable, retry/relaunch", looping on a typo.
     """
     missing = tmp_path / "missing.bin"
-    failure = SCPFileError(f"Local file not found: {missing}")
+    failure = SCPFileError(
+        f"Local file not found: {missing}",
+        hint=f"Check the local path: ls -l {missing}",
+    )
     _install_transfer(
         monkeypatch,
         tmp_path,
@@ -154,7 +157,10 @@ def test_transfer_local_validation_is_exit1_without_crash_claim(
     assert rc == 1
     if fmt == "text":
         assert captured.out == ""
-        assert captured.err == f"[qmu] Error: Local file not found: {missing}\n"
+        assert captured.err == (
+            f"[qmu] Error: Local file not found: {missing}\n"
+            f"[qmu] Hint: Check the local path: ls -l {missing}\n"
+        )
         return
     if fmt == "ndjson":
         assert len(captured.out.splitlines()) == 1
@@ -162,6 +168,7 @@ def test_transfer_local_validation_is_exit1_without_crash_claim(
     assert payload["ok"] is False
     assert payload["error_type"] == "SCPFileError"
     assert payload["error"] == f"Local file not found: {missing}"
+    assert payload["hint"] == f"Check the local path: ls -l {missing}"
     assert "crash" not in payload
     assert "crash_detected" not in payload
     assert "ssh_error" not in payload
@@ -197,11 +204,35 @@ def test_transfer_remote_filesystem_failure_is_operational_exit1(
     out = capsys.readouterr().out
     payload = json.loads(out)
 
+    # The hint names the guest path, never the host-environment generic: scp's
+    # non-255 exit proves the connection worked and the path did not.
+    if operation == "push" and stderr == "No such file or directory":
+        hint = (
+            "The guest directory must exist: qmu exec --vm xfer-vm 'ls -ld /root'; "
+            "create it first with qmu exec --vm xfer-vm 'mkdir -p /root'"
+        )
+    elif operation == "push":
+        hint = (
+            "Check ownership/mode on the guest path: qmu exec --vm xfer-vm "
+            "'ls -ld /root'"
+        )
+    elif stderr == "No such file or directory":
+        hint = (
+            "Check the guest file exists: qmu exec --vm xfer-vm "
+            "'ls -l /root/payload.bin'; and that the local destination "
+            "directory exists"
+        )
+    else:
+        hint = (
+            "Check ownership/mode on the guest path: qmu exec --vm xfer-vm "
+            "'ls -l /root/payload.bin'; and that the local destination is writable"
+        )
     assert rc == 1
     assert payload == {
         "ok": False,
         "error": message,
         "error_type": "SCPFileError",
+        "hint": hint,
     }
 
 

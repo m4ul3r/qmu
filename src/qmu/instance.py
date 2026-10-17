@@ -18,7 +18,18 @@ _KNOWN_INSTANCE_SUFFIXES = (".serial.log", ".qemu.log", ".qmp.sock", ".json")
 
 
 class QMUError(RuntimeError):
-    pass
+    """An operational qmu error (exit 1).
+
+    `hint` is an optional recovery step (`qmu log --vm X --tail 50`, "pass
+    --ssh-port N") that rides as `hint` in the `{"ok": false}` envelope and,
+    in text mode, as a `[qmu] Hint:` line after the error. Subclasses inherit
+    the keyword; a subclass that renders its own structured hint
+    (`ConfigError`) keeps its own `hint` attribute, which this base reads.
+    """
+
+    def __init__(self, *args: object, hint: str | None = None) -> None:
+        super().__init__(*args)
+        self.hint = hint if hint is not None else getattr(self, "hint", None)
 
 
 @dataclass(kw_only=True)
@@ -52,6 +63,13 @@ class VMInstance:
     # Byte offset at which the currently restored guest generation begins.
     # Zero preserves old instance JSON and includes all bytes from a new launch.
     guest_epoch_serial_offset: int = 0
+    # How that boundary was learned: "observed" (a QMP RESET the daemon saw,
+    # or a snapshot load qmu performed — the log size at the event) or
+    # "banner" (the kernel's boot banner, the log-local heuristic a standalone
+    # `wait` falls back to). None for a record that never moved its epoch.
+    # `status` reports it as `guest_epoch_source` when the daemon serves the
+    # VM, so a reader knows whether a reboot was witnessed or inferred.
+    guest_epoch_source: str | None = None
     # Whether `cmdline` came from a full override rather than from `profile`.
     # Without this, `status` prints a Profile: whose parameters never reached
     # the kernel, and unknown-param attribution credits a profile that
@@ -99,13 +117,15 @@ def save_instance(inst: VMInstance) -> Path:
         raise
     return path
 
-def save_guest_epoch_serial_offset(inst: VMInstance, offset: int) -> VMInstance:
+def save_guest_epoch_serial_offset(
+    inst: VMInstance, offset: int, *, source: str = "observed"
+) -> VMInstance:
     """Atomically persist an explicitly captured guest-generation boundary."""
     if type(offset) is not int:
         raise TypeError("offset must be an integer")
     if offset < 0:
         raise ValueError("offset must be non-negative")
-    updated = replace(inst, guest_epoch_serial_offset=offset)
+    updated = replace(inst, guest_epoch_serial_offset=offset, guest_epoch_source=source)
     save_instance(updated)
     return updated
 
@@ -548,7 +568,10 @@ def choose_instance(vm_id: str | None = None) -> VMInstance:
         _refuse_autoselect_if_required()
     instances = list_instances()
     if not instances:
-        raise QMUError("No running VMs. Start one with: qmu launch --kernel <bzImage>")
+        raise QMUError(
+            "No running VMs. Start one with: qmu launch --kernel <bzImage>",
+            hint="qmu list; qmu launch --name <name> --no-replace",
+        )
 
     if vm_id is not None:
         for inst in instances:
@@ -563,7 +586,8 @@ def choose_instance(vm_id: str | None = None) -> VMInstance:
         raise QMUError(
             f"VM '{vm_id}' not found. "
             f"Running: {', '.join(i.vm_id for i in instances) or 'none'}; "
-            f"Stopped: {', '.join(i.vm_id for i in stopped) or 'none'}."
+            f"Stopped: {', '.join(i.vm_id for i in stopped) or 'none'}.",
+            hint="qmu list",
         )
 
     if len(instances) == 1:
@@ -575,7 +599,7 @@ def choose_instance(vm_id: str | None = None) -> VMInstance:
             lines.append(f"  {inst.vm_id}  (pid={inst.pid}, harness)")
         else:
             lines.append(f"  {inst.vm_id}  (pid={inst.pid}, ssh={inst.ssh_port})")
-    raise QMUError("\n".join(lines))
+    raise QMUError("\n".join(lines), hint="qmu list; pass --vm <id>")
 
 
 def find_instance(vm_id: str | None = None) -> VMInstance:
@@ -592,12 +616,16 @@ def find_instance(vm_id: str | None = None) -> VMInstance:
         raise QMUError(
             f"VM '{vm_id}' not found. "
             f"Running: {', '.join(i.vm_id for i in running) or 'none'}; "
-            f"Stopped: {', '.join(i.vm_id for i in stopped) or 'none'}."
+            f"Stopped: {', '.join(i.vm_id for i in stopped) or 'none'}.",
+            hint="qmu list",
         )
 
     candidates = running + stopped
     if not candidates:
-        raise QMUError("No VMs found. Start one with: qmu launch --kernel <bzImage>")
+        raise QMUError(
+            "No VMs found. Start one with: qmu launch --kernel <bzImage>",
+            hint="qmu list; qmu launch --name <name> --no-replace",
+        )
     if len(candidates) == 1:
         return _autoselect(candidates[0], running=bool(running))
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import platform
-import sys
 import tomllib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -123,6 +122,10 @@ _FIXED_SCHEMA: dict[str, dict[str, str]] = {
     "gdb": {
         "port_start": "integer",
     },
+    "daemon": {
+        "autostart": "boolean",
+        "idle_exit": "integer",
+    },
 }
 
 # QMUConfig path fields -> the TOML key that sets them, for provenance text.
@@ -155,6 +158,8 @@ _FIELD_TOML_KEYS: dict[str, str] = {
     "ssh_user": "ssh.user",
     "ssh_port_start": "ssh.port_start",
     "gdb_port_start": "gdb.port_start",
+    "daemon_autostart": "daemon.autostart",
+    "daemon_idle_exit": "daemon.idle_exit",
 }
 
 
@@ -498,6 +503,13 @@ class QMUConfig:
     # gdb
     gdb_port_start: int = 1234
 
+    # daemon (#70): the per-user supervisor that owns QMP connections. The
+    # client spawns it on demand unless `autostart` is false (QMU_DAEMON=off
+    # disables the whole layer per process); it exits after `idle_exit`
+    # seconds with no running VM and no client (0 = never).
+    daemon_autostart: bool = True
+    daemon_idle_exit: int = 600
+
     # profiles (name -> cmdline)
     profiles: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_PROFILES))
 
@@ -742,19 +754,28 @@ def _with_recovery(exc: ConfigError, recovery: str) -> ConfigError:
 
 # One command may resolve config twice (the dispatch-level project-config gate in
 # cli.main plus a handler that needs the QMUConfig object), and this warning is a
-# per-COMMAND diagnostic, not a per-process one: cli.main clears the dedup set via
+# per-COMMAND diagnostic, not a per-process one: cli._parse clears the list via
 # reset_global_config_warnings() before dispatching, so repeated resolve_config()
 # calls within one command still dedupe, but the next command warns again. Keyed
 # on the rendered message so a different file or a different error still warns.
-_global_config_warnings: set[str] = set()
+# Nothing is written here: the warning fires in the config gate BEFORE the
+# handler runs, and the renderer attaches it to the command's Result so it
+# reaches stderr in every mode AND the JSON envelope's `warnings[]` (#74).
+_global_config_warnings: list[str] = []
 
 
 def reset_global_config_warnings() -> None:
-    """Clear the warn-once dedup set. Called once per CLI invocation by
-    cli.main (so the dedup is per-command, not per-process) and by the test
+    """Clear the warn-once list. Called once per CLI invocation by
+    cli._parse (so the dedup is per-command, not per-process) and by the test
     suite's isolate_qmu_env fixture (so a warning from one test cannot mask
     the same message in the next)."""
     _global_config_warnings.clear()
+
+
+def global_config_warnings() -> tuple[str, ...]:
+    """The `[qmu] Warning: …` lines recorded by resolve_config() since the last
+    reset, in order, newline-terminated — the shape `Result.warnings` takes."""
+    return tuple(_global_config_warnings)
 
 
 def resolve_config(
@@ -793,8 +814,7 @@ def resolve_config(
             })
             warning = f"[qmu] Warning: ignoring global config: {exc}\n"
             if warning not in _global_config_warnings:
-                _global_config_warnings.add(warning)
-                sys.stderr.write(warning)
+                _global_config_warnings.append(warning)
 
     # Layer 2: project config (or explicit --config). Unlike the project
     # search (which simply finds nothing when no qmu.toml exists upward from
@@ -911,6 +931,11 @@ user = "root"
 
 [gdb]
 # port_start = 1234
+
+[daemon]
+# autostart = true               # spawn the per-user supervisor on demand (it owns each
+#                                #   VM's QMP connection; QMU_DAEMON=off disables per process)
+# idle_exit = 600                # seconds with no running VM and no client before it exits
 
 [profiles.exploit-dev]
 cmdline = "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0 selinux=0 apparmor=0 kasan.fault=panic"

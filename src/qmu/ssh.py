@@ -90,8 +90,9 @@ class SCPFileError(QMUError):
         *,
         returncode: int | None = None,
         stderr: str = "",
+        hint: str | None = None,
     ) -> None:
-        super().__init__(message)
+        super().__init__(message, hint=hint)
         self.returncode = returncode
         self.stderr = stderr
 
@@ -144,6 +145,7 @@ def _watch_child(
     timeout: float,
     abort_when: Callable[[], bool] | None,
     poll_interval: float = 0.5,
+    on_chunk: Callable[[str, bytes], None] | None = None,
 ) -> tuple[list[bytes], bool, bool]:
     """Drain `pipes` until the child exits, the budget expires or `abort_when`
     fires. Returns (raw output per pipe, completed, aborted); a child that
@@ -162,7 +164,18 @@ def _watch_child(
     returned after 10 s). Output is returned as bytes: guest output is
     arbitrary bytes (a leak primitive dumping raw memory is the everyday
     case) and the caller decides how to present them.
+
+    `on_chunk(stream, data)` is called with every read as it is drained —
+    `stream` is `"stdout"`/`"stderr"` by which of `proc`'s pipes produced it,
+    `data` the raw bytes, no line assembly — so a caller can relay a
+    long-running command's progress live instead of only when it ends. The
+    same bytes are still accumulated and returned. The final drain after a
+    kill reaches it too, so partial output on a timeout/abort is relayed
+    before the exception carries it. A callback that raises (a reader that
+    closed the pipe) kills the child first: the drain loop is the only thing
+    reaping it.
     """
+    names = {pipe.fileno(): "stdout" if pipe is proc.stdout else "stderr" for pipe in pipes}
     chunks: dict[int, list[bytes]] = {pipe.fileno(): [] for pipe in pipes}
     sel = selectors.DefaultSelector()
     for pipe in pipes:
@@ -177,6 +190,8 @@ def _watch_child(
                 continue
             if data:
                 chunks[key.fd].append(data)
+                if on_chunk is not None:
+                    on_chunk(names[key.fd], data)
             else:
                 sel.unregister(key.fileobj)
 
@@ -218,6 +233,11 @@ def _watch_child(
             proc.wait()
             # Whatever is already in the pipes is still the guest's output.
             drain(0.0)
+    except BaseException:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        raise
     finally:
         sel.close()
         for pipe in pipes:
@@ -344,6 +364,7 @@ class SSHClient:
         *,
         abort_when: Callable[[], bool] | None = None,
         poll_interval: float = 0.5,
+        on_chunk: Callable[[str, bytes], None] | None = None,
     ) -> tuple[int, GuestText, GuestText]:
         """Run a command in the guest. Returns (exit_code, stdout, stderr).
 
@@ -358,7 +379,9 @@ class SSHClient:
         (`ServerAliveInterval × ServerAliveCountMax` = 15 s) while the panic
         is on disk within ~100 ms; a halted vCPU never drops it at all. A
         `--timeout` overrun raises :class:`SSHError` carrying the partial
-        output the same way. See :func:`_watch_child` for the drain.
+        output the same way. `on_chunk` relays each drained read as it
+        arrives (see :func:`_watch_child`); the returned/raised output is the
+        same bytes in full.
         """
         cmd = self._ssh_base() + [self._target(), command]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -368,6 +391,7 @@ class SSHClient:
             timeout=timeout,
             abort_when=abort_when,
             poll_interval=poll_interval,
+            on_chunk=on_chunk,
         )
         stdout, stderr = GuestText(stdout_raw), GuestText(stderr_raw)
         if aborted:
@@ -399,11 +423,15 @@ class SSHClient:
         """Copy a file to the guest. `abort_when` as in :meth:`run`."""
         local = Path(local_path)
         if not local.exists():
-            raise SCPFileError(f"Local file not found: {local_path}")
+            raise SCPFileError(
+                f"Local file not found: {local_path}",
+                hint=f"Check the local path: ls -l {local_path}",
+            )
         if local.is_dir():
             raise SCPFileError(
                 f"push transfers single files only; {local_path!r} is a "
-                "directory (archive it first, e.g. tar)"
+                "directory (archive it first, e.g. tar)",
+                hint=f"tar czf <archive>.tgz -C {local_path} . ; then push the archive",
             )
         cmd = self._scp_base() + [
             str(local),

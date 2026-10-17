@@ -12,7 +12,6 @@ import json
 import re
 import shutil
 import subprocess
-import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -536,7 +535,8 @@ def _handle_kbase(args: argparse.Namespace) -> Result:
     if rc != 0:
         diagnostic = (stderr or stdout or "no diagnostic").strip()
         raise QMUError(
-            f"failed to read guest /proc/kallsyms (exit {rc}): {diagnostic}"
+            f"failed to read guest /proc/kallsyms (exit {rc}): {diagnostic}",
+            hint=f"qmu status --vm {inst.vm_id}; qmu log --vm {inst.vm_id} --tail 50",
         )
 
     runtime_base = _parse_kallsyms_text(stdout)
@@ -609,12 +609,16 @@ def _handle_gdb(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     if inst.gdb_port is None:
         raise QMUError(
-            "VM was launched without --gdb. Relaunch with: qmu launch --gdb --kernel ..."
+            "VM was launched without --gdb. Relaunch with: qmu launch --gdb --kernel ...",
+            hint=f"qmu kill --vm {inst.vm_id}; qmu launch --gdb --name {inst.vm_id} --no-replace",
         )
 
     pry = shutil.which("pry")
     if not pry:
-        raise QMUError("pry not found in PATH. Install pry and ensure it is on PATH.")
+        raise QMUError(
+            "pry not found in PATH. Install pry and ensure it is on PATH.",
+            hint="which pry; install pry or add it to PATH, then re-run qmu gdb",
+        )
 
     # #40 / debug audit D4: the QEMU gdbstub serves ONE client. A second
     # `pry launch` against an attached stub blocks until the 15 s cap, exits 4
@@ -634,7 +638,8 @@ def _handle_gdb(args: argparse.Namespace) -> Result:
         )
         raise QMUError(
             f"A debugger client is already attached to port {inst.gdb_port}"
-            f"{bridge}. Reuse it, or detach with: {detach}"
+            f"{bridge}. Reuse it, or detach with: {detach}",
+            hint=f"pry --instance qmu-{inst.vm_id} (reuse) or {detach}",
         )
     # A recorded bridge that is alive while NO client is attached is the #40
     # stranded case (its stub died under it, or it dropped the connection).
@@ -679,10 +684,17 @@ def _handle_gdb(args: argparse.Namespace) -> Result:
             f"pry launch did not connect to the GDB stub on port {inst.gdb_port} "
             f"within {_PRY_LAUNCH_TIMEOUT} s. Another client may hold the stub "
             "(QEMU serves one); check `pry doctor` and `ss -tnp` for an "
-            f"ESTABLISHED socket on port {inst.gdb_port}."
+            f"ESTABLISHED socket on port {inst.gdb_port}.",
+            hint=f"pry doctor; ss -tnp | grep :{inst.gdb_port}",
         ) from None
     if result.returncode != 0:
-        raise QMUError(f"pry launch failed: {_pry_launch_error(result)}")
+        raise QMUError(
+            f"pry launch failed: {_pry_launch_error(result)}",
+            hint=(
+                f"pry doctor; qmu log --vm {inst.vm_id} --tail 50; then re-run "
+                f"qmu gdb --vm {inst.vm_id}"
+            ),
+        )
 
     bridge_pid = _pry_launch_pid(result)
     inst = replace(
@@ -1046,7 +1058,8 @@ def _before_mutation(inst: VMInstance, verb: str) -> int | None:
 
 
 def _after_mutation(
-    inst: VMInstance, verb: str, output: str, epoch: int | None
+    inst: VMInstance, verb: str, output: str, epoch: int | None,
+    warnings: list[str],
 ) -> VMInstance:
     """Post-mutation bookkeeping plus the debugger coherence warning.
 
@@ -1055,9 +1068,9 @@ def _after_mutation(
     and an empty stderr, which is precisely the wrong-answer-with-no-error
     class debug.py exists to prevent. savevm/loadvm suppress on a failed op
     (the same classifier the snapshot handlers use), since a failed op
-    mutated nothing. A failed epoch persist is raised only AFTER the SSH
-    master drop and the coherence warning, which the mutation that already
-    landed still needs.
+    landed still needs. The coherence warnings are appended to `warnings`
+    (even when the persist raises) so the caller can put them on its Result:
+    stderr in every mode and the envelope's `warnings[]` (#74).
     """
     failed = verb in ("savevm", "loadvm") and _snapshot_failed(output)
     persist_error: OSError | None = None
@@ -1070,13 +1083,13 @@ def _after_mutation(
         _drop_ssh_master(inst)
     if verb == "system_reset":
         if debug_session_present(inst):
-            sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
+            warnings.append(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
     elif verb == "savevm":
         if debug_stub_present(inst) and not failed:
-            sys.stderr.write(savevm_breakpoint_warning(inst.vm_id) + "\n")
+            warnings.append(savevm_breakpoint_warning(inst.vm_id) + "\n")
     elif verb == "loadvm":
         if debug_session_present(inst) and not failed:
-            sys.stderr.write(loadvm_stale_session_warning(inst.vm_id) + "\n")
+            warnings.append(loadvm_stale_session_warning(inst.vm_id) + "\n")
     if persist_error is not None:
         raise persist_error
     return inst
@@ -1103,8 +1116,9 @@ def _finish_mutation(
     stdout, the first of which a consumer could accept as the result).
     Exit 4: the guest did what was asked; qmu's own state is what failed.
     """
+    warnings: list[str] = []
     try:
-        _after_mutation(inst, verb, output, epoch)
+        _after_mutation(inst, verb, output, epoch, warnings)
     except OSError as exc:
         error = (
             f"{verb or 'command'} reached the guest, but qmu could not record "
@@ -1130,8 +1144,8 @@ def _finish_mutation(
             stem=stem,
             exit_code=4,
             refusal=True,
-        )
-    return Result(data=data, text=text, stem=stem)
+        ).warn(*warnings)
+    return Result(data=data, text=text, stem=stem).warn(*warnings)
 
 
 def _handle_qmp(args: argparse.Namespace) -> Result:

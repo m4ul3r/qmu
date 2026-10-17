@@ -19,10 +19,10 @@ object with `"ok": <bool>` — the single, command-agnostic success predicate.
 
 - **Exception paths** (`QMUError`, `ConfigError`, `QMPError`, `SSHError`,
   `SnapshotError`, `SCPFileError`, internal): `{"ok": false, "error": "…",
-  "error_type": "<ExceptionClassName>"}` plus, for `ConfigError`, `source`,
-  `key`, `hint` (first problem) and `errors: [{source, key, message, hint}]`
-  for every problem in the file. Text mode prints `[qmu] Error: …`, `[qmu]
-  QMP error: …` or `[qmu] SSH error: …` on **stderr**.
+  "error_type": "<ExceptionClassName>", "hint": "…"}` plus, for `ConfigError`,
+  `source`, `key` and `errors: [{source, key, message, hint}]` for every
+  problem in the file. Text mode prints `[qmu] Error: …`, `[qmu] QMP error:
+  …` or `[qmu] SSH error: …` on **stderr**.
 - **Result-style failures** — the command ran and the answer is "no": a
   non-zero guest exit or `--timeout` overrun on `exec`/`run`/`compile --run`
   (`exit_code`, `timed_out`), transport loss (exit 3/4, `ssh_error`,
@@ -32,10 +32,38 @@ object with `"ok": <bool>` — the single, command-agnostic success predicate.
   fields, not `error`/`error_type`**, and text mode prints the report on
   **stdout** with no prefix. The paused/panicked refusal of an SSH command is
   the hybrid: JSON `guest_state`/`qemu_status` without `error`, text `[qmu]
-  Error: …` on stderr.
+  Error: …` on stderr. The one result-style failure that *does* carry
+  `error`/`error_type` is an expired `--ssh-timeout` on `launch`/`run`
+  (exit 124, `error_type: "TimeoutError"`, `timed_out: true`, `ssh_error:
+  true`, `hint`): the same shape for both verbs, so a caller branches once.
 - **Usage errors** (exit 2): text prints argparse usage on stderr; a JSON
   format emits `{"ok": false, "error": …, "error_type": "UsageError",
-  "usage": …}` on stdout. `run --harness` is this class.
+  "usage": …, "hint": …}` on stdout. `run --harness` is this class.
+
+**Every exception-path `ok: false` envelope carries `hint`** — the next
+command to run (launch's `no-console-output`/timeout envelopes carry one too). A
+raise site that knows the recovery names it (`qmu log --vm X --tail 50`,
+`relaunch with --ssh-port N`); otherwise the hint is the `error_type`
+default: `SSHError` → `qmu status --vm X; qmu log --vm X --tail 50`,
+`QMPError` → `qmu status --vm X` (`QMPBusyError`: retry when the other
+client finishes; `QMPTimeoutError`: retry with a larger `--timeout`),
+`ConfigError` → `qmu config show` / `qmu doctor`, `UsageError` → `qmu <sub>
+--help`, anything else → `qmu status --vm X for VM state; qmu doctor for the
+host environment` (doctor checks the host, never a guest path or a VM's
+state — a transfer the guest filesystem refused names the guest path and the
+`qmu exec … ls -ld` that inspects it instead). Text mode prints `[qmu] Hint: …`
+after the error line only for a site-specific hint, never for a type default.
+
+**`warnings: [str]`** rides in every json/ndjson envelope that has
+something to warn about — launch-time lints, the debugger-coherence warnings
+(`snapshot save`/`load`, `qmp`/`monitor system_reset`, `kill` with a stranded
+pry bridge), the `ignoring global config` notice from a broken
+`~/.config/qmu/config.toml` (it fires in the config gate before the handler,
+and still lands in the envelope — on success and on an `ok: false` one
+alike). The same lines go to stderr in every mode, `[qmu] Warning:`-prefixed,
+for a human tailing the terminal; the envelope entries are the bare
+messages, deduplicated, in the order they fired. A clean command has no
+`warnings` key (launch always has the list, `[]` when clean).
 
 Every path emits **exactly one** object. A mutation whose QEMU side succeeded
 but whose qmu bookkeeping then failed (`qmu qmp system_reset` / `qmu monitor
@@ -68,6 +96,37 @@ Guest `\r\n` is not translated. JSON cannot hold raw bytes, so its `stdout`/
 something was replaced — read text mode or `--out` for the real bytes (a
 spilled guest-output artifact is `.txt`, bytes verbatim).
 
+### Streaming (`exec`, `run`, `compile --run`)
+
+Guest output is relayed **as it arrives**, not when the command ends: a
+long-running exploit's progress lines show up at ~the moment the guest
+prints them, and are still there after a `--timeout` (exit 124) or a
+mid-command panic (exit 3, the crash narrative follows what was already
+printed). What is relayed is the raw read (no line assembly), flushed per
+chunk. `compile --run` streams only the program's run; compile/chmod
+diagnostics stay in the envelope.
+
+- **text**: guest stdout chunks → stdout, guest stderr chunks → stderr, live;
+  the `[exit code: N]` trailer and other notes follow on stderr once the
+  command ends (on a fresh line if the guest's stderr ended without one).
+  Bytes are identical to the buffered rendering (`| sha256sum` matches).
+  `--out FILE` streams into the file as chunks arrive and prints the
+  `[qmu] Output written to …` line at the end. Without `--out`, output up to
+  the spill budget (40 000 bytes of stdout) streams inline; the chunk that
+  crosses it diverts the **rest** to a spill file, the file holds the whole
+  output (prefix included, `.txt`, bytes verbatim), and the stream closes
+  with `[qmu] Output spilled to <path> (~N tokens)` / `[qmu] Preview: first
+  40000 of B bytes (C omitted) streamed above` — pointer *after* the preview,
+  unlike a buffered spill.
+- **ndjson**: each chunk is one line `{"event": "chunk", "stream":
+  "stdout"|"stderr", "data": "<text>"}` — `data` is the bytes decoded as
+  UTF-8 with `surrogateescape` (JSON-escaped, so undecodable bytes survive as
+  lone surrogates and a chunk may end mid-character); intermediate lines
+  carry `event` and **no** `ok`. The last line is the normal envelope (`ok`,
+  full `stdout`/`stderr`, …), so a reader that ignores `event` lines sees
+  exactly the json result.
+- **json**: unchanged — one buffered envelope.
+
 ## Exit 3 vs 4
 
 Exit `3` is guest-side and always corroborated by a fresh serial crash report;
@@ -87,25 +146,31 @@ spill root — `$QMU_TEMP_DIR/spills`, else `$XDG_RUNTIME_DIR/qmu/spills`, else
 - **text**: `[qmu] Output spilled to <path> (~N tokens)`, then a preview
   bounded by **both** 40 lines and 4096 bytes (so one 200 000-byte line shows
   4096 bytes, not all of it), then `[qmu] Preview: first A of B bytes (C
-  omitted; L of M lines)`; no JSON envelope.
+  omitted; L of M lines)`; no JSON envelope. A *streamed* guest command
+  (`exec`/`run`/`compile --run`) has already put its first 40 000 bytes on
+  stdout when the budget is crossed, so there the pointer and `Preview: …
+  streamed above` trailer come **last** (see *Streaming*).
 - **json/ndjson**: a pointer envelope `{"ok", "artifact_path", "format",
   "bytes", "sha256", "token_estimate", "estimator": "chars/4", "summary"}`.
 
 Both also print `[qmu] Output spilled to <path>` on stderr. Always consume the
 printed path / `artifact_path`; never reconstruct spill names. `--out PATH`
-forces a file and prints the pointer envelope (as JSON, in every format); the
-file holds the result rendered in `--format`, so `qmu crash --vm X --format
-text --out report.txt` saves the plain report while `--format json --out`
-saves the `{"ok", "crash", …}` envelope with escaped newlines.
-The pointer envelope's `ok` is the **operation's** result, never "the file
-was written": a guest command that exited non-zero rendered through text
-`--out` reports `ok: false` plus `exit_code` (present only when known —
-omitted on a timeout, where it is null) next to the artifact keys, the
-process exit stays 1 (`[exit code: N]` still on stderr), and JSON `--out`
-carries the same `ok: false` — the artifact still holds the exact captured
-bytes either way. An automatic text spill prints only the `[qmu] Output
-spilled to …` pointer and preview (no envelope), so there the failure is the
-process exit plus the stderr trailer. Branch on the exit code or `ok`, never
-on the presence of `artifact_path`.
+forces a file; the file holds the result rendered in `--format`, so `qmu
+crash --vm X --format text --out report.txt` saves the plain report while
+`--format json --out` saves the `{"ok", "crash", …}` envelope with escaped
+newlines. What stdout shows is per format: json/ndjson print the pointer
+envelope above; **text prints one line**, `[qmu] Output written to <path>
+(<N> bytes, exit <code>)` — `exit <code>` when the guest exit code is known,
+`failed` when only `ok: false` is, nothing on success — never JSON (#71).
+The pointer's `ok`/exit is the **operation's** result, never "the file was
+written": a guest command that exited non-zero rendered through text `--out`
+says `exit 7`, the process exit stays 1 (`[exit code: N]` still on stderr),
+and JSON `--out` carries `ok: false` plus `exit_code` (present only when
+known — omitted on a timeout, where it is null) next to the artifact keys —
+the artifact still holds the exact captured bytes either way. An automatic
+text spill prints only the `[qmu] Output spilled to …` pointer and preview
+(no envelope), so there the failure is the process exit plus the stderr
+trailer. Branch on the exit code or `ok`, never on the presence of
+`artifact_path`.
 `rootfs cat` spills binary content to a `.bin`. Aged automatic spills are
 reclaimed by `qmu prune --runtime` (`reference/cache.md`).

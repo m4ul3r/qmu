@@ -45,6 +45,9 @@ def test_usage_error_emits_envelope_under_json_formats(fmt, capsys):
         "error": "unrecognized arguments: --bogus",
         "error_type": "UsageError",
         "usage": payload["usage"],
+        # #74: every ok:false envelope carries a hint; a usage error with no
+        # specific one points at the subcommand's help.
+        "hint": "qmu launch --help",
     }
     assert payload["usage"].startswith("usage: qmu")
     if fmt == "ndjson":
@@ -85,7 +88,8 @@ def test_format_after_double_dash_is_a_guest_argument(capsys):
 
 def test_guest_command_dash_words_get_a_hint_in_text_and_json(capsys):
     """`qmu exec uname -a` is "unrecognized arguments: -a"; the hint names the
-    two working forms. Other subcommands' usage errors carry no hint."""
+    two working forms. Other subcommands' usage errors fall back to the
+    `<prog> --help` default (#74) and print no hint line in text mode."""
     hint = (
         "Hint: quote the guest command ('uname -a') or put -- before it "
         "(qmu exec -- uname -a); qmu flags may appear anywhere."
@@ -101,9 +105,15 @@ def test_guest_command_dash_words_get_a_hint_in_text_and_json(capsys):
     assert payload["error"] == "unrecognized arguments: -a"
     assert payload["hint"] == hint
 
-    code, out, _ = _run(["launch", "--bogus", "--format", "json"], capsys)
+    code, out, err = _run(["launch", "--bogus", "--format", "json"], capsys)
     assert code == 2
-    assert "hint" not in json.loads(out)
+    assert json.loads(out)["hint"] == "qmu launch --help"
+    code, out, err = _run(["kbase", "--format", "json"], capsys)
+    assert code == 2
+    assert json.loads(out)["hint"] == "qmu kbase --help"
+    code, _, err = _run(["launch", "--bogus"], capsys)
+    assert code == 2
+    assert "Hint" not in err and "--help" not in err.splitlines()[-1]
 
 
 def test_missing_subcommand_under_json_is_an_envelope(capsys):

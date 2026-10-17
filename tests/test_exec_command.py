@@ -28,6 +28,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 
 import pytest
@@ -359,23 +360,32 @@ def test_text_out_file_holds_the_exact_stdout_bytes(wired, tmp_path, capsys):
 
     assert rc == 0
     assert out.read_bytes() == b"\x00\xff no newline"
-    envelope = json.loads(capsys.readouterr().out)
-    assert envelope["artifact_path"] == str(out)
-    assert envelope["bytes"] == 13
+    pointer = capsys.readouterr().out
+    assert pointer.startswith(f"[qmu] Output written to {out} (13 bytes")
 
 
-def test_text_spill_preserves_the_bytes_in_the_artifact(wired, capsys, monkeypatch, tmp_path):
+def test_text_spill_preserves_the_bytes_in_the_artifact(
+    wired, capsysbinary, monkeypatch, tmp_path
+):
+    """Streamed stdout cannot be sized before it is written: the first
+    STREAM_SPILL_BYTES go by live, the rest is diverted to a spill file that
+    holds the whole output, and the pointer + preview trailer close the
+    stream (they used to open a buffered one)."""
     monkeypatch.setenv("QMU_TEMP_DIR", str(tmp_path / "rt"))
     body = b"\xff" + b"0" * 200_000
     wired(rc=0, stdout=GuestText(body))
 
     rc = cli.main(["exec", "--vm", "exec-vm", "cmd"])
 
-    captured = capsys.readouterr()
+    captured = capsysbinary.readouterr()
     assert rc == 0
-    pointer = captured.out.splitlines()[0]
+    head = captured.out[: guest.STREAM_SPILL_BYTES]
+    pointer, trailer = captured.out[guest.STREAM_SPILL_BYTES:].decode().splitlines()
+    assert head == body[: guest.STREAM_SPILL_BYTES]
     assert pointer.startswith("[qmu] Output spilled to ")
-    assert len(captured.out) < 5000
+    assert trailer.startswith(
+        f"[qmu] Preview: first {guest.STREAM_SPILL_BYTES} of {len(body)} bytes"
+    )
     artifact = pointer.split(" ")[4]
     assert artifact.endswith(".txt")
     with open(artifact, "rb") as stream:
@@ -394,11 +404,9 @@ def test_failed_command_text_out_envelope_reports_the_failure(wired, tmp_path, c
 
     assert rc == 1
     assert out.read_bytes() == b"nope"
-    envelope = json.loads(capsys.readouterr().out)
-    assert envelope["ok"] is False
-    assert envelope["exit_code"] == 7
-    assert envelope["artifact_path"] == str(out)
-    assert envelope["bytes"] == 4
+    pointer = capsys.readouterr().out
+    assert pointer.startswith(f"[qmu] Output written to {out} (4 bytes")
+    assert "exit 7" in pointer
 
 
 def test_failed_command_json_out_envelope_reports_the_failure(wired, tmp_path, capsys):
@@ -417,7 +425,7 @@ def test_failed_command_json_out_envelope_reports_the_failure(wired, tmp_path, c
 
 
 def test_failed_command_text_spill_keeps_the_bytes_and_the_failure(
-    wired, capsys, monkeypatch, tmp_path
+    wired, capsysbinary, monkeypatch, tmp_path
 ):
     monkeypatch.setenv("QMU_TEMP_DIR", str(tmp_path / "rt"))
     body = b"\xff" + b"0" * 200_000
@@ -425,12 +433,13 @@ def test_failed_command_text_spill_keeps_the_bytes_and_the_failure(
 
     rc = cli.main(["exec", "--vm", "exec-vm", "cmd"])
 
-    captured = capsys.readouterr()
+    captured = capsysbinary.readouterr()
     assert rc == 1
-    pointer = captured.out.splitlines()[0]
+    pointer = captured.out[guest.STREAM_SPILL_BYTES:].decode().splitlines()[0]
     assert pointer.startswith("[qmu] Output spilled to ")
     with open(pointer.split(" ")[4], "rb") as stream:
         assert stream.read() == body
+    assert captured.err == b"[qmu] Output spilled to " + pointer.split(" ")[4].encode() + b"\n[exit code: 7]\n"
 
 
 def test_successful_command_text_out_envelope_has_no_failure_marks(wired, tmp_path, capsys):
@@ -440,9 +449,7 @@ def test_successful_command_text_out_envelope_has_no_failure_marks(wired, tmp_pa
     rc = cli.main(["exec", "--vm", "exec-vm", "--out", str(out), "cmd"])
 
     assert rc == 0
-    envelope = json.loads(capsys.readouterr().out)
-    assert envelope["ok"] is True
-    assert envelope["exit_code"] == 0
+    assert capsys.readouterr().out == f"[qmu] Output written to {out} (4 bytes, exit 0)\n"
 
 
 # --- the serial watcher -----------------------------------------------------
@@ -925,3 +932,194 @@ def test_wait_pid_exit_on_a_foreign_pid_still_times_out_only_while_alive():
     """A live pid that is not our child (`waitpid` → `ChildProcessError`) is
     handled like before: the budget elapses and the pid is reported alive."""
     assert _wait_pid_exit(os.getppid(), timeout=0.1) is False
+
+
+# --- streamed output (#71a) ---------------------------------------------------
+
+
+class StreamingSSH(WatchedSSH):
+    """A fake whose `run` relays `chunks` through `on_chunk` before returning
+    (or aborting with) the joined output, the way the real client does."""
+
+    def __init__(self, serial_path, *, chunks, **kw):
+        super().__init__(serial_path, **kw)
+        self._chunks = chunks
+        self.chunk_order: list[tuple[str, bytes]] = []
+
+    def run(self, command, timeout=30.0, check=False, **kwargs):
+        on_chunk = kwargs.get("on_chunk")
+        out, err = b"", b""
+        for stream, data in self._chunks:
+            if stream == "stdout":
+                out += data
+            else:
+                err += data
+            if on_chunk is not None:
+                on_chunk(stream, data)
+                self.chunk_order.append((stream, data))
+        self._stdout, self._stderr = GuestText(out), GuestText(err)
+        return super().run(command, timeout, check, **kwargs)
+
+
+@pytest.fixture
+def streaming(monkeypatch, tmp_path):
+    serial = tmp_path / "exec-vm.serial.log"
+
+    def install(chunks, *, initial_serial="boot ok\n", **ssh_kw):
+        serial.write_text(initial_serial)
+        inst = _instance(str(serial))
+        fake = StreamingSSH(serial, chunks=chunks, **ssh_kw)
+        monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
+        monkeypatch.setattr(guest, "_make_ssh", lambda i: fake)
+        monkeypatch.setattr(guest, "_preflight_ssh_guest", lambda *a, **kw: None)
+        monkeypatch.setattr(guest, "_require_running_vm", lambda vm, command: None)
+        monkeypatch.setattr(guest.time, "sleep", lambda _: None)
+        return fake
+
+    return install
+
+
+CHUNKS = [
+    ("stdout", b"a\x00b"),
+    ("stderr", b"warn"),
+    ("stdout", b"\n2\n"),
+]
+
+
+def test_text_mode_streams_stdout_and_stderr_as_they_arrive(streaming, capsysbinary):
+    """Chunks go to stdout/stderr in arrival order, byte for byte (`printf
+    'a\\0b'` included); guest stderr is not repeated after the stream and the
+    `[exit code: N]` trailer starts on a fresh line after it."""
+    fake = streaming(CHUNKS, rc=3)
+    snapshots: list[tuple[bytes, bytes]] = []
+    original = fake.run
+
+    def run(command, *a, **kw):
+        on_chunk = kw["on_chunk"]
+
+        def observe(stream, data):
+            on_chunk(stream, data)
+            snapshots.append(
+                (sys.stdout.buffer.getvalue(), sys.stderr.buffer.getvalue())
+            )
+
+        kw["on_chunk"] = observe
+        return original(command, *a, **kw)
+
+    fake.run = run
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "cmd"])
+
+    captured = capsysbinary.readouterr()
+    assert rc == 1
+    assert captured.out == b"a\x00b\n2\n"
+    assert captured.err == b"warn\n[exit code: 3]\n"
+    assert fake.chunk_order == CHUNKS
+    # Each chunk was on its stream before the next one arrived.
+    assert snapshots == [
+        (b"a\x00b", b""),
+        (b"a\x00b", b"warn"),
+        (b"a\x00b\n2\n", b"warn"),
+    ]
+
+
+def test_text_mode_streamed_stdout_is_byte_identical_to_the_buffered_rendering(
+    streaming, wired, capsysbinary
+):
+    body = b"\xff\x00 no newline \xfe"
+    wired(rc=0, stdout=GuestText(body))
+    cli.main(["exec", "--vm", "exec-vm", "cmd"])
+    buffered = capsysbinary.readouterr().out
+
+    streaming([("stdout", body[:5]), ("stdout", body[5:])], rc=0)
+    rc = cli.main(["exec", "--vm", "exec-vm", "cmd"])
+
+    assert rc == 0
+    assert capsysbinary.readouterr().out == buffered == body
+
+
+def test_ndjson_mode_emits_chunk_events_then_the_final_envelope(streaming, capsys):
+    streaming(CHUNKS, rc=0)
+
+    rc = cli.main(["--format", "ndjson", "exec", "--vm", "exec-vm", "cmd"])
+
+    assert rc == 0
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    events, envelope = lines[:-1], lines[-1]
+    assert events == [
+        {"event": "chunk", "stream": "stdout", "data": "a\x00b"},
+        {"event": "chunk", "stream": "stderr", "data": "warn"},
+        {"event": "chunk", "stream": "stdout", "data": "\n2\n"},
+    ]
+    assert all("ok" not in event for event in events)
+    assert envelope["ok"] is True
+    assert "event" not in envelope
+    assert envelope["stdout"] == "a\x00b\n2\n"
+    assert envelope["stderr"] == "warn"
+
+
+def test_ndjson_chunk_data_round_trips_undecodable_bytes_with_surrogateescape(
+    streaming, capsys
+):
+    streaming([("stdout", b"\xff\xfe")], rc=0)
+
+    cli.main(["--format", "ndjson", "exec", "--vm", "exec-vm", "cmd"])
+
+    event = json.loads(capsys.readouterr().out.splitlines()[0])
+    assert event["data"].encode("utf-8", errors="surrogateescape") == b"\xff\xfe"
+
+
+def test_json_mode_buffers_the_envelope_with_no_chunk_lines(streaming, capsys):
+    streaming(CHUNKS, rc=0)
+
+    cli.main(["--format", "json", "exec", "--vm", "exec-vm", "cmd"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stdout"] == "a\x00b\n2\n"
+
+
+def test_text_out_streams_into_the_file_and_points_at_it_last(
+    streaming, tmp_path, capsysbinary
+):
+    out = tmp_path / "streamed.bin"
+    fake = streaming([("stdout", b"first"), ("stdout", b" second")], rc=0)
+    sizes: list[int] = []
+    original = fake.run
+
+    def run(command, *a, **kw):
+        on_chunk = kw["on_chunk"]
+
+        def observe(stream, data):
+            on_chunk(stream, data)
+            sizes.append(out.stat().st_size)
+
+        kw["on_chunk"] = observe
+        return original(command, *a, **kw)
+
+    fake.run = run
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "--out", str(out), "cmd"])
+
+    assert rc == 0
+    assert sizes == [5, 12]  # each chunk was on disk before the next arrived
+    assert out.read_bytes() == b"first second"
+    assert capsysbinary.readouterr().out == (
+        f"[qmu] Output written to {out} (12 bytes, exit 0)\n".encode()
+    )
+
+
+def test_a_panic_mid_stream_keeps_the_delivered_lines_and_exits_3(
+    streaming, capsysbinary
+):
+    """What was already on stdout stays; the crash report follows it (exit
+    3 + the usual stderr note), and nothing is printed twice."""
+    fake = streaming([("stdout", b"line 1\n")], append_during_run=PANIC)
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "trigger"])
+
+    captured = capsysbinary.readouterr()
+    assert rc == 3
+    assert fake.predicate_answers == [True]
+    assert captured.out.startswith(b"line 1\nSSH connection lost while running: trigger\n")
+    assert captured.out.count(b"line 1") == 1
+    assert b"Kernel panic - not syncing" in captured.out

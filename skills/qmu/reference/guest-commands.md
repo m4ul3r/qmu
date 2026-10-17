@@ -30,6 +30,14 @@ in `exit_code` (`exit 255` → qmu exit 1, `exit_code: 255`, `ok: false`,
 `ssh_error: false`, `crash_detected: false` — not a crash; 3 always needs a
 fresh serial report). The reserved codes 2/3/4/124 are never guest values.
 
+- Output is **streamed**: in text mode guest stdout/stderr reach the host's
+  stdout/stderr as the guest writes them (`for i in 1 2 3; do echo $i; sleep
+  1; done` prints one line per second, not three after 3 s), byte-exact, with
+  `[exit code: N]` after the command ends; `--format ndjson` emits
+  `{"event": "chunk", "stream": …, "data": …}` lines before the final
+  envelope; `--format json` buffers. Partial output on `--timeout` / a panic
+  is therefore already on the terminal when the 124 / 3 narrative arrives.
+  Detail, `--out` and the spill cut-over: `output-contract.md` → *Streaming*.
 - `--timeout` (default 30 s; `run` 60 s): on expiry the envelope keeps the
   `stdout`/`stderr` captured so far, `exit_code: null`, `timed_out: true`,
   exit 124. The remote command is **not** killed in the guest. A held QMP
@@ -104,7 +112,8 @@ expiry with the guest still answering SSH the exit is 124 (not 4) with
 (Ns) but the guest is still answering SSH …`). A lost transport during
 `--run` likewise keeps `run_exit: null` with the partial streams
 (`run_stdout_lossy` when bytes were replaced). Text mode prints `Compiled and
-ran X:` on stderr and the run's stdout on stdout, byte-exact.
+ran X:` on stderr and the run's stdout on stdout, byte-exact and streamed as
+the program writes it (compile diagnostics are not streamed).
 
 After **any** suspected panic, including a bare `[exit code: 255]`, confirm
 with `qmu crash --vm X`. A `panic=N` guest reboots instead of staying down;

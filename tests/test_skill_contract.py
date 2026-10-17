@@ -173,6 +173,29 @@ def test_main_skill_stays_short():
     )
 
 
+def test_daemon_reference_claims_match_the_code():
+    """#70: daemon.md's load-bearing numbers and names come from the code, not
+    from memory: the idle default, the socket/record names, the QMU_DAEMON
+    modes, the ops list, and the `qmp: daemon` / `guest_epoch_source` keys."""
+    from qmu import daemon_client
+    from qmu.config import QMUConfig
+
+    page = (SKILL.parent / "reference" / "daemon.md").read_text()
+    skill = SKILL.read_text()
+    assert "reference/daemon.md" in skill
+    assert f"idles out after {QMUConfig().daemon_idle_exit} s" in skill
+    assert f"(default {QMUConfig().daemon_idle_exit}; 0 =" in page
+    assert f"<cache>/{daemon_client.DAEMON_SOCKET_NAME}" in page
+    assert f"<cache>/{daemon_client.DAEMON_RECORD_NAME}" in page
+    assert f"<cache>/{daemon_client.DAEMON_LOG_NAME}" in page
+    for mode in (daemon_client.MODE_OFF, daemon_client.MODE_REQUIRE):
+        assert f"`QMU_DAEMON={mode}`" in page, mode
+    for key in ("`qmp: \"daemon\"`", "`guest_epoch_source: \"observed\"|\"banner\"`"):
+        assert key in page, key
+    for verb in ("status", "start", "stop", "run"):
+        assert f"`daemon {verb}`" in page, verb
+
+
 # Claims a second round of fresh-agent dogfooding proved wrong against the
 # tool. Each regex is the wording that misled; the reason says what is true.
 RETIRED_CLAIMS = [
@@ -261,7 +284,7 @@ REQUIRED_CLAIMS = [
     # #110: the failed-restore recovery must be stated where the agent copies from.
     (SKILL, "`qemu_status: \"restore-vm\"`"),
     (REFERENCE_DIR / "snapshots.md", "`qmu cont --vm X` enforces this"),
-    (REFERENCE_DIR / "output-contract.md", "The pointer envelope's `ok` is the **operation's** result"),
+    (REFERENCE_DIR / "output-contract.md", "The pointer's `ok`/exit is the **operation's** result"),
     # #53: `skill install` statuses — the relink receipt is the whole point.
     (SKILL, "relinked"),
     (REFERENCE_DIR / "troubleshooting.md", "`relinked` (pointed at another checkout — JSON `previous_target` names it)"),
@@ -285,7 +308,7 @@ REQUIRED_CLAIMS = [
     (REFERENCE_DIR / "snapshots.md", "`may_have_landed: true`"),
     (REFERENCE_DIR / "snapshots.md", "`may_have_landed: false`"),
     (REFERENCE_DIR / "snapshots.md", "a reply tagged with another client's `id` is dropped"),
-    (REFERENCE_DIR / "wait.md", "`124` means the same thing on both commands"),
+    (REFERENCE_DIR / "wait.md", "`124` means the same thing on every command"),
     # #77: the probe's cost is an observable on status and list rows.
     (SKILL, "`ssh_probe_ms` says"),
     (REFERENCE_DIR / "launch.md", "`ssh_probe_ms` (the probe's wall time in ms; null when no\nprobe was sent"),
@@ -293,6 +316,35 @@ REQUIRED_CLAIMS = [
     # #76: the first-QMP-connect retry is observable and field-evidenced.
     (REFERENCE_DIR / "launch.md", "`warnings[]` gains `QMP connect retried N× (ECONNRESET)`"),
     (REFERENCE_DIR / "launch.md", "`~/qmu-audit/crashpaths` receipt 2"),
+    # #113: concurrent launches serialise port allocation; the lock is named.
+    (REFERENCE_DIR / "launch.md", "holds `flock` on `<cache>/instances/ports.lock`"),
+    (REFERENCE_DIR / "launch.md", "Waited N.Ns for the port-allocation lock"),
+    # #74: every exception-path envelope carries `hint`; warnings ride in `warnings[]`.
+    (SKILL, "run the `hint` (every `error_type` envelope has one)"),
+    (REFERENCE_DIR / "output-contract.md", "**Every exception-path `ok: false` envelope carries `hint`**"),
+    (REFERENCE_DIR / "output-contract.md", "`SSHError` → `qmu status --vm X; qmu log --vm X --tail 50`"),
+    (REFERENCE_DIR / "output-contract.md", "**`warnings: [str]`** rides in every json/ndjson envelope"),
+    (REFERENCE_DIR / "output-contract.md", "the `ignoring global config` notice"),
+    (REFERENCE_DIR / "output-contract.md", "only for a site-specific hint, never for a type default"),
+    # #72: launch and run agree that an expired --ssh-timeout is 124.
+    (SKILL, "`launch`/`run` `--ssh-timeout` expired before SSH answered (`launch` keeps the VM, `ssh_status: \"timeout\"`)"),
+    (SKILL, "| `ssh_status: \"timeout\"`, `timed_out: true` (launch exit 124) |"),
+    (REFERENCE_DIR / "launch.md", "on expiry both `launch` and `run` exit **124**"),
+    (REFERENCE_DIR / "launch.md", "`error_type: \"TimeoutError\"`, `error`, `hint`"),
+    (REFERENCE_DIR / "output-contract.md", "an expired `--ssh-timeout` on `launch`/`run`\n  (exit 124, `error_type: \"TimeoutError\"`"),
+    # #71(b): text --out prints a text pointer, never JSON.
+    (REFERENCE_DIR / "output-contract.md", "**text prints one line**, `[qmu] Output written to <path>\n(<N> bytes, exit <code>)`"),
+    # #71(a): guest output streams; ndjson carries `chunk` events; the
+    # streamed-spill pointer trails the preview.
+    (SKILL, "**streamed\nas the guest writes it**"),
+    (SKILL, "ndjson\ngets `chunk` events, json stays buffered"),
+    (REFERENCE_DIR / "guest-commands.md", "- Output is **streamed**"),
+    (REFERENCE_DIR / "output-contract.md", "### Streaming (`exec`, `run`, `compile --run`)"),
+    (REFERENCE_DIR / "output-contract.md", "`{\"event\": \"chunk\", \"stream\":\n  \"stdout\"|\"stderr\", \"data\": \"<text>\"}`"),
+    (REFERENCE_DIR / "output-contract.md", "carry `event` and **no** `ok`"),
+    (REFERENCE_DIR / "output-contract.md", "UTF-8 with `surrogateescape`"),
+    (REFERENCE_DIR / "output-contract.md", "streamed above` — pointer *after* the preview"),
+    (REFERENCE_DIR / "output-contract.md", "`compile --run` streams only the program's run"),
 ]
 
 

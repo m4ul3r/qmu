@@ -17,6 +17,7 @@ call time.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shlex
 import sys
@@ -42,7 +43,23 @@ from ..serial import (
     serial_log_offset,
     tail_log,
 )
-from ..ssh import SSHClient, SSHError, guest_bytes, guest_lossy, is_transport_failure
+from ..output import (
+    DEFAULT_SPILL_TOKEN_LIMIT,
+    _CHARS_PER_TOKEN,
+    _artifact_payload,
+    _estimate_tokens,
+    _spill_path,
+    text_out_pointer,
+)
+from ..runtime import invalidate_owned_spill_marker, mark_spill_artifact
+from ..ssh import (
+    SCPFileError,
+    SSHClient,
+    SSHError,
+    guest_bytes,
+    guest_lossy,
+    is_transport_failure,
+)
 from .._cliutil import (
     Result,
     _add_common_opts,
@@ -68,12 +85,72 @@ def _require_running_vm(vm_id: str | None, command: str) -> None:
 
     explanation = describe_non_running(vm_id, command=command)
     if explanation is not None:
-        raise QMUError(explanation)
+        raise QMUError(
+            explanation,
+            hint=f"qmu status --vm {vm_id} describes it; qmu launch --name {vm_id} --no-replace starts a fresh one",
+        )
 
 
 # ---------------------------------------------------------------------------
 # push / pull
 # ---------------------------------------------------------------------------
+
+
+def _scp_file_hint(
+    exc: SCPFileError, *, inst: VMInstance, operation: str, remote: str
+) -> str:
+    """A recovery hint for a transfer the guest filesystem refused.
+
+    scp's non-255 exit means the connection was fine and the path was not,
+    so the generic "check the VM" advice sends the reader to the wrong place.
+    Name the guest path to inspect (`qmu exec … ls -ld`) and, for a missing
+    push destination, how to create it.
+    """
+    reason = f"{exc.stderr} {exc}"
+    vm = inst.vm_id
+    if remote.endswith("/"):
+        remote_dir = remote.rstrip("/") or "/"
+    else:
+        remote_dir = remote.rsplit("/", 1)[0] or "/"
+    if operation == "push":
+        if "No such file or directory" in reason:
+            return (
+                f"The guest directory must exist: qmu exec --vm {vm} "
+                f"'ls -ld {remote_dir}'; create it first with qmu exec "
+                f"--vm {vm} 'mkdir -p {remote_dir}'"
+            )
+        if "Permission denied" in reason:
+            return (
+                f"Check ownership/mode on the guest path: qmu exec --vm {vm} "
+                f"'ls -ld {remote_dir}'"
+            )
+        return f"Inspect the guest destination: qmu exec --vm {vm} 'ls -ld {remote_dir}'"
+    if "No such file or directory" in reason:
+        return (
+            f"Check the guest file exists: qmu exec --vm {vm} 'ls -l {remote}'; "
+            f"and that the local destination directory exists"
+        )
+    if "Permission denied" in reason:
+        return (
+            f"Check ownership/mode on the guest path: qmu exec --vm {vm} "
+            f"'ls -l {remote}'; and that the local destination is writable"
+        )
+    return f"Inspect the guest file: qmu exec --vm {vm} 'ls -l {remote}'"
+
+
+def _rethrow_scp_file_error(
+    exc: SCPFileError, *, inst: VMInstance, operation: str, remote: str
+) -> None:
+    """Attach a path-specific hint to a filesystem refusal and re-raise it.
+
+    The exit-1 / `error_type: SCPFileError` contract is untouched; only the
+    `hint` gains the guest path and the command that inspects it. A hint the
+    raiser already set (a missing local file) is kept.
+    """
+    if exc.hint is None:
+        exc.hint = _scp_file_hint(exc, inst=inst, operation=operation, remote=remote)
+    raise exc
+
 
 
 def _transfer_transport_lost(
@@ -257,6 +334,8 @@ def _handle_push(args: argparse.Namespace) -> Result:
             args.remote,
             abort_when=_guest_abort_watcher(inst, start_offset=start_offset),
         )
+    except SCPFileError as exc:
+        _rethrow_scp_file_error(exc, inst=inst, operation="push", remote=args.remote)
     except SSHError as exc:
         return _classify_transfer_failure(
             exc, inst=inst, start_offset=start_offset, operation="push",
@@ -290,6 +369,8 @@ def _handle_pull(args: argparse.Namespace) -> Result:
             args.local,
             abort_when=_guest_abort_watcher(inst, start_offset=start_offset),
         )
+    except SCPFileError as exc:
+        _rethrow_scp_file_error(exc, inst=inst, operation="pull", remote=args.remote)
     except SSHError as exc:
         return _classify_transfer_failure(
             exc, inst=inst, start_offset=start_offset, operation="pull",
@@ -628,6 +709,8 @@ def _with_guest_output(
     outcome: tuple[int, dict[str, Any], list[str]],
     stdout: str,
     stderr: str,
+    *,
+    note_stderr: bool = True,
 ) -> tuple[int, dict[str, Any], str, list[str], list[str | bytes]]:
     """Attach what the guest printed to a lost/expired/halted outcome.
 
@@ -636,11 +719,207 @@ def _with_guest_output(
     has told the caller where it got to, and dropping that with the
     classification made every such run look silent. Guest stdout leads on
     stdout (it is stdout) with the classification's text after it; guest
-    stderr goes to the stderr notes, verbatim.
+    stderr goes to the stderr notes, verbatim — unless a stream sink already
+    relayed it live (`note_stderr=False`).
     """
     status, data, text = outcome
     data.update(_stream_fields(stdout, stderr))
-    return status, data, stdout, text, [guest_bytes(stderr)] if stderr else []
+    notes: list[str | bytes] = [guest_bytes(stderr)] if stderr and note_stderr else []
+    return status, data, stdout, text, notes
+
+
+# Bytes of guest stdout a streamed text-mode command may put on stdout before
+# the rest is diverted to a spill file: the same budget `write_bytes_result`
+# applies to a buffered payload, measured in bytes because the stream cannot
+# be decoded before it is written.
+STREAM_SPILL_BYTES = DEFAULT_SPILL_TOKEN_LIMIT * _CHARS_PER_TOKEN
+
+
+class _TextStreamSink:
+    """Relay guest output to the terminal as it arrives (text mode).
+
+    stdout chunks go to `sys.stdout.buffer` and stderr chunks to
+    `sys.stderr.buffer`, flushed after every write, so a long-running
+    exploit's progress is visible before it exits or `--timeout` fires. The
+    bytes are copied verbatim — `qmu exec ... | sha256sum` matches the
+    buffered rendering byte for byte.
+
+    The spill/`--out` contract of `Result.raw` is kept, with the one
+    difference a live stream forces: `--out FILE` streams into the file and
+    the pointer envelope follows at the end; without `--out`, output within
+    the budget (:data:`STREAM_SPILL_BYTES`) stays on stdout, and the first
+    chunk crossing it diverts the remainder into a spill file that then holds
+    the *whole* output (the prefix already shown included), announced by the
+    usual pointer + preview trailer once the command ends. The trailing
+    `text` lines (a crash report, the timeout notice) follow the stream to
+    the same destination, exactly as they were appended to `raw`.
+
+    `finish` writes whatever the final output holds beyond what was
+    relayed: nothing for the real client, everything for a test double that
+    returns output without ever calling `on_chunk`.
+    """
+
+    streams_stderr = True
+
+    def __init__(self, *, out_path: Path | None, stem: str) -> None:
+        self._stem = stem
+        self._explicit_out = out_path
+        self._file = None
+        self._path: Path | None = None
+        self._spilled = False
+        self._shown = 0  # bytes on stdout
+        self._prefix = bytearray()  # stdout bytes shown, kept until diverted
+        self._out_received = 0
+        self._err_received = 0
+        self.err_at_line_start = True
+        if out_path is not None:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            invalidate_owned_spill_marker(out_path)
+            self._open(out_path)
+
+    def _open(self, path: Path) -> None:
+        self._path = path
+        self._file = path.open("wb")
+
+    def on_chunk(self, stream: str, data: bytes) -> None:
+        if stream == "stderr":
+            self._err_received += len(data)
+            if data:
+                sys.stderr.flush()
+                sys.stderr.buffer.write(data)
+                sys.stderr.buffer.flush()
+                self.err_at_line_start = data.endswith(b"\n")
+            return
+        self._out_received += len(data)
+        self._write_out(data)
+
+    def _write_out(self, data: bytes) -> None:
+        if not data:
+            return
+        if self._file is None:
+            room = STREAM_SPILL_BYTES - self._shown
+            if len(data) <= room:
+                self._emit(data)
+                self._prefix += data
+                return
+            # Budget crossed: show what still fits, then divert everything
+            # (the shown prefix included) to a spill file.
+            self._emit(data[:room])
+            self._prefix += data[:room]
+            self._spilled = True
+            self._open(_spill_path(self._stem, ".txt"))
+            self._file.write(bytes(self._prefix))
+            self._prefix = bytearray()
+            data = data[room:]
+        self._file.write(data)
+        self._file.flush()
+
+    def _emit(self, data: bytes) -> None:
+        sys.stdout.flush()
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+        self._shown += len(data)
+
+    def finish(
+        self,
+        stdout: str,
+        stderr: str,
+        text: list[str],
+        *,
+        source_ok: bool,
+        exit_code: int | None,
+    ) -> None:
+        """Flush the un-relayed remainder, the `text` trailer, and the
+        pointer when the stream went to a file."""
+        out_raw, err_raw = guest_bytes(stdout), guest_bytes(stderr)
+        self.on_chunk("stdout", out_raw[self._out_received:])
+        self.on_chunk("stderr", err_raw[self._err_received:])
+        tail = b""
+        if text:
+            if out_raw and not out_raw.endswith(b"\n"):
+                tail += b"\n"
+            tail += "\n".join(text).encode("utf-8")
+            if not tail.endswith(b"\n"):
+                tail += b"\n"
+            self._write_out(tail)
+        if self._file is None:
+            return
+        self._file.close()
+        full = out_raw + tail
+        if self._spilled:
+            mark_spill_artifact(self._path)
+        artifact = _artifact_payload(
+            artifact_path=self._path,
+            fmt="text",
+            encoded=full,
+            token_estimate=_estimate_tokens(full.decode("utf-8", errors="replace")),
+            value={"kind": "bytes", "bytes": len(full)},
+            source_ok=source_ok,
+        )
+        if exit_code is not None:
+            artifact["exit_code"] = exit_code
+        if self._spilled:
+            # The preview already went by live; say where the rest is.
+            rendered = (
+                f"[qmu] Output spilled to {self._path} "
+                f"(~{artifact['token_estimate']} tokens)\n"
+                f"[qmu] Preview: first {self._shown} of {len(full)} bytes "
+                f"({len(full) - self._shown} omitted) streamed above\n"
+            )
+        else:
+            rendered = text_out_pointer(artifact)
+        sys.stdout.flush()
+        sys.stdout.buffer.write(rendered.encode("utf-8"))
+        sys.stdout.buffer.flush()
+        if self._spilled:
+            sys.stderr.write(f"[qmu] Output spilled to {self._path}\n")
+            sys.stderr.flush()
+
+
+class _NdjsonStreamSink:
+    """Relay guest output as `{"event": "chunk", ...}` lines (ndjson mode).
+
+    Each drained read becomes one line on stdout, `stream` being `stdout` or
+    `stderr` and `data` the bytes decoded as UTF-8 with `surrogateescape`
+    (JSON-escaped, so undecodable bytes round-trip as lone surrogates and a
+    chunk boundary may split a multibyte character). The normal final
+    envelope — the one line carrying `ok` — follows as the last line and
+    still holds the complete `stdout`/`stderr`, so a reader may ignore the
+    chunk events entirely. Nothing is relayed at `finish`: the envelope has
+    the whole output, only live data is worth an event.
+    """
+
+    streams_stderr = False
+    err_at_line_start = True
+
+    def on_chunk(self, stream: str, data: bytes) -> None:
+        line = json.dumps(
+            {
+                "event": "chunk",
+                "stream": stream,
+                "data": data.decode("utf-8", errors="surrogateescape"),
+            },
+            sort_keys=True,
+        )
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+    def finish(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def _stream_sink(
+    args: argparse.Namespace, *, stem: str
+) -> _TextStreamSink | _NdjsonStreamSink | None:
+    """The live relay for a guest command under this `--format`, or None for
+    `json` (buffered envelope, unchanged)."""
+    fmt = getattr(args, "format", "text")
+    if fmt == "text":
+        out = getattr(args, "out", None)
+        return _TextStreamSink(out_path=Path(out) if out else None, stem=stem)
+    if fmt == "ndjson":
+        return _NdjsonStreamSink()
+    return None
 
 
 def _run_guest_command(
@@ -649,6 +928,7 @@ def _run_guest_command(
     inst: VMInstance,
     *,
     timeout: float,
+    sink: _TextStreamSink | _NdjsonStreamSink | None = None,
 ) -> tuple[int, dict[str, Any], str, list[str], list[str | bytes]]:
     """Run `command` in the guest and classify the outcome.
 
@@ -667,12 +947,21 @@ def _run_guest_command(
     kills it immediately instead of waiting the keepalive window (15 s) plus
     the liveness re-probes for ssh to report the loss itself (measured 20–50 s
     for a sysrq crash the serial log showed within 100 ms).
+
+    `sink` (from :func:`_stream_sink`) receives the output live; a text sink
+    relays guest stderr itself, so the stderr bytes then stay out of `notes`.
     """
     command_start_offset = serial_log_offset(inst.serial_log)
     watcher = _guest_abort_watcher(inst, start_offset=command_start_offset)
 
+    note_stderr = sink is None or not sink.streams_stderr
     try:
-        rc, stdout, stderr = ssh.run(command, timeout=timeout, abort_when=watcher)
+        rc, stdout, stderr = ssh.run(
+            command,
+            timeout=timeout,
+            abort_when=watcher,
+            on_chunk=sink.on_chunk if sink is not None else None,
+        )
     except SSHError as exc:
         # qmu stopped the child: the watcher saw a panic, or --timeout expired.
         # The latter is NOT by itself a crash: a guest that still answers SSH
@@ -692,7 +981,9 @@ def _run_guest_command(
                 explained = _ssh_lost_payload(
                     command, inst, start_offset=command_start_offset
                 )
-        return _with_guest_output(explained, exc.stdout, exc.stderr)
+        return _with_guest_output(
+            explained, exc.stdout, exc.stderr, note_stderr=note_stderr
+        )
 
     # A kernel panic during the command drops the connection and ssh exits 255 —
     # often with EMPTY stderr (LogLevel=ERROR suppresses the keepalive message),
@@ -711,13 +1002,13 @@ def _run_guest_command(
                 command, inst, start_offset=command_start_offset
             )
         if explained is not None:
-            return _with_guest_output(explained, stdout, stderr)
+            return _with_guest_output(explained, stdout, stderr, note_stderr=note_stderr)
 
     kernel_warning = extract_crash(
         inst.serial_log, start_offset=command_start_offset
     )
     notes: list[str | bytes] = []
-    if stderr:
+    if stderr and note_stderr:
         notes.append(guest_bytes(stderr))
     if rc != 0:
         notes.append(f"[exit code: {rc}]")
@@ -745,10 +1036,12 @@ def _guest_result(
     *,
     data: dict[str, Any],
     stdout: str = "",
+    stderr: str = "",
     text: list[str] = (),
     notes: list[str | bytes] = (),
     stem: str,
     exit_code: int,
+    sink: _TextStreamSink | _NdjsonStreamSink | None = None,
 ) -> Result:
     """A guest command Result; text mode keeps stdout for guest stdout.
 
@@ -765,7 +1058,29 @@ def _guest_result(
     decorations as if the guest had printed them; then it rendered the
     stdout as text, so `printf x` arrived as `x\\n` and a 0xff byte as
     U+FFFD. JSON modes: `data` is the envelope.
+
+    With a text `sink` the stdout bytes (and guest stderr) were relayed as
+    they arrived; `sink.finish` writes the trailer and any remainder, and
+    the Result is `streamed` so render adds nothing to stdout. The
+    `[exit code: N]`/warning/hint notes still follow on stderr, on a fresh
+    line after streamed stderr that ended without one. An ndjson sink has
+    nothing left to do: the envelope renders as usual.
     """
+    if isinstance(sink, _TextStreamSink):
+        exit_rc = data.get("exit_code")
+        sink.finish(
+            stdout,
+            stderr,
+            list(text),
+            source_ok=bool(data.get("ok", False)),
+            exit_code=exit_rc if isinstance(exit_rc, int) else None,
+        )
+        if not sink.err_at_line_start and any(isinstance(n, str) for n in notes):
+            notes = [b"\n", *notes]
+        return Result(
+            data=data, stem=stem, exit_code=exit_code, notes=tuple(notes),
+            streamed=True,
+        )
     raw = guest_bytes(stdout)
     if text:
         if raw and not raw.endswith(b"\n"):
@@ -791,12 +1106,13 @@ def _handle_exec(args: argparse.Namespace) -> Result:
         return refused
     ssh = _make_ssh(inst)
     command = _join_exec_command(args.command)
+    sink = _stream_sink(args, stem="exec")
     status, data, stdout, text, notes = _run_guest_command(
-        ssh, command, inst, timeout=args.timeout
+        ssh, command, inst, timeout=args.timeout, sink=sink
     )
     return _guest_result(
-        data=data, stdout=stdout, text=text, notes=notes, stem="exec",
-        exit_code=status,
+        data=data, stdout=stdout, stderr=data.get("stderr", ""), text=text,
+        notes=notes, stem="exec", exit_code=status, sink=sink,
     )
 
 
@@ -1035,13 +1351,15 @@ def _handle_compile(args: argparse.Namespace) -> Result:
     # as transport loss: a program that printed and then slept past
     # `--timeout 1` came back as 4 `ssh_error` ("VM unreachable") against a
     # serving guest, while the same program under `exec` was 124.
+    sink = _stream_sink(args, stem="compile")
     status, data, stdout, text, notes = _run_guest_command(
-        ssh, shlex.quote(remote_bin), inst, timeout=args.timeout
+        ssh, shlex.quote(remote_bin), inst, timeout=args.timeout, sink=sink
     )
+    run_stderr = data.get("stderr", "")
     data = {**result, **_as_run_fields(data)}
     return _guest_result(
-        data=data, stdout=stdout, text=text, notes=notes, stem="compile",
-        exit_code=status,
+        data=data, stdout=stdout, stderr=run_stderr, text=text, notes=notes,
+        stem="compile", exit_code=status, sink=sink,
     )
 
 

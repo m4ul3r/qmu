@@ -46,22 +46,32 @@ def launch_env(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("output_format", ["json", "ndjson", "text"])
 def test_requested_ssh_timeout_fails_and_retains_vm(launch_env, capsys, output_format):
+    """#72: an expired --ssh-timeout is the timeout class (124), the same code
+    `run` exits for the same condition — not the SSH-transport class (4). The
+    VM, its metadata and serial log are retained; the envelope says
+    `timed_out: true` and names the follow-up commands."""
     inst, serial, _ = launch_env
 
     rc = cli.main(["launch", "--ssh-timeout", "0", "--format", output_format])
     output = capsys.readouterr()
 
-    assert rc == 4
+    assert rc == 124
     if output_format == "text":
         assert "SSH" in output.out
         assert "timeout" in output.out
-        assert f"qmu log --vm {inst.vm_id}" in output.err
+        assert "[qmu] Error: SSH did not become ready" in output.err
+        assert f"qmu log --vm {inst.vm_id} --tail 50" in output.err
     else:
         payload = json.loads(output.out)
         assert payload["ok"] is False
-        assert payload["error_type"] == "SSHError"
+        assert payload["timed_out"] is True
+        assert payload["ssh_error"] is True
+        assert payload["error_type"] == "TimeoutError"
         assert "SSH" in payload["error"]
-        assert "timeout" in payload["ssh_status"]
+        assert payload["ssh_status"] == "timeout"
+        assert f"qmu log --vm {inst.vm_id} --tail 50" in payload["hint"]
+        assert f"qmu status --vm {inst.vm_id}" in payload["hint"]
+        assert "--ssh-timeout" in payload["hint"]
         assert payload["vm_id"] == inst.vm_id
         assert payload["serial_log"] == str(serial)
     assert load_instance(inst.vm_id) is not None
@@ -199,8 +209,8 @@ def test_serial_output_keeps_the_ordinary_timeout_path(launch_env, capsys, monke
     rc = cli.main(["launch", "--ssh-timeout", "0", "--format", "json"])
     payload = json.loads(capsys.readouterr().out)
 
-    assert rc == 4
-    assert payload["ssh_status"].startswith("timeout")
+    assert rc == 124
+    assert payload["ssh_status"] == "timeout"
 
 
 def test_console_silence_is_not_checked_before_the_grace_period(
@@ -213,8 +223,8 @@ def test_console_silence_is_not_checked_before_the_grace_period(
     rc = cli.main(["launch", "--ssh-timeout", "0", "--format", "json"])
     payload = json.loads(capsys.readouterr().out)
 
-    assert rc == 4
-    assert payload["ssh_status"].startswith("timeout")
+    assert rc == 124
+    assert payload["ssh_status"] == "timeout"
 
 
 # ---------------------------------------------------------------------------

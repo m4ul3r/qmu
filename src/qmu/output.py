@@ -155,6 +155,28 @@ def _text_spill_pointer(payload: dict[str, Any], rendered: str) -> str:
     return "\n".join([pointer, head, trailer]) + "\n"
 
 
+def text_out_pointer(payload: dict[str, Any]) -> str:
+    """Text-mode stand-in for an explicit `--out` file: one `[qmu]` line.
+
+    `--format text --out f` printed the JSON pointer envelope (#71): text mode
+    promises text on stdout, so the pointer is one line naming the file, its
+    size and the source operation's outcome (`exit N` when the guest exit
+    code is known, `failed` when only `ok: false` is). json/ndjson keep the
+    envelope.
+    """
+    exit_code = payload.get("exit_code")
+    if isinstance(exit_code, int):
+        outcome = f", exit {exit_code}"
+    elif payload["ok"] is False:
+        outcome = ", failed"
+    else:
+        outcome = ""
+    return (
+        f"[qmu] Output written to {payload['artifact_path']} "
+        f"({payload['bytes']} bytes{outcome})\n"
+    )
+
+
 def write_output_result(
     value: Any,
     *,
@@ -182,7 +204,11 @@ def write_output_result(
             source_ok=artifact_ok,
         )
         return OutputWriteResult(
-            rendered=_artifact_envelope(artifact, fmt),
+            rendered=(
+                text_out_pointer(artifact)
+                if fmt == "text"
+                else _artifact_envelope(artifact, fmt)
+            ),
             artifact=artifact,
             spilled=False,
         )
@@ -275,7 +301,7 @@ def write_bytes_result(
         rendered=(
             _text_spill_pointer(artifact, rendered)
             if spilled
-            else _artifact_envelope(artifact, "text")
+            else text_out_pointer(artifact)
         ),
         artifact=artifact,
         spilled=spilled,

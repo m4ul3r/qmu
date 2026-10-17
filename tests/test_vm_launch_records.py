@@ -15,7 +15,14 @@ something QEMU was never told.
 
 from __future__ import annotations
 
+import fcntl
+import os
+import socket
+import stat
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -356,3 +363,131 @@ def test_missing_rootfs_and_key_errors_name_resolved_path_and_source(tmp_path):
         f"SSH key not found: {tmp_path / 'missing_key'} "
         "(from [ssh] key in config: /work/cfg.toml)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Concurrent launches allocate distinct ports (#113)
+#
+# find_free_port closes its probe before QEMU binds, so eight launchers probing
+# from the same ssh_port_start all picked the same port and seven lost the
+# bind. PortAllocationLock holds `<instances_dir>/ports.lock` across the
+# probe→bind window so the next probe sees the port taken.
+# ---------------------------------------------------------------------------
+
+
+def test_eight_concurrent_allocators_under_the_lock_get_distinct_ports(tmp_path):
+    lock_home = tmp_path / "instances"
+    lock_home.mkdir()
+    start = 28100
+    ports: list[int] = []
+    bound: list[socket.socket] = []
+    errors: list[BaseException] = []
+    go = threading.Barrier(8)
+    record = threading.Lock()
+
+    def allocate() -> None:
+        lock = vm_module.PortAllocationLock(lock_home)
+        try:
+            go.wait()
+            lock.acquire()
+            try:
+                port = vm_module.find_free_port(start)
+                # The window a real launch spends between probe and QEMU's
+                # bind; without the lock every thread lands on `start` here.
+                time.sleep(0.05)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.bind(("127.0.0.1", port))
+                with record:
+                    ports.append(port)
+                    bound.append(sock)
+            finally:
+                lock.release()
+        except BaseException as exc:  # pragma: no cover - reported below
+            with record:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=allocate) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    try:
+        assert errors == []
+        assert sorted(ports) == list(range(start, start + 8))
+    finally:
+        for sock in bound:
+            sock.close()
+    lock_path = lock_home / vm_module.PORT_LOCK_NAME
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+
+def test_port_lock_is_released_when_its_holder_dies(tmp_path):
+    """flock, not a lock file: a launcher killed mid-window frees its siblings."""
+    lock_home = tmp_path / "instances"
+    lock_home.mkdir()
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from qmu.vm import PortAllocationLock\n"
+            f"lock = PortAllocationLock(Path({str(lock_home)!r}))\n"
+            "lock.acquire()\n"
+            "print('held', flush=True)\n"
+            "time.sleep(60)\n",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        lock = vm_module.PortAllocationLock(lock_home)
+        probe = os.open(lock.path, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+        holder.kill()
+        holder.wait(timeout=10)
+        lock.acquire()
+        assert lock.held
+        lock.release()
+        assert not lock.held
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=10)
+
+
+def test_launch_releases_the_port_lock_once_qmp_answers(boot_files, healthy_qemu):
+    inst = launch_vm(
+        config=_config(boot_files),
+        kernel=str(boot_files["kernel"]),
+        name="locked",
+    )
+    assert inst.ssh_port == QMUConfig().ssh_port_start + 5
+    lock_path = vm_module.instances_dir() / vm_module.PORT_LOCK_NAME
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # free: launch let go
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def test_launch_reports_a_long_wait_for_the_port_lock(boot_files, healthy_qemu, monkeypatch):
+    monkeypatch.setattr(vm_module, "PORT_LOCK_WAIT_NOTE_SECONDS", 0.0)
+    notes: list[str] = []
+    launch_vm(
+        config=_config(boot_files),
+        kernel=str(boot_files["kernel"]),
+        name="waited",
+        notes=notes,
+    )
+    assert len(notes) == 1
+    assert notes[0].startswith("Waited ")
+    assert "port-allocation lock" in notes[0]
+    assert str(vm_module.instances_dir() / vm_module.PORT_LOCK_NAME) in notes[0]

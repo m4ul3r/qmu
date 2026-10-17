@@ -32,7 +32,7 @@ from qmu.instance import (
     VMInstance,
     classify_vm,
 )
-from qmu.ssh import SSHAborted, SSHError
+from qmu.ssh import GuestText, SSHAborted, SSHError
 
 
 VM = "subject"
@@ -1494,6 +1494,85 @@ def test_list_running_rows_carry_the_qemu_status_that_status_reports(
 
 
 # ---------------------------------------------------------------------------
+# Axis 4, list vs status when the daemon serves the VM (#70). Neither command
+# opens QMP: both read the daemon's cached state, both say `qmp: daemon`, and
+# both scope the guest on the daemon's observed epoch — so a panic from the
+# boot BEFORE an observed RESET is out of scope for both, and the new
+# `guest_epoch_source` key appears on both running rows (and on neither when
+# the layer is off, which is every other row in this file).
+# ---------------------------------------------------------------------------
+
+
+def _daemon_served(monkeypatch, *, epoch_offset, epoch_source="observed"):
+    state = {
+        "watched": True, "running": True, "qemu_status": "running",
+        "panicked": False, "exited": False, "last_event": "RESET",
+        "event_data": {"source": "qmp"}, "boot_offset": epoch_offset,
+        "epoch_offset": epoch_offset, "epoch_source": epoch_source,
+    }
+    monkeypatch.setattr(lifecycle, "_daemon_state", lambda inst, adopt=True: dict(state))
+    monkeypatch.setattr(
+        lifecycle, "_qmp_ctx",
+        lambda inst: pytest.fail("opened QMP while the daemon serves the VM"),
+    )
+    return state
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_list_and_status_agree_when_the_daemon_serves_the_vm(
+    output_format, cache, monkeypatch, capsys
+):
+    first_boot = "[ 0.0] Linux version 6.12.0\n[ 9.0] Kernel panic - not syncing: old\n"
+    second_boot = "[ 0.0] Linux version 6.12.0\nsecond boot up\n"
+    inst = _ssh_capable(_vm_with_log(cache, "sup", first_boot + second_boot), 10022)
+    _daemon_served(monkeypatch, epoch_offset=len(first_boot))
+    _register_running(monkeypatch, inst)
+    monkeypatch.setattr(
+        lifecycle, "_make_ssh",
+        lambda i: type("S", (), {"is_ready": lambda self, timeout=2: True})(),
+    )
+
+    cli.main(["--format", output_format, "list"])
+    listing = capsys.readouterr().out
+    cli.main(["--format", output_format, "status", "--vm", "sup"])
+    detail = capsys.readouterr().out
+
+    if output_format == "json":
+        row = json.loads(listing)["vms"][0]
+        payload = json.loads(detail)
+        assert row["qmp"] == payload["qmp"] == "daemon"
+        assert row["guest"] == payload["guest"] == "serving"
+        assert row["crash_detected"] is payload["crash_detected"] is False
+        assert row["guest_epoch_source"] == payload["guest_epoch_source"] == "observed"
+        assert payload["guest_epoch_serial_offset"] == len(first_boot)
+        assert payload["boot_offset"] == len(first_boot)
+    else:
+        assert "qmp=" not in listing, listing  # quiet, like `connected`
+        assert "PANICKED" not in listing
+        assert "QMP:       daemon (boot scope: observed epoch" in detail
+        assert "panicked" not in detail
+
+
+def test_daemon_keys_are_absent_on_the_standalone_path(cache, monkeypatch, capsys):
+    """`QMU_DAEMON=off` (the suite default) must yield exactly today's shape."""
+    inst = _ssh_capable(_vm_with_log(cache, "solo", "[ 0.0] Linux version 6.12.0\n"), 10022)
+    _qmp(monkeypatch, True)
+    _register_running(monkeypatch, inst)
+    monkeypatch.setattr(
+        lifecycle, "_make_ssh",
+        lambda i: type("S", (), {"is_ready": lambda self, timeout=2: True})(),
+    )
+
+    cli.main(["--format", "json", "list"])
+    row = json.loads(capsys.readouterr().out)["vms"][0]
+    cli.main(["--format", "json", "status", "--vm", "solo"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert row["qmp"] == payload["qmp"] == "connected"
+    for key in ("guest_epoch_source", "boot_offset", "guest_epoch_serial_offset"):
+        assert key not in row and key not in payload, key
+
+# ---------------------------------------------------------------------------
 # The SSH readiness probe logs in, and a login runs `uname`. With a gdb
 # client attached that is a breakpoint on `__x64_sys_newuname` fired by qmu's
 # own `status` — which then halted the guest it was asked to describe
@@ -2282,22 +2361,71 @@ def test_out_artifact_agrees_with_the_exit_code_in_both_formats(
     command, cache, monkeypatch, capsys, tmp_path
 ):
     """Axis 3 (text vs JSON), the `--out` leg: a failed guest command exits 1
-    in both formats, and the pointer envelope each format prints says
-    `ok: false` with the guest exit code. Measured live before this row
-    (#108): text `--out` said `ok: true` for `printf nope; exit 7` while JSON
-    `--out` said `ok: false` for the same command."""
+    in both formats, and the pointer each format prints says the guest
+    failed with its exit code — JSON as the envelope, text as the one-line
+    `[qmu] Output written to …` pointer (#71b: text mode used to print the
+    JSON envelope). Measured live before this row (#108): text `--out` said
+    `ok: true` for `printf nope; exit 7` while JSON `--out` said `ok: false`
+    for the same command."""
     _serving_subject(cache, monkeypatch, _ServingSSH(7, "nope", "err\n"))
     text_out, json_out = tmp_path / "text.bin", tmp_path / "data.json"
 
     rc_text = cli.main(["--format", "text", *_LOST_ARGV[command], "--out", str(text_out)])
-    text_envelope = json.loads(capsys.readouterr().out)
+    text_pointer = capsys.readouterr().out
     rc_json = cli.main(["--format", "json", *_LOST_ARGV[command], "--out", str(json_out)])
     json_envelope = json.loads(capsys.readouterr().out)
 
     assert rc_text == rc_json == 1
-    assert text_envelope["ok"] is json_envelope["ok"] is False
-    assert text_envelope["exit_code"] == json.loads(json_out.read_text())["exit_code"] == 7
+    assert text_pointer == f"[qmu] Output written to {text_out} (4 bytes, exit 7)\n"
+    assert json_envelope["ok"] is False
+    assert json.loads(json_out.read_text())["exit_code"] == 7
     assert text_out.read_bytes() == b"nope"
+
+
+class _StreamingServingSSH(_ServingSSH):
+    """A guest whose output arrives in pieces (`on_chunk`), as the real
+    client relays it, before the joined result is returned."""
+
+    def __init__(self, rc, chunks):
+        self._chunks = chunks
+        out = b"".join(d for s, d in chunks if s == "stdout")
+        err = b"".join(d for s, d in chunks if s == "stderr")
+        super().__init__(rc, GuestText(out), GuestText(err))
+
+    def run(self, command, timeout=30.0, check=False, **kwargs):
+        on_chunk = kwargs.get("on_chunk")
+        if on_chunk is not None:
+            for stream, data in self._chunks:
+                on_chunk(stream, data)
+        return self._result
+
+
+def test_streamed_text_ndjson_and_buffered_json_agree_on_the_guest_output(
+    cache, monkeypatch, capsys
+):
+    """Axis 3 (text vs JSON) × the live relay (#71a): text mode writes guest
+    stdout as it arrives, ndjson emits `chunk` events then the envelope, json
+    buffers. All three must report the same bytes once, with guest stderr
+    and the exit trailer kept off stdout — a stream that was also rendered
+    at the end would print everything twice."""
+    chunks = [("stdout", b"line 1\n"), ("stderr", b"err\n"), ("stdout", b"line 2\n")]
+    _serving_subject(cache, monkeypatch, _StreamingServingSSH(5, chunks))
+
+    rc_json = cli.main(["--format", "json", *_LOST_ARGV["exec"]])
+    payload = json.loads(capsys.readouterr().out)
+    rc_ndjson = cli.main(["--format", "ndjson", *_LOST_ARGV["exec"]])
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    rc_text = cli.main(["--format", "text", *_LOST_ARGV["exec"]])
+    captured = capsys.readouterr()
+
+    assert rc_json == rc_ndjson == rc_text == 1
+    events, envelope = lines[:-1], lines[-1]
+    assert [e["event"] for e in events] == ["chunk"] * 3
+    assert "".join(e["data"] for e in events if e["stream"] == "stdout") == "line 1\nline 2\n"
+    assert envelope["stdout"] == payload["stdout"] == captured.out == "line 1\nline 2\n"
+    assert envelope["stderr"] == payload["stderr"] == "err\n"
+    assert captured.err == "err\n[exit code: 5]\n"
+    assert "[exit code" not in captured.out
 
 
 # ---------------------------------------------------------------------------
@@ -3108,6 +3236,132 @@ def test_no_console_output_is_one_state_in_both_formats(
     # Retained, like the SSH-timeout sibling: never "not found" afterwards.
     assert instance_mod.load_instance(VM) is not None
     assert "timeout (VM may still be booting)" not in message
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson", "text"])
+def test_launch_ssh_timeout_is_the_timeout_class_in_every_format(
+    fmt, tmp_path, monkeypatch, capsys
+):
+    """Axis 3/4 (text vs JSON, subcommand vs subcommand): an expired
+    `--ssh-timeout` is exit 124 in every format — the code `run` exits for the
+    same condition — with the VM retained, never the transport class (4) one
+    verb used while its sibling said 124 (#72). The envelope shape is the one
+    `tests/test_run_command.py::SSH_TIMEOUT_ENVELOPE_KEYS` pins for `run`."""
+    SSH_TIMEOUT_ENVELOPE_KEYS = {
+        "ok", "error", "error_type", "timed_out", "ssh_error", "hint",
+    }
+
+    _launch_subject(tmp_path, monkeypatch, serial_text="[0.0] Linux\n", ready=False)
+
+    rc = cli.main(["--format", fmt, "launch", "--name", VM, "--ssh-timeout", "0"])
+    captured = capsys.readouterr()
+
+    assert rc == 124
+    if fmt == "text":
+        assert "timeout" in captured.out
+        assert "[qmu] Error: SSH did not become ready" in captured.err
+        assert f"qmu log --vm {VM} --tail 50" in captured.err
+    else:
+        payload = json.loads(captured.out)
+        assert SSH_TIMEOUT_ENVELOPE_KEYS <= set(payload)
+        assert payload["ok"] is False
+        assert payload["timed_out"] is True
+        assert payload["ssh_error"] is True
+        assert payload["error_type"] == "TimeoutError"
+        assert payload["ssh_status"] == "timeout"
+        assert f"qmu log --vm {VM} --tail 50" in payload["hint"]
+    # Retained: `status` answers afterwards, never "not found".
+    assert instance_mod.load_instance(VM) is not None
+
+
+# ---------------------------------------------------------------------------
+# Every `ok: false` envelope carries a `hint` (#74), whichever exception class
+# produced it and whichever JSON format was asked for. Measured live before
+# this row: `qmu status --vm nope --format json` was `{ok, error, error_type}`
+# and an agent had to guess the recovery from prose.
+# ---------------------------------------------------------------------------
+
+
+def _raise(exc):
+    def handler(args):
+        raise exc
+    return handler
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+@pytest.mark.parametrize(
+    "exc,rc,expected",
+    [
+        (
+            instance_mod.QMUError("boom"),
+            1,
+            f"qmu status --vm {VM} for VM state; qmu doctor for the host environment",
+        ),
+        (
+            instance_mod.QMUError("boom", hint="relaunch with --ssh-port 10022"),
+            1,
+            "relaunch with --ssh-port 10022",
+        ),
+        (SSHError("ssh died"), 4, f"qmu status --vm {VM}; qmu log --vm {VM} --tail 50"),
+        (
+            RuntimeError("unexpected"),
+            4,
+            f"qmu status --vm {VM} for VM state; qmu doctor for the host environment",
+        ),
+    ],
+    ids=["qmu-default", "qmu-specific", "ssh-default", "catch-all"],
+)
+def test_every_error_envelope_carries_a_hint(fmt, exc, rc, expected, monkeypatch, capsys):
+    monkeypatch.setattr(lifecycle, "_handle_status", _raise(exc))
+
+    assert cli.main(["--format", fmt, "status", "--vm", VM]) == rc
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["ok"] is False
+    assert payload["error_type"] == type(exc).__name__
+    assert expected in payload["hint"]
+    if fmt == "ndjson":
+        assert captured.out.count("\n") == 1
+
+
+def test_text_mode_prints_only_a_specific_hint(monkeypatch, capsys):
+    """Axis 3: text stays quiet on the type default and prints `[qmu] Hint:`
+    only when the raise site named a recovery."""
+    monkeypatch.setattr(lifecycle, "_handle_status", _raise(instance_mod.QMUError("boom")))
+    assert cli.main(["status", "--vm", VM]) == 1
+    assert "Hint" not in capsys.readouterr().err
+
+    monkeypatch.setattr(
+        lifecycle, "_handle_status",
+        _raise(instance_mod.QMUError("boom", hint="pass --ssh-port N")),
+    )
+    assert cli.main(["status", "--vm", VM]) == 1
+    err = capsys.readouterr().err
+    assert "[qmu] Error: boom\n[qmu] Hint: pass --ssh-port N\n" in err
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_result_warnings_reach_stderr_and_the_envelope(fmt, monkeypatch, capsys):
+    """Axis 3: a `Result.warn(...)` line goes to stderr in every mode AND to the
+    envelope's `warnings[]` (#74), prefix-stripped, merged with any
+    `warnings` the handler already put in its data, without duplicates."""
+    from qmu._cliutil import Result
+
+    def handler(args):
+        return Result(
+            data={"ok": True, "warnings": ["already here"]},
+            text="fine",
+        ).warn("[qmu] WARNING: VM 'x' has a GDB stub\n", "[qmu] Warning: already here\n")
+
+    monkeypatch.setattr(lifecycle, "_handle_status", handler)
+
+    assert cli.main(["--format", fmt, "status", "--vm", VM]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["warnings"] == ["already here", "VM 'x' has a GDB stub"]
+    assert "[qmu] WARNING: VM 'x' has a GDB stub\n" in captured.err
 
 
 # ---------------------------------------------------------------------------

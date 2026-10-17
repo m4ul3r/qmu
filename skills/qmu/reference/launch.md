@@ -39,8 +39,13 @@ qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only 
   offline injection before boot. Every target — image, local file, guest
   directory — is validated read-only **before** a same-named running VM is
   killed; a bad target leaves the old VM running.
-- `--ssh-timeout`: on expiry `launch` exits 4 (`SSHError`) and retains the VM;
-  `run` reaps it and exits 124. A serial log still empty after ~10 s fails
+- `--ssh-timeout`: on expiry both `launch` and `run` exit **124** with the
+  same envelope (`ok: false`, `timed_out: true`, `ssh_error: true`,
+  `error_type: "TimeoutError"`, `error`, `hint`); `launch` retains the VM
+  (`ssh_status: "timeout"`, `qmu status --vm X` still answers), `run` stops it
+  with state preserved. Not exit 4: nothing broke, the guest may still be
+  booting — `qmu log --vm X --tail 50`, `qmu status --vm X`, or relaunch with
+  a longer `--ssh-timeout`. A serial log still empty after ~10 s fails
   earlier with `ssh_status: "no-console-output"` (exit 4, VM retained), naming
   the expected `console=` for the arch.
 - `--harness` implies `--no-wait-ssh --no-net`, skips the rootfs/SSH-key
@@ -51,8 +56,8 @@ qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only 
 ## Launch result
 
 `launch --format json`: `vm_id`, `pid`, `ssh_port`, `gdb_port`, `ssh_status`
-(`ready` · `skipped` · `no-console-output` · `timeout (VM may still be
-booting)` · `n/a (harness)` · `none (--no-net, no --ssh-port)`), `kvm`,
+(`ready` · `skipped` · `no-console-output` · `timeout` · `n/a (harness)` ·
+`none (--no-net, no --ssh-port)`), `kvm`,
 `arch`, `cmdline`, `profile`, `profile_applied`, `rootfs`, `serial_log`,
 `qemu_log`, `qmp_socket`, `warnings: [str]`, `config_sources: [paths]`
 (global → project/explicit order), `replaced: {"vm_id", "pid"} | null`,
@@ -100,7 +105,13 @@ running pid — it never launches alongside, which would strand the first QEMU.
 ## Multiple VMs and auto-selection
 
 Each VM gets its own SSH port (from 10021; ports are recycled across agents
-as soon as a VM dies), QMP socket and serial log. With exactly one VM running
+as soon as a VM dies), QMP socket and serial log. Concurrent workers may
+launch at once: port allocation holds `flock` on `<cache>/instances/ports.lock`
+from the free-port probe until QEMU has bound (first QMP answer), so eight
+netted launches get eight distinct ports (24/24, wave 6); a wait ≥ 1 s on
+that lock is reported (`Waited N.Ns for the port-allocation lock …`), and a
+bind failure that survives all 3 retries names the lock as held — a foreign
+listener owns the port. With exactly one VM running
 most commands auto-select it, print `[qmu] Auto-selected the only running VM
 'X' (pass --vm to pin it).` on stderr and set `autoselected: true`; `log`/
 `crash`/`wait --pattern` also consider stopped VMs. `QMU_REQUIRE_VM=1` makes

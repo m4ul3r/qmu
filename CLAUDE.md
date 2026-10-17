@@ -67,11 +67,24 @@ a module attribute before calling `cli.main([...])` is seen by dispatch.
 `0` success · `1` operation failed (guest non-zero, doctor unhealthy, snapshot
 failed, no crash found, operational QMUError) · `2` usage/argparse ONLY · `3`
 guest kernel crash · `4` infra/internal (QMP/SSH failures, unexpected errors,
-`wait --pattern` on an unreadable log → `inconclusive: true`) · `124` timeout
-(`wait`, `run` never reaching SSH, a guest command outrunning `--timeout` on a
-reachable guest, `snapshot save` outrunning its budget — result unknown,
-`may_have_landed: true`). `QMUError -> 1`, `QMPError`/`SSHError -> 4`, the
-catch-all `-> 4`. Never let a raw traceback escape to the agent.
+`wait --pattern` on an unreadable log → `inconclusive: true`, launch
+`no-console-output`) · `124` timeout (`wait`, `launch`/`run` `--ssh-timeout`
+expiring before the guest answered SSH — **both** 124 with one envelope shape
+(`timed_out: true`, `ssh_error: true`, `error_type: "TimeoutError"`, `hint`);
+`launch` retains the VM, `ssh_status: "timeout"` (#72: it used to be the
+transport class 4 while `run` said 124) — a guest command outrunning
+`--timeout` on a reachable guest, `snapshot save` outrunning its budget —
+result unknown, `may_have_landed: true`). `QMUError -> 1`,
+`QMPError`/`SSHError -> 4`, the catch-all `-> 4`. Never let a raw traceback
+escape to the agent.
+
+**Every exception-path `ok: false` envelope carries `hint`** (#74).
+`QMUError(msg, hint="…")` (and every subclass) carries the raise site's
+recovery; `_emit_error` writes it, else the `error_type` default from
+`_cliutil._DEFAULT_HINTS` (MRO walk, `qmu doctor` catch-all; usage errors get
+`qmu <sub> --help` in `cli._emit_usage_error`). Text mode prints `[qmu]
+Hint:` only for a site-specific hint so text stays quiet. Give a new `raise
+QMUError(` a hint when the SKILL.md recovery table has a matching row.
 
 **Exit `3` requires a corroborating fresh serial crash report.** A dropped SSH
 or scp connection alone is `4` (guest merely unreachable — a VM running no sshd
@@ -101,21 +114,54 @@ exception→exit-code mapping. The byte-exact paths (`exec`/`run`/`dmesg`/
 built by `_refusal`) put `text` on stderr as `[qmu] Error:` lines with
 nothing on stdout; `notes` are text-mode stderr trailers (guest stderr, `[exit
 code: N]`); `warnings` are stderr text written after the output in every
-mode (debugger-coherence warnings, follow-up hints — `result.warn(...)`);
-`Result.silent_exit(n)` renders nothing (group help, `rootfs shell`, `skill
-install`). Work that must precede the output (reaping, epoch persistence)
-happens before the `return`; text that must follow it rides in `warnings`.
-Text mode renders `text`; `json`/`ndjson` render `data` as a `{"ok": bool, ...}`
-envelope. Results whose estimated size exceeds `DEFAULT_SPILL_TOKEN_LIMIT`
-(~10k tokens, chars/4) are spilled to a file under the spill root
-(`$QMU_TEMP_DIR/spills`, else XDG/platform temp). json/ndjson stdout becomes an
-artifact-pointer envelope; text stdout becomes `[qmu] Output spilled to <path>
-(~N tokens)` plus the first 40 lines, never JSON, because `--format text`
-promises text. `--out` forces a file. A pointer envelope's `ok` is the
-**operation's** result, not "the artifact was written": a failed guest
-command rendered through text `--out` carries `ok: false` (+ `exit_code`)
-exactly like the JSON path (#108) — never let a byte-artifact helper default
-to success.
+mode (debugger-coherence warnings, follow-up hints — `result.warn(...)`) AND,
+under json/ndjson, the envelope's `warnings: [str]` (#74) — prefix-stripped
+(`envelope_warning`), merged with any `warnings` the handler put in `data`
+(launch's), deduplicated. A warning that fires before the handler — the
+broken-global-config notice in the dispatch gate — is recorded by
+`config.global_config_warnings()` (never written there) and attached by
+`cli._dispatch` (`result.warn(...)`) or `_emit_error` on the failure path, so
+`invoke()` callers get it on the Result and nothing is lost to stderr-only.
+Debugger-coherence warnings on the raw `qmp`/`monitor` routes travel the same
+way (`_after_mutation(..., warnings)`); never `sys.stderr.write` a warning
+from a handler. `Result.silent_exit(n)` renders nothing (group help, `rootfs
+shell`, `skill install`). Work that must precede the output (reaping, epoch
+persistence) happens before the `return`; text that must follow it rides in
+`warnings`. Text mode renders `text`; `json`/`ndjson` render `data` as a
+`{"ok": bool, ...}` envelope. Results whose estimated size exceeds
+`DEFAULT_SPILL_TOKEN_LIMIT` (~10k tokens, chars/4) are spilled to a file under
+the spill root (`$QMU_TEMP_DIR/spills`, else XDG/platform temp). json/ndjson
+stdout becomes an artifact-pointer envelope; text stdout becomes `[qmu] Output
+spilled to <path> (~N tokens)` plus the first 40 lines, never JSON, because
+`--format text` promises text. `--out` forces a file: json/ndjson print the
+pointer envelope, text prints one line `[qmu] Output written to <path> (<N>
+bytes, exit <code>)` (`output.text_out_pointer`, #71b — it used to print the
+JSON envelope). A pointer's `ok`/exit is the **operation's** result, not "the
+artifact was written": a failed guest command rendered through text `--out`
+says `exit 7` exactly as the JSON path says `ok: false` + `exit_code` (#108)
+— never let a byte-artifact helper default to success.
+
+**Streamed guest output (#71a) is the one sanctioned exception to "handlers
+never write stdout".** `SSHClient.run(..., on_chunk=)` relays every drained
+read (`ssh._watch_child`, raw bytes, no line assembly, the post-kill drain
+included so a timeout/abort still relays its partial output). `guest.
+_stream_sink(args, stem)` picks the relay for the format: `_TextStreamSink`
+writes stdout chunks to `sys.stdout.buffer` and stderr chunks to
+`sys.stderr.buffer` as they arrive (`--out` streams into the file; past
+`STREAM_SPILL_BYTES` the remainder is diverted to a spill file that holds
+the whole output, pointer + `Preview … streamed above` trailer last);
+`_NdjsonStreamSink` prints `{"event":"chunk","stream","data"}` lines
+(surrogateescape) before the ordinary envelope; json gets `None` (buffered).
+`_run_guest_command(..., sink=)` threads it to `run` and keeps guest stderr
+out of `notes` when the sink already relayed it; `_guest_result(...,
+sink=)` calls `sink.finish` (un-relayed remainder — nothing for the real
+client, everything for a fake that never called `on_chunk` — then the crash/
+timeout `text`, then the pointer) and returns `Result(streamed=True)`, which
+`render` honours by skipping stdout and still writing `notes`/`warnings`.
+Only the exec phase streams: `compile`'s gcc/chmod steps and `dmesg` pass no
+sink. Fakes keep working because `run(**kwargs)` may ignore `on_chunk`; a
+test that asserts *liveness* must relay chunks itself (`StreamingSSH` in
+`tests/test_exec_command.py`, `_StreamingServingSSH` in the matrix).
 
 ### Instance lifecycle & PID-recycling guard (`instance.py`, `vm.py`)
 
@@ -127,8 +173,12 @@ at launch) against the recorded value so a recycled PID after a reboot is not
 mistaken for a live VM — prefer it over bare `is_pid_alive()` anywhere a stale
 instance JSON might name a reused PID. `list_stopped_instances()` also
 synthesizes records from orphan `.serial.log` files. `launch_vm()` auto-allocates
-free ports and retries up to 3× on a launch-time bind race (find_free_port has a
-TOCTOU window that it deliberately does not try to close).
+free ports under `vm.PortAllocationLock` — an `flock` on
+`<instances_dir>/ports.lock` held from `find_free_port` until QEMU has bound
+(first QMP connect) — so concurrent launchers probing from the same
+`ssh_port_start` cannot pick the same port (#113). The 3× retry on a bind
+failure stays as a backstop for a foreign listener; its exhaustion message
+names the lock so the reader does not blame qmu's own concurrency.
 
 ### VM state has TWO orthogonal axes
 
@@ -322,6 +372,45 @@ toolchains, key permissions, a rootfs whose `/etc/qmu-rootfs.json` lacks
 after the libguestfs row is `ok`); `info` for cache/pry/skills and checks that
 could not run (`not checked (<reason>)`).
 
+### The daemon layer (`daemon.py`, `daemon_client.py`, `commands/daemon_cmds.py`)
+
+QEMU serves one QMP client, so per-command connections contended (`busy`) and
+nobody was connected long enough to see events. `qmu daemon run` is a
+per-cache-dir supervisor: one QMP connection + reader thread per watched VM
+(`RESET` → persist the observed epoch through a re-read record,
+`guest_epoch_source: "observed"`, drop the SSH ControlMaster; `STOP`/`RESUME`
+→ cached `running`; `SHUTDOWN`/EOF → `exited` + `debug.reap_bridge_on_exit`;
+`GUEST_PANICKED` → `panicked`), one 100 ms serial tick that scans only on
+growth and wakes `wait` subscribers, and a newline-JSON protocol (`ping`,
+`watch`, `unwatch`, `vm_state`, `qmp`, `wait`, `shutdown`; streaming ops send
+`{"id", "event"}` lines first). The client (`daemon_client.connect`) discovers
+it via `<cache>/daemon.json` (pid + /proc start-time, build id, socket path),
+autostarts it detached unless `QMU_DAEMON=off` or `[daemon] autostart=false`,
+and falls back to the standalone path silently on any failure (`require`
+errors instead). **Every handler path keeps working with the layer off** —
+that is the contract, and `tests/test_state_agreement_matrix.py` pins that
+`QMU_DAEMON=off` output carries none of the daemon-only keys.
+
+- `_cliutil._qmp_ctx` returns a `DaemonQMP` whose `connect()` proxies through
+  the daemon when it watches the VM and is a plain `QMPClient` otherwise; tests
+  that patch `_qmp_ctx` are unaffected. `lifecycle._daemon_state` is the one
+  seam `status`/`list`/`wait` read cached state through (`qmp: "daemon"`,
+  `_QMPProbe.daemon`); `kill` calls `_release_from_daemon` before `_kill_vm`;
+  `launch` calls `_watch_in_daemon` after `launch_vm`.
+- **Build id respawn**: the daemon reports `sha256(package dir + newest *.py
+  mtime)[:16]`; a client that sees a different id sends `shutdown` and
+  respawns, because editable installs change under a long-lived process.
+  Expect `qmu daemon status` to show a new pid after any source edit.
+- **Test isolation rule**: `tests/conftest.py` sets `QMU_DAEMON=off` and calls
+  `daemon_client.reset()` for every test. Only `tests/test_daemon*.py` run
+  the layer, in-process (`Daemon(cache, idle_exit=0)` against a fake QMP
+  server) except one real `daemon start`/`stop` round trip. A test that
+  needs daemon behaviour must set `QMU_DAEMON=require` itself — never leave
+  a detached daemon behind.
+- The per-process memos (`_spawn_failed`, `_unwatchable`) exist because one
+  command calls `_qmp_ctx`/`_observe_guest` several times; without them a
+  failed spawn cost 2 s per call and a busy adoption 1 s per call.
+
 ### Harness mode
 
 `--harness` = boot-and-die VMs (kernelCTF/syzkaller): implies `--no-wait-ssh` +
@@ -368,8 +457,9 @@ capability).
   now. A save on a `--gdb` VM therefore always warns; the skill documents this
   as the one exception to attached-client suppression — do not "fix" it by
   switching that call to the session gate.
-- Warnings fire on exactly the mutation events, all to **stderr** so the stdout
-  JSON envelope is untouched: `snapshot save` (#45, baked-in `int3`s),
+- Warnings fire on exactly the mutation events, via `Result.warn(...)` — stderr
+  in every mode plus the envelope's `warnings[]` under json/ndjson (#74), so
+  the stdout JSON stays one object: `snapshot save` (#45, baked-in `int3`s),
   `snapshot load` (#44, stale vCPU/bookkeeping), `qmp`/`monitor system_reset`
   (#46, dropped breakpoint set), and `kill` (#40, stranded pry bridge). The
   KVM-watchpoint warning (#39) is the exception: it rides in the `qmu gdb`

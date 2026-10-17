@@ -36,7 +36,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .instance import instance_json_path, is_pid_alive, proc_pid_start, save_instance
+from .instance import (
+    instance_json_path,
+    is_pid_alive,
+    load_instance,
+    proc_pid_start,
+    save_instance,
+)
 
 # TCP states from include/net/tcp_states.h as they appear (hex, upper-case) in
 # field 4 of /proc/net/tcp{,6}. An attached gdb client shows up as the gdbstub
@@ -220,6 +226,21 @@ def reap_bridge(inst: Any) -> bool:
     except (OSError, TypeError, ValueError):
         pass
     return killed
+
+
+def reap_bridge_on_exit(vm_id: str) -> bool:
+    """Reap the bridge recorded for `vm_id` once its QEMU is observed gone.
+
+    The daemon's per-VM supervisor calls this on SHUTDOWN/POWERDOWN/QMP EOF:
+    the stub died with QEMU, so a bridge parked on it can only strand the
+    next `pry` command (#78). The record is re-read here, not passed in,
+    because the supervisor's copy may predate a `qmu gdb` that recorded the
+    bridge after the watch began. False when there is no record or no bridge.
+    """
+    inst = load_instance(vm_id)
+    if inst is None or inst.gdb_bridge_pid is None:
+        return False
+    return reap_bridge(inst)
 
 
 # --- Warning builders ------------------------------------------------------
