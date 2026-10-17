@@ -208,6 +208,47 @@ def test_malformed_json_without_serial_is_skipped_conservatively():
     ) == []
 
 
+def test_refusal_reasons_distinguish_age_from_malformed_metadata(monkeypatch):
+    """A malformed `.json` is refused at ANY age; a young qemu-log remnant is
+    refused by the cutoff; a parseable record whose QMP socket still answers
+    is refused for that. `classify_vm` must name which (#109)."""
+    json_path = _touch("invalid", ".json", mtime=1.0)
+    json_path.write_text("{not-json")
+    _touch("invalid", ".qemu.log", mtime=1.0)
+    young = _touch("young", ".qemu.log", mtime=999.0)
+    save_instance(_instance("busy"))
+    busy_sock = _stale_qmp("busy")
+    monkeypatch.setattr(
+        instance_module, "probe_unix_socket",
+        lambda path: "alive" if path == busy_sock else "stale",
+    )
+    monkeypatch.setattr(instance_module, "find_orphan_qemus", lambda: [])
+
+    refused = instance_module.prune_refusals(older_than_seconds=0.0, now=1000.0)
+    assert refused == {
+        "invalid": (instance_module.HELD_MALFORMED_METADATA, json_path),
+        "busy": (instance_module.HELD_QMP_BUSY, busy_sock),
+    }
+    refused = instance_module.prune_refusals(older_than_seconds=100.0, now=1000.0)
+    assert refused["young"] == (instance_module.HELD_AGE, young)
+    assert set(refused) == {"invalid", "young", "busy"}
+    assert list_prunable_instance_ids(older_than_seconds=100.0, now=1000.0) == []
+
+    monkeypatch.setattr(instance_module.time, "time", lambda: 1000.0)
+    invalid = instance_module.classify_vm("invalid", older_than_seconds=0.0)
+    assert (invalid["state"], invalid["held_reason"], invalid["held_path"]) == (
+        instance_module.VM_HELD_BACK, "malformed-metadata", str(json_path)
+    )
+    assert instance_module.classify_vm("young", older_than_seconds=100.0)["held_reason"] == "age"
+    assert instance_module.classify_vm("young", older_than_seconds=0.0)["held_reason"] is None
+    assert instance_module.classify_vm("busy", older_than_seconds=0.0)["held_reason"] == "qmp-busy"
+    assert instance_module.held_back_vms(older_than_seconds=100.0) == [
+        {"vm_id": "busy", "reason": "qmp-busy", "path": str(busy_sock)},
+        {"vm_id": "invalid", "reason": "malformed-metadata", "path": str(json_path)},
+        {"vm_id": "young", "reason": "age", "path": str(young)},
+    ]
+
+
 def test_discovery_ignores_unknown_suffixes_nested_content_and_unrelated_files():
     real = _touch("real", ".qemu.log")
     _touch("unknown", ".other")
@@ -379,6 +420,7 @@ def test_prune_keep_logs_preserves_both_logs_for_orphan_bundle(capsys):
         # Always present, so a script gating on `pruned` being empty cannot
         # conclude the cache is clean while `qmu list` still shows a remnant.
         "held_back": [],
+        "refused": [],
         "keep_logs": True,
     }
     assert serial.exists()

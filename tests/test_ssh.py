@@ -218,3 +218,28 @@ def test_run_completed_child_is_never_reported_as_timed_out(tmp_path, monkeypatc
     )
 
     assert (rc, stdout, stderr) == (0, "done\n", "")
+
+
+def test_run_deadline_wins_over_a_child_that_finished_during_a_slow_predicate(
+    tmp_path, monkeypatch
+):
+    """#90: `exec --timeout 1.05 'sleep 1.1; printf late'` with the QMP socket
+    held returned exit 0 with `late`. The watcher sampled the clock, then
+    blocked in the bounded QMP probe; the child finished inside that window
+    but after the deadline, and `proc.poll()` was trusted over the budget.
+    The budget is re-checked after the predicate returns, and the result is
+    a timeout that keeps the output the child managed to print."""
+    client = _fake_ssh_on_path(tmp_path, monkeypatch, "sleep 0.6\nprintf late\n")
+
+    def slow_probe() -> bool:
+        time.sleep(0.5)  # a held QMP socket: the probe returns after the deadline
+        return False
+
+    started = time.monotonic()
+    with pytest.raises(ssh.SSHError) as excinfo:
+        client.run("sleep 0.6; printf late", timeout=0.5, abort_when=slow_probe, poll_interval=0.3)
+
+    assert time.monotonic() - started < 3
+    assert not isinstance(excinfo.value, ssh.SSHAborted)
+    assert "timed out after 0.5s" in str(excinfo.value)
+    assert excinfo.value.stdout == "late"

@@ -97,5 +97,15 @@ forces a file and prints the pointer envelope (as JSON, in every format); the
 file holds the result rendered in `--format`, so `qmu crash --vm X --format
 text --out report.txt` saves the plain report while `--format json --out`
 saves the `{"ok", "crash", …}` envelope with escaped newlines.
+The pointer envelope's `ok` is the **operation's** result, never "the file
+was written": a guest command that exited non-zero rendered through text
+`--out` reports `ok: false` plus `exit_code` (present only when known —
+omitted on a timeout, where it is null) next to the artifact keys, the
+process exit stays 1 (`[exit code: N]` still on stderr), and JSON `--out`
+carries the same `ok: false` — the artifact still holds the exact captured
+bytes either way. An automatic text spill prints only the `[qmu] Output
+spilled to …` pointer and preview (no envelope), so there the failure is the
+process exit plus the stderr trailer. Branch on the exit code or `ok`, never
+on the presence of `artifact_path`.
 `rootfs cat` spills binary content to a `.bin`. Aged automatic spills are
 reclaimed by `qmu prune --runtime` (`reference/cache.md`).

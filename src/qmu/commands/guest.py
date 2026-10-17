@@ -788,7 +788,14 @@ def _emit_guest_result(
         if not raw.endswith(b"\n"):
             raw += b"\n"
     if raw or getattr(args, "out", None):
-        _emit_bytes(args, raw, stem=stem)
+        exit_code = data.get("exit_code")
+        _emit_bytes(
+            args,
+            raw,
+            stem=stem,
+            source_ok=bool(data.get("ok", False)),
+            exit_code=exit_code if isinstance(exit_code, int) else None,
+        )
     if not notes:
         return
     sys.stdout.flush()

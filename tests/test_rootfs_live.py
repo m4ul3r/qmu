@@ -189,3 +189,43 @@ def test_link_targets_are_data_not_framing(image):
     }
     assert got["new\nline"]["type"] == "file"
     assert all(e["type"] == "symlink" for n, e in got.items() if n != "new\nline")
+
+
+def test_cr_and_lf_names_are_distinct_entries(image):
+    """#111: text-mode stdout turned the `\\r` into `\\n` before the NUL split,
+    so the CR-named file vanished and the LF-named one was listed twice."""
+    _fish(image, "mkdir-p /root/cr-case",
+          'write "/root/cr-case/a\\rb" CR-CONTENT',
+          'write "/root/cr-case/a\\nb" LF',
+          'write "/root/cr-case/a\\r\\nb" CRLF-CON',
+          'ln-s "x\\ry" "/root/cr-case/link"')
+
+    got = _ls(image, "/root/cr-case")
+
+    assert {n: e["size"] for n, e in got.items() if e["type"] == "file"} == {
+        "a\rb": 10, "a\nb": 2, "a\r\nb": 8,
+    }
+    assert got["link"]["target"] == "x\ry"
+    assert rootfs_mod.read_file(str(image), "/root/cr-case/a\rb", partition=0) == b"CR-CONTENT"
+    assert rootfs_mod.remove(str(image), ["/root/cr-case/a\rb"], partition=0)["removed"] == [
+        "/root/cr-case/a\rb"
+    ]
+    assert set(_ls(image, "/root/cr-case")) == {"a\nb", "a\r\nb", "link"}
+
+
+def test_non_utf8_name_round_trips_as_bytes(image):
+    import base64
+    _fish(image, "mkdir-p /root/latin1",
+          'write "/root/latin1/caf\\351" x',
+          'ln-s "\\377\\376" /root/latin1/l')
+
+    entries = rootfs_mod.listdir(str(image), "/root/latin1", partition=0)
+
+    by_b64 = {e.get("name_bytes_b64"): e for e in entries}
+    name = by_b64[base64.b64encode(b"caf\xe9").decode()]
+    assert name["size"] == 1
+    link = next(e for e in entries if e["name"] == "l")
+    assert base64.b64decode(link["target_bytes_b64"]) == b"\xff\xfe"
+    # The bytes recovered from the listing address the file again.
+    raw = base64.b64decode(name["name_bytes_b64"]).decode("utf-8", "surrogateescape")
+    assert rootfs_mod.read_file(str(image), "/root/latin1/" + raw, partition=0) == b"x"

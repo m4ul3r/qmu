@@ -524,7 +524,7 @@ def test_missing_dirs_reads_guestfish_is_dir_answers(tmp_path, monkeypatch):
 
     def fake_run(cmd, input=None, text=None, capture_output=None):
         calls["input"] = input
-        return SimpleNamespace(returncode=0, stdout="true\nfalse\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout=b"true\nfalse\n", stderr=b"")
 
     monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
 
@@ -534,14 +534,14 @@ def test_missing_dirs_reads_guestfish_is_dir_answers(tmp_path, monkeypatch):
     )
 
     assert missing == ["/zzz"]
-    assert "is-dir" in calls["input"]
+    assert b"is-dir" in calls["input"]
 
 
 def test_missing_dirs_is_inconclusive_on_a_short_read(tmp_path, monkeypatch):
     """Never invent a verdict about paths guestfish did not report on."""
     monkeypatch.setattr(
         rootfs_mod.subprocess, "run",
-        lambda *a, **k: SimpleNamespace(returncode=0, stdout="true\n", stderr=""),
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"true\n", stderr=b""),
     )
 
     assert rootfs_mod._missing_dirs(
@@ -560,7 +560,7 @@ def test_rm_errors_on_a_missing_path(tmp_path, monkeypatch):
     image.write_text("disk")
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
     monkeypatch.setattr(
-        rootfs_mod, "_run_script", lambda *a, **k: "false\n"
+        rootfs_mod, "_run_script", lambda *a, **k: b"false\n"
     )
 
     with pytest.raises(QMUError) as exc:
@@ -580,7 +580,7 @@ def test_rm_force_reports_a_missing_path_instead_of_claiming_removal(
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
     monkeypatch.setattr(
         rootfs_mod, "_run_script",
-        lambda img, part, script, action: scripts.append(script) or "false\n",
+        lambda img, part, script, action: scripts.append(script) or b"false\n",
     )
 
     result = rootfs_mod.remove(
@@ -600,7 +600,7 @@ def test_rm_force_removes_only_the_present_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
     monkeypatch.setattr(
         rootfs_mod, "_run_script",
-        lambda img, part, script, action: scripts.append(script) or "true\nfalse\n",
+        lambda img, part, script, action: scripts.append(script) or b"true\nfalse\n",
     )
 
     result = rootfs_mod.remove(
@@ -621,7 +621,7 @@ def test_rm_recursive_uses_rm_rf(tmp_path, monkeypatch):
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
     monkeypatch.setattr(
         rootfs_mod, "_run_script",
-        lambda img, part, script, action: scripts.append(script) or "true\n",
+        lambda img, part, script, action: scripts.append(script) or b"true\n",
     )
 
     rootfs_mod.remove(str(image), ["/rooot"], partition=0, recursive=True)

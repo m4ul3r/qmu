@@ -57,6 +57,17 @@ its process and preserving the serial log. `qmu prune --all` names any
 remnant the age gate held back rather than reporting "No stopped VMs to
 prune" while `qmu list` still shows one.
 
+**`held_reason` names why.** Every `held_back` answer (`status --vm X`,
+`list` stopped rows, `prune --vm`/`--all` in both `--dry-run` and real mode)
+carries `held_reason`: `age` — the gate above, cleared by `--older-than 0`;
+`malformed-metadata` — the VM's `.json` exists but cannot be parsed and no
+serial log corroborates it, so prune refuses it at **every** age (`--older-
+than 0` is not the fix) and lists it under `refused[]` as `{vm_id, reason,
+path}`; text says `metadata unreadable: <path> — repair or delete the .json
+by hand, then prune`. `qmp-busy` — the remnant's socket still answers, so a
+QEMU is alive behind it: reap it (`kill --vm`, `prune --orphans`) first.
+`held_reason` is `null` for every state other than `held_back`.
+
 ## `--dry-run`
 
 **`--dry-run` previews; it never acts.** Supported with `--vm`, `--all`,

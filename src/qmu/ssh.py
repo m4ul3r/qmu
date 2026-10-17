@@ -147,7 +147,10 @@ def _watch_child(
 ) -> tuple[list[bytes], bool, bool]:
     """Drain `pipes` until the child exits, the budget expires or `abort_when`
     fires. Returns (raw output per pipe, completed, aborted); a child that
-    did not complete has been killed.
+    did not complete has been killed. `completed` means the child exited
+    *within* the budget: the deadline is checked first, so a child that
+    finished while the loop was blocked in `abort_when` after the deadline
+    had already passed still counts as timed out (its output is kept).
 
     `abort_when` is polled every `poll_interval` seconds while the child runs;
     it must return promptly (the loop is single-threaded, so a predicate that
@@ -180,14 +183,24 @@ def _watch_child(
     deadline = time.monotonic() + timeout
     next_poll = time.monotonic() + poll_interval
     aborted = False
+    timed_out = False
     try:
         while sel.get_map():
             now = time.monotonic()
             if now >= deadline:
+                timed_out = True
                 break
             if abort_when is not None and now >= next_poll:
                 if abort_when():
                     aborted = True
+                    break
+                # The predicate may have blocked (a bounded QMP probe against
+                # a held socket): re-sample before trusting the budget. The
+                # child may have exited during that wait, but after the
+                # deadline, and the timeout must win over `proc.poll()`.
+                now = time.monotonic()
+                if now >= deadline:
+                    timed_out = True
                     break
                 next_poll = now + poll_interval
             wake = min(deadline, next_poll) if abort_when is not None else deadline
@@ -199,7 +212,7 @@ def _watch_child(
                 proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
             except subprocess.TimeoutExpired:
                 pass
-        completed = proc.poll() is not None
+        completed = not timed_out and proc.poll() is not None
         if not completed:
             proc.kill()
             proc.wait()

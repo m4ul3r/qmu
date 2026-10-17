@@ -36,7 +36,9 @@ fresh serial report). The reserved codes 2/3/4/124 are never guest values.
   slot (debugger bridge, another command) does not defeat the deadline: the
   watcher's QMP probe runs off the deadline thread, so the result is 124
   within ~N+0.3 s of the command starting (the pre-command QMP preflight may
-  itself spend its 2 s busy budget first).
+  itself spend its 2 s busy budget first). The budget wins outright: a guest
+  command that finishes *after* the deadline — even while that bounded probe
+  was blocked — is still 124, `timed_out: true`, never a late `ok: true`.
 - A kernel panic while the command runs is reported as exit 3 as soon as the
   serial log shows `Kernel panic - not syncing` (sub-second), with the partial
   `stdout`/`stderr` on the crash envelope — not after the SSH keepalive
@@ -45,8 +47,9 @@ fresh serial report). The reserved codes 2/3/4/124 are never guest values.
   true`, `crash_detected: false`).
 - Against a `panicked` or `paused` guest (any QMP `running: false` state) the
   command refuses in under a second: exit 1, `guest_state: "panicked" |
-  "paused"`, `hint` naming `qmu crash --vm X` / `qmu kill --vm X` or `qmu cont
-  --vm X`. A debugger stop that fires mid-command (`exec`, `compile --run`,
+  `"paused"`, `hint` naming `qmu crash --vm X` / `qmu kill --vm X` or `qmu cont
+  --vm X` (for `qemu_status: "restore-vm"` the hint is a known-good `snapshot
+  load` or `kill` + relaunch instead — never `cont`). A debugger stop that fires mid-command (`exec`, `compile --run`,
   `dmesg`) aborts the SSH session within ~1 s and gives the same `paused`
   envelope — never the 15–20 s keepalive wait.
 - Text mode: `reference/output-contract.md` → *Guest-command text mode*.
@@ -171,9 +174,15 @@ qmu rootfs shell ./rootfs.img                                  # interactive gue
   `ls`/`cat`.
 - `ls`: text is `mode uid gid size mtime name [-> target]` per entry (no
   `total` line), sorted by name; JSON `entries[]` of `{name, type, mode, uid,
-  gid, size, mtime, target?}`. Names and link targets are exact — newlines,
+  gid, size, mtime, target?, name_bytes_b64?, target_bytes_b64?}`. Names and
+  link targets are exact bytes end to end — newlines, carriage returns,
   quotes, backslashes, non-ASCII and a target such as `/etc/passwd` all come
-  back as written, never as an empty string or a quoting error.
+  back as written (a CR-named and an LF-named file are two distinct
+  entries, never merged or duplicated). When a name/target is not valid
+  UTF-8, `name`/`target` is a lossy U+FFFD decode and `name_bytes_b64` /
+  `target_bytes_b64` carries the exact bytes; both keys are absent
+  otherwise. Text mode escapes control characters (`\r`, `\n`, `\t`, else
+  `\xNN`) and shows U+FFFD for non-UTF-8.
 - `cat`: text is the file's exact bytes (no added newline; binary passes
   through; large output spills to a `.bin`); JSON `content`, `size`,
   `encoding` (`utf-8` or `base64`).

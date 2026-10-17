@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import posixpath
 import shutil
@@ -194,9 +195,9 @@ def _missing_dirs(
     script = "".join(f"is-dir {guestfish_quote(d)}\n" for d in wanted)
     mode = "--ro" if read_only else "--rw"
     cmd = [fish, mode, "-a", image] + _mount_args(partition)
-    proc = subprocess.run(cmd, input=script, text=True, capture_output=True)
+    proc = _invoke(cmd, script)
     if proc.returncode != 0:
-        out = (proc.stderr or proc.stdout or "").strip()
+        out = _failure_text(proc)
         diagnosis = _diagnose_guestfish_failure(out, image, partition)
         raise QMUError(
             f"guestfish could not inspect {image} (exit {proc.returncode}).\n"
@@ -208,7 +209,7 @@ def _missing_dirs(
     # rather than inventing a verdict about paths it never reported on.
     if len(answers) != len(wanted):
         return []
-    return [d for d, ok in zip(wanted, answers) if ok.strip().lower() != "true"]
+    return [d for d, ok in zip(wanted, answers) if ok.strip().lower() != b"true"]
 
 
 def _diagnose_guestfish_failure(output: str, image: str, partition: int) -> str | None:
@@ -373,9 +374,9 @@ def inject(
 
     script = "\n".join(script_lines) + "\n"
     cmd = [fish, "--rw", "-a", str(img_path)] + _mount_args(partition)
-    proc = subprocess.run(cmd, input=script, text=True, capture_output=True)
+    proc = _invoke(cmd, script)
     if proc.returncode != 0:
-        out = (proc.stderr or proc.stdout or "").strip()
+        out = _failure_text(proc)
         diagnosis = _diagnose_guestfish_failure(out, image, partition)
         if diagnosis is None:
             diagnosis = f"Try `qmu rootfs shell {image} --partition <N>` to inspect."
@@ -426,6 +427,25 @@ def _ownership_lines(local_path: Path, target: str) -> list[str]:
     return lines
 
 
+def _invoke(cmd: list[str], script: str) -> subprocess.CompletedProcess[bytes]:
+    """Run guestfish on `script` with a byte-exact transport.
+
+    Text mode would apply universal-newline decoding to stdout, which turns a
+    `\\r` inside an `ls0` frame into `\\n` *before* the NUL split — a CR-named
+    file then vanished from a listing and the LF-named sibling was reported
+    twice, with exit 0. Names that are not UTF-8 ride the script as
+    `surrogateescape` so the bytes guestfish printed are the bytes it gets
+    back.
+    """
+    return subprocess.run(
+        cmd, input=script.encode("utf-8", "surrogateescape"), capture_output=True
+    )
+
+
+def _failure_text(proc: subprocess.CompletedProcess[bytes]) -> str:
+    return (proc.stderr or proc.stdout or b"").decode("utf-8", "replace").strip()
+
+
 def _run_script(
     image: str,
     partition: int,
@@ -433,8 +453,8 @@ def _run_script(
     action: str,
     *,
     read_only: bool = False,
-) -> str:
-    """Run a guestfish script against an image and return its stdout.
+) -> bytes:
+    """Run a guestfish script against an image and return its raw stdout.
 
     A read-only run skips the busy-image guard and opens the image `--ro`.
     Inspecting an image while a VM runs is precisely the "did my inject land,
@@ -450,9 +470,9 @@ def _run_script(
 
     mode = "--ro" if read_only else "--rw"
     cmd = [fish, mode, "-a", str(img_path)] + _mount_args(partition)
-    proc = subprocess.run(cmd, input=script, text=True, capture_output=True)
+    proc = _invoke(cmd, script)
     if proc.returncode != 0:
-        out = (proc.stderr or proc.stdout or "").strip()
+        out = _failure_text(proc)
         diagnosis = _diagnose_guestfish_failure(out, image, partition)
         if diagnosis is None:
             diagnosis = f"Try `qmu rootfs shell {image} --partition <N>` to inspect."
@@ -463,10 +483,24 @@ def _run_script(
     return proc.stdout
 
 
-def _parse_stat_blocks(out: str) -> list[dict[str, int]]:
+def _decode_name(raw: bytes) -> tuple[str, str | None]:
+    """`(text, bytes_b64)` for a guest name or link target.
+
+    `text` is the exact name when it is valid UTF-8 and the b64 field is
+    None. Otherwise `text` is a lossy rendering fit for a JSON/terminal
+    consumer and `bytes_b64` carries the exact bytes, so the entry is still
+    reversible without putting lone surrogates on stdout.
+    """
+    try:
+        return raw.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", "replace"), base64.b64encode(raw).decode("ascii")
+
+
+def _parse_stat_blocks(out: bytes) -> list[dict[str, int]]:
     """Split concatenated `lstatns` output into one {field: int} per record."""
     records: list[dict[str, int]] = []
-    for raw in out.splitlines():
+    for raw in out.decode("ascii", "replace").split("\n"):
         line = raw.strip()
         if ":" not in line or not line.startswith("st_"):
             continue
@@ -493,12 +527,13 @@ _TYPE_NAMES = (
 )
 
 
-def _entry_from_stat(name: str, st: dict[str, int], target: str | None) -> dict:
+def _entry_from_stat(name: bytes, st: dict[str, int], target: bytes | None) -> dict:
     mode = st.get("st_mode", 0)
     kind = next((label for test, label in _TYPE_NAMES if test(mode)), "unknown")
     mtime = datetime.fromtimestamp(st.get("st_mtime_sec", 0), tz=timezone.utc)
+    text, name_b64 = _decode_name(name)
     entry = {
-        "name": name,
+        "name": text,
         "type": kind,
         "mode": f"{stat_mod.S_IMODE(mode):04o}",
         "uid": st.get("st_uid", 0),
@@ -506,9 +541,23 @@ def _entry_from_stat(name: str, st: dict[str, int], target: str | None) -> dict:
         "size": st.get("st_size", 0),
         "mtime": mtime.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if name_b64 is not None:
+        entry["name_bytes_b64"] = name_b64
     if kind == "symlink":
-        entry["target"] = target or ""
+        target_text, target_b64 = _decode_name(target or b"")
+        entry["target"] = target_text
+        if target_b64 is not None:
+            entry["target_bytes_b64"] = target_b64
     return entry
+
+
+def _display(text: str) -> str:
+    """A name for one terminal line: control characters become escapes."""
+    return "".join(
+        {"\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(ch, f"\\x{ord(ch):02x}")
+        if ord(ch) < 0x20 or ch == "\x7f" else ch
+        for ch in text
+    )
 
 
 def format_entry(entry: dict) -> str:
@@ -521,14 +570,14 @@ def format_entry(entry: dict) -> str:
     }.get(entry["type"], 0)
     line = (
         f"{stat_mod.filemode(type_bits | mode)} {entry['uid']:>5} {entry['gid']:>5} "
-        f"{entry['size']:>9} {entry['mtime']} {entry['name']}"
+        f"{entry['size']:>9} {entry['mtime']} {_display(entry['name'])}"
     )
     if entry["type"] == "symlink":
-        line += f" -> {entry['target']}"
+        line += f" -> {_display(entry['target'])}"
     return line
 
 
-def _split_tail_stats(out: str, count: int) -> tuple[str, list[dict[str, int]]]:
+def _split_tail_stats(out: bytes, count: int) -> tuple[bytes, list[dict[str, int]]]:
     """Split a script's stdout into (prefix, last `count` lstatns records).
 
     The stat records are the *tail* of the output and each starts with an
@@ -537,20 +586,20 @@ def _split_tail_stats(out: str, count: int) -> tuple[str, list[dict[str, int]]]:
     matter what it contains — a target of `st_dev: 1` only adds lines
     *before* the real records.
     """
-    lines = out.split("\n")
-    starts = [i for i, line in enumerate(lines) if line.startswith("st_dev:")]
+    lines = out.split(b"\n")
+    starts = [i for i, line in enumerate(lines) if line.startswith(b"st_dev:")]
     if len(starts) < count:
         return out, _parse_stat_blocks(out)
     cut = starts[len(starts) - count] if count else len(lines)
-    prefix = "\n".join(lines[:cut])
+    prefix = b"\n".join(lines[:cut])
     if cut:
-        prefix += "\n"
-    return prefix, _parse_stat_blocks("\n".join(lines[cut:]))
+        prefix += b"\n"
+    return prefix, _parse_stat_blocks(b"\n".join(lines[cut:]))
 
 
 def _parse_readlink_targets(
-    links_out: str, stats: list[dict[str, int]]
-) -> list[str | None] | None:
+    links_out: bytes, stats: list[dict[str, int]]
+) -> list[bytes | None] | None:
     """Per-entry symlink targets from concatenated `readlink` output.
 
     guestfish prints each target followed by a newline, with nothing else to
@@ -562,9 +611,9 @@ def _parse_readlink_targets(
     link changed between stat and readlink), which the caller reports rather
     than guesses about.
     """
-    data = links_out.encode("utf-8", "surrogateescape")
+    data = links_out
     pos = 0
-    targets: list[str | None] = []
+    targets: list[bytes | None] = []
     for st in stats:
         if not stat_mod.S_ISLNK(st.get("st_mode", 0)):
             targets.append(None)
@@ -573,7 +622,7 @@ def _parse_readlink_targets(
         chunk = data[pos : pos + size]
         if len(chunk) != size or data[pos + size : pos + size + 1] != b"\n":
             return None
-        targets.append(chunk.decode("utf-8", "surrogateescape"))
+        targets.append(chunk)
         pos += size + 1
     if pos != len(data):
         return None
@@ -591,20 +640,22 @@ def listdir(image: str, guest_path: str = "/", partition: int = 1) -> list[dict]
     while looking fresh.
 
     Names come from `ls0` (NUL-terminated, so a newline in a name is data,
-    not a record boundary). Link targets are parsed by position from their
-    `st_size`, never by a string delimiter: a sentinel string appearing as
-    a target shifted every later entry's target while still reporting
-    success.
+    not a record boundary) over a byte transport — text mode would fold a
+    `\\r` into `\\n` before the split. Link targets are parsed by position
+    from their `st_size`, never by a string delimiter: a sentinel string
+    appearing as a target shifted every later entry's target while still
+    reporting success. A name or target that is not UTF-8 gets a lossy
+    `name`/`target` plus `name_bytes_b64`/`target_bytes_b64`.
     """
     path = guest_path or "/"
     names_out = _run_script(
         image, partition, f"ls0 {guestfish_quote(path)} -\n", "ls", read_only=True
     )
-    names = sorted(n for n in names_out.split("\0") if n)
+    names = sorted(n for n in names_out.split(b"\0") if n)
     if not names:
         return []
 
-    full = [posixpath.join(path, n) for n in names]
+    full = [posixpath.join(path, n.decode("utf-8", "surrogateescape")) for n in names]
     # `-readlink` tolerates the error a non-symlink produces (stderr only)
     # and prints nothing for it. Targets come first and the stat records
     # last, so the records can be found from the tail regardless of what
@@ -614,18 +665,19 @@ def listdir(image: str, guest_path: str = "/", partition: int = 1) -> list[dict]
     out = _run_script(image, partition, script, "ls", read_only=True)
 
     links_part, stats = _split_tail_stats(out, len(names))
+    said = out.decode("utf-8", "replace").strip()
     if len(stats) != len(names):
         raise QMUError(
             f"guestfish ls returned {len(stats)} stat records for {len(names)} "
             f"entries in {path}; the listing is inconclusive.\n\nguestfish said:\n"
-            f"{out.strip()}"
+            f"{said}"
         )
     targets = _parse_readlink_targets(links_part, stats)
     if targets is None:
         raise QMUError(
             f"guestfish ls could not align readlink output with the symlinks "
             f"in {path}; the listing is inconclusive.\n\nguestfish said:\n"
-            f"{out.strip()}"
+            f"{said}"
         )
     return [
         _entry_from_stat(name, st, target)
@@ -689,7 +741,7 @@ def remove(
     if len(answers) == len(guest_paths):
         present = []
         for guest_path, answer in zip(guest_paths, answers):
-            (present if answer.strip().lower() == "true" else missing).append(guest_path)
+            (present if answer.strip().lower() == b"true" else missing).append(guest_path)
     if missing and not force:
         raise QMUError(
             f"Not found in {image}: {', '.join(missing)}. "

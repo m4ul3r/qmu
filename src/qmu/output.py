@@ -224,6 +224,8 @@ def write_bytes_result(
     stem: str,
     spill_token_limit: int = DEFAULT_SPILL_TOKEN_LIMIT,
     suffix: str = ".bin",
+    source_ok: bool = True,
+    exit_code: int | None = None,
 ) -> OutputWriteResult:
     """Text-mode delivery of a byte payload with NO rendering applied.
 
@@ -234,7 +236,9 @@ def write_bytes_result(
     (named `<stem>-...<suffix>`) exactly, with the usual artifact envelope
     describing the file. The inline `rendered` is a lossy decode for callers
     that can only take text; byte-exact callers write `raw` themselves when
-    `artifact` is None.
+    `artifact` is None. The envelope carries the *source operation's*
+    `source_ok` (and its `exit_code` when the caller knows one): writing the
+    artifact succeeding says nothing about whether the guest command did.
     """
     rendered = raw.decode("utf-8", errors="replace")
     token_estimate = _estimate_tokens(rendered)
@@ -263,8 +267,10 @@ def write_bytes_result(
         encoded=raw,
         token_estimate=token_estimate,
         value=summary,
-        source_ok=True,
+        source_ok=source_ok,
     )
+    if exit_code is not None:
+        artifact["exit_code"] = exit_code
     return OutputWriteResult(
         rendered=(
             _text_spill_pointer(artifact, rendered)

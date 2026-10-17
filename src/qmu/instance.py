@@ -354,25 +354,23 @@ def _path_mtime(path: Path | None) -> float | None:
         return None
 
 
-def _bundle_is_age_eligible(
+def _bundle_too_young(
     bundle: InstanceArtifacts, *, cutoff: float
-) -> bool:
-    """True when every present known artifact is at or older than cutoff."""
+) -> Path | None:
+    """The first present artifact newer than cutoff (or unstatable), else None."""
     for path in (
         bundle.json_path,
         bundle.qmp_socket,
         bundle.serial_log,
         bundle.qemu_log,
     ):
-        mtime = _path_mtime(path)
-        if mtime is None:
-            # Path listed but unstatable: treat as ineligible.
-            if path is not None:
-                return False
+        if path is None:
             continue
-        if mtime > cutoff:
-            return False
-    return True
+        mtime = _path_mtime(path)
+        # Path listed but unstatable: treat as ineligible.
+        if mtime is None or mtime > cutoff:
+            return path
+    return None
 
 
 def _qmp_safe_to_prune(qmp_socket: Path | None) -> bool:
@@ -391,59 +389,95 @@ def _qmp_safe_to_prune(qmp_socket: Path | None) -> bool:
     return state in ("stale", "gone")
 
 
-def list_prunable_instance_ids(
-    *, older_than_seconds: float, now: float | None = None
-) -> list[str]:
-    """Return VM ids whose exact known artifacts are safe to prune.
+# Why prune withholds a bundle. `classify_vm` reports the reason next to
+# `held_back` so no command describes a permanent metadata refusal as an age
+# gate that `--older-than 0` could clear (#109).
+HELD_AGE = "age"                            # younger than the --older-than cutoff
+HELD_MALFORMED_METADATA = "malformed-metadata"  # unparseable .json, no serial log
+HELD_QMP_BUSY = "qmp-busy"                  # the QMP socket still answers
 
-    Parseable stopped records and serial-only orphans remain immediately
+
+def prune_refusal(
+    bundle: InstanceArtifacts, *, cutoff: float
+) -> tuple[str, Path | None] | None:
+    """Why `bundle` is withheld from prune: (reason, path), or None if eligible.
+
+    Parseable stopped records and serial-only orphans are immediately
     eligible (no age gate). QEMU-log/QMP-only remnants require every present
     known artifact to be at or older than the cutoff, and any QMP socket must
-    probe stale/gone. Live parseable instances and malformed JSON without a
-    serial-log recovery path are never returned.
+    probe stale/gone. Malformed JSON without a serial-log recovery path is
+    refused regardless of age: qmu cannot tell what the bundle was, so it is
+    the operator's call — repair or delete the .json by hand. Live parseable
+    instances are not a refusal class; callers exclude them first.
     """
+    if bundle.instance is not None:
+        if not _qmp_safe_to_prune(bundle.qmp_socket):
+            return HELD_QMP_BUSY, bundle.qmp_socket
+        return None
+
+    if bundle.invalid_json:
+        # Unknown identity: only the serial-log recovery path is eligible.
+        if bundle.serial_log is None:
+            return HELD_MALFORMED_METADATA, bundle.json_path
+        if not _qmp_safe_to_prune(bundle.qmp_socket):
+            return HELD_QMP_BUSY, bundle.qmp_socket
+        return None
+
+    # Metadata-free remnant: serial-only stays immediate; qemu/QMP age-gated.
+    if (
+        bundle.serial_log is not None
+        and bundle.qmp_socket is None
+        and bundle.qemu_log is None
+    ):
+        return None
+
+    young = _bundle_too_young(bundle, cutoff=cutoff)
+    if young is not None:
+        return HELD_AGE, young
+    if not _qmp_safe_to_prune(bundle.qmp_socket):
+        return HELD_QMP_BUSY, bundle.qmp_socket
+    return None
+
+
+def _prune_cutoff(older_than_seconds: float, now: float | None) -> float:
     if not math.isfinite(older_than_seconds) or older_than_seconds < 0:
         raise ValueError("older_than_seconds must be finite and non-negative")
     current_time = time.time() if now is None else now
     if not math.isfinite(current_time):
         raise ValueError("now must be finite")
-    cutoff = current_time - older_than_seconds
+    return current_time - older_than_seconds
 
+
+def prune_refusals(
+    *, older_than_seconds: float, now: float | None = None
+) -> dict[str, tuple[str, Path | None]]:
+    """Map vm_id -> (reason, path) for every stopped bundle prune withholds."""
+    cutoff = _prune_cutoff(older_than_seconds, now)
+    refused: dict[str, tuple[str, Path | None]] = {}
+    for bundle in discover_instance_artifacts():
+        if bundle.instance is not None and instance_alive(bundle.instance):
+            continue
+        refusal = prune_refusal(bundle, cutoff=cutoff)
+        if refusal is not None:
+            refused[bundle.vm_id] = refusal
+    return refused
+
+
+def list_prunable_instance_ids(
+    *, older_than_seconds: float, now: float | None = None
+) -> list[str]:
+    """Return VM ids whose exact known artifacts are safe to prune.
+
+    The complement of `prune_refusals` over the same discovery; see
+    `prune_refusal` for the eligibility rules.
+    """
+    cutoff = _prune_cutoff(older_than_seconds, now)
     eligible: list[str] = []
     for bundle in discover_instance_artifacts():
-        if bundle.instance is not None:
-            if instance_alive(bundle.instance):
-                continue
-            # Parseable stopped records prune immediately for compatibility.
-            if not _qmp_safe_to_prune(bundle.qmp_socket):
-                continue
+        if bundle.instance is not None and instance_alive(bundle.instance):
+            continue
+        if prune_refusal(bundle, cutoff=cutoff) is None:
             eligible.append(bundle.vm_id)
-            continue
-
-        if bundle.invalid_json:
-            # Unknown identity: only serial-log recovery path is eligible.
-            if bundle.serial_log is None:
-                continue
-            if not _qmp_safe_to_prune(bundle.qmp_socket):
-                continue
-            eligible.append(bundle.vm_id)
-            continue
-
-        # Metadata-free remnant: serial-only stays immediate; qemu/QMP age-gated.
-        if (
-            bundle.serial_log is not None
-            and bundle.qmp_socket is None
-            and bundle.qemu_log is None
-        ):
-            eligible.append(bundle.vm_id)
-            continue
-
-        if not _bundle_is_age_eligible(bundle, cutoff=cutoff):
-            continue
-        if not _qmp_safe_to_prune(bundle.qmp_socket):
-            continue
-        eligible.append(bundle.vm_id)
-
     return eligible
 
 
@@ -702,7 +736,9 @@ def classify_vm(
 ) -> dict[str, Any]:
     """Return the single authoritative description of `vm_id`.
 
-    Keys: state, instance (VMInstance|None), pid (int|None), serial_log.
+    Keys: state, instance (VMInstance|None), pid (int|None), serial_log,
+    held_reason (one of HELD_* when state is `held_back`, else None) and
+    held_path (the artifact the refusal is about, or None).
     """
     for inst in list_instances():
         if inst.vm_id == vm_id:
@@ -711,6 +747,8 @@ def classify_vm(
                 "instance": inst,
                 "pid": inst.pid,
                 "serial_log": inst.serial_log,
+                "held_reason": None,
+                "held_path": None,
             }
 
     stopped = {inst.vm_id: inst for inst in list_stopped_instances()}
@@ -718,6 +756,7 @@ def classify_vm(
     if inst is None:
         return {
             "state": VM_ABSENT, "instance": None, "pid": None, "serial_log": None,
+            "held_reason": None, "held_path": None,
         }
 
     if orphan_pids is None:
@@ -729,16 +768,54 @@ def classify_vm(
             "instance": inst,
             "pid": orphan_pid,
             "serial_log": inst.serial_log,
+            "held_reason": None,
+            "held_path": None,
         }
 
-    prunable = set(
-        list_prunable_instance_ids(older_than_seconds=older_than_seconds)
-    )
-    state = VM_STOPPED if vm_id in prunable else VM_HELD_BACK
+    refusal = prune_refusals(older_than_seconds=older_than_seconds).get(vm_id)
+    if refusal is None:
+        return {
+            "state": VM_STOPPED, "instance": inst, "pid": None,
+            "serial_log": inst.serial_log,
+            "held_reason": None, "held_path": None,
+        }
+    reason, path = refusal
     return {
-        "state": state, "instance": inst, "pid": None,
+        "state": VM_HELD_BACK, "instance": inst, "pid": None,
         "serial_log": inst.serial_log,
+        "held_reason": reason,
+        "held_path": str(path) if path is not None else None,
     }
+
+
+def held_back_vms(
+    *,
+    older_than_seconds: float = 86400.0,
+    orphan_pids: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Stopped remnants prune withholds, as `{vm_id, reason, path}` in a stable order.
+
+    Not every refusal is the age gate: a malformed `.json` with no serial log
+    is withheld at any `--older-than`, so each entry carries its reason.
+    """
+    refused = prune_refusals(older_than_seconds=older_than_seconds)
+    orphaned = set(
+        orphan_serial_logs() if orphan_pids is None else orphan_pids
+    )
+    out: list[dict[str, Any]] = []
+    for inst in sorted(list_stopped_instances(), key=lambda i: i.vm_id):
+        if inst.serial_log in orphaned:
+            continue
+        refusal = refused.get(inst.vm_id)
+        if refusal is None:
+            continue
+        reason, path = refusal
+        out.append({
+            "vm_id": inst.vm_id,
+            "reason": reason,
+            "path": str(path) if path is not None else None,
+        })
+    return out
 
 
 def held_back_vm_ids(
@@ -746,14 +823,9 @@ def held_back_vm_ids(
     older_than_seconds: float = 86400.0,
     orphan_pids: dict[str, int] | None = None,
 ) -> list[str]:
-    """Stopped remnants the age gate withheld, in a stable order."""
-    prunable = set(
-        list_prunable_instance_ids(older_than_seconds=older_than_seconds)
-    )
-    orphaned = set(
-        orphan_serial_logs() if orphan_pids is None else orphan_pids
-    )
-    return sorted(
-        inst.vm_id for inst in list_stopped_instances()
-        if inst.vm_id not in prunable and inst.serial_log not in orphaned
-    )
+    """Stopped remnants prune withheld, in a stable order."""
+    return [
+        entry["vm_id"] for entry in held_back_vms(
+            older_than_seconds=older_than_seconds, orphan_pids=orphan_pids
+        )
+    ]

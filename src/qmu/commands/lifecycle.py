@@ -31,6 +31,9 @@ from ..config import resolve_config
 from .. import debug as debug_mod
 from ..debug import debug_session_present, reset_dropped_breakpoints_warning
 from ..instance import (
+    HELD_AGE,
+    HELD_MALFORMED_METADATA,
+    HELD_QMP_BUSY,
     QMUError,
     VM_HELD_BACK,
     VM_ORPHANED,
@@ -39,7 +42,7 @@ from ..instance import (
     choose_instance,
     classify_vm,
     find_orphan_qemus,
-    held_back_vm_ids,
+    held_back_vms,
     instance_alive,
     is_pid_alive,
     list_instances,
@@ -1002,6 +1005,34 @@ def _classify(vm_id: str, older_than: float = 86400.0) -> dict[str, Any]:
     return info
 
 
+def _held_hint(
+    vm_id: str, reason: str | None, path: str | None, *, older_than: float
+) -> str:
+    """The one sentence every command uses for a prune-withheld remnant.
+
+    Keyed on the refusal reason, never on `held_back` alone: a malformed
+    `.json` with no serial log is refused at any age, so prescribing
+    `--older-than 0` for it sends the caller around the same loop forever
+    (#109). qmu will not delete metadata it cannot read; the operator can.
+    """
+    if reason == HELD_MALFORMED_METADATA:
+        return (
+            f"metadata unreadable: {path} — repair or delete the .json by "
+            f"hand, then prune"
+        )
+    if reason == HELD_QMP_BUSY:
+        return (
+            f"QMP socket still answers: {path} — something still serves it; "
+            f"reap with `qmu kill --vm {vm_id}` or `qmu prune --orphans`, "
+            f"then prune"
+        )
+    return (
+        f"younger than the --older-than cutoff ({older_than:g}s); re-run with "
+        f"`qmu prune --vm {vm_id} --older-than 0` to remove it"
+    )
+
+
+
 def _retained_logs(inst: Any) -> dict[str, Any]:
     """What a stopped VM left behind, in the words `status`/`kill`/`list` share.
 
@@ -1130,6 +1161,15 @@ def _handle_kill(args: argparse.Namespace) -> int:
             # for the same reason: it is qmu's own, not the guest's.
             _close_ssh_master(inst)
             bridge_reaped = _reap_recorded_bridge(inst)
+            if info["state"] == VM_HELD_BACK:
+                remove = "not prunable as-is: " + _held_hint(
+                    args.vm, info["held_reason"], info["held_path"],
+                    older_than=86400.0,
+                )
+                remove_record = remove
+            else:
+                remove = f"remove with: qmu prune --vm {args.vm}"
+                remove_record = f"remove its record with: qmu prune --vm {args.vm}"
             _emit(
                 args,
                 data={
@@ -1139,13 +1179,14 @@ def _handle_kill(args: argparse.Namespace) -> int:
                     "logs_retained": retained["logs_retained"],
                     "serial_log": retained["serial_log"],
                     "bridge_reaped": bridge_reaped,
+                    "held_reason": info["held_reason"],
+                    "held_path": info["held_path"],
                 },
                 text=(
-                    f"VM '{args.vm}' is already stopped; state retained "
-                    f"(remove with: qmu prune --vm {args.vm})"
+                    f"VM '{args.vm}' is already stopped; state retained ({remove})"
                     if retained["logs_retained"]
                     else f"VM '{args.vm}' is already stopped; no logs retained "
-                    f"(remove its record with: qmu prune --vm {args.vm})"
+                    f"({remove_record})"
                 )
                 + (" Reaped its recorded debugger bridge." if bridge_reaped else ""),
                 stem="kill",
@@ -1728,7 +1769,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
                 f"VM '{vm}' is running. Use 'qmu kill --vm {vm}' first."
             )
         found = True
-        held_back: list[str] = []
+        refused: list[dict[str, Any]] = []
         if vm in prunable:
             targets = [vm]
         else:
@@ -1747,12 +1788,16 @@ def _handle_prune(args: argparse.Namespace) -> int:
             if info["state"] == VM_STOPPED:
                 targets = [vm]
             elif info["state"] == VM_HELD_BACK:
-                # The age gate is an outcome, not an error: `prune --all`
+                # A refusal is an outcome, not an error: `prune --all`
                 # reports the same remnant as `held_back` with exit 0, and
                 # `--dry-run` must land in the preview envelope rather than
                 # fail and prescribe the destructive run.
                 targets = []
-                held_back = [vm]
+                refused = [{
+                    "vm_id": vm,
+                    "reason": info["held_reason"],
+                    "path": info["held_path"],
+                }]
             else:
                 # Absent. A default `kill` already removed everything, so the
                 # cleanup idiom `kill && prune --vm` must not fail on it.
@@ -1766,7 +1811,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
         # a remnant holding megabytes of serial log left behind, and the
         # preview — the thing a cautious operator runs first — reintroduced
         # the original false statement outright.
-        held_back = held_back_vm_ids(
+        refused = held_back_vms(
             older_than_seconds=args.older_than, orphan_pids=_orphan_serial_logs()
         )
     else:
@@ -1774,10 +1819,22 @@ def _handle_prune(args: argparse.Namespace) -> int:
             "Specify a mode: " + _all_modes_phrase() + "."
         )
 
-    held_note = (
+    # `held_back` keeps the id list; `refused` says WHY each one stayed, so a
+    # malformed-metadata refusal is never dressed up as the age gate (#109).
+    held_back = [entry["vm_id"] for entry in refused]
+    aged = [e["vm_id"] for e in refused if e["reason"] == HELD_AGE]
+    held_lines = [
         f"Held back by the --older-than cutoff ({args.older_than:g}s): "
-        f"{', '.join(held_back)}. Re-run with `--older-than 0` to include them."
-    ) if held_back else None
+        f"{', '.join(aged)}. Re-run with `--older-than 0` to include them."
+    ] if aged else []
+    held_lines += [
+        f"Not pruned {entry['vm_id']}: "
+        + _held_hint(
+            entry["vm_id"], entry["reason"], entry["path"],
+            older_than=args.older_than,
+        )
+        for entry in refused if entry["reason"] != HELD_AGE
+    ]
     absent_note = (
         f"Nothing to prune for '{vm}': no state on disk (already removed by "
         "kill, or never existed)."
@@ -1803,6 +1860,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
             "pruned": [],
             "would_prune": targets,
             "held_back": held_back,
+            "refused": refused,
             "keep_logs": args.keep_logs,
         }
         if found is not None:
@@ -1815,8 +1873,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
             verb = "keep logs for" if args.keep_logs else "remove"
             text = [f"Would {verb} {len(targets)} VM(s): {', '.join(targets)}"]
             text.append("Re-run without --dry-run to do it.")
-        if held_note:
-            text.append(held_note)
+        text.extend(held_lines)
         if cache_note:
             text.append(cache_note)
         _emit(args, data=data, text=text, stem="prune")
@@ -1831,13 +1888,12 @@ def _handle_prune(args: argparse.Namespace) -> int:
         lines = [absent_note]
     elif not pruned:
         lines = ["No stopped VMs to prune."] if not held_back else [
-            "No stopped VMs were old enough to prune."
+            "No stopped VMs could be pruned."
         ]
     else:
         verb = "kept logs for" if args.keep_logs else "removed"
         lines = [f"Pruned {len(pruned)} VM(s) ({verb}): {', '.join(pruned)}"]
-    if held_note:
-        lines.append(held_note)
+    lines.extend(held_lines)
     if cache_note:
         lines.append(cache_note)
     data = {
@@ -1846,6 +1902,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
         "unmanaged_cache": unmanaged,
         "pruned": pruned,
         "held_back": held_back,
+        "refused": refused,
         "keep_logs": args.keep_logs,
     }
     if found is not None:
@@ -2539,6 +2596,10 @@ def _handle_list(args: argparse.Namespace) -> int:
                 # QEMU (a terminal panic needs no second opinion): a null
                 # read as "probe failed" and contradicted `status`.
                 "qmp": obs.qmp_state or "skipped",
+                # Same reading `status` reports: QEMU's run-state when the
+                # shared probe connected, "unknown" when it was busy,
+                # unreachable or skipped (#106).
+                "qemu_status": obs.qmp.status if obs.qmp is not None else "unknown",
                 "pid": inst.pid,
                 "harness": inst.harness,
                 "ssh_port": inst.ssh_port,
@@ -2558,11 +2619,14 @@ def _handle_list(args: argparse.Namespace) -> int:
             orphan_pid = orphan_logs.get(inst.serial_log)
             retained = _retained_logs(inst)
             # `status` and `prune` call a young log-only remnant `held_back`;
-            # `list` must not present the same artifacts as a plain `stopped`.
-            held_back = (
-                not orphan_pid
-                and classify_vm(inst.vm_id)["state"] == VM_HELD_BACK
+            # `list` must not present the same artifacts as a plain `stopped`
+            # — and must name the same refusal reason they do (#109).
+            held = (
+                {"held_reason": None, "held_path": None} if orphan_pid
+                else classify_vm(inst.vm_id)
             )
+            held_reason = held["held_reason"]
+            held_back = held_reason is not None
             data.append({
                 "vm_id": inst.vm_id,
                 "status": "orphaned" if orphan_pid else "stopped",
@@ -2586,6 +2650,8 @@ def _handle_list(args: argparse.Namespace) -> int:
                 "logs_retained": retained["logs_retained"],
                 "crash_detected": retained["crash_detected"],
                 "held_back": held_back,
+                "held_reason": held_reason,
+                "held_path": held["held_path"],
             })
         _output({"ok": True, "vms": data}, args, stem="list")
         return 0
@@ -2627,10 +2693,16 @@ def _handle_list(args: argparse.Namespace) -> int:
             # `kill` kept this report on purpose and said so; a bare
             # [stopped] here hid that from the one command that lists it.
             state = "[stopped — crash report retained]"
-        elif classify_vm(inst.vm_id)["state"] == VM_HELD_BACK:
-            state = "[stopped — held back from prune (younger than 24h; --older-than 0)]"
         else:
-            state = "[stopped]"
+            info = classify_vm(inst.vm_id)
+            if info["state"] == VM_HELD_BACK:
+                hint = _held_hint(
+                    inst.vm_id, info["held_reason"], info["held_path"],
+                    older_than=86400.0,
+                )
+                state = f"[stopped — not prunable: {hint}]"
+            else:
+                state = "[stopped]"
         lines.append(f"  {inst.vm_id}  {profile_str}  {kernel_str}  {state}")
     _output("VMs:\n" + "\n".join(lines), args, stem="list")
     return 0
@@ -2724,12 +2796,18 @@ def describe_non_running(
             else "there is no live state to report"
         )
         retained = _retained_logs(info["instance"])
+        if state == VM_HELD_BACK:
+            remove = "Not prunable as-is: " + _held_hint(
+                vm_id, info["held_reason"], info["held_path"],
+                older_than=older_than,
+            ) + "."
+        else:
+            remove = f"Remove them with `qmu prune --vm {vm_id}`."
         if retained["logs_retained"]:
             return (
                 f"VM '{vm_id}' is stopped; only its logs remain, so {verb}. "
                 f"Read them with `qmu log --vm {vm_id}` or "
-                f"`qmu crash --vm {vm_id}`, and remove them with "
-                f"`qmu prune --vm {vm_id}`. "
+                f"`qmu crash --vm {vm_id}`. {remove} "
                 f"Serial log: {retained['serial_log']}"
             )
         # A `.qemu.log`/`.qmp.sock`-only remnant (#104): no console to read,
@@ -2741,7 +2819,7 @@ def describe_non_running(
         )
         return (
             f"VM '{vm_id}' is stopped; no serial log remains, so {verb}. "
-            f"Remove its leftovers with `qmu prune --vm {vm_id}`. {what}"
+            f"{remove} {what}"
         )
     return None
 
@@ -2773,13 +2851,28 @@ def _status_non_running(args: argparse.Namespace, info: dict[str, Any]) -> int:
         "qemu_log": retained["qemu_log"],
         "logs_retained": retained["logs_retained"],
         "crash_detected": retained["crash_detected"],
+        # Why prune withholds it, or null. A malformed-metadata refusal must
+        # never be presented as the age gate (#109).
+        "held_reason": info.get("held_reason"),
+        "held_path": info.get("held_path"),
     }
+    held_hint = (
+        _held_hint(
+            vm_id, info["held_reason"], info["held_path"], older_than=86400.0
+        )
+        if state == VM_HELD_BACK
+        else None
+    )
     if state == VM_ORPHANED:
         text = describe_non_running(vm_id, info=info) or f"VM '{vm_id}' is orphaned."
     elif not retained["logs_retained"]:
         text = (
             f"VM '{vm_id}' is stopped (no serial log retained; QEMU log: "
-            f"{retained['qemu_log']}; remove with: qmu prune --vm {vm_id})"
+            f"{retained['qemu_log']}; "
+            + (
+                f"not prunable as-is: {held_hint})" if held_hint
+                else f"remove with: qmu prune --vm {vm_id})"
+            )
             if retained["qemu_log"]
             else f"VM '{vm_id}' is stopped (no logs retained)"
         )
@@ -2791,7 +2884,10 @@ def _status_non_running(args: argparse.Namespace, info: dict[str, Any]) -> int:
     else:
         text = (
             f"VM '{vm_id}' is stopped (logs retained: qmu log --vm {vm_id}; "
-            f"remove with: qmu prune --vm {vm_id})"
+            + (
+                f"not prunable as-is: {held_hint})" if held_hint
+                else f"remove with: qmu prune --vm {vm_id})"
+            )
         )
     _emit(args, data=data, text=text, stem="status")
     return 0
