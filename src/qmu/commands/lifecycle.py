@@ -24,7 +24,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from dataclasses import dataclass, field, replace
 
@@ -1244,9 +1244,12 @@ def _close_ssh_master(inst: Any) -> bool:
 
 
 def _release_from_daemon(inst: Any) -> bool:
-    """Ask the daemon to drop `inst`'s watch (and its QMP connection) before
-    a kill. Never spawns a daemon; False when none is running or the layer
-    is off. Also the patch point for tests."""
+    """Ask the daemon to give `inst` up while its process lives: the watch
+    and its QMP connection go, and every `wait` subscribed to it finishes
+    standalone (`released`). For a caller that takes the VM over — a
+    `--replace` launch — never for `kill`, which quits through the daemon so
+    the watch itself sees the exit. Never spawns a daemon; False when none
+    is running or the layer is off. Also the patch point for tests."""
     if not daemon_client.enabled():
         return False
     return daemon_client.unwatch(inst.vm_id)
@@ -1326,10 +1329,13 @@ def _handle_kill(args: argparse.Namespace) -> Result:
     # later surprise. qmu still does not manage the pry lifecycle.
     had_bridge = debug_session_present(inst) if inst.gdb_port is not None else False
     _close_ssh_master(inst)
-    # The daemon holds the VM's QMP connection; release it so the graceful
-    # `quit` below reaches QEMU directly instead of queueing behind a slot
-    # the daemon would otherwise keep until it noticed the exit.
-    _release_from_daemon(inst)
+    # The daemon keeps its watch through the kill (#118). `_kill_vm`'s
+    # graceful `quit` rides the daemon's own QMP connection (`_qmp_ctx`
+    # proxies when the VM is watched), and the daemon marks the watch exited
+    # once the EOF-then-PID check proves the process gone — which is the
+    # terminal transition every in-flight `wait` on this VM is owed. Releasing
+    # the watch first, as this used to, orphaned those waiters: they burned
+    # their whole timeout on a VM that was already dead.
     _kill_vm(inst, force=args.force, clean=clean)
     bridge_reaped = _reap_recorded_bridge(inst)
     if preserve_crash:
@@ -1801,6 +1807,14 @@ def _handle_prune_orphans(args: argparse.Namespace) -> Result:
         "killed": killed,
         "failed": failed,
     }
+    if failed:
+        pids = ", ".join(str(f["pid"]) for f in failed)
+        data["hint"] = (
+            f"SIGTERM to pid(s) {pids} failed (see `failed[].error`: usually "
+            "another user's process, or one that exited meanwhile). Confirm "
+            f"with `ps -o user,pid,cmd -p {pids}`; only a QEMU you own can be "
+            "killed from this account"
+        )
     if not orphans:
         text: Any = "No orphaned qmu QEMU processes."
     else:
@@ -2099,15 +2113,37 @@ def _handle_wait(args: argparse.Namespace) -> Result:
         if info["state"] == VM_ORPHANED:
             _require_running(args.vm, "wait")
     inst = choose_instance(args.vm)
-
-    daemon = _daemon_state(inst)
-    if daemon is not None:
-        return _wait_via_daemon(args, inst, daemon)
-
     start = time.monotonic()
     deadline: float | None = (
         start + args.timeout if args.timeout is not None else None
     )
+
+    daemon = _daemon_state(inst)
+    if daemon is not None:
+        return _wait_via_daemon(args, inst, daemon, start=start, deadline=deadline)
+    return _wait_standalone(args, inst, start=start, deadline=deadline, warnings=[])
+
+
+def _wait_standalone(
+    args: argparse.Namespace,
+    inst: Any,
+    *,
+    start: float,
+    deadline: float | None,
+    warnings: list[str],
+    last_event: str | None = None,
+    event_data: Any = None,
+) -> Result:
+    """The poll loop: PID liveness, an incremental console scan and one
+    short-lived `query-status` per tick, until the process is gone, the guest
+    took a terminal panic, or `deadline` passes.
+
+    Also the continuation of a daemon-backed wait whose subscription the
+    daemon ended (`released`, #118): `start`/`deadline` are the original
+    wait's, `warnings` carries what the daemon phase collected, and
+    `last_event`/`event_data` seed the transition report so an event the
+    daemon streamed is not forgotten.
+    """
     reason = "timeout"
     stopped = False
     crash: str | None = None
@@ -2115,15 +2151,13 @@ def _handle_wait(args: argparse.Namespace) -> Result:
     probe: _QMPProbe | None = None
     qemu_status = "unknown"
     last_status: str | None = None
-    last_event: str | None = None
-    event_data: Any = None
     boot_offset = current_boot_offset(inst.serial_log, inst.guest_epoch_serial_offset)
     # Line-aligned high-water mark of the console bytes already examined.
     # Rescanning from `boot_offset` every tick made a 20 s wait on a chatty
     # guest burn half a core (r2-shared: 10 s user CPU); each tick now reads
     # only what QEMU appended since the last one.
     scanned = boot_offset
-    warned_reset_debug = False
+    reset_warning = reset_dropped_breakpoints_warning(inst.vm_id) + "\n"
 
     def scan_console() -> bool:
         """One incremental console scan; adopts a moved boot boundary.
@@ -2137,7 +2171,6 @@ def _handle_wait(args: argparse.Namespace) -> Result:
         anything, so the new one is adopted the same way (#103).
         """
         nonlocal scanned, boot_offset, last_event, event_data, inst
-        nonlocal warned_reset_debug
         scanned, banner, panicked = scan_console_growth(
             inst.serial_log, scanned=scanned, boot_offset=boot_offset
         )
@@ -2149,9 +2182,10 @@ def _handle_wait(args: argparse.Namespace) -> Result:
             inst = save_guest_epoch_serial_offset(inst, banner)
             # #46: a reset drops the gdbstub breakpoint set without telling the
             # client. `wait` is the one place qmu sees a reset it did not issue.
-            if not warned_reset_debug and debug_session_present(inst):
-                warned_reset_debug = True
-                sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
+            # Collected once for the Result (#121): `render` writes it to
+            # stderr exactly once and the envelope carries it in `warnings[]`.
+            if reset_warning not in warnings and debug_session_present(inst):
+                warnings.append(reset_warning)
         return panicked
 
     def terminal_panic_report() -> str | None:
@@ -2255,7 +2289,23 @@ def _handle_wait(args: argparse.Namespace) -> Result:
         qemu_status=qemu_status,
         last_event=last_event, event_data=event_data,
         console_tail=_console_tail(inst.serial_log, boot_offset),
+        warnings=warnings,
     )
+
+
+class _WaitReleased(Exception):
+    """The daemon ended this wait's subscription while the VM's process lives
+    on — an explicit `unwatch`, its own shutdown, or a lost connection. The
+    wait is not over: it continues standalone, on PID liveness and the
+    console, for whatever is left of its deadline (#118). `note` is the
+    warning line the final Result carries; `last_event`/`event_data` are
+    what the daemon phase had observed."""
+
+    def __init__(self, note: str, *, last_event: Any = None, event_data: Any = None):
+        super().__init__(note)
+        self.note = note
+        self.last_event = last_event
+        self.event_data = event_data
 
 
 def _daemon_wait_request(
@@ -2264,24 +2314,32 @@ def _daemon_wait_request(
     *,
     pattern: str | None = None,
     start_offset: int | None = None,
+    warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     """Block on the daemon's `wait` op until it answers; no polling here.
 
     QMP events the daemon observes meanwhile stream back as they happen and
-    are relayed the way the standalone loop reports them: a RESET under an
-    attached debugger gets the #46 warning (the breakpoint set is gone) at
-    the moment it is seen, not when the wait ends.
+    are relayed to the progress sink. A RESET under an attached debugger
+    earns the #46 warning (the breakpoint set is gone): it is appended to
+    `warnings` once, for the Result — never written here, so a structured
+    caller gets it in `warnings[]` and a terminal sees it exactly once
+    (#121). Raises `_WaitReleased` when the daemon answers `released` or
+    the connection is lost: the caller finishes the wait standalone.
     """
-    warned_reset_debug = False
     started = time.monotonic()
+    reset_warning = reset_dropped_breakpoints_warning(inst.vm_id) + "\n"
 
     def on_event(event: dict[str, Any]) -> None:
-        nonlocal warned_reset_debug
         kind = event.get("kind")
         if kind == "progress":
             daemon_client.report_progress(
                 float(event.get("elapsed", 0.0)), int(event.get("scanned", 0)),
                 f"waiting on {inst.vm_id}",
+            )
+            return
+        if kind == "released":
+            daemon_client.report_progress(
+                time.monotonic() - started, 0, f"daemon released {inst.vm_id}; finishing standalone",
             )
             return
         if kind == "qmp_event":
@@ -2291,10 +2349,10 @@ def _daemon_wait_request(
             )
         if (
             kind == "qmp_event" and event.get("name") == "RESET"
-            and not warned_reset_debug and debug_session_present(inst)
+            and warnings is not None and reset_warning not in warnings
+            and debug_session_present(inst)
         ):
-            warned_reset_debug = True
-            sys.stderr.write(reset_dropped_breakpoints_warning(inst.vm_id) + "\n")
+            warnings.append(reset_warning)
 
     conn = daemon_client.connect()
     if conn is None:
@@ -2302,7 +2360,7 @@ def _daemon_wait_request(
     deadline = None if args.timeout is None else float(args.timeout)
     with conn:
         try:
-            return conn.request(
+            reply = conn.request(
                 "wait",
                 # The daemon enforces the deadline; the socket budget only
                 # guards against a daemon that died with the wait in flight.
@@ -2315,21 +2373,46 @@ def _daemon_wait_request(
                 ignore_crash=bool(getattr(args, "ignore_crash", False)),
             )
         except daemon_client.DaemonUnavailable as exc:
-            raise QMPError(f"daemon connection lost during wait on '{inst.vm_id}': {exc}") from exc
+            raise _WaitReleased(
+                f"[qmu] Note: the daemon connection was lost during the wait on "
+                f"'{inst.vm_id}' ({exc}); the wait finished standalone on PID "
+                "liveness.\n"
+            ) from exc
+    if reply.get("reason") == "released":
+        raise _WaitReleased(
+            f"[qmu] Note: the daemon released VM '{inst.vm_id}' mid-wait (an "
+            "explicit unwatch or a daemon shutdown); the wait finished standalone "
+            "on PID liveness.\n",
+            last_event=reply.get("last_event"), event_data=reply.get("event_data"),
+        )
+    return reply
 
 
-def _wait_via_daemon(args: argparse.Namespace, inst: Any, state: dict[str, Any]) -> Result:
+def _wait_via_daemon(
+    args: argparse.Namespace, inst: Any, state: dict[str, Any], *,
+    start: float, deadline: float | None,
+) -> Result:
     """Bare `wait` served by the daemon's event stream instead of a poll loop.
 
     Same verdicts and the same renderer as the standalone loop: the daemon
     returns WHEN the wait ended and what it observed; the crash report, the
     console tail and the guest axis are read here, from the log as it is
-    now, exactly as the standalone path does after its loop.
+    now, exactly as the standalone path does after its loop. A `released`
+    answer hands the rest of the wait to that loop (#118): the daemon no
+    longer owns the VM, and this process must not hand it straight back.
     """
+    warnings: list[str] = []
     try:
-        reply = _daemon_wait_request(args, inst)
+        reply = _daemon_wait_request(args, inst, warnings=warnings)
     except daemon_client.DaemonError as exc:
         raise QMPError(str(exc)) from exc
+    except _WaitReleased as released:
+        daemon_client.mark_released(inst.vm_id)
+        warnings.append(released.note)
+        return _wait_standalone(
+            args, inst, start=start, deadline=deadline, warnings=warnings,
+            last_event=released.last_event, event_data=released.event_data,
+        )
     stopped = bool(reply.get("stopped"))
     reason = str(reply.get("reason", "timeout"))
     elapsed = float(reply.get("elapsed", 0.0))
@@ -2366,6 +2449,7 @@ def _wait_via_daemon(args: argparse.Namespace, inst: Any, state: dict[str, Any])
         guest_detail=guest_detail, crash=crash, qmp_state=QMP_DAEMON,
         qemu_status=qemu_status, last_event=last_event, event_data=event_data,
         console_tail=_console_tail(inst.serial_log, boot_offset),
+        warnings=warnings,
     )
 
 
@@ -2426,6 +2510,7 @@ def _finish_wait(
     last_event: str | None,
     event_data: Any,
     console_tail: list[str],
+    warnings: Sequence[str] = (),
 ) -> Result:
     """Render one bare-`wait` outcome and map it to the exit code.
 
@@ -2511,9 +2596,14 @@ def _finish_wait(
         exit_code = 0
     elif reason == _WAIT_REASON_TERMINAL_PANIC:
         exit_code = 3
+        result["hint"] = f"Guest PANICKED: qmu crash --vm {inst.vm_id}; then qmu kill --vm {inst.vm_id}"
     else:
         exit_code = 124
-    return Result(data=result, text=lines, stem="wait", exit_code=exit_code)
+        result["hint"] = (
+            "VM still running after --timeout; raise --timeout, or check "
+            f"qmu status --vm {inst.vm_id}; qmu log --vm {inst.vm_id} --tail 50"
+        )
+    return Result(data=result, text=lines, stem="wait", exit_code=exit_code).warn(*warnings)
 
 
 # How long to let a detected crash finish printing before extracting it, and
@@ -2582,9 +2672,35 @@ def _wait_for_pattern(args: argparse.Namespace) -> Result:
 
     if daemon is not None:
         return _pattern_wait_via_daemon(
-            args, inst, start_offset=start_offset, scan_scope=scan_scope
+            args, inst, matcher, start=start, deadline=deadline,
+            start_offset=start_offset, scan_scope=scan_scope,
         )
+    return _pattern_wait_standalone(
+        args, inst, matcher, start=start, deadline=deadline,
+        start_offset=start_offset, scan_scope=scan_scope,
+    )
 
+
+def _pattern_wait_standalone(
+    args: argparse.Namespace,
+    inst: Any,
+    matcher: re.Pattern[str],
+    *,
+    start: float,
+    deadline: float | None,
+    start_offset: int,
+    scan_scope: str,
+    warnings: Sequence[str] = (),
+) -> Result:
+    """The poll loop over the serial log: one `scan_for_pattern` step and one
+    PID-liveness check per tick, until a match, a terminal panic, the process
+    exits, or `deadline` passes.
+
+    Also the continuation of a daemon-backed wait whose subscription the
+    daemon ended (`released`, #118): the scan restarts at `start_offset` —
+    every line before the daemon's cursor had already failed to match, so
+    the verdict is the same — and `start`/`deadline` are the original wait's.
+    """
     tail = SerialTail(inst.serial_log, offset=start_offset)
     matched_line: str | None = None
     reason = "timeout"
@@ -2650,6 +2766,7 @@ def _wait_for_pattern(args: argparse.Namespace) -> Result:
         matched_line=matched_line, reason=reason, crash=crash,
         terminal_panic_seen=terminal_panic_seen, start_offset=start_offset,
         scan_scope=scan_scope, elapsed=time.monotonic() - start,
+        warnings=warnings,
     )
 
 
@@ -2682,18 +2799,32 @@ def _pattern_inconclusive(args: argparse.Namespace, inst: Any, exc: BaseExceptio
 
 
 def _pattern_wait_via_daemon(
-    args: argparse.Namespace, inst: Any, *, start_offset: int, scan_scope: str
+    args: argparse.Namespace,
+    inst: Any,
+    matcher: re.Pattern[str],
+    *,
+    start: float,
+    deadline: float | None,
+    start_offset: int,
+    scan_scope: str,
 ) -> Result:
     """`wait --pattern` served by the daemon: it runs the same per-tick scan
     (`serial.scan_for_pattern`) woken by its 100 ms serial tick, and this
     process blocks on the socket until the verdict. The crash report is read
-    here afterwards, exactly as the standalone loop reads it."""
+    here afterwards, exactly as the standalone loop reads it. A `released`
+    answer hands the rest of the wait to that loop (#118)."""
     try:
         reply = _daemon_wait_request(args, inst, pattern=args.pattern, start_offset=start_offset)
     except daemon_client.DaemonError as exc:
         if exc.fields.get("inconclusive"):
             return _pattern_inconclusive(args, inst, OSError(str(exc)))
         raise QMPError(str(exc)) from exc
+    except _WaitReleased as released:
+        daemon_client.mark_released(inst.vm_id)
+        return _pattern_wait_standalone(
+            args, inst, matcher, start=start, deadline=deadline,
+            start_offset=start_offset, scan_scope=scan_scope, warnings=(released.note,),
+        )
     matched_line = reply.get("matched_line")
     matched_line = matched_line if isinstance(matched_line, str) else None
     reason = str(reply.get("reason", "timeout"))
@@ -2724,6 +2855,7 @@ def _finish_pattern_wait(
     start_offset: int,
     scan_scope: str,
     elapsed: float,
+    warnings: Sequence[str] = (),
 ) -> Result:
     """Render one `--pattern` outcome: 0 match, 3 terminal panic, 1 exit
     without a match, 124 timeout."""
@@ -2775,15 +2907,29 @@ def _finish_pattern_wait(
         ]
     if crash:
         lines_out.append("\nCrash from serial log:\n" + crash)
+    vm, p = inst.vm_id, args.pattern
     if matched:
         exit_code = 0
     elif crash and terminal_panic_seen:
         exit_code = 3
+        result["hint"] = (
+            f"Guest panicked before /{p}/ matched; read it: qmu crash --vm {vm}; "
+            f"then reap: qmu kill --vm {vm}"
+        )
     elif reason == "process_exited":
         exit_code = 1
+        result["hint"] = (
+            f"QEMU exited before /{p}/ matched; read the retained log: "
+            f"qmu log --vm {vm} --tail 100; then qmu prune --vm {vm}"
+        )
     else:
         exit_code = 124
-    return Result(data=result, text=lines_out, stem="wait", exit_code=exit_code)
+        result["hint"] = (
+            f"Pattern /{p}/ did not appear within --timeout; raise --timeout, or "
+            f"check qmu log --vm {vm} --tail 50 for the marker (scan started at "
+            f"byte {start_offset})"
+        )
+    return Result(data=result, text=lines_out, stem="wait", exit_code=exit_code).warn(*warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -3901,8 +4047,21 @@ def _handle_doctor(args: argparse.Namespace) -> Result:
     if not project_sources:
         lines.append("")
         lines.append("Tip: run `qmu config init` to create a starter qmu.toml in this directory.")
+    data: dict[str, Any] = {"ok": all_ok, "checks": checks}
+    if not all_ok:
+        # The envelope's own recovery (#120): name the failing rows and point
+        # at their per-row `hint`s, which are the actual fixes. Never a bare
+        # "run qmu doctor" — this IS doctor.
+        failing = [c for c in checks if c["blocking"]]
+        fixes = "; ".join(f"{c['check']}: {c['hint']}" for c in failing if c["hint"])
+        data["hint"] = (
+            f"Fix the [!] row(s): {', '.join(c['check'] for c in failing)}"
+            + (f" — {fixes}" if fixes else "")
+            + ". Each failing row in `checks[]` carries its own `hint`; "
+            "re-run qmu doctor until exit 0"
+        )
     return Result(
-        data={"ok": all_ok, "checks": checks},
+        data=data,
         text=lines,
         stem="doctor",
         exit_code=0 if all_ok else 1,

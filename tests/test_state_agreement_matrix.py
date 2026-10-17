@@ -3501,6 +3501,104 @@ def test_bare_wait_agrees_with_status_that_the_guest_panicked(
     # The evidence `status` pointed at is still there.
     assert Path(inst.serial_log).exists()
 
+# ---------------------------------------------------------------------------
+# A VM killed under an in-flight `wait` (#118): bare and `--pattern` waits
+# must agree the process EXITED — 0/process_exited and 1/process_exited —
+# whoever owned their liveness: the standalone loop, the daemon's watch, or
+# a daemon that released them mid-wait (explicit `unwatch`, its own
+# shutdown). The daemon-backed pair used to burn their whole timeout
+# (124, `stopped: false`, `last_event: SHUTDOWN`) after a kill that had
+# released the watch first.
+# ---------------------------------------------------------------------------
+
+
+def _wait_owner(monkeypatch, owner):
+    """Who owns the wait's liveness, and the terminal transition it delivers."""
+    if owner == "standalone":
+        _qmp(monkeypatch, True)
+        return
+    state = {
+        "watched": True, "running": True, "qemu_status": "running", "panicked": False,
+        "exited": False, "last_event": None, "epoch_offset": 0,
+        "epoch_source": "banner", "boot_offset": 0,
+    }
+    monkeypatch.setattr(lifecycle, "_daemon_state", lambda inst, adopt=True: dict(state))
+    if owner == "released":
+        _qmp(monkeypatch, True)
+        monkeypatch.setattr(lifecycle.daemon_client, "mark_released", lambda vm_id: None)
+
+        def released(args, inst, *, pattern=None, start_offset=None, warnings=None):
+            raise lifecycle._WaitReleased(
+                f"[qmu] Note: the daemon released VM '{inst.vm_id}' mid-wait (an "
+                "explicit unwatch or a daemon shutdown); the wait finished "
+                "standalone on PID liveness.\n"
+            )
+
+        monkeypatch.setattr(lifecycle, "_daemon_wait_request", released)
+        return
+    monkeypatch.setattr(
+        lifecycle, "_qmp_ctx",
+        lambda inst: pytest.fail("opened QMP while the daemon serves the VM"),
+    )
+
+    def exited(args, inst, *, pattern=None, start_offset=None, warnings=None):
+        if pattern is None:
+            return {
+                "stopped": True, "reason": "process_exited", "elapsed": 0.7,
+                "running": False, "qemu_status": "shutdown", "last_event": "SHUTDOWN",
+                "event_data": {"source": "qmp", "guest": False}, "boot_offset": 0,
+                "panicked": False, "exited": True,
+            }
+        return {
+            "matched_line": None, "reason": "process_exited", "terminal_panic_seen": False,
+            "elapsed": 0.7, "scan_offset": start_offset or 0, "exited": True,
+        }
+
+    monkeypatch.setattr(lifecycle, "_daemon_wait_request", exited)
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+@pytest.mark.parametrize("owner", ["standalone", "daemon", "released"])
+def test_bare_and_pattern_wait_agree_that_a_killed_vm_exited(
+    fmt, owner, cache, monkeypatch, capsys
+):
+    inst = _vm_with_log(cache, VM, "[ 0.0] Linux version 6.12.0 (x) #1\n[ 1.0] serving\n")
+    _register_running(monkeypatch, inst)
+    _wait_owner(monkeypatch, owner)
+    # The kill lands after the wait began: the recorded identity is gone on
+    # the first liveness check either loop makes.
+    monkeypatch.setattr(lifecycle, "instance_alive", lambda i: False)
+    monkeypatch.setattr(lifecycle, "remove_instance", lambda vm_id: None)
+
+    bare_rc = cli.main(["--format", fmt, "wait", "--vm", VM, "--timeout", "5", "--no-clean"])
+    bare = capsys.readouterr()
+    pattern_rc = cli.main([
+        "--format", fmt, "wait", "--vm", VM, "--pattern", "^NEVER_UNIQUE$", "--timeout", "5",
+    ])
+    pattern = capsys.readouterr()
+
+    assert (bare_rc, pattern_rc) == (0, 1), (owner, bare.out, pattern.out)
+    for captured in (bare, pattern):
+        assert "not found" not in captured.out + captured.err
+        assert "still running" not in captured.out and "Timed out" not in captured.out
+    if fmt == "json":
+        bare_payload, pattern_payload = json.loads(bare.out), json.loads(pattern.out)
+        assert bare_payload["stopped"] is True and bare_payload["reason"] == "process_exited"
+        assert bare_payload["guest"] is None and "hint" not in bare_payload
+        assert pattern_payload["matched"] is False
+        assert pattern_payload["reason"] == "process_exited"
+        assert "qmu log --vm" in pattern_payload["hint"]
+        released = [
+            w for p in (bare_payload, pattern_payload)
+            for w in p.get("warnings", []) if "released VM" in w
+        ]
+        assert len(released) == (2 if owner == "released" else 0), released
+    else:
+        assert f"VM '{VM}' stopped (process_exited" in bare.out
+        assert f"VM '{VM}' exited after" in pattern.out and "without matching" in pattern.out
+        notes = (bare.err + pattern.err).count("released VM")
+        assert notes == (2 if owner == "released" else 0), (bare.err, pattern.err)
+
 
 # ---------------------------------------------------------------------------
 # prune --orphans --dry-run names the VM, not just a pid
@@ -3827,3 +3925,169 @@ def test_ssh_probe_duration_is_null_when_no_probe_was_sent(cache, monkeypatch, c
     assert status["guest"] == row["guest"] == "panicked"
     assert status["ssh_probe_ms"] is None and row["ssh_probe_ms"] is None
     assert status["ssh"] == row["ssh"] == "skipped"
+
+
+# ---------------------------------------------------------------------------
+# Every failed *Result* carries a result-specific `hint` (#120, reopened #74).
+# The #74 row above covers exception envelopes; wave 6 shipped it for those
+# only, and the ordinary domain outcomes — `wait` timing out, `crash` finding
+# nothing, `doctor` unhealthy, a guest command exiting 7 — were `ok: false`
+# with no recovery at all. `render` now backstops any `ok: false` without a
+# hint with a neutral generic; this row pins that the known producers do NOT
+# lean on it (the generic is the one string every case must NOT equal) and
+# that the hint never sends the reader to `qmu doctor` for a guest/caller
+# condition.
+# ---------------------------------------------------------------------------
+
+
+class _TimeoutSSH(_ServingSSH):
+    """A guest that answers the liveness probe but whose command outlives
+    --timeout: `ssh.run` raises the SSHError the client raises on expiry."""
+
+    def run(self, command, timeout=30.0, check=False, **kwargs):
+        raise SSHError(f"SSH command timed out after {timeout}s: {command}", stdout="", stderr="")
+
+
+def _wait_timeout_case(cache, monkeypatch):
+    inst = _vm_with_log(cache, VM, "[ 0.0] Linux version 6.12.0 (x) #1\nbooted\n")
+    _qmp(monkeypatch, True)
+    _register_running(monkeypatch, inst)
+    monkeypatch.setattr(lifecycle, "instance_alive", lambda i: True)
+    monkeypatch.setattr(lifecycle, "_PATTERN_POLL_INTERVAL", 0.001)
+    return ["wait", "--vm", VM, "--pattern", "^NEVER$", "--timeout", "0"], 124, ("--timeout",)
+
+
+def _crash_none_case(cache, monkeypatch):
+    inst = _vm_with_log(cache, VM, "[ 0.0] Linux version 6.12.0 (x) #1\nbooted\n")
+    _register_running(monkeypatch, inst)
+    monkeypatch.setattr(guest_mod, "find_instance", lambda vm=None: inst)
+    return (
+        ["crash", "--vm", VM], 1,
+        (f"qmu log --vm {VM} --tail 200", f"qmu crash --vm {VM} --full-history"),
+    )
+
+
+def _doctor_unhealthy_case(cache, monkeypatch):
+    from qmu.config import QMUConfig
+
+    config = QMUConfig(
+        arch="x86_64", net_backend="user", kernel=str(cache / "missing-bzImage"),
+        rootfs=None, ssh_key=None, _sources=["config: fixture"],
+    )
+    monkeypatch.setattr(lifecycle, "resolve_config", lambda **kwargs: config)
+    monkeypatch.setattr(lifecycle, "list_instances", lambda: [])
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(lifecycle, "all_skill_source_dirs", lambda: [])
+    monkeypatch.setattr(lifecycle, "skill_install_roots", lambda: [])
+    monkeypatch.setattr(lifecycle.shutil, "which", lambda name: None)
+    return ["doctor"], 1, ("Fix the [!] row(s)", "checks[]")
+
+
+def _guest_exit_case(cache, monkeypatch):
+    _serving_subject(cache, monkeypatch, _ServingSSH(7, "", "boom\n"))
+    return ["exec", "--vm", VM, "false"], 1, ("exited 7", "stderr")
+
+
+def _guest_timeout_case(cache, monkeypatch):
+    _serving_subject(cache, monkeypatch, _TimeoutSSH())
+    return ["exec", "--vm", VM, "--timeout", "2", "sleep 10"], 124, ("--timeout",)
+
+
+def _compile_failure_case(cache, monkeypatch, tmp_path):
+    _serving_subject(cache, monkeypatch, _ServingSSH(1, "", "x.c:1: error\n"))
+    source = tmp_path / "x.c"
+    source.write_text("int main(){}")
+    return ["compile", "--vm", VM, str(source)], 1, ("compile_stderr", "--cflags")
+
+
+def _dmesg_failure_case(cache, monkeypatch):
+    _serving_subject(cache, monkeypatch, _ServingSSH(1, "", "dmesg: read kernel buffer failed\n"))
+    return ["dmesg", "--vm", VM], 1, ("dmesg exited 1", f"qmu log --vm {VM} --tail 100")
+
+
+def _snapshot_refusal_case(cache, monkeypatch):
+    from qmu.commands import qmp_cmds
+    from qmu.snapshot import SnapshotResult
+
+    _savevm_subject(cache, monkeypatch)
+    monkeypatch.setattr(
+        qmp_cmds, "save_snapshot",
+        lambda qmp, name, timeout: SnapshotResult(False, "Error: boom", reason="hmp"),
+    )
+    return ["snapshot", "save", "clean", "--vm", VM], 1, ("snapshot",)
+
+
+def _prune_refusal_case(cache, monkeypatch):
+    serial = _write_remnant(cache)
+    orphan = {"pid": 4242, "serial_log": str(serial), "cmdline": "qemu"}
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [orphan])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [orphan])
+
+    def refuse(pid, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(lifecycle.os, "kill", refuse)
+    return ["prune", "--orphans"], 1, ("4242", "ps -o user,pid,cmd")
+
+
+_FAILED_RESULT_CASES = {
+    "wait-timeout": _wait_timeout_case,
+    "crash-none": _crash_none_case,
+    "doctor-unhealthy": _doctor_unhealthy_case,
+    "guest-exit-7": _guest_exit_case,
+    "guest-timeout": _guest_timeout_case,
+    "compile-failure": _compile_failure_case,
+    "dmesg-failure": _dmesg_failure_case,
+    "snapshot-refusal": _snapshot_refusal_case,
+    "prune-refusal": _prune_refusal_case,
+}
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+@pytest.mark.parametrize("case", list(_FAILED_RESULT_CASES))
+def test_every_failed_result_carries_a_specific_hint(case, fmt, cache, monkeypatch, capsys, tmp_path):
+    from qmu import _cliutil
+
+    build = _FAILED_RESULT_CASES[case]
+    argv, rc, expected = (
+        build(cache, monkeypatch, tmp_path) if case == "compile-failure"
+        else build(cache, monkeypatch)
+    )
+    generic = _cliutil._BACKSTOP_HINT.format(vm=VM)
+
+    assert cli.main(["--format", fmt, *argv]) == rc
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+
+    assert payload["ok"] is False
+    hint = payload.get("hint")
+    assert isinstance(hint, str) and hint, f"{case}: no hint in {sorted(payload)}"
+    assert hint != generic, f"{case} relies on the render backstop"
+    for fragment in expected:
+        assert fragment in hint, f"{case}: {hint!r} lacks {fragment!r}"
+    assert "qmu doctor" not in hint or case == "doctor-unhealthy", case
+    if fmt == "ndjson":
+        assert out.count("\n") == 1
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_render_backstops_a_failed_result_without_a_hint(fmt, monkeypatch, capsys):
+    """The safety net, in isolation: a handler that forgot the hint still
+    produces an envelope with one (neutral, no `qmu doctor`); a successful
+    Result is left alone."""
+    from qmu._cliutil import Result
+
+    monkeypatch.setattr(
+        lifecycle, "_handle_status",
+        lambda args: Result(data={"ok": False, "vm_id": VM}, text="nope", stem="status", exit_code=1),
+    )
+    assert cli.main(["--format", fmt, "status", "--vm", VM]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hint"] == f"qmu status --vm {VM}; qmu log --vm {VM} --tail 50"
+
+    monkeypatch.setattr(
+        lifecycle, "_handle_status",
+        lambda args: Result(data={"ok": True, "vm_id": VM}, text="fine", stem="status"),
+    )
+    assert cli.main(["--format", fmt, "status", "--vm", VM]) == 0
+    assert "hint" not in json.loads(capsys.readouterr().out)

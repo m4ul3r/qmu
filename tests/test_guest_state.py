@@ -619,7 +619,8 @@ def test_dmesg_guest_exit255_on_a_live_guest_is_not_a_crash(dmesg_ssh, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert rc == 1
     assert fake.is_ready_calls >= 1
-    assert set(payload) == {"ok", "exit_code", "text", "stderr", "vm_id"}
+    assert set(payload) == {"ok", "exit_code", "text", "stderr", "vm_id", "hint"}
+    assert "crash_detected" not in payload and "ssh_error" not in payload
     assert payload["exit_code"] == 255
 
 

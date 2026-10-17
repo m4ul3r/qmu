@@ -645,8 +645,19 @@ def test_doctor_blocks_on_a_configured_initrd_that_is_missing(
     assert row["detail"].startswith("./initramfs.cpio.gz (not found) — resolves to ")
     assert "launch will fail with `Initrd not found`" in row["detail"]
     assert row["hint"] == "set [boot] initrd in qmu.toml or pass --initrd"
+    # #120: the unhealthy envelope itself carries a hint that names the
+    # failing row(s) and their fixes — not a bare "run qmu doctor".
+    assert payload["hint"].startswith("Fix the [!] row(s): initrd — initrd: set [boot] initrd")
+    assert "checks[]" in payload["hint"]
     cli.main(["doctor"])
     assert "[!] initrd: ./initramfs.cpio.gz (not found)" in capsys.readouterr().out
+
+
+def test_doctor_healthy_envelope_carries_no_hint(doctor_env, monkeypatch, capsys):
+    _passt_ok(monkeypatch)
+    rc, payload = _run_json_doctor(capsys)
+    assert rc == 0 and payload["ok"] is True
+    assert "hint" not in payload
 
 
 def test_doctor_passes_a_configured_initrd_that_exists(

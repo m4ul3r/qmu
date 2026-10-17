@@ -13,6 +13,7 @@ import argparse
 import os
 import signal
 import time
+from typing import Any
 
 from .. import daemon_client
 from ..config import resolve_config
@@ -110,8 +111,13 @@ def _handle_daemon_stop(args: argparse.Namespace) -> Result:
                 pass
             gone = _wait_gone(pid)
             daemon_client._remove_stale(None)
+            data: dict[str, Any] = {
+                "ok": gone, "stopped": gone, "pid": pid, "signalled": True,
+            }
+            if not gone:
+                data["hint"] = _still_alive_hint(pid)
             return Result(
-                data={"ok": gone, "stopped": gone, "pid": pid, "signalled": True},
+                data=data,
                 text=f"Daemon pid {pid} did not answer its socket; sent SIGTERM"
                      + ("." if gone else " but it is still alive."),
                 stem="daemon",
@@ -130,15 +136,28 @@ def _handle_daemon_stop(args: argparse.Namespace) -> Result:
         except (daemon_client.DaemonError, daemon_client.DaemonUnavailable):
             pass
     gone = _wait_gone(info["pid"])
+    data = {
+        "ok": gone, "stopped": gone, "pid": info["pid"],
+        "watched": len(info.get("vms", [])),
+    }
+    if not gone:
+        data["hint"] = _still_alive_hint(info["pid"])
     return Result(
-        data={"ok": gone, "stopped": gone, "pid": info["pid"],
-              "watched": len(info.get("vms", []))},
+        data=data,
         text=(
             f"Daemon pid {info['pid']} stopped." if gone
             else f"Daemon pid {info['pid']} was asked to stop but is still alive."
         ),
         stem="daemon",
         exit_code=0 if gone else 1,
+    )
+
+
+def _still_alive_hint(pid: int) -> str:
+    return (
+        f"The daemon (pid {pid}) is still alive 5 s after being asked to stop; "
+        f"re-run qmu daemon stop, or `kill -TERM {pid}` (`kill -KILL {pid}` as "
+        "a last resort), then qmu daemon status"
     )
 
 

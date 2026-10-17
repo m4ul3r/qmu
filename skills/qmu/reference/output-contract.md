@@ -40,19 +40,34 @@ object with `"ok": <bool>` — the single, command-agnostic success predicate.
   format emits `{"ok": false, "error": …, "error_type": "UsageError",
   "usage": …, "hint": …}` on stdout. `run --harness` is this class.
 
-**Every exception-path `ok: false` envelope carries `hint`** — the next
-command to run (launch's `no-console-output`/timeout envelopes carry one too). A
-raise site that knows the recovery names it (`qmu log --vm X --tail 50`,
-`relaunch with --ssh-port N`); otherwise the hint is the `error_type`
-default: `SSHError` → `qmu status --vm X; qmu log --vm X --tail 50`,
+**Every `ok: false` envelope carries `hint`**, whichever of the three shapes
+produced it — the next command to run. On an exception path a raise site that
+knows the recovery names it (`qmu log --vm X --tail 50`, `relaunch with
+--ssh-port N`); otherwise the hint is the `error_type` default:
+`SSHError` → `qmu status --vm X; qmu log --vm X --tail 50`,
 `QMPError` → `qmu status --vm X` (`QMPBusyError`: retry when the other
 client finishes; `QMPTimeoutError`: retry with a larger `--timeout`),
 `ConfigError` → `qmu config show` / `qmu doctor`, `UsageError` → `qmu <sub>
 --help`, anything else → `qmu status --vm X for VM state; qmu doctor for the
 host environment` (doctor checks the host, never a guest path or a VM's
 state — a transfer the guest filesystem refused names the guest path and the
-`qmu exec … ls -ld` that inspects it instead). Text mode prints `[qmu] Hint: …`
-after the error line only for a site-specific hint, never for a type default.
+`qmu exec … ls -ld` that inspects it instead).
+A result-style failure sets its hint at the producer, specific to the
+outcome: a guest exit N → `see stderr; qmu exec --vm X 'dmesg | tail -n 30'`
+(or `qmu crash --vm X` when a kernel report was captured during the command),
+a guest `--timeout` → raise it, `crash` with no current report → `qmu log --vm
+X --tail 200` / `qmu crash --vm X --full-history`, `doctor` unhealthy → the
+failing rows and their per-row `hint`s, `wait` timeout → raise `--timeout` /
+`qmu log --vm X --tail 50`, `compile` failure → `compile_stderr` /
+`--cflags`/`--host-build`, `prune --orphans` kill failure → the pid and `ps`.
+None of these send you to `qmu doctor`: it checks the host, not the guest or
+the caller's arguments. The renderer backstops any `ok: false` that reached it
+without a hint with the neutral `qmu status --vm X; qmu log --vm X --tail 50`
+— a safety net for a producer that forgot, never the intended answer (the
+test matrix pins that the known producers do not rely on it). Text mode prints
+`[qmu] Hint: …` after an error line only for a site-specific exception hint,
+never for a type default; result-style hints are JSON-only (text mode already
+prints the report and its `[exit code: N]`/follow-up notes).
 
 **`warnings: [str]`** rides in every json/ndjson envelope that has
 something to warn about — launch-time lints, the debugger-coherence warnings
