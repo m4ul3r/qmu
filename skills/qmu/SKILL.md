@@ -369,16 +369,15 @@ is exit 1 `QMUError`; the same words inside data (a snapshot tagged
 - `pry` bridges are host-global: `pry --instance qmu-<vm>` (or `<pid>`).
 - A matched marker or a green run is not a verified claim: `reference/evidence-contract.md`.
 
-## Files on disk and the daemon
+## Files on disk, the daemon, and MCP
 
-State lives under `~/.cache/qmu/instances/` (`$QMU_CACHE_DIR`): `<name>.json`,
-`<name>.serial.log` (read via `qmu log`; write-only — use SSH), `<name>.qmp.sock`,
-`<name>.qemu.log`. `kill` removes all four unless the guest is `crashed`/
-`panicked` or `--no-clean` (then `prune --vm X`). Prune modes: `reference/cache.md`.
-A per-user **daemon** (`<cache>/daemon.sock`, autostarted, idles out after 600 s)
-owns each running VM's one QMP connection: it observes RESET/STOP/SHUTDOWN
-(`status`: `qmp: daemon`, `guest_epoch_source: observed`), proxies QMP so concurrent
-commands never see `busy`, and wakes `wait` without polling. `QMU_DAEMON=off` disables it per process: `reference/daemon.md`.
+State lives under `~/.cache/qmu/instances/` (`$QMU_CACHE_DIR`): `<name>.json`, `<name>.serial.log` (read via `qmu log`;
+write-only — use SSH), `<name>.qmp.sock`, `<name>.qemu.log`. `kill` removes all four unless the guest is `crashed`/`panicked`
+or `--no-clean` (then `prune --vm X`). Prune modes: `reference/cache.md`.
+A per-user **daemon** (`<cache>/daemon.sock`, autostarted, idles out after 600 s) owns each running VM's one QMP connection: it observes
+RESET/STOP/SHUTDOWN (`status`: `qmp: daemon`, `guest_epoch_source: observed`), proxies QMP so concurrent commands never see `busy`, and
+wakes `wait` without polling; `QMU_DAEMON=off` disables it per process: `reference/daemon.md`. `qmu mcp serve` exposes every subcommand as an
+MCP tool (`qmu_<sub>` / `qmu_<group>_<sub>`, plus `qmu_argv` for a raw argv) returning this same envelope with `exit_code` added — register once with `claude mcp add qmu -- qmu mcp serve`: `reference/mcp.md`.
 
 ## Reference files
 
@@ -398,3 +397,4 @@ Read on demand with `read skill://qmu/reference/<file>.md`:
 | `reference/cross-arch.md` | aarch64/arm32 guests, `compile --host` toolchains, multiarch gdb |
 | `reference/cache.md` | cache layout, `prune` modes, `cache du/ls` |
 | `reference/daemon.md` | the per-user daemon: what it owns, autostart/`QMU_DAEMON`, `daemon status/stop`, stale socket |
+| `reference/mcp.md` | `qmu mcp serve`: registration, tool naming, envelope + `exit_code`, resources, progress, limits |

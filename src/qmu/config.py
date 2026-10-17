@@ -3,6 +3,7 @@ from __future__ import annotations
 import platform
 import tomllib
 from collections.abc import Iterable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from difflib import get_close_matches
 from pathlib import Path
@@ -761,7 +762,12 @@ def _with_recovery(exc: ConfigError, recovery: str) -> ConfigError:
 # Nothing is written here: the warning fires in the config gate BEFORE the
 # handler runs, and the renderer attaches it to the command's Result so it
 # reaches stderr in every mode AND the JSON envelope's `warnings[]` (#74).
-_global_config_warnings: list[str] = []
+# A ContextVar holding a tuple, not a module-level list: the MCP façade
+# dispatches concurrent commands in separate contexts, and a shared list would
+# hand one command's warning to another's envelope.
+_global_config_warnings: ContextVar[tuple[str, ...]] = ContextVar(
+    "qmu_global_config_warnings", default=()
+)
 
 
 def reset_global_config_warnings() -> None:
@@ -769,13 +775,13 @@ def reset_global_config_warnings() -> None:
     cli._parse (so the dedup is per-command, not per-process) and by the test
     suite's isolate_qmu_env fixture (so a warning from one test cannot mask
     the same message in the next)."""
-    _global_config_warnings.clear()
+    _global_config_warnings.set(())
 
 
 def global_config_warnings() -> tuple[str, ...]:
     """The `[qmu] Warning: …` lines recorded by resolve_config() since the last
     reset, in order, newline-terminated — the shape `Result.warnings` takes."""
-    return tuple(_global_config_warnings)
+    return _global_config_warnings.get()
 
 
 def resolve_config(
@@ -813,8 +819,8 @@ def resolve_config(
                 "problem": exc.describe_problem(),
             })
             warning = f"[qmu] Warning: ignoring global config: {exc}\n"
-            if warning not in _global_config_warnings:
-                _global_config_warnings.append(warning)
+            if warning not in _global_config_warnings.get():
+                _global_config_warnings.set(_global_config_warnings.get() + (warning,))
 
     # Layer 2: project config (or explicit --config). Unlike the project
     # search (which simply finds nothing when no qmu.toml exists upward from

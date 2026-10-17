@@ -38,7 +38,7 @@ source edits take effect immediately with no reinstall; dogfood with
 ### CLI is a command package with a strict one-way dependency DAG
 
 ```
-cli.py  ->  commands/{lifecycle,guest,qmp_cmds,meta}  ->  _cliutil.py  ->  domain modules
+mcp_server.py  ->  cli.py  ->  commands/{lifecycle,guest,qmp_cmds,meta,daemon_cmds,mcp_cmds}  ->  _cliutil.py  ->  domain modules
 ```
 
 - `cli.py` is *only* `invoke()`/`main()`: it builds the argparse tree (calling
@@ -50,6 +50,9 @@ cli.py  ->  commands/{lifecycle,guest,qmp_cmds,meta}  ->  _cliutil.py  ->  domai
   serial-facing).
 - `commands/qmp_cmds.py` — snapshot, gdb, cont, qmp (raw), monitor (HMP).
 - `commands/meta.py` — config, rootfs, skill, version.
+- `commands/daemon_cmds.py` — daemon run/start/stop/status.
+- `commands/mcp_cmds.py` — `mcp serve` (runs `mcp_server.serve_stdio`).
+- `mcp_server.py` — the MCP façade, *above* `cli.py` (see below).
 - `_cliutil.py` — shared helpers (`Result`/`render`, `_kill_vm`, arg-option
   registrars, config resolution, QMP/SSH context). Bottom of the DAG; never
   imports `cli` or `commands.*`.
@@ -61,6 +64,36 @@ what makes them patchable: tests patch the *owning* command module, e.g.
 `guest._make_ssh` for `exec` — not `cli.*`. Patching works because each
 `_add_*` looks up the handler name at `main()`-call time, so a test that patches
 a module attribute before calling `cli.main([...])` is seen by dispatch.
+
+### MCP façade (`mcp_server.py`, `commands/mcp_cmds.py`)
+
+`qmu mcp serve` is a renderer substitute over the CLI, not a second command
+layer, and two rules keep it that way: **it never renders and it never
+re-implements a handler.** The tool list is walked out of `cli.build_parser()`
+at startup — one tool per argparse leaf, `qmu_<sub>` / `qmu_<group>_<sub>`,
+schema from the actions (`type`/`choices`/`nargs`/store-true, `help` first
+sentence), `--format`/`--out` omitted — so a new `_add_*` leaf is a new tool
+with no edit in `mcp_server.py` (`tests/test_mcp.py` walks the parser
+independently and diffs). Excluded on purpose: `mcp`, `daemon run`, `skill
+install`, `rootfs shell`. A call becomes argv (options, then `--`, then
+positionals in order — one string is one token, the `exec`/`run` rule) and
+runs `cli.main(["--format", "json", *argv])` with `sys.stdout` captured
+per worker thread (`_ThreadStdout`); the captured JSON, parsed back and
+given `exit_code`, is the result. That is why the envelope, the `UsageError`
+shape, spill pointers and `warnings[]` are byte-identical to the CLI's:
+they *are* the CLI's. Errors are results (`isError` mirrors `ok`), never
+protocol errors. `qmu_argv` passes a raw argv through (refusing the managed
+`--format`/`--out`); `qmu://vms` and `qmu://vm/{id}/log` are `list` and
+`log --tail 200` through the same path. Tool calls run concurrently in
+worker threads, which is why `instance._autoselected_vm` and
+`config._global_config_warnings` are `ContextVar`s, not module globals.
+Progress: `daemon_client.progress_sink` (a ContextVar, default no-op) is
+set per call; the daemon-backed `wait` (`lifecycle._daemon_wait_request`)
+calls `daemon_client.report_progress(elapsed, scanned, note)` on each
+daemon `progress` (≤1/s) or QMP event, and the façade relays it as
+`notifications/progress`. Keep tool descriptions to one sentence:
+`mcp_server.schema_cost()` measures the serialised `tools/list` (~5.4k
+tokens for 38 tools); trim descriptions, never tools, if it grows past ~12k.
 
 ### Exit-code contract (see the epilog in `cli.py:main`)
 

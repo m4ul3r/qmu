@@ -35,7 +35,7 @@ from ._cliutil import (
     _resolve_config_from_args,
     render,
 )
-from .commands import daemon_cmds, guest, lifecycle, meta, qmp_cmds, run
+from .commands import daemon_cmds, guest, lifecycle, mcp_cmds, meta, qmp_cmds, run
 
 # Re-exported solely so test_snapshot_exit can reach it as ``cli._snapshot_failed``.
 from .commands.qmp_cmds import _snapshot_failed  # noqa: F401
@@ -52,10 +52,12 @@ from .commands.qmp_cmds import _snapshot_failed  # noqa: F401
 # whether the project is valid. Exempt verbs: those that never read
 # qmu.toml (skill/version), author it (config init), diagnose it
 # read-only (doctor), or operate purely on host artifact dirs
-# (cache/rootfs build-side). Gated handlers may resolve again; the
-# resolution is idempotent and the error identical.
+# (cache/rootfs build-side). `mcp serve` is a long-lived server: each tool
+# call dispatches through this gate itself, so the error lands in that
+# call's envelope rather than refusing to start. Gated handlers may resolve
+# again; the resolution is idempotent and the error identical.
 _CONFIG_EXEMPT_SUBCOMMANDS = frozenset({
-    "cache", "config", "doctor", "rootfs", "skill", "version",
+    "cache", "config", "doctor", "mcp", "rootfs", "skill", "version",
 })
 
 
@@ -173,6 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     qmp_cmds._add_monitor(sub)
     meta._add_rootfs(sub)
     daemon_cmds._add_daemon(sub)
+    mcp_cmds._add_mcp(sub)
     meta._add_skill(sub)
     meta._add_version(sub)
     return parser

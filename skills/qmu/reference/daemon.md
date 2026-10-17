@@ -37,7 +37,10 @@ unchanged (none of those keys appear).
 `wait` (bare and `--pattern`) blocks on the daemon socket and is woken by the
 tick/event stream — the client does not poll. Verdicts, exit codes and the
 JSON shape are identical to the standalone loop (`qmp: "daemon"` in the bare
-wait's envelope); `last_event` is the real QMP event name.
+wait's envelope); `last_event` is the real QMP event name. While a wait is
+in flight the daemon also streams a `progress` event (elapsed, scanned byte)
+at most once per second; the CLI ignores it, the MCP façade relays it to its
+client (`reference/mcp.md`).
 
 ## Autostart, opt-out, lifecycle
 

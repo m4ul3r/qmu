@@ -786,15 +786,29 @@ class Daemon:
             if event is not None:
                 session.send_event(request_id, event)
 
+        # A `progress` event at most once per second while the wait is idle,
+        # so an in-process caller (the MCP façade) can relay liveness to its
+        # client; the CLI ignores it. `scanned` is the serial-log byte the
+        # scan has reached.
+        last_progress = start
+
+        def progress(scanned: int) -> None:
+            nonlocal last_progress
+            now = time.monotonic()
+            if now - last_progress < 1.0:
+                return
+            last_progress = now
+            stream({"kind": "progress", "elapsed": round(now - start, 3), "scanned": scanned})
+
         if pattern is None:
-            return self._wait_bare(session, watch, start, deadline, pending_event, stream)
+            return self._wait_bare(session, watch, start, deadline, pending_event, stream, progress)
         return self._wait_pattern(
-            session, watch, start, deadline, pending_event, stream,
+            session, watch, start, deadline, pending_event, stream, progress,
             pattern=pattern, start_offset=start_offset, ignore_crash=ignore_crash,
         )
 
     def _wait_bare(
-        self, session, watch: VMWatch, start, deadline, pending_event, stream
+        self, session, watch: VMWatch, start, deadline, pending_event, stream, progress
     ) -> dict[str, Any]:
         reason = "timeout"
         stopped = False
@@ -823,6 +837,7 @@ class Daemon:
                     self.cond.wait(1.0 if remaining is None else min(1.0, remaining))
             # Sent outside the lock: a slow client must not stall the tick.
             stream(event)
+            progress(watch.scanned)
         stream(event)
         return {
             "stopped": stopped,
@@ -838,7 +853,7 @@ class Daemon:
         }
 
     def _wait_pattern(
-        self, session, watch: VMWatch, start, deadline, pending_event, stream, *,
+        self, session, watch: VMWatch, start, deadline, pending_event, stream, progress, *,
         pattern: str, start_offset: int | None, ignore_crash: bool,
     ) -> dict[str, Any]:
         try:
@@ -858,6 +873,7 @@ class Daemon:
                 if session.closed.is_set():
                     raise _ClientGone()
             stream(event)
+            progress(tail.offset)
             try:
                 scan = scan_for_pattern(tail, matcher, final=final, stop_at_panic=not ignore_crash)
             except OSError as exc:
