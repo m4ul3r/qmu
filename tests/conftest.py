@@ -11,6 +11,15 @@ Seams (see src/qmu/paths.py):
   * QMU_TEMP_DIR    -> paths.runtime_root()      (spills, SSH control sockets)
   * TMPDIR          -> tempfile.gettempdir()     (runtime fallback and shell tests)
   * HOME            -> paths.skill_install_roots() and every *_home() default
+  * QMU_DAEMON=off  -> daemon_client.enabled()   (no daemon connect, no spawn)
+
+The daemon layer (#70) is OFF for every test by default: with it on, any
+handler that opens QMP would try to reach — and spawn — a per-cache-dir
+daemon, a real detached process that would outlive the test. The isolated
+QMU_CACHE_DIR keeps such a daemon from ever meeting the developer's real one,
+but the suite must stay a pure unit suite; the tests that exercise the daemon
+(tests/test_daemon*.py) opt back in explicitly with `QMU_DAEMON=require` and
+their own cache dir.
 Individual tests may further override these (e.g. test_config.py sets its own
 QMU_CONFIG_DIR and chdir's into an empty dir); that is fine — monkeypatch within
 a test wins over this autouse default and is undone at test teardown.
@@ -37,6 +46,7 @@ from pathlib import Path
 
 import pytest
 
+from qmu import daemon_client
 from qmu.config import reset_global_config_warnings
 
 
@@ -66,8 +76,10 @@ def isolate_qmu_env(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("QMU_TEMP_DIR", str(runtime_dir))
     monkeypatch.setenv("TMPDIR", str(tmp_dir))
     monkeypatch.setenv("HOME", str(home_dir))
+    monkeypatch.setenv("QMU_DAEMON", "off")
     for var in ("CLAUDE_HOME", "CODEX_HOME", "AGENTS_HOME", "PI_CODING_AGENT_DIR"):
         monkeypatch.delenv(var, raising=False)
+    daemon_client.reset()
 
     # TMPDIR is honored by tempfile.gettempdir() when tests exercise the
     # platform-temp fallback.
