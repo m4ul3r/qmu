@@ -77,7 +77,9 @@ anti-pattern in `skill://qmu/reference/cross-arch.md`).
   `running:false` state (`paused`, `debug`, `restore-vm`, `prelaunch`, …)
   fails in ~0.1 s with exit 1, `guest_state:"paused"`, `qemu_status`,
   `ssh_error:false`, `crash_detected:false` and a `qmu cont` / `pry continue`
-  hint; text mode prints `[qmu] Error: VM 'X' is debug (vCPU halted).` on
+  hint — except `restore-vm` (a failed mid-restore `snapshot load`), whose
+  hint is a known-good `snapshot load` or `kill` + relaunch and which `qmu
+  cont` itself refuses (`snapshots.md`); text mode prints `[qmu] Error: VM 'X' is debug (vCPU halted).` on
   stderr (the word is QEMU's status name: `debug` for a breakpoint stop,
   `paused` after `qmu gdb`/`stop`). A breakpoint that fires **during**
   `exec`/`compile --run`/`dmesg` is caught by the same QMP watch within ~1 s:

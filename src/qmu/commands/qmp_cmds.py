@@ -48,11 +48,13 @@ from ..debug import (
 from .._cliutil import (
     _add_common_opts,
     _emit,
+    _emit_refusal,
     _make_group_help_handler,
     _make_ssh,
     _preflight_ssh_guest,
     _require_ssh,
     _qmp_ctx,
+    _stopped_guest_payload,
 )
 
 
@@ -679,12 +681,34 @@ def _add_cont(sub: argparse._SubParsersAction) -> None:
         help="Resume a vCPU halted by the debugger (issues QMP cont)",
     )
     _add_common_opts(p)
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Resume even when QEMU reports `restore-vm` (a snapshot load that "
+             "failed mid-restore left the disks rewound under un-restored "
+             "device state). Without it `cont` refuses with exit 1.",
+    )
     p.set_defaults(handler=_handle_cont)
 
 
 def _handle_cont(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
     with _qmp_ctx(inst) as qmp:
+        before = qmp.execute("query-status")
+        before_state = (
+            before.get("status") if isinstance(before, dict) else None
+        )
+        # #110: `restore-vm` is the one halt `cont` must not be the answer
+        # to. A `snapshot load` that failed mid-restore leaves the disk
+        # rewound and the devices not; resuming that machine performs the
+        # inconsistent resume the failed load refused. The recovery is a
+        # known-good load or a relaunch — the same hint `exec` gives.
+        if before_state == "restore-vm" and not args.force:
+            data, text = _stopped_guest_payload(inst, "restore-vm")
+            data["hint"] += " To resume anyway: qmu cont --vm " + inst.vm_id + " --force."
+            text.append(f"Override: qmu cont --vm {inst.vm_id} --force")
+            _emit_refusal(args, data=data, text=text, stem="cont")
+            return 1
         # Resume the guest. QMP "cont" returns {} on success; if the VM is
         # already running QEMU raises an error, which surfaces as QMPError.
         qmp.execute("cont")
@@ -692,12 +716,12 @@ def _handle_cont(args: argparse.Namespace) -> int:
     run_state = (
         status.get("status", "unknown") if isinstance(status, dict) else str(status)
     )
-    _emit(
-        args,
-        data={"ok": True, "vm_id": inst.vm_id, "status": run_state},
-        text=f"VM '{inst.vm_id}' resumed (status: {run_state})",
-        stem="cont",
-    )
+    data = {"ok": True, "vm_id": inst.vm_id, "status": run_state}
+    text = f"VM '{inst.vm_id}' resumed (status: {run_state})"
+    if before_state == "restore-vm":
+        data["forced"] = True
+        text += " — forced out of restore-vm; the machine state may be inconsistent"
+    _emit(args, data=data, text=text, stem="cont")
     return 0
 
 

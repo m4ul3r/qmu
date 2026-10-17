@@ -411,3 +411,76 @@ def test_malformed_command_is_rejected_before_choosing_the_instance(
     monkeypatch.setattr(qmp_cmds, "choose_instance", _boom)
     assert cli.main(["qmp", "not json"]) == 1
     assert "pass the bare method name" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# `qmu cont` and a guest left in `restore-vm` by a failed snapshot load (#110)
+# ---------------------------------------------------------------------------
+
+
+class _RestoreVMQMP(FakeQMP):
+    """QEMU after a `loadvm` that failed mid-restore: `restore-vm` until `cont`."""
+
+    def __init__(self, status="restore-vm") -> None:
+        super().__init__()
+        self.status = status
+
+    def execute(self, command, args=None):
+        self.calls.append((command, args))
+        if command == "cont":
+            self.status = "running"
+            return {}
+        return {"status": self.status, "running": self.status == "running"}
+
+
+@pytest.fixture()
+def restore_vm(monkeypatch):
+    fake = _RestoreVMQMP()
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: _FakeInst())
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(fake)
+    )
+    return fake
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+def test_cont_refuses_a_partially_restored_guest(restore_vm, capsys, fmt):
+    rc = cli.main(["--format", fmt, "cont", "--vm", "dev"])
+    out, err = capsys.readouterr()
+
+    assert rc == 1
+    assert ("cont", None) not in restore_vm.calls, "cont was sent anyway"
+    assert restore_vm.status == "restore-vm"
+    if fmt == "json":
+        payload = json.loads(out)
+        assert payload["ok"] is False
+        assert payload["qemu_status"] == "restore-vm"
+        assert "snapshot load" in payload["hint"]
+        assert "--force" in payload["hint"]
+    else:
+        assert out == ""
+        assert "restore-vm" in err and "--force" in err
+
+
+def test_cont_force_resumes_a_partially_restored_guest(restore_vm, capsys):
+    rc = cli.main(["--format", "json", "cont", "--vm", "dev", "--force"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert ("cont", None) in restore_vm.calls
+    assert payload == {"ok": True, "vm_id": "dev", "status": "running", "forced": True}
+
+
+def test_cont_resumes_an_ordinary_pause_without_force(monkeypatch, capsys):
+    fake = _RestoreVMQMP(status="paused")
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: _FakeInst())
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(fake)
+    )
+
+    rc = cli.main(["--format", "json", "cont", "--vm", "dev"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert ("cont", None) in fake.calls
+    assert payload == {"ok": True, "vm_id": "dev", "status": "running"}

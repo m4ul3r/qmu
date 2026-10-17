@@ -31,6 +31,7 @@ import pytest
 from qmu.output import (
     TOKEN_ESTIMATOR,
     OutputWriteResult,
+    write_bytes_result,
     write_output_result,
     render_value,
     _estimate_tokens,
@@ -182,6 +183,39 @@ def test_json_spill_envelopes_are_unchanged(isolate_spill_runtime, fmt):
     )
     assert res.spilled is True
     assert json.loads(res.rendered) == res.artifact
+
+
+@pytest.mark.parametrize("explicit_out", [True, False])
+def test_bytes_artifact_carries_the_source_outcome_not_the_write(
+    isolate_spill_runtime, tmp_path, explicit_out
+):
+    """#108: a text `--out` for a failed guest command said `ok: true`
+    because the byte writer defaulted the envelope to its own success. The
+    envelope's `ok`/`exit_code` are the source operation's, on both the
+    explicit `--out` path and the automatic spill, and the bytes are exact."""
+    res = write_bytes_result(
+        b"nope",
+        out_path=tmp_path / "failed.bin" if explicit_out else None,
+        stem="exec",
+        spill_token_limit=0,
+        source_ok=False,
+        exit_code=7,
+    )
+
+    assert res.artifact is not None
+    assert res.artifact["ok"] is False
+    assert res.artifact["exit_code"] == 7
+    assert res.spilled is not explicit_out
+    assert Path(res.artifact["artifact_path"]).read_bytes() == b"nope"
+
+
+def test_bytes_artifact_omits_exit_code_when_unknown(tmp_path):
+    res = write_bytes_result(
+        b"x" * 100, out_path=tmp_path / "o.bin", stem="exec", source_ok=True
+    )
+
+    assert res.artifact["ok"] is True
+    assert "exit_code" not in res.artifact
 
 
 def test_auto_spill_writes_valid_ownership_marker():

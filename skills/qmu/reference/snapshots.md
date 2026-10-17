@@ -84,7 +84,11 @@ A `load` whose HMP `loadvm` fails is exit 1, `ok:false` with `error`,
   `restore-vm`; `exec`/`push`/`pull`/`compile`/`dmesg` refuse with
   `guest_state: "paused"`) and the hint says `Do not resume it blindly with
   qmu cont`: recover with a known-good `qmu snapshot load <tag> --vm X` or
-  `qmu kill --vm X` + `qmu launch`. The recovery load needs no `qmu cont`:
+  `qmu kill --vm X` + `qmu launch`. `qmu cont --vm X` enforces this: against
+  `qemu_status: "restore-vm"` it refuses (exit 1, no `cont` sent) and names
+  the same two recoveries; `qmu cont --force` sends it anyway, for an
+  operator who accepts an inconsistent machine — ordinary `paused`/`debug`
+  halts are unaffected. The recovery load needs no `qmu cont`:
   QEMU alone would leave a `restore-vm` guest stopped (`loadvm` only restarts
   a guest that was running), so qmu issues `cont` in exactly that case and
   the success envelope says so (`resumed: true`, text `Guest resumed (it was

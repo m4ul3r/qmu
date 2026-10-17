@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from unittest import mock
 
 import pytest
@@ -61,8 +63,8 @@ def _inject_with_fake_guestfish(tmp_path, guest, mkdir=False, *, dir_exists=True
     local.write_text("payload")
     image = tmp_path / "rootfs.img"
     image.write_text("disk")
-    answer = "true\n" if dir_exists else "false\n"
-    completed = mock.Mock(returncode=0, stderr="", stdout=answer)
+    answer = b"true\n" if dir_exists else b"false\n"
+    completed = mock.Mock(returncode=0, stderr=b"", stdout=answer)
     with mock.patch.object(rootfs_mod, "_require_guestfish", return_value="guestfish"):
         with mock.patch.object(rootfs_mod.subprocess, "run", return_value=completed):
             rootfs_mod.inject(
@@ -171,9 +173,10 @@ def test_preflight_inject_opens_read_only_and_skips_the_busy_guard(tmp_path, mon
         lambda img: pytest.fail("preflight must not take the write guard"),
     )
 
-    def fake_run(cmd, input=None, text=None, capture_output=None):
+    def fake_run(cmd, input=None, capture_output=None):
         seen["cmd"] = cmd
-        return mock.Mock(returncode=0, stderr="", stdout="false\n")
+        assert isinstance(input, bytes), "guestfish transport must be byte-exact"
+        return mock.Mock(returncode=0, stderr=b"", stdout=b"false\n")
 
     monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
 
@@ -187,13 +190,13 @@ def test_preflight_inject_opens_read_only_and_skips_the_busy_guard(tmp_path, mon
         rootfs_mod.preflight_inject("/no/img", [(str(local), "/root")], partition=0)
 
 
-def _stat_block(mode: int, size: int, uid: int = 0, gid: int = 0, mtime: int = 0) -> str:
+def _stat_block(mode: int, size: int, uid: int = 0, gid: int = 0, mtime: int = 0) -> bytes:
     return (
         f"st_dev: 2048\nst_ino: 306\nst_mode: {mode}\nst_nlink: 1\nst_uid: {uid}\n"
         f"st_gid: {gid}\nst_rdev: 0\nst_size: {size}\nst_blksize: 4096\nst_blocks: 8\n"
         f"st_atime_sec: 1\nst_atime_nsec: 0\nst_mtime_sec: {mtime}\n"
         f"st_mtime_nsec: 0\nst_ctime_sec: 1\nst_ctime_nsec: 0\n"
-    )
+    ).encode()
 
 
 def _guestfish_unquote(token: str) -> str:
@@ -214,37 +217,47 @@ def _guestfish_unquote(token: str) -> str:
     return "".join(out)
 
 
-def _fake_guestfish(tree: dict[str, dict[str, tuple]]):
+def _b(s: str | bytes) -> bytes:
+    return s if isinstance(s, bytes) else s.encode("utf-8", "surrogateescape")
+
+
+def _fake_guestfish(tree: dict[str, dict[str | bytes, tuple]]):
     """A subprocess.run double that behaves like guestfish for the commands
     `listdir` emits: `ls0 DIR -` (NUL-terminated names), `-readlink P`
     (target + newline for symlinks, nothing otherwise) and `lstatns P`.
-    `tree` is {dir: {name: (st_mode, size, uid, gid, target)}}."""
+    `tree` is {dir: {name: (st_mode, size, uid, gid, target)}}; names and
+    targets may be bytes to model a guest that is not UTF-8. Like the real
+    guestfish it reads and writes raw bytes, so a `\\r` in a name survives
+    only if the caller never puts the pipe in text mode."""
     import posixpath
+
+    btree = {d: {_b(n): v for n, v in entries.items()} for d, entries in tree.items()}
 
     def lookup(path):
         d, n = posixpath.split(path)
-        return tree[d][n]
+        return btree[d][_b(n)]
 
-    def run(cmd, input=None, text=None, capture_output=None):
+    def run(cmd, input=None, capture_output=None):
+        assert isinstance(input, bytes), "guestfish transport must be byte-exact"
         out = []
-        for line in input.split("\n"):
+        for line in input.decode("utf-8", "surrogateescape").split("\n"):
             if not line:
                 continue
             verb, _, rest = line.partition(" ")
             if verb == "ls0":
                 arg = _guestfish_unquote(rest[: rest.rindex('"') + 1])
                 assert rest.endswith(" -")
-                out.append("".join(n + "\0" for n in tree[arg]))
+                out.append(b"".join(n + b"\0" for n in btree[arg]))
             elif verb == "-readlink":
                 mode, size, uid, gid, target = lookup(_guestfish_unquote(rest))
                 if rootfs_mod.stat_mod.S_ISLNK(mode):
-                    out.append(target + "\n")
+                    out.append(_b(target) + b"\n")
             elif verb == "lstatns":
                 mode, size, uid, gid, target = lookup(_guestfish_unquote(rest))
                 out.append(_stat_block(mode, size, uid, gid))
             else:
                 raise AssertionError(f"unexpected guestfish command: {line}")
-        return mock.Mock(returncode=0, stderr="", stdout="".join(out))
+        return mock.Mock(returncode=0, stderr=b"", stdout=b"".join(out))
 
     return run
 
@@ -330,10 +343,10 @@ def test_listdir_short_stat_read_is_an_error_not_a_guess(tmp_path, monkeypatch):
     image.write_text("disk")
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
 
-    def fake_run(cmd, input=None, text=None, capture_output=None):
-        if input.startswith("ls0 "):
-            return mock.Mock(returncode=0, stderr="", stdout="a\0b\0")
-        return mock.Mock(returncode=0, stderr="", stdout=_stat_block(_REG, 1))
+    def fake_run(cmd, input=None, capture_output=None):
+        if input.startswith(b"ls0 "):
+            return mock.Mock(returncode=0, stderr=b"", stdout=b"a\0b\0")
+        return mock.Mock(returncode=0, stderr=b"", stdout=_stat_block(_REG, 1))
 
     monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
     with pytest.raises(QMUError, match="inconclusive"):
@@ -341,11 +354,11 @@ def test_listdir_short_stat_read_is_an_error_not_a_guess(tmp_path, monkeypatch):
 
 
 def _fake_download(payload: bytes):
-    def fake_run(cmd, input=None, text=None, capture_output=None):
-        assert input.startswith("download ")
+    def fake_run(cmd, input=None, capture_output=None):
+        assert input.startswith(b"download ")
         from pathlib import Path
-        Path(_guestfish_unquote(input.strip().split(" ")[-1])).write_bytes(payload)
-        return mock.Mock(returncode=0, stderr="", stdout="")
+        Path(_guestfish_unquote(input.decode().strip().split(" ")[-1])).write_bytes(payload)
+        return mock.Mock(returncode=0, stderr=b"", stdout=b"")
     return fake_run
 
 
@@ -404,3 +417,63 @@ def test_inject_json_reports_landed_path_and_owner(tmp_path, monkeypatch, capsys
     assert data["injected"] == [
         {"local": str(local), "guest": "/root/", "path": "/root/exploit", "owner": "0:0"}
     ]
+
+
+def _listdir(tmp_path, monkeypatch, entries: dict[str | bytes, tuple]) -> list[dict]:
+    image = tmp_path / "rootfs.img"
+    image.write_text("disk")
+    monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
+    monkeypatch.setattr(rootfs_mod.subprocess, "run", _fake_guestfish({"/d": entries}))
+    return rootfs_mod.listdir(str(image), "/d", partition=0)
+
+
+def test_listdir_keeps_cr_lf_and_crlf_names_distinct(tmp_path, monkeypatch):
+    """#111: text-mode stdout folded `\\r` into `\\n` before the NUL split, so
+    the CR-named file vanished and the LF-named one was listed twice."""
+    entries = _listdir(tmp_path, monkeypatch, {
+        "a\rb": (_REG, 10, 0, 0, None),
+        "a\nb": (_REG, 2, 0, 0, None),
+        "a\r\nb": (_REG, 8, 0, 0, None),
+    })
+    assert sorted((e["name"], e["size"]) for e in entries) == [
+        ("a\nb", 2), ("a\r\nb", 8), ("a\rb", 10),
+    ]
+    assert not any("name_bytes_b64" in e for e in entries)
+    # The JSON a consumer reads back distinguishes the three as well.
+    assert {json.loads(json.dumps(e))["name"] for e in entries} == {"a\rb", "a\nb", "a\r\nb"}
+
+
+def test_listdir_cr_in_link_target_is_preserved(tmp_path, monkeypatch):
+    entries = _listdir(tmp_path, monkeypatch, {
+        "link": (_LNK, 3, 0, 0, "x\ry"), "other": (_LNK, 3, 0, 0, "x\ny"),
+    })
+    assert [e["target"] for e in entries] == ["x\ry", "x\ny"]
+
+
+def test_listdir_non_utf8_name_and_target_carry_exact_bytes(tmp_path, monkeypatch):
+    raw_name = b"caf\xe9"
+    raw_target = b"\xff\xfe"
+    entries = _listdir(tmp_path, monkeypatch, {
+        raw_name: (_REG, 1, 0, 0, None), "l": (_LNK, 2, 0, 0, raw_target),
+    })
+    by_name = {e.get("name_bytes_b64", e["name"]): e for e in entries}
+    name_entry = by_name[base64.b64encode(raw_name).decode()]
+    assert base64.b64decode(name_entry["name_bytes_b64"]) == raw_name
+    assert name_entry["size"] == 1
+    link = by_name["l"]
+    assert base64.b64decode(link["target_bytes_b64"]) == raw_target
+    assert "name_bytes_b64" not in link
+    # Every field is encodable for a stdout consumer: no lone surrogates.
+    for e in entries:
+        json.dumps(e).encode("utf-8")
+        rootfs_mod.format_entry(e).encode("utf-8")
+
+
+def test_format_entry_keeps_one_line_per_entry(tmp_path, monkeypatch):
+    entries = _listdir(tmp_path, monkeypatch, {
+        "a\rb": (_REG, 1, 0, 0, None), "a\nb": (_REG, 1, 0, 0, None),
+        "a\r\nb": (_REG, 1, 0, 0, None),
+    })
+    lines = [rootfs_mod.format_entry(e) for e in entries]
+    assert all("\n" not in line and "\r" not in line for line in lines)
+    assert len(set(lines)) == 3

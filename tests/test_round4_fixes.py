@@ -330,7 +330,7 @@ def test_rm_force_uses_rm_f_so_enoent_is_tolerated(tmp_path, monkeypatch):
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
     monkeypatch.setattr(
         rootfs_mod, "_run_script",
-        lambda img, part, script, action: scripts.append(script) or "",
+        lambda img, part, script, action: scripts.append(script) or b"",
     )
 
     result = rootfs_mod.remove(str(image), ["/root/nope"], partition=0, force=True)
@@ -391,7 +391,7 @@ def test_ls_opens_read_only_and_skips_the_busy_guard(tmp_path, monkeypatch):
 
     def fake_run(cmd, input=None, text=None, capture_output=None):
         seen["cmd"] = cmd
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
 
@@ -415,9 +415,9 @@ def test_cat_also_opens_read_only(tmp_path, monkeypatch):
         seen["cmd"] = cmd
         # `download <guest> <local>`: the fake fills the local file like
         # guestfish would (arguments are guestfish double-quoted).
-        local = input.strip().split(" ")[-1].strip('"')
+        local = input.decode().strip().split(" ")[-1].strip('"')
         Path(local).write_bytes(b"hi\n")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
 
@@ -435,7 +435,7 @@ def test_writers_still_take_the_guard(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         rootfs_mod.subprocess, "run",
-        lambda *a, **k: SimpleNamespace(returncode=0, stdout="true\n", stderr=""),
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"true\n", stderr=b""),
     )
 
     rootfs_mod.remove(str(image), ["/root/x"], partition=0)

@@ -645,15 +645,15 @@ def test_preview_and_real_agree_on_a_mixed_cache(cache, monkeypatch, capsys):
     _write_remnant(cache, "held")
     monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
     monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
-    # Age out only "prunable" by making the cutoff match nothing else.
-    real_prunable = lifecycle.list_prunable_instance_ids
+    # Age out only "prunable" by making the cutoff match nothing else. The
+    # eligibility and refusal views are one discovery; patch both halves.
     monkeypatch.setattr(
         lifecycle, "list_prunable_instance_ids",
         lambda **kw: ["prunable"],
     )
     monkeypatch.setattr(
-        instance_mod, "list_prunable_instance_ids",
-        lambda **kw: ["prunable"],
+        instance_mod, "prune_refusals",
+        lambda **kw: {"held": (instance_mod.HELD_AGE, None)},
     )
 
     cli.main(["--format", "json", "prune", "--all", "--dry-run"])
@@ -711,7 +711,8 @@ def test_empty_and_partial_prune_are_equally_disclosing(cache, monkeypatch, caps
 
     _write_remnant(cache, "prunable")
     monkeypatch.setattr(
-        instance_mod, "list_prunable_instance_ids", lambda **kw: ["prunable"],
+        instance_mod, "prune_refusals",
+        lambda **kw: {VM: (instance_mod.HELD_AGE, None)},
     )
     monkeypatch.setattr(
         lifecycle, "list_prunable_instance_ids", lambda **kw: ["prunable"],
@@ -1459,10 +1460,37 @@ def test_list_and_status_agree_a_held_qmp_slot_is_busy(
         payload = json.loads(detail)
         assert row["qmp"] == payload["qmp"] == "busy"
         assert row["guest"] == payload["guest"] == "serving"
+        # #106: the running row carries the same QEMU run-state field `status`
+        # does, and a busy probe reads "unknown" in both.
+        assert row["qemu_status"] == payload["qemu_status"] == "unknown"
     else:
         assert "qmp=busy" in listing
         assert "unreachable" not in listing
         assert "QMP:       busy" in detail
+
+
+def test_list_running_rows_carry_the_qemu_status_that_status_reports(
+    cache, monkeypatch, capsys
+):
+    """#106: `status` exposes `qemu_status`; a running `list` row must too, with
+    the same value, while a stopped row — no QEMU to ask — omits it."""
+    inst = _ssh_capable(_vm_with_log(cache, "live", "[ 0.0] Linux version 6.12.0\n"), 10022)
+    _qmp(monkeypatch, False)
+    _register_running(monkeypatch, inst)
+    _write_remnant(cache, "gone")
+
+    cli.main(["--format", "json", "list"])
+    rows = {
+        (r["vm_id"], r["status"]): r
+        for r in json.loads(capsys.readouterr().out)["vms"]
+    }
+    cli.main(["--format", "json", "status", "--vm", "live"])
+    payload = json.loads(capsys.readouterr().out)
+
+    live, gone = rows[("live", "running")], rows[("gone", "stopped")]
+    assert live["qemu_status"] == payload["qemu_status"] == "paused"
+    assert live["guest"] == payload["guest"] == "paused"
+    assert "qemu_status" not in gone and "qmp_socket" not in gone
 
 
 # ---------------------------------------------------------------------------
@@ -2249,6 +2277,29 @@ def test_text_stdout_is_the_guest_stdout_json_carries_the_rest(
     assert "[exit code" not in captured.out and "[dmesg failed" not in captured.out
 
 
+@pytest.mark.parametrize("command", ["exec", "dmesg"])
+def test_out_artifact_agrees_with_the_exit_code_in_both_formats(
+    command, cache, monkeypatch, capsys, tmp_path
+):
+    """Axis 3 (text vs JSON), the `--out` leg: a failed guest command exits 1
+    in both formats, and the pointer envelope each format prints says
+    `ok: false` with the guest exit code. Measured live before this row
+    (#108): text `--out` said `ok: true` for `printf nope; exit 7` while JSON
+    `--out` said `ok: false` for the same command."""
+    _serving_subject(cache, monkeypatch, _ServingSSH(7, "nope", "err\n"))
+    text_out, json_out = tmp_path / "text.bin", tmp_path / "data.json"
+
+    rc_text = cli.main(["--format", "text", *_LOST_ARGV[command], "--out", str(text_out)])
+    text_envelope = json.loads(capsys.readouterr().out)
+    rc_json = cli.main(["--format", "json", *_LOST_ARGV[command], "--out", str(json_out)])
+    json_envelope = json.loads(capsys.readouterr().out)
+
+    assert rc_text == rc_json == 1
+    assert text_envelope["ok"] is json_envelope["ok"] is False
+    assert text_envelope["exit_code"] == json.loads(json_out.read_text())["exit_code"] == 7
+    assert text_out.read_bytes() == b"nope"
+
+
 # ---------------------------------------------------------------------------
 # A guest `status`/`list` call PANICKED must be refused by every SSH-facing
 # command, in both formats, before any SSH attempt — and a panic the guest
@@ -2874,6 +2925,27 @@ def test_status_and_ssh_commands_agree_a_partially_restored_guest_is_paused(
             assert "restore-vm" in captured.err, f"`qmu {command}`"
     assert qmp.cont_sent == 0
 
+    # `cont` is the one command whose whole job is the resume the hint
+    # forbids (#110): it must refuse like `exec` does, name the same
+    # recovery, and send nothing — unless the caller overrides.
+    rc = cli.main(["--format", fmt, "cont", "--vm", VM])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert qmp.cont_sent == 0, "`qmu cont` resumed a partially restored guest"
+    if fmt == "json":
+        refusal = json.loads(captured.out)
+        assert refusal["ok"] is False
+        assert refusal["qemu_status"] == "restore-vm"
+        assert f"qmu kill --vm {VM}" in refusal["hint"]
+        assert "--force" in refusal["hint"]
+    else:
+        assert captured.out == ""
+        assert captured.err.startswith("[qmu] Error:")
+        assert "restore-vm" in captured.err
+    rc = cli.main(["--format", "json", "status", "--vm", VM])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["qemu_status"] == "restore-vm"
+
     # The recovery the hint names: a known-good load succeeds AND resumes
     # the guest (QEMU alone restarts only a guest that was running before),
     # so `status` and `exec` go straight back to serving.
@@ -3199,3 +3271,112 @@ def test_prune_orphans_preview_names_the_vm_it_would_kill(
         }]
     else:
         assert f"{VM}  pid {pid}" in out
+
+
+# ---------------------------------------------------------------------------
+# A malformed `.json` plus a `.qemu.log` (#109): held back at ANY age. Every
+# reporter must name the real refusal — unreadable metadata — and none may
+# prescribe `--older-than 0`, which can never clear it.
+# ---------------------------------------------------------------------------
+
+
+def _malformed_metadata_remnant(cache, monkeypatch):
+    idir = cache / "instances"
+    idir.mkdir(parents=True, exist_ok=True)
+    json_path = idir / f"{VM}.json"
+    json_path.write_text("{not json")
+    (idir / f"{VM}.qemu.log").write_text("qemu\n")
+    monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
+    monkeypatch.setattr(instance_mod, "find_orphan_qemus", lambda: [])
+    return json_path
+
+
+def test_malformed_metadata_is_held_back_for_its_own_reason(cache, monkeypatch):
+    json_path = _malformed_metadata_remnant(cache, monkeypatch)
+    for older in (86400.0, 0.0):
+        info = classify_vm(VM, older_than_seconds=older)
+        assert (info["state"], info["held_reason"], info["held_path"]) == (
+            VM_HELD_BACK, "malformed-metadata", str(json_path)
+        )
+    _write_remnant(cache, "young")
+    assert classify_vm("young")["held_reason"] == "age"
+    assert classify_vm("young", older_than_seconds=0.0)["held_reason"] is None
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_malformed_metadata_reason_agrees_across_status_list_kill_and_prune(
+    fmt, cache, monkeypatch, capsys
+):
+    json_path = _malformed_metadata_remnant(cache, monkeypatch)
+    _decoy_running(monkeypatch)
+
+    outputs = {}
+    for name, argv in {
+        "list": ["list"],
+        "status": ["status", "--vm", VM],
+        "kill": ["kill", "--vm", VM],
+        "prune --vm --dry-run": ["prune", "--vm", VM, "--older-than", "0", "--dry-run"],
+        "prune --vm": ["prune", "--vm", VM, "--older-than", "0"],
+        "prune --all --dry-run": ["prune", "--all", "--older-than", "0", "--dry-run"],
+        "prune --all": ["prune", "--all", "--older-than", "0"],
+    }.items():
+        assert cli.main(["--format", fmt, *argv]) == 0, name
+        outputs[name] = capsys.readouterr().out
+        assert json_path.exists(), f"`qmu {name}` deleted metadata it cannot read"
+
+    for name, out in outputs.items():
+        assert VM in out, f"`qmu {name}` omits the remnant"
+        assert "not found" not in out and "No running VMs" not in out, name
+        # The age gate is not why it stayed; prescribing the flag the caller
+        # just used sends them around the loop forever.
+        assert "--older-than 0" not in out, f"`qmu {name}` advertises the age gate"
+        assert "Held back by the --older-than" not in out, name
+        assert str(json_path) in out, f"`qmu {name}` does not name the unreadable file"
+
+    if fmt == "json":
+        row = next(r for r in json.loads(outputs["list"])["vms"] if r["vm_id"] == VM)
+        status = json.loads(outputs["status"])
+        killed = json.loads(outputs["kill"])
+        prunes = {k: json.loads(v) for k, v in outputs.items() if k.startswith("prune")}
+        assert (row["status"], row["held_back"], row["held_reason"]) == (
+            "stopped", True, "malformed-metadata"
+        )
+        assert (status["status"], status["held_reason"]) == (VM_HELD_BACK, "malformed-metadata")
+        assert killed["held_reason"] == "malformed-metadata"
+        expected = [{"vm_id": VM, "reason": "malformed-metadata", "path": str(json_path)}]
+        for name, payload in prunes.items():
+            assert payload["held_back"] == [VM], name
+            assert payload["refused"] == expected, name
+            assert payload["pruned"] == [] and payload.get("would_prune", []) == [], name
+        assert prunes["prune --vm"]["found"] is True
+
+    # Still there after every command, and `status` has not changed its mind.
+    assert cli.main(["--format", "json", "status", "--vm", VM]) == 0
+    assert json.loads(capsys.readouterr().out)["held_reason"] == "malformed-metadata"
+
+
+# ---------------------------------------------------------------------------
+# `cont --force` is the explicit opt-out of the restore-vm refusal (#110).
+# ---------------------------------------------------------------------------
+
+
+def test_cont_force_resumes_a_partially_restored_guest(cache, monkeypatch, capsys):
+    inst, qmp = _loadvm_subject(cache, monkeypatch, _INCOMPATIBLE_DEVICE_LOAD)
+    assert cli.main(["--format", "json", "snapshot", "load", "clean", "--vm", VM]) == 1
+    capsys.readouterr()
+    assert qmp.running is False
+
+    assert cli.main(["--format", "json", "cont", "--vm", VM]) == 1
+    capsys.readouterr()
+    assert qmp.cont_sent == 0
+
+    rc = cli.main(["--format", "json", "cont", "--vm", VM, "--force"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert qmp.cont_sent == 1 and qmp.running is True
+    assert payload == {"ok": True, "vm_id": VM, "status": "running", "forced": True}
+
+    # And `status` now agrees the guest is no longer halted.
+    monkeypatch.setattr(lifecycle, "_make_ssh", lambda i: _ServingSSH())
+    assert cli.main(["--format", "json", "status", "--vm", VM]) == 0
+    assert json.loads(capsys.readouterr().out)["qemu_status"] == "running"

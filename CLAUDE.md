@@ -95,7 +95,11 @@ envelope. Results whose estimated size exceeds `DEFAULT_SPILL_TOKEN_LIMIT`
 (`$QMU_TEMP_DIR/spills`, else XDG/platform temp). json/ndjson stdout becomes an
 artifact-pointer envelope; text stdout becomes `[qmu] Output spilled to <path>
 (~N tokens)` plus the first 40 lines, never JSON, because `--format text`
-promises text. `--out` forces a file.
+promises text. `--out` forces a file. A pointer envelope's `ok` is the
+**operation's** result, not "the artifact was written": a failed guest
+command rendered through text `--out` carries `ok: false` (+ `exit_code`)
+exactly like the JSON path (#108) — never let a byte-artifact helper default
+to success.
 
 ### Instance lifecycle & PID-recycling guard (`instance.py`, `vm.py`)
 
@@ -120,6 +124,12 @@ Never collapse them into one enum.
   `vm_id` must route through it. `status`/`kill` once used `choose_instance`
   (running-only) while `list`/`log` used `find_instance`, which is why
   "not found" kept being reported for VMs `qmu list` was displaying.
+  `held_back` carries a `held_reason` (`age` / `malformed-metadata` /
+  `qmp-busy`; `null` elsewhere) because only `age` is cleared by
+  `--older-than 0`: an unparseable `.json` with no serial log is refused at
+  every age (prune reports it under `refused[]`) and the fix is a hand
+  repair/delete of the file — advertising the age hint there sent the reader
+  in a loop (#109).
 - **Guest usability** — `lifecycle._guest_state(inst)` → `serving` / `paused` /
   `crashed` / `panicked` / `unknown`. The predicate is **usability**, never
   "is a crash retrievable" — those diverge, and conflating them is a bug that
@@ -127,7 +137,14 @@ Never collapse them into one enum.
   - `panicked` — `serial.has_terminal_panic()` found `Kernel panic - not
     syncing`; the guest is gone and reaping is correct. SSH is not probed.
   - `paused` — QMP `running:false`; where `qmu gdb` leaves every VM until
-    `qmu cont`.
+    `qmu cont`. The axis is coarse on purpose; `qemu_status` carries QEMU's
+    own word, and one value is load-bearing: **`restore-vm`** is a `snapshot
+    load` that failed mid-restore (#87, disks rewound, devices not). `qmu
+    cont` refuses it (exit 1, `guest_state: "paused"`, `qemu_status`,
+    recovery hint) unless `--force`; the SSH-command refusal and the skill's
+    recovery table hand out the same two recoveries (known-good load, or
+    kill + relaunch), never `cont` (#110). Add a `restore-vm` row to the
+    matrix for any new command that answers about a paused guest.
   - `crashed` — a report is retrievable AND the guest still serves. Under the
     default `exploit-dev` profile (deliberately no `oops=panic`) an Oops kills
     only the faulting task, so this is the common outcome of a trigger. It is
@@ -369,8 +386,13 @@ envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
   clears setuid/setgid, and a merge must not re-own pre-existing guest files
   (#95/#96/#97). Generated guestfish scripts quote with
   `rootfs.guestfish_quote`, never `shlex.quote`: guestfish's tokenizer is not
-  a POSIX shell (#98), and `ls` output is framed so names/targets containing
-  the old separator or newlines come back exact (#99).
+  a POSIX shell (#98), and `ls` output is NUL-framed so names/targets
+  containing the old separator or newlines come back exact (#99). The
+  guestfish transport is **bytes-only** (`rootfs._invoke`): never add
+  `text=True` to a guestfish call — universal newlines fold `\r` into `\n`
+  before the NUL framing is split, which merged a CR-named and an LF-named
+  file into one duplicated entry (#111). Non-UTF-8 names decode lossily with
+  `name_bytes_b64`/`target_bytes_b64` carrying the exact bytes.
 - **A failed `loadvm` is not always resumable.** QEMU reverts the block layer
   before it loads the vmstate, so a load that fails *after* restoration began
   (`snapshot.loadvm_restore_state` → `partial`/`unknown`) leaves pre-snapshot

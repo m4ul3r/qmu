@@ -248,6 +248,12 @@ REQUIRED_CLAIMS = [
     (REFERENCE_DIR / "troubleshooting.md", "paths.<key>.exists"),
     (REFERENCE_DIR / "troubleshooting.md", "qmu config path"),
     (REFERENCE_DIR / "cross-arch.md", "[boot]"),
+    # #106 (reopened): list row schema — qemu_status on running rows only.
+    (REFERENCE_DIR / "launch.md", "a running row carries `qmp` and\n`qemu_status`"),
+    # #110: the failed-restore recovery must be stated where the agent copies from.
+    (SKILL, "`qemu_status: \"restore-vm\"`"),
+    (REFERENCE_DIR / "snapshots.md", "`qmu cont --vm X` enforces this"),
+    (REFERENCE_DIR / "output-contract.md", "The pointer envelope's `ok` is the **operation's** result"),
 ]
 
 
@@ -256,6 +262,45 @@ REQUIRED_CLAIMS = [
 )
 def test_required_claims_present(path, phrase):
     assert phrase in path.read_text(), f"{path.name} no longer states {phrase!r}"
+
+
+def _recovery_rows(path: Path) -> list[tuple[int, str, str]]:
+    """(lineno, symptom, do) for every row of the Recovery table in PATH."""
+    rows: list[tuple[int, str, str]] = []
+    in_table = False
+    for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+        if raw.startswith("## "):
+            in_table = raw.startswith("## Recovery")
+            continue
+        if in_table and raw.startswith("| `"):
+            cells = [c.strip() for c in raw.strip().strip("|").split(" | ")]
+            if len(cells) == 3:
+                rows.append((lineno, cells[0], cells[2]))
+    return rows
+
+
+def test_recovery_table_never_resumes_a_failed_restore():
+    """#110: `cont` is the one action a mid-restore failure must not get.
+
+    The runtime (#87) leaves a `partial`/`unknown` load paused in `restore-vm`
+    on purpose; a recovery row that answers `paused` with `qmu cont --vm X`
+    walks the agent straight into the inconsistent resume. The failed-restore
+    state therefore needs its own row, and an ordinary-pause row must not
+    claim that state.
+    """
+    rows = _recovery_rows(SKILL)
+    restore_rows = [r for r in rows if "restore-vm" in r[1]]
+    assert restore_rows, "no recovery row keyed on qemu_status restore-vm"
+    for lineno, _symptom, do in restore_rows:
+        assert "qmu cont --vm X`" not in do, f"SKILL.md:{lineno} resumes a failed restore"
+        assert "qmu snapshot load" in do and "qmu kill --vm X" in do, lineno
+    plain_pause = [
+        r for r in rows if r[1].startswith("| `guest: \"paused\"`") or r[1].startswith("`guest: \"paused\"`")
+    ]
+    plain_pause = [r for r in plain_pause if "restore-vm" not in r[1]]
+    assert plain_pause, "no ordinary paused row"
+    for lineno, symptom, _do in plain_pause:
+        assert "restore" not in symptom.lower(), f"SKILL.md:{lineno} lumps a failed restore into the cont row"
 
 
 def _table_commands(path: Path) -> list[tuple[int, str]]:

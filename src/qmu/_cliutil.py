@@ -177,7 +177,14 @@ def _emit(
         _output(data, args, stem=stem, source_ok=source_ok)
 
 
-def _emit_bytes(args: argparse.Namespace, raw: bytes, *, stem: str) -> None:
+def _emit_bytes(
+    args: argparse.Namespace,
+    raw: bytes,
+    *,
+    stem: str,
+    source_ok: bool,
+    exit_code: int | None = None,
+) -> None:
     """Text-mode delivery of a byte payload on stdout, verbatim.
 
     `_emit` renders through `render_value`, which decodes and appends a
@@ -186,11 +193,19 @@ def _emit_bytes(args: argparse.Namespace, raw: bytes, *, stem: str) -> None:
     Inline output goes to `sys.stdout.buffer` untouched; a payload over the
     spill budget, or `--out`, is written to the file exactly and described by
     the usual pointer/envelope, so the artifact is checksum-comparable with
-    what the guest wrote.
+    what the guest wrote. The envelope's `ok` is `source_ok` — the outcome
+    of the operation that produced the bytes, never "the file got written" —
+    with `exit_code` alongside when known, so a failed guest command looks
+    failed in text `--out`/spill exactly as it does in JSON `--out`.
     """
     out = getattr(args, "out", None)
     result = write_bytes_result(
-        raw, out_path=Path(out) if out else None, stem=stem, suffix=".txt"
+        raw,
+        out_path=Path(out) if out else None,
+        stem=stem,
+        suffix=".txt",
+        source_ok=source_ok,
+        exit_code=exit_code,
     )
     if result.artifact is None:
         sys.stdout.flush()

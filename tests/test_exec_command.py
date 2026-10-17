@@ -382,6 +382,69 @@ def test_text_spill_preserves_the_bytes_in_the_artifact(wired, capsys, monkeypat
         assert stream.read() == body
 
 
+def test_failed_command_text_out_envelope_reports_the_failure(wired, tmp_path, capsys):
+    """#108: `exec --out f 'printf nope; exit 7'` exited 1 but the pointer
+    envelope said `ok: true` — the writer's own success leaked in as the
+    operation's. The envelope carries the guest command's outcome and its
+    exit code; the bytes are still delivered exactly."""
+    out = tmp_path / "failed-stdout.bin"
+    wired(rc=7, stdout=GuestText(b"nope"))
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "--out", str(out), "printf nope; exit 7"])
+
+    assert rc == 1
+    assert out.read_bytes() == b"nope"
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["ok"] is False
+    assert envelope["exit_code"] == 7
+    assert envelope["artifact_path"] == str(out)
+    assert envelope["bytes"] == 4
+
+
+def test_failed_command_json_out_envelope_reports_the_failure(wired, tmp_path, capsys):
+    out = tmp_path / "failed.json"
+    wired(rc=7, stdout=GuestText(b"nope"))
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "--out", str(out), "cmd"])
+
+    assert rc == 1
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["ok"] is False
+    payload = json.loads(out.read_text())
+    assert payload["ok"] is False
+    assert payload["exit_code"] == 7
+    assert payload["stdout"] == "nope"
+
+
+def test_failed_command_text_spill_keeps_the_bytes_and_the_failure(
+    wired, capsys, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("QMU_TEMP_DIR", str(tmp_path / "rt"))
+    body = b"\xff" + b"0" * 200_000
+    wired(rc=7, stdout=GuestText(body))
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "cmd"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    pointer = captured.out.splitlines()[0]
+    assert pointer.startswith("[qmu] Output spilled to ")
+    with open(pointer.split(" ")[4], "rb") as stream:
+        assert stream.read() == body
+
+
+def test_successful_command_text_out_envelope_has_no_failure_marks(wired, tmp_path, capsys):
+    out = tmp_path / "ok.bin"
+    wired(rc=0, stdout=GuestText(b"fine"))
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "--out", str(out), "cmd"])
+
+    assert rc == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["ok"] is True
+    assert envelope["exit_code"] == 0
+
+
 # --- the serial watcher -----------------------------------------------------
 
 
