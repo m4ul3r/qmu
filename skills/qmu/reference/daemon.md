@@ -15,7 +15,8 @@ proxy a command through that one connection.
   persists the observed guest epoch (`guest_epoch_serial_offset` = serial-log
   size at the event, `guest_epoch_source: "observed"`) and tears down the
   VM's SSH ControlMaster; `STOP`/`RESUME` update the cached run-state;
-  `SHUTDOWN`/socket EOF mark the VM exited and reap a recorded pry bridge;
+  socket EOF **confirmed by PID identity** marks the VM exited and reaps a
+  recorded pry bridge (a `SHUTDOWN` event alone only updates `qemu_status`);
   `GUEST_PANICKED` marks it panicked.
 - **One serial tick** (100 ms, an `os.stat` per watched log, a scan only on
   growth) that wakes `wait` subscribers.
@@ -41,6 +42,44 @@ wait's envelope); `last_event` is the real QMP event name. While a wait is
 in flight the daemon also streams a `progress` event (elapsed, scanned byte)
 at most once per second; the CLI ignores it, the MCP façade relays it to its
 client (`reference/mcp.md`).
+
+## Ownership rule: a subscribed `wait` is never stranded
+
+The daemon keeps a VM's watch until its recorded process is **positively
+gone** (PID + start-time, the same identity every command uses). A QMP
+`SHUTDOWN` event alone is never treated as death. Two consequences:
+
+- **`kill` quits *through* the daemon** (the `quit` rides the daemon's own
+  connection; `--force` skips `quit` and the socket EOF does the same job),
+  so the watch itself sees the exit and every in-flight `wait` on that VM
+  gets its terminal transition at once: bare `wait` **0 / `process_exited`**,
+  `wait --pattern` **1 / `process_exited`** (the marker never came). Before
+  this rule `kill` released the watch first and both waiters burned their
+  whole `--timeout` (124, `stopped: false`, `last_event: SHUTDOWN`) on a VM
+  that was already dead (#118). `kill --no-clean`, a clean kill and
+  `--force` behave identically here, and a wait with no `--timeout` ends
+  too.
+- **Release is complete when answered.** An explicit release
+  (`daemon_client.unwatch(vm)`, which a `--replace` launch does before it
+  kills the namesake, or the daemon stopping — `daemon stop`, idle exit, the
+  build-id respawn) answers only after the daemon's QMP reader is shut down
+  and joined, so a fresh standalone client gets QEMU's greeting immediately
+  (no 2 s `QMPBusyError`, #119) — and every `wait` subscribed to that VM is
+  answered `released` (after a `{"kind": "released"}` event) instead of
+  being left behind. The wait is **not over**: the client finishes it
+  standalone on PID liveness for the rest of its deadline — bare `wait`
+  polls as under `QMU_DAEMON=off` (`qmp` then reports what *it* observed,
+  e.g. `connected`), `--pattern` rescans from the same `scan_offset` — with
+  the same verdicts and exit codes, and the result says so in `warnings[]`:
+  `Note: the daemon released VM 'X' mid-wait (an explicit unwatch or a
+  daemon shutdown); the wait finished standalone on PID liveness.` That
+  process does not hand the VM back to the daemon for the rest of the
+  command; the next command re-adopts it.
+
+A RESET observed during a daemon-backed `wait` under an attached debugger
+adds the debugger-coherence warning (`reference/debugging.md`) to the
+wait's own result — stderr once, `warnings[]` once — never to the
+daemon's log alone (#121).
 
 ## Autostart, opt-out, lifecycle
 

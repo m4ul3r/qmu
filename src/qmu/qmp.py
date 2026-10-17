@@ -247,7 +247,19 @@ class QMPClient:
         return str(result)
 
     def close(self) -> None:
+        """Release QEMU's one QMP slot NOW, not when the last reader lets go.
+
+        `socket.close()` only drops the descriptor once no thread is inside a
+        call on it; a reader parked in `recv` (the daemon's per-VM thread)
+        keeps the connection open from QEMU's side until it wakes, and a
+        fresh client meanwhile gets no greeting (#119). `shutdown(SHUT_RDWR)`
+        sends the FIN immediately and wakes that reader with EOF.
+        """
         if self._sock is not None:
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # never connected, or the peer already hung up
             try:
                 self._sock.close()
             except OSError:

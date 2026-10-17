@@ -360,22 +360,212 @@ def test_status_with_the_layer_off_has_no_daemon_keys(daemon_env, vm, monkeypatc
     assert "boot_offset" not in payload
 
 
-def test_kill_releases_the_watch_before_signalling(daemon_env, vm, monkeypatch, capsys):
-    daemon_client.watch("fake-vm")
-    order: list[str] = []
+# ---------------------------------------------------------------------------
+# ownership (#118, #119): a subscribed wait is never stranded
+# ---------------------------------------------------------------------------
+
+
+def _liveness(monkeypatch, vm):
+    """One switch for the fake VM's recorded-PID identity, on every seam."""
+    import qmu.daemon as daemon_mod
+
+    alive = {"v": True}
+    monkeypatch.setattr(daemon_mod, "instance_alive", lambda inst: alive["v"])
+    monkeypatch.setattr(lifecycle, "instance_alive", lambda inst: alive["v"])
     monkeypatch.setattr(lifecycle, "choose_instance", lambda vm_id=None: vm["inst"])
-    real_release = lifecycle._release_from_daemon
+    monkeypatch.setattr(lifecycle, "_CRASH_SETTLE_MAX", 0.2)
+    monkeypatch.setattr(daemon_mod.debug_mod, "reap_bridge_on_exit", lambda vm_id: None)
+    return alive
 
-    def release(inst):
-        order.append("release")
-        return real_release(inst)
 
-    monkeypatch.setattr(lifecycle, "_release_from_daemon", release)
-    monkeypatch.setattr(lifecycle, "_kill_vm", lambda inst, force=False, clean=True: order.append("kill"))
-    rc = cli.main(["--format", "json", "kill", "--vm", "fake-vm"])
-    assert rc == 0
-    assert order == ["release", "kill"]
+def _killable(monkeypatch, vm, alive):
+    """Let the REAL `_kill_vm` run against the fake VM (whose pid is this
+    process): `quit` rides the real `_qmp_ctx`, and process death is what
+    QEMU's would look like — the QMP socket closes and the identity is gone."""
+    from qmu import _cliutil
+
+    def die():
+        alive["v"] = False
+        vm["server"].drop_client()
+
+    def pid_exits(pid, timeout):
+        die()
+        return True
+
+    def pid_alive(pid):
+        die()  # the SIGKILL `--force` would send; no signal reaches the test
+        return False
+
+    monkeypatch.setattr(_cliutil, "_wait_pid_exit", pid_exits)
+    monkeypatch.setattr(_cliutil, "is_pid_alive", pid_alive)
+
+
+class _Waiter(threading.Thread):
+    """One in-process `qmu wait` on its own thread (`cli.invoke`, unrendered)."""
+
+    def __init__(self, argv: list[str]):
+        super().__init__(daemon=True)
+        self.argv = argv
+        self.result = None
+        self.error: BaseException | None = None
+        self.started_at = time.monotonic()
+        self.start()
+
+    def run(self) -> None:
+        try:
+            self.result = cli.invoke(self.argv)
+        except BaseException as exc:  # noqa: BLE001 — reported by the test
+            self.error = exc
+
+    def finish(self, bound: float = 5.0):
+        self.join(bound)
+        assert not self.is_alive(), f"wait {self.argv} still running after {bound}s"
+        if self.error is not None:
+            raise self.error
+        self.elapsed = time.monotonic() - self.started_at
+        return self.result
+
+
+def _two_waits(timeout: str | None = "10") -> tuple[_Waiter, _Waiter]:
+    budget = [] if timeout is None else ["--timeout", timeout]
+    bare = _Waiter(["--format", "json", "wait", "--vm", "fake-vm", "--no-clean", *budget])
+    pattern = _Waiter([
+        "--format", "json", "wait", "--vm", "fake-vm", "--pattern", "^NEVER_UNIQUE$", *budget,
+    ])
+    return bare, pattern
+
+
+@pytest.mark.parametrize("flags", [["--no-clean"], [], ["--force"]], ids=["no-clean", "clean", "force"])
+def test_kill_ends_in_flight_bare_and_pattern_waits_promptly(flags, daemon_env, vm, monkeypatch, capsys):
+    """#118 (receipts 18/19): both waiters burned their full timeout after
+    the kill — `kill` had released the watch first, so nobody owned their
+    liveness. Now `quit` rides the daemon's connection and the watch sees
+    the exit: bare wait 0/process_exited, pattern wait 1/process_exited."""
+    daemon_client.watch("fake-vm")
+    alive = _liveness(monkeypatch, vm)
+    _killable(monkeypatch, vm, alive)
+    bare, pattern = _two_waits()
+    time.sleep(0.4)
+
+    rc = cli.main(["--format", "json", "kill", "--vm", "fake-vm", *flags])
+    assert rc == 0, capsys.readouterr()
+
+    bare_res, pattern_res = bare.finish(), pattern.finish()
+    assert bare_res.exit_code == 0 and bare_res.data["reason"] == "process_exited", bare_res.data
+    assert bare_res.data["stopped"] is True and bare_res.data["qmp"] == "daemon"
+    assert pattern_res.exit_code == 1 and pattern_res.data["reason"] == "process_exited", pattern_res.data
+    assert pattern_res.data["matched"] is False
+    assert bare.elapsed < 3.0 and pattern.elapsed < 3.0, (bare.elapsed, pattern.elapsed)
+    # The watch outlived the kill and saw the exit by PID identity.
+    state = daemon_env.vm_state("fake-vm")
+    assert state["exited"] is True and state["exit_reason"] == "process_exited"
+    sent = [r.get("execute") for r in vm["server"].requests]
+    assert ("quit" in sent) is ("--force" not in flags), sent
+
+
+def test_wait_without_a_timeout_still_ends_on_kill(daemon_env, vm, monkeypatch, capsys):
+    """[INFERENCE in #118]: an unlimited waiter could stay forever. Bounded here."""
+    daemon_client.watch("fake-vm")
+    alive = _liveness(monkeypatch, vm)
+    _killable(monkeypatch, vm, alive)
+    bare, pattern = _two_waits(timeout=None)
+    time.sleep(0.4)
+    assert cli.main(["--format", "json", "kill", "--vm", "fake-vm", "--no-clean"]) == 0
+    assert bare.finish().data["reason"] == "process_exited"
+    assert pattern.finish().exit_code == 1
+
+
+def test_unwatch_releases_subscribers_to_standalone_liveness(daemon_env, vm, monkeypatch):
+    """An explicit `unwatch` under live waits ends their subscriptions with a
+    `released` transition; each finishes standalone on PID liveness, says so
+    in `warnings[]`, and the daemon does not get the VM handed straight back."""
+    daemon_client.watch("fake-vm")
+    alive = _liveness(monkeypatch, vm)
+    bare, pattern = _two_waits()
+    time.sleep(0.4)
+
+    assert daemon_client.unwatch("fake-vm") is True
     assert daemon_env.vm_state("fake-vm") == {"watched": False, "vm_id": "fake-vm"}
+    time.sleep(0.6)  # both waiters are now polling standalone against a live VM
+    assert bare.is_alive() and pattern.is_alive()
+    alive["v"] = False
+    vm["server"].drop_client()
+
+    bare_res, pattern_res = bare.finish(), pattern.finish()
+    assert bare_res.exit_code == 0 and bare_res.data["reason"] == "process_exited"
+    assert bare_res.data["qmp"] != "daemon"  # the standalone loop observed it
+    assert pattern_res.exit_code == 1 and pattern_res.data["reason"] == "process_exited"
+    for res in (bare_res, pattern_res):
+        assert any("released VM 'fake-vm' mid-wait" in w for w in res.warnings), res.warnings
+    assert daemon_env.vm_state("fake-vm") == {"watched": False, "vm_id": "fake-vm"}
+
+
+def test_unwatch_answers_only_once_the_qmp_slot_is_free(daemon_env, vm):
+    """#119 (receipts 22/23): `released: true` came back while the daemon's
+    reader was still parked in `recv`, so the next standalone client got no
+    greeting for 2 s and reported busy. The reader is shut down and joined
+    before the answer."""
+    from qmu.qmp import QMPClient
+
+    daemon_client.watch("fake-vm")
+    assert daemon_client.unwatch("fake-vm") is True
+    direct = QMPClient(str(vm["server"].path))
+    direct.greeting_timeout = 0.5
+    started = time.monotonic()
+    greeting = direct.connect()
+    assert "QMP" in greeting
+    assert time.monotonic() - started < 0.5
+    assert direct.execute("query-status")["status"] == "running"
+    direct.close()
+
+
+def test_daemon_shutdown_releases_in_flight_waits(daemon_env, vm, monkeypatch):
+    """A stopping daemon (build-id respawn, `daemon stop`) owns nothing any
+    more: every in-flight wait is answered `released` before its connection
+    is cut and finishes standalone — not exit 4."""
+    daemon_client.watch("fake-vm")
+    alive = _liveness(monkeypatch, vm)
+    monkeypatch.setenv("QMU_DAEMON", "auto")
+    monkeypatch.setattr(daemon_client, "autostart_allowed", lambda: False)
+    bare, pattern = _two_waits()
+    time.sleep(0.4)
+
+    daemon_env.stop.set()
+    _wait_until(lambda: not daemon_env.socket_path.exists(), what="daemon stop")
+    time.sleep(0.3)
+    alive["v"] = False
+    vm["server"].drop_client()
+
+    bare_res, pattern_res = bare.finish(), pattern.finish()
+    assert bare_res.exit_code == 0 and bare_res.data["reason"] == "process_exited", bare_res.data
+    assert pattern_res.exit_code == 1 and pattern_res.data["reason"] == "process_exited"
+    for res in (bare_res, pattern_res):
+        assert any("released VM 'fake-vm' mid-wait" in w for w in res.warnings), res.warnings
+
+
+def test_wait_reset_warning_rides_the_result_once(daemon_env, vm, monkeypatch, capsys):
+    """#121 (receipt 165): the RESET-under-debugger warning went straight to
+    stderr from the event callback and the envelope had no `warnings[]`.
+    It is collected once and rendered by `render`: stderr exactly once,
+    `warnings[]` carries it."""
+    daemon_client.watch("fake-vm")
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm_id=None: vm["inst"])
+    monkeypatch.setattr(lifecycle, "debug_session_present", lambda inst: True)
+    monkeypatch.setattr(lifecycle, "save_guest_epoch_serial_offset", lambda inst, off, **kw: inst)
+
+    def reset_twice() -> None:
+        vm["server"].emit("RESET", {"guest": True, "reason": "guest-reset"})
+        time.sleep(0.2)
+        vm["server"].emit("RESET", {"guest": True, "reason": "guest-reset"})
+
+    threading.Timer(0.2, reset_twice).start()
+    rc = cli.main(["--format", "json", "wait", "--vm", "fake-vm", "--timeout", "1.2"])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert rc == 124 and payload["last_event"] == "RESET"
+    assert len(payload["warnings"]) == 1
+    assert "was just reset" in payload["warnings"][0]
+    assert captured.err.count("was just reset") == 1
 
 
 # ---------------------------------------------------------------------------

@@ -122,8 +122,27 @@ from a `--pattern` wait, is the receipt for a successful harness run.
   once more, so a panic that lands during the final (possibly 2 s busy) probe
   is still exit 3 `terminal_panic` with `crash`, not 124 with the report
   buried in `console_tail`.
-- A VM stopped by `qmu kill` while it was being waited on reports the loss as
-  exit 1/4 rather than a clean exit 0; treat that as "someone killed it".
+- **A VM killed while it is being waited on is a process exit, whoever owns
+  the wait** (#118): bare `wait` returns **0 / `process_exited`** and
+  `--pattern` **1 / `process_exited`** promptly after the `kill` — with or
+  without `--no-clean`, with `--force`, and with no `--timeout`. `kill` quits
+  *through* the daemon so the daemon's watch sees the exit; a daemon that
+  gives a VM up while it lives (explicit `unwatch`, `daemon stop`, build-id
+  respawn) answers every subscribed wait `released` and the wait finishes
+  standalone on PID liveness for the rest of its deadline — same verdicts,
+  `warnings[]` gains `Note: the daemon released VM 'X' mid-wait …`, `qmp`
+  reports what the standalone poll observed. A wait is never left to burn
+  its timeout on a dead VM (`reference/daemon.md`, *Ownership rule*).
+- A RESET under an attached debugger (`qmu gdb` + `qmp system_reset`, or a
+  guest reboot) adds the debugger-coherence warning to the **wait's own
+  result** — `warnings[]` in json/ndjson, stderr once in every mode, never
+  twice and never dropped — on both the daemon-backed and the standalone
+  path (#121). Re-arm per `reference/debugging.md` before trusting a
+  breakpoint again.
+- Every failed verdict carries `hint`: `timeout` → raise `--timeout` or check
+  `qmu status --vm X; qmu log --vm X --tail 50`; `terminal_panic` → `qmu
+  crash --vm X` then `qmu kill --vm X`; a `--pattern` `process_exited` →
+  `qmu log --vm X --tail 100` then `qmu prune --vm X`.
 - No command prints the profile-sourced unknown-parameter note; `launch`
   keeps it in JSON only. Operator-param warnings still appear on `launch`.
 

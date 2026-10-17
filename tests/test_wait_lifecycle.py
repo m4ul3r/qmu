@@ -796,6 +796,44 @@ def test_wait_observes_a_reboot_and_persists_the_epoch_before_the_next_liveness_
     assert calls.index("alive1") < calls.index("save_epoch") < calls.index("alive2")
 
 
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_wait_reset_under_a_debugger_warns_once_on_the_result(
+    fmt, monkeypatch, capsys, tmp_path
+):
+    """#121, the standalone manifestation: the #46 coherence warning used to
+    go straight to stderr from the scan closure, so a JSON reader never saw
+    it. It rides the Result: `warnings[]` carries it, stderr has it exactly
+    once — even across two reboots in one wait."""
+    inst = _instance(tmp_path)
+    log = Path(inst.serial_log)
+    checks = 0
+
+    def alive(selected):
+        nonlocal checks
+        checks += 1
+        if checks in (1, 2):
+            with log.open("a") as stream:
+                stream.write("[ 9.0] reboot: Restarting system\n" + BOOT)
+        return True
+
+    monkeypatch.setattr(lifecycle, "debug_session_present", lambda i: True)
+    monkeypatch.setattr(
+        lifecycle, "save_guest_epoch_serial_offset",
+        lambda record, offset: replace(record, guest_epoch_serial_offset=offset),
+    )
+    rc, payload, captured, _, _, _ = _invoke_wait(
+        monkeypatch, capsys, tmp_path, alive=alive, inst=inst, timeout=2.0, fmt=fmt,
+    )
+
+    assert rc == 124
+    assert captured.err.count("was just reset") == 1
+    if fmt == "json":
+        assert payload["last_event"] == "RESET"
+        assert len(payload["warnings"]) == 1 and "was just reset" in payload["warnings"][0]
+        assert "--timeout" in payload["hint"]
+
+
+
 def test_wait_reboot_scopes_the_exit_crash_to_the_new_boot(
     monkeypatch, capsys, tmp_path
 ):
