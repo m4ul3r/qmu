@@ -380,6 +380,7 @@ def _handle_config_show(args: argparse.Namespace) -> int:
             "nic_model": config.nic_model,
             "net_backend": config.net_backend,
             "accel": config.accel,
+            "no_reboot": config.no_reboot,
             "qemu_binary": config.qemu_binary(),
             "kvm": config.use_kvm(),
             "extra_args": config.extra_args,
@@ -429,6 +430,7 @@ def _handle_config_show(args: argparse.Namespace) -> int:
         ))
     lines.append(row("Arch:", f"{config.arch} ({config.qemu_binary()})", "machine.arch"))
     lines.append(row("Accel:", f"{config.accel} (kvm={config.use_kvm()})", "machine.accel"))
+    lines.append(row("No-reboot:", str(config.no_reboot).lower(), "machine.no_reboot"))
     lines.append(row("Memory:", config.memory, "machine.memory"))
     lines.append(row("CPUs:", str(config.cpus), "machine.cpus"))
     lines.append(row("CPU model:", config.cpu_model or "(qemu default)", "machine.cpu"))
@@ -739,6 +741,7 @@ def _add_skill(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_make_group_help_handler(p))
     sp = p.add_subparsers(dest="skill_cmd")
     s = sp.add_parser("install", help="Install skills into ~/.claude (and ~/.codex / ~/.agents when present)")
+    _add_format_opts(s)
     s.set_defaults(handler=_handle_skill_install)
 
 
@@ -781,6 +784,51 @@ def _prepare_install_roots(roots: list[Path]) -> None:
             ) from exc
 
 
+_LINK_STATUSES = ("installed", "relinked", "replaced", "current")
+
+
+def _link_skill(src: Path, dst: Path) -> tuple[str, str | None]:
+    """Point `dst` at `src`, reporting what was there before.
+
+    Four outcomes, because "installed" is a different fact from each of the
+    others and anyone re-running this needs to know which one they got:
+
+    * ``current``  — already a link to this source. NOTHING is written; the
+      link is left byte-identical (mtime included) instead of being removed
+      and recreated, so a re-run is a true no-op rather than N rewrites of
+      links a live agent session may be reading through.
+    * ``relinked`` — a link to a DIFFERENT source, whose old target comes back
+      so the caller can be told. This is the outcome that matters: an install
+      run from a stale checkout leaves every link pointing at a tree that no
+      longer matches the repo, and calling that "installed" is exactly how
+      such a swap goes unnoticed.
+    * ``replaced`` — a real directory or file, which is deleted. Destructive,
+      so it has to be visible in the output.
+    * ``installed`` — nothing was there.
+    """
+    previous: str | None = None
+    if dst.is_symlink():
+        previous = str(dst.readlink())
+        if dst.resolve() == src.resolve():
+            return "current", previous
+        dst.unlink()
+        status = "relinked"
+    elif dst.exists():
+        if dst.is_dir():
+            shutil.rmtree(dst)
+        else:
+            # A plain file here used to reach shutil.rmtree() and raise
+            # NotADirectoryError into cli's catch-all as exit 4, which the
+            # contract reserves for infra faults; it is the caller's own
+            # filesystem state and is simply replaceable.
+            dst.unlink()
+        status = "replaced"
+    else:
+        status = "installed"
+    dst.symlink_to(src)
+    return status, previous
+
+
 def _handle_skill_install(args: argparse.Namespace) -> int:
     skill_dirs = all_skill_source_dirs()
     if not skill_dirs:
@@ -788,22 +836,73 @@ def _handle_skill_install(args: argparse.Namespace) -> int:
 
     roots = skill_install_roots()
     _prepare_install_roots(roots)
+
+    links: list[dict[str, object]] = []
+    counts = dict.fromkeys(_LINK_STATUSES, 0)
+    changed: list[str] = []
     for src in skill_dirs:
-        name = src.name
         for root in roots:
-            dst = root / name
-            if dst.is_symlink() or dst.exists():
-                if dst.is_symlink():
-                    dst.unlink()
-                else:
-                    shutil.rmtree(dst)
-            dst.symlink_to(src)
-            print(f"Skill installed: {dst} -> {src}")
+            dst = root / src.name
+            status, previous = _link_skill(src, dst)
+            counts[status] += 1
+            links.append({
+                "skill": src.name,
+                "root": str(root),
+                "path": str(dst),
+                "target": str(src),
+                "status": status,
+                "previous_target": previous if status == "relinked" else None,
+            })
+            if status == "current":
+                # Tallied instead of listed: one line per unchanged link is
+                # what buried the changed ones, and every re-run is all-
+                # unchanged. The JSON payload still carries each link.
+                continue
+            if status == "relinked":
+                detail = f"  (was {previous})"
+            elif status == "replaced":
+                detail = "  (removed what was there)"
+            else:
+                detail = ""
+            changed.append(f"{status:<9} {dst} -> {src}{detail}")
+
+    skipped: list[dict[str, str]] = []
     if agents_skills_dir() not in roots:
-        print(
-            f"Skipped {agents_skills_dir()} (OMP not detected: no directory at "
-            f"{agents_home()} or {omp_agent_dir()})"
+        skipped.append({
+            "path": str(agents_skills_dir()),
+            "reason": (
+                f"OMP not detected: no directory at {agents_home()} or "
+                f"{omp_agent_dir()}"
+            ),
+        })
+
+    total = len(links)
+    link_s = "" if total == 1 else "s"
+    root_s = "" if len(roots) == 1 else "s"
+    if counts["current"] == total:
+        summary = (
+            f"All {total} link{link_s} in {len(roots)} root{root_s} already "
+            f"current — nothing to do."
         )
+    else:
+        tally = ", ".join(f"{counts[s]} {s}" for s in _LINK_STATUSES if counts[s])
+        summary = f"{total} link{link_s} in {len(roots)} root{root_s}: {tally}."
+    lines = [*changed, summary]
+    lines.extend(f"Skipped {e['path']} ({e['reason']})" for e in skipped)
+
+    _emit(
+        args,
+        data={
+            "ok": True,
+            "roots": [str(r) for r in roots],
+            "skills": [d.name for d in skill_dirs],
+            "links": links,
+            "counts": counts,
+            "skipped_roots": skipped,
+        },
+        text=lines,
+        stem="skill-install",
+    )
     return 0
 
 
