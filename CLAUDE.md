@@ -41,15 +41,16 @@ source edits take effect immediately with no reinstall; dogfood with
 cli.py  ->  commands/{lifecycle,guest,qmp_cmds,meta}  ->  _cliutil.py  ->  domain modules
 ```
 
-- `cli.py` is *only* `main()`: it builds the argparse tree (calling each
-  module's `_add_*` registrar in display order) and maps handler exceptions to
-  exit codes. No handlers live here.
+- `cli.py` is *only* `invoke()`/`main()`: it builds the argparse tree (calling
+  each module's `_add_*` registrar in display order), dispatches, renders the
+  returned `Result` and maps handler exceptions to exit codes. No handlers
+  live here.
 - `commands/lifecycle.py` — launch, kill, prune, wait, list, status, doctor.
 - `commands/guest.py` — push, pull, exec, compile, dmesg, crash, log (SSH- and
   serial-facing).
 - `commands/qmp_cmds.py` — snapshot, gdb, cont, qmp (raw), monitor (HMP).
 - `commands/meta.py` — config, rootfs, skill, version.
-- `_cliutil.py` — shared helpers (`_emit`/`_output`, `_kill_vm`, arg-option
+- `_cliutil.py` — shared helpers (`Result`/`render`, `_kill_vm`, arg-option
   registrars, config resolution, QMP/SSH context). Bottom of the DAG; never
   imports `cli` or `commands.*`.
 
@@ -87,9 +88,23 @@ the marker can still arrive, and aborting on it made callers paste
 It exists so agents stop hand-rolling `until grep -q ... serial.log; do sleep;
 done`, which cannot terminate on either of the middle two.
 
-### Output rendering (`output.py`)
+### Output rendering (`_cliutil.Result`, `_cliutil.render`, `output.py`)
 
-Every handler funnels its result through `_emit(args, data=<dict>, text=<str|list>, stem=...)`.
+Handlers never write stdout. Every handler **returns** a frozen
+`Result(data=<dict>, text=<str|list>, stem=..., exit_code=...)`; `cli.main`
+renders it with `render(args, result) -> int`, which owns the one `--format`
+fork. `cli.invoke(argv) -> Result` is parse + config gate + dispatch with no
+rendering and handler exceptions propagating — the seam for in-process
+callers (MCP façade, daemon); `main` = `invoke` + `render` + the
+exception→exit-code mapping. The byte-exact paths (`exec`/`run`/`dmesg`/
+`rootfs cat`) set `raw=<bytes>` instead of `text`; refusals (`refusal=True`,
+built by `_refusal`) put `text` on stderr as `[qmu] Error:` lines with
+nothing on stdout; `notes` are text-mode stderr trailers (guest stderr, `[exit
+code: N]`); `warnings` are stderr text written after the output in every
+mode (debugger-coherence warnings, follow-up hints — `result.warn(...)`);
+`Result.silent_exit(n)` renders nothing (group help, `rootfs shell`, `skill
+install`). Work that must precede the output (reaping, epoch persistence)
+happens before the `return`; text that must follow it rides in `warnings`.
 Text mode renders `text`; `json`/`ndjson` render `data` as a `{"ok": bool, ...}`
 envelope. Results whose estimated size exceeds `DEFAULT_SPILL_TOKEN_LIMIT`
 (~10k tokens, chars/4) are spilled to a file under the spill root

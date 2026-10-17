@@ -89,13 +89,11 @@ from ..serial import (
 )
 from ..vm import launch_vm, suspect_dotted_params
 from .._cliutil import (
+    Result,
     _add_common_opts,
     _add_launch_opts,
-    _emit,
-    _emit_refusal,
     _kill_vm,
     _make_ssh,
-    _output,
     _qmp_ctx,
     _resolve_config_from_args,
 )
@@ -621,7 +619,7 @@ def _no_console_output_error(inst: Any, arch: str | None) -> str:
     )
 
 
-def _handle_launch(args: argparse.Namespace) -> int:
+def _handle_launch(args: argparse.Namespace) -> Result:
     prep = _BootPrep()
     config, name = _prepare_boot(args, prep)
 
@@ -752,8 +750,7 @@ def _handle_launch(args: argparse.Namespace) -> int:
         result["error"] = error
         if args.format == "text":
             sys.stderr.write(f"[qmu] Error: {error}\n")
-    _emit(args, data=result, text=lines, stem="launch")
-    return exit_code
+    return Result(data=result, text=lines, stem="launch", exit_code=exit_code)
 
 
 def _orphan_serial_logs() -> dict[str, int]:
@@ -1081,7 +1078,7 @@ def _add_kill(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_kill)
 
 
-def _kill_orphan_if_named(args: argparse.Namespace) -> int | None:
+def _kill_orphan_if_named(args: argparse.Namespace) -> Result | None:
     """Reap an orphaned remnant that `kill` would otherwise call nonexistent.
 
     `qmu list` shows these as [ORPHANED — process alive] with a live pid, and
@@ -1124,8 +1121,7 @@ def _kill_orphan_if_named(args: argparse.Namespace) -> int | None:
             f"VM '{vm}' was an orphaned remnant (no metadata); killed its "
             f"QEMU process (pid {pid}). State preserved at {inst.serial_log}"
         )
-        _emit(
-            args,
+        return Result(
             data={
                 "ok": True,
                 "vm_id": vm,
@@ -1137,7 +1133,6 @@ def _kill_orphan_if_named(args: argparse.Namespace) -> int | None:
             text=msg,
             stem="kill",
         )
-        return 0
     return None
 
 
@@ -1154,7 +1149,7 @@ def _close_ssh_master(inst: Any) -> bool:
     return bool(_make_ssh(inst).close_control_master())
 
 
-def _handle_kill(args: argparse.Namespace) -> int:
+def _handle_kill(args: argparse.Namespace) -> Result:
     orphan_result = _kill_orphan_if_named(args)
     if orphan_result is not None:
         return orphan_result
@@ -1183,8 +1178,7 @@ def _handle_kill(args: argparse.Namespace) -> int:
             else:
                 remove = f"remove with: qmu prune --vm {args.vm}"
                 remove_record = f"remove its record with: qmu prune --vm {args.vm}"
-            _emit(
-                args,
+            return Result(
                 data={
                     "ok": True,
                     "vm_id": args.vm,
@@ -1204,7 +1198,6 @@ def _handle_kill(args: argparse.Namespace) -> int:
                 + (" Reaped its recorded debugger bridge." if bridge_reaped else ""),
                 stem="kill",
             )
-            return 0
     inst = choose_instance(args.vm)
     # A panicked or crashed guest has a report in its serial log that `status`
     # just told the reader to pull. The default clean deleted it without a
@@ -1233,8 +1226,7 @@ def _handle_kill(args: argparse.Namespace) -> int:
         msg = f"VM '{inst.vm_id}' stopped. State preserved at {inst.serial_log}"
     else:
         msg = f"VM '{inst.vm_id}' stopped."
-    _emit(
-        args,
+    res = Result(
         data={
             "ok": True,
             "vm_id": inst.vm_id,
@@ -1249,14 +1241,14 @@ def _handle_kill(args: argparse.Namespace) -> int:
         stem="kill",
     )
     if had_bridge and not bridge_reaped:
-        sys.stderr.write(
+        res = res.warn(
             f"[qmu] Note: VM '{inst.vm_id}' had an attached debugger on GDB port "
             f"{inst.gdb_port}. That pry bridge now points at a dead stub; qmu does "
             "not manage it. If a later `pry` command reports \"Multiple bridge "
             "instances\", this is the stale one — clean it up (`pry doctor`, then "
             "kill it).\n"
         )
-    return 0
+    return res
 
 
 def _reap_recorded_bridge(inst: Any) -> bool:
@@ -1455,7 +1447,7 @@ def _capped(items: list[Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     }
 
 
-def _handle_prune_build_residue(args: argparse.Namespace) -> int:
+def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
     """Reclaim in-tree kernel build intermediates.
 
     The age gate is the only thing standing between this and a live build:
@@ -1522,9 +1514,8 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> int:
             "build_residue": payload,
             "unmanaged_cache": unmanaged,
         }
-        _emit(args, data=data, text=_residue_lines(report, dry_run=True, older_than=older_than),
-              stem="prune-build-residue")
-        return 0
+        return Result(data=data, text=_residue_lines(report, dry_run=True, older_than=older_than),
+                      stem="prune-build-residue")
 
     removed, failed = remove_items(report.bucket_items("eligible"))
     shown, withheld = _capped(removed)
@@ -1554,8 +1545,9 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> int:
         "build_residue": payload,
         "unmanaged_cache": unmanaged,
     }
-    _emit(
-        args,
+    # A refused group is a reported outcome, not a failure: exiting non-zero
+    # would make scripted use fail on any cache holding one root-owned tree.
+    return Result(
         data=data,
         text=_residue_lines(
             report, dry_run=False, older_than=older_than,
@@ -1564,9 +1556,6 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> int:
         ),
         stem="prune-build-residue",
     )
-    # A refused group is a reported outcome, not a failure: exiting non-zero
-    # would make scripted use fail on any cache holding one root-owned tree.
-    return 0
 
 
 def _residue_lines(
@@ -1636,7 +1625,7 @@ def _orphan_vm_id(orphan: dict[str, Any]) -> str | None:
     return None
 
 
-def _handle_prune_orphans(args: argparse.Namespace) -> int:
+def _handle_prune_orphans(args: argparse.Namespace) -> Result:
     orphans = find_orphan_qemus()
 
     if getattr(args, "dry_run", False):
@@ -1668,8 +1657,7 @@ def _handle_prune_orphans(args: argparse.Namespace) -> int:
                     f"serial={o.get('serial_log') or '?'}"
                 )
             text.append("Re-run without --dry-run to kill them.")
-        _emit(args, data=data, text=text, stem="prune-orphans")
-        return 0
+        return Result(data=data, text=text, stem="prune-orphans")
 
     killed: list[int] = []
     failed: list[dict[str, Any]] = []
@@ -1703,11 +1691,12 @@ def _handle_prune_orphans(args: argparse.Namespace) -> int:
         text = [f"Killed {len(killed)} orphaned QEMU process(es):"]
         text.extend(f"  pid {pid}" for pid in killed)
         text.extend(f"  pid {f['pid']}: FAILED — {f['error']}" for f in failed)
-    _emit(args, data=data, text=text, stem="prune-orphans")
-    return 1 if failed else 0
+    return Result(
+        data=data, text=text, stem="prune-orphans", exit_code=1 if failed else 0
+    )
 
 
-def _handle_prune(args: argparse.Namespace) -> int:
+def _handle_prune(args: argparse.Namespace) -> Result:
     if getattr(args, "prune_build_residue", False):
         return _handle_prune_build_residue(args)
     # A mode-scoped flag must be implemented for every mode the parser accepts
@@ -1766,8 +1755,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
                 f"Pruned {removed_n} qmu-owned runtime artifact(s); "
                 f"skipped {live_n} live and {indet_n} indeterminate."
             )
-        _emit(args, data=data, text=text, stem="prune")
-        return 0
+        return Result(data=data, text=text, stem="prune")
 
     running = list_instances()
     running_ids = {inst.vm_id for inst in running}
@@ -1889,8 +1877,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
         text.extend(held_lines)
         if cache_note:
             text.append(cache_note)
-        _emit(args, data=data, text=text, stem="prune")
-        return 0
+        return Result(data=data, text=text, stem="prune")
 
     pruned: list[str] = []
     for vm_id in targets:
@@ -1920,8 +1907,7 @@ def _handle_prune(args: argparse.Namespace) -> int:
     }
     if found is not None:
         data["found"] = found
-    _emit(args, data=data, text=lines, stem="prune")
-    return 0
+    return Result(data=data, text=lines, stem="prune")
 
 
 # ---------------------------------------------------------------------------
@@ -1982,7 +1968,7 @@ def _add_wait(sub: argparse._SubParsersAction) -> None:
 _PATTERN_POLL_INTERVAL = 0.25
 
 
-def _handle_wait(args: argparse.Namespace) -> int:
+def _handle_wait(args: argparse.Namespace) -> Result:
     if getattr(args, "pattern", None) is not None:
         return _wait_for_pattern(args)
     if args.vm:
@@ -2174,7 +2160,7 @@ def _console_tail(log_path: str | None, start: int) -> list[str]:
     return lines[-_CONSOLE_TAIL_LINES:]
 
 
-def _wait_already_stopped(args: argparse.Namespace, inst: Any) -> int:
+def _wait_already_stopped(args: argparse.Namespace, inst: Any) -> Result:
     """Bare `wait --vm X` on a VM whose process exited before the wait began.
 
     The retained log is scanned from its last boot, like every other reader.
@@ -2208,7 +2194,7 @@ def _finish_wait(
     last_event: str | None,
     event_data: Any,
     console_tail: list[str],
-) -> int:
+) -> Result:
     """Render one bare-`wait` outcome and map it to the exit code.
 
     0 — the recorded process is gone (now, or before the wait began).
@@ -2289,13 +2275,13 @@ def _finish_wait(
         lines.extend(f"  {line}" for line in console_tail)
     if cleaned:
         lines.append("[qmu] Instance metadata cleaned up.")
-    _emit(args, data=result, text=lines, stem="wait")
-
     if stopped:
-        return 0
-    if reason == _WAIT_REASON_TERMINAL_PANIC:
-        return 3
-    return 124
+        exit_code = 0
+    elif reason == _WAIT_REASON_TERMINAL_PANIC:
+        exit_code = 3
+    else:
+        exit_code = 124
+    return Result(data=result, text=lines, stem="wait", exit_code=exit_code)
 
 
 # How long to let a detected crash finish printing before extracting it, and
@@ -2320,7 +2306,7 @@ def _settled_crash(inst: Any, start_offset: int) -> str | None:
     return extract_crash(inst.serial_log, start_offset=start_offset)
 
 
-def _wait_for_pattern(args: argparse.Namespace) -> int:
+def _wait_for_pattern(args: argparse.Namespace) -> Result:
     """Block until a regex matches a serial console line.
 
     This replaces the `until grep -q ... serial.log; do sleep 2; done` shell
@@ -2377,8 +2363,7 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
                 f"Cannot inspect serial log for '{inst.vm_id}': {exc}. "
                 "Pattern result is inconclusive."
             )
-            _emit_refusal(
-                args,
+            return Result(
                 data={
                     "ok": False,
                     "error": message,
@@ -2390,8 +2375,9 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
                 },
                 text=[message],
                 stem="wait",
+                exit_code=4,
+                refusal=True,
             )
-            return 4
         if saw_dead:
             # The process is already gone, so nothing more will be appended.
             # Release the withheld fragment: the marker may be the final,
@@ -2509,15 +2495,15 @@ def _wait_for_pattern(args: argparse.Namespace) -> int:
         ]
     if crash:
         lines_out.append("\nCrash from serial log:\n" + crash)
-    _emit(args, data=result, text=lines_out, stem="wait")
-
     if matched:
-        return 0
-    if crash and terminal_panic_seen:
-        return 3
-    if reason == "process_exited":
-        return 1
-    return 124
+        exit_code = 0
+    elif crash and terminal_panic_seen:
+        exit_code = 3
+    elif reason == "process_exited":
+        exit_code = 1
+    else:
+        exit_code = 124
+    return Result(data=result, text=lines_out, stem="wait", exit_code=exit_code)
 
 
 # ---------------------------------------------------------------------------
@@ -2581,14 +2567,13 @@ def _guest_note(obs: _GuestObservation) -> str | None:
     return None
 
 
-def _handle_list(args: argparse.Namespace) -> int:
+def _handle_list(args: argparse.Namespace) -> Result:
     # The project-config gate lives at the cli.main dispatch choke point, so
     # this handler is already running under a validated project config.
     running = list_instances()
     stopped = list_stopped_instances()
     if not running and not stopped:
-        _emit(args, data={"ok": True, "vms": []}, text="No VMs.", stem="list")
-        return 0
+        return Result(data={"ok": True, "vms": []}, text="No VMs.", stem="list")
 
     # Hoisted: _orphan_serial_logs() walks all of /proc, so calling it per
     # stopped VM made `list --format json` scan the process table N times.
@@ -2597,6 +2582,9 @@ def _handle_list(args: argparse.Namespace) -> int:
     orphan_logs = _orphan_serial_logs()
     probes = _probe_all_running(running)
 
+    # The one handler that forks on --format itself: the per-VM probes above
+    # are shared, but the stopped-VM classification below is re-read per
+    # row, so only the requested rendering is built.
     if args.format != "text":
         data = []
         for inst, obs in zip(running, probes):
@@ -2667,8 +2655,7 @@ def _handle_list(args: argparse.Namespace) -> int:
                 "held_reason": held_reason,
                 "held_path": held["held_path"],
             })
-        _output({"ok": True, "vms": data}, args, stem="list")
-        return 0
+        return Result(data={"ok": True, "vms": data}, text=None, stem="list")
 
     lines = []
     for inst, obs in zip(running, probes):
@@ -2718,8 +2705,7 @@ def _handle_list(args: argparse.Namespace) -> int:
             else:
                 state = "[stopped]"
         lines.append(f"  {inst.vm_id}  {profile_str}  {kernel_str}  {state}")
-    _output("VMs:\n" + "\n".join(lines), args, stem="list")
-    return 0
+    return Result(data=None, text="VMs:\n" + "\n".join(lines), stem="list")
 
 
 # ---------------------------------------------------------------------------
@@ -2838,7 +2824,7 @@ def describe_non_running(
     return None
 
 
-def _status_non_running(args: argparse.Namespace, info: dict[str, Any]) -> int:
+def _status_non_running(args: argparse.Namespace, info: dict[str, Any]) -> Result:
     """`status` on a VM `list` shows but no process serves: a description, not an error.
 
     A kill that kept its logs is the normal end of every exploit run, and
@@ -2903,11 +2889,10 @@ def _status_non_running(args: argparse.Namespace, info: dict[str, Any]) -> int:
                 else f"remove with: qmu prune --vm {vm_id})"
             )
         )
-    _emit(args, data=data, text=text, stem="status")
-    return 0
+    return Result(data=data, text=text, stem="status")
 
 
-def _handle_status(args: argparse.Namespace) -> int:
+def _handle_status(args: argparse.Namespace) -> Result:
     # Validation of the project/explicit config happens once, at the cli.main
     # dispatch gate (#37), so every sibling verb gives one answer about whether
     # the project is valid. status reads no boot settings from qmu.toml.
@@ -3016,8 +3001,7 @@ def _handle_status(args: argparse.Namespace) -> int:
     notice = _crash_warning(guest, inst.vm_id, crash_detected=obs.crash_detected)
     if notice:
         lines.append(notice.strip())
-    _emit(args, data=result, text=lines, stem="status")
-    return 0
+    return Result(data=result, text=lines, stem="status")
 
 
 # ---------------------------------------------------------------------------
@@ -3266,7 +3250,7 @@ def _missing_path_detail(config: Any, field_name: str) -> str:
     return f"{text} [{config.source_layer(field_name)}]"
 
 
-def _handle_doctor(args: argparse.Namespace) -> int:
+def _handle_doctor(args: argparse.Namespace) -> Result:
     config_path = getattr(args, "config", None)
     config = resolve_config(
         config_path_override=Path(config_path) if config_path else None,
@@ -3593,6 +3577,9 @@ def _handle_doctor(args: argparse.Namespace) -> int:
     if not project_sources:
         lines.append("")
         lines.append("Tip: run `qmu config init` to create a starter qmu.toml in this directory.")
-    _emit(args, data={"ok": all_ok, "checks": checks}, text=lines, stem="doctor")
-
-    return 0 if all_ok else 1
+    return Result(
+        data={"ok": all_ok, "checks": checks},
+        text=lines,
+        stem="doctor",
+        exit_code=0 if all_ok else 1,
+    )

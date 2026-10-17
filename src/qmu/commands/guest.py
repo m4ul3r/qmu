@@ -44,9 +44,8 @@ from ..serial import (
 )
 from ..ssh import SSHClient, SSHError, guest_bytes, guest_lossy, is_transport_failure
 from .._cliutil import (
+    Result,
     _add_common_opts,
-    _emit,
-    _emit_bytes,
     _make_ssh,
     _preflight_ssh_guest,
     _qmp_stopped_status,
@@ -77,8 +76,7 @@ def _require_running_vm(vm_id: str | None, command: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _emit_transfer_transport_lost(
-    args: argparse.Namespace,
+def _transfer_transport_lost(
     *,
     operation: str,
     local: str,
@@ -86,8 +84,8 @@ def _emit_transfer_transport_lost(
     inst: VMInstance,
     start_offset: int,
     stem: str | None = None,
-) -> int:
-    """Emit the scp-transport-lost envelope; exit 3 only with a fresh crash.
+) -> Result:
+    """The scp-transport-lost envelope; exit 3 only with a fresh crash.
 
     The same split :func:`_ssh_lost_payload` applies to `exec`: an scp failure
     (rc=255 + transport marker) is a weak guest-death signal on its own — it
@@ -129,26 +127,24 @@ def _emit_transfer_transport_lost(
         "crash": crash,
         "hint": hint,
     }
-    _emit(
-        args,
+    return Result(
         data=result,
         text=[f"SCP transport lost during {operation}: {direction}", detail],
         stem=stem or operation,
+        exit_code=status,
     )
-    return status
 
 
-def _emit_transfer_halted(
-    args: argparse.Namespace,
+def _transfer_halted(
     inst: VMInstance,
     start_offset: int,
     *,
     operation: str,
     stem: str,
-) -> int | None:
-    """Emit the paused envelope when a lost transfer is explained by a halted
+) -> Result | None:
+    """The paused envelope when a lost transfer is explained by a halted
     vCPU (the watcher aborted it, or ssh gave up on a stopped guest). Returns
-    the exit status (1), or None when the vCPU runs and the transport
+    the exit-1 Result, or None when the vCPU runs and the transport
     classification applies.
     """
     qemu_status = _halted_not_panicked(inst, start_offset=start_offset)
@@ -156,13 +152,12 @@ def _emit_transfer_halted(
         return None
     data, text = _stopped_guest_payload(inst, qemu_status)
     data["operation"] = operation
-    _emit(
-        args,
+    return Result(
         data=data,
         text=[f"SSH connection lost during {operation}.", *text],
         stem=stem,
+        exit_code=1,
     )
-    return 1
 
 
 class _DeliveryTransportLost(SSHError):
@@ -178,7 +173,6 @@ class _DeliveryTransportLost(SSHError):
 
 
 def _classify_transfer_failure(
-    args: argparse.Namespace,
     exc: SSHError,
     *,
     inst: VMInstance,
@@ -187,8 +181,8 @@ def _classify_transfer_failure(
     local: str,
     remote: str,
     stem: str,
-) -> int:
-    """Emit the envelope for a transfer `exc` ended and return the exit status;
+) -> Result:
+    """The envelope for a transfer `exc` ended, with its exit status;
     re-raises `exc` when nothing qmu holds explains it (plain infra, exit 4).
 
     One decision for push, pull and host-build delivery, in the order
@@ -209,8 +203,8 @@ def _classify_transfer_failure(
       crash-vs-unreachable split; an ordinary scp timeout or protocol failure
       with no panic stays infra.
     """
-    halted = _emit_transfer_halted(
-        args, inst, start_offset, operation=operation, stem=stem
+    halted = _transfer_halted(
+        inst, start_offset, operation=operation, stem=stem
     )
     if halted is not None:
         return halted
@@ -221,8 +215,7 @@ def _classify_transfer_failure(
             raise exc
     elif not is_transport_failure(exc.returncode, exc.stderr):
         raise exc
-    return _emit_transfer_transport_lost(
-        args,
+    return _transfer_transport_lost(
         operation=operation,
         local=local,
         remote=remote,
@@ -251,11 +244,11 @@ def _add_push(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_push)
 
 
-def _handle_push(args: argparse.Namespace) -> int:
+def _handle_push(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
-    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="push")) is not None:
-        return preflight_rc
+    if (refused := _preflight_ssh_guest(inst, stem="push")) is not None:
+        return refused
     ssh = _make_ssh(inst)
     start_offset = serial_log_offset(inst.serial_log)
     try:
@@ -266,16 +259,14 @@ def _handle_push(args: argparse.Namespace) -> int:
         )
     except SSHError as exc:
         return _classify_transfer_failure(
-            args, exc, inst=inst, start_offset=start_offset, operation="push",
+            exc, inst=inst, start_offset=start_offset, operation="push",
             local=args.local, remote=args.remote, stem="push",
         )
-    _emit(
-        args,
+    return Result(
         data={"ok": True, "vm_id": inst.vm_id, "local": args.local, "remote": args.remote},
         text=f"Pushed {args.local} -> guest:{args.remote}",
         stem="push",
     )
-    return 0
 
 
 def _add_pull(sub: argparse._SubParsersAction) -> None:
@@ -286,11 +277,11 @@ def _add_pull(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_pull)
 
 
-def _handle_pull(args: argparse.Namespace) -> int:
+def _handle_pull(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
-    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="pull")) is not None:
-        return preflight_rc
+    if (refused := _preflight_ssh_guest(inst, stem="pull")) is not None:
+        return refused
     ssh = _make_ssh(inst)
     start_offset = serial_log_offset(inst.serial_log)
     try:
@@ -301,16 +292,14 @@ def _handle_pull(args: argparse.Namespace) -> int:
         )
     except SSHError as exc:
         return _classify_transfer_failure(
-            args, exc, inst=inst, start_offset=start_offset, operation="pull",
+            exc, inst=inst, start_offset=start_offset, operation="pull",
             local=args.local, remote=args.remote, stem="pull",
         )
-    _emit(
-        args,
+    return Result(
         data={"ok": True, "vm_id": inst.vm_id, "local": args.local, "remote": args.remote},
         text=f"Pulled guest:{args.remote} -> {args.local}",
         stem="pull",
     )
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +397,7 @@ def _ssh_lost_payload(
     against the contract that a tooling fault is never mistaken for a panic.
     Status 3 requires a corroborating fresh serial crash; otherwise the guest is
     merely unreachable and this is transport-layer (4). This matches the
-    discrimination `_emit_transfer_transport_lost` already applied to scp, so
+    discrimination `_transfer_transport_lost` already applied to scp, so
     the two siblings no longer disagree about the same condition.
 
     A (status, data, text) triple rather than an emitter so ``qmu exec``,
@@ -671,7 +660,7 @@ def _run_guest_command(
     byte, followed by the text lines when the command was lost (the crash
     report); the notes belong on stderr (guest stderr bytes verbatim, the
     `[exit code: N]` trailer, a survived kernel report) — see
-    :func:`_emit_guest_result`.
+    :func:`_guest_result`.
 
     The ssh child is watched by :func:`_guest_abort_watcher`: a terminal
     panic appended after the command started, or a vCPU QMP reports halted,
@@ -752,34 +741,31 @@ def _run_guest_command(
     return (0 if rc == 0 else 1), data, stdout, [], notes
 
 
-def _emit_guest_result(
-    args: argparse.Namespace,
+def _guest_result(
     *,
     data: dict[str, Any],
     stdout: str = "",
     text: list[str] = (),
     notes: list[str | bytes] = (),
     stem: str,
-) -> None:
-    """Emit a guest command result; text mode keeps stdout for guest stdout.
+    exit_code: int,
+) -> Result:
+    """A guest command Result; text mode keeps stdout for guest stdout.
 
     Text mode writes the guest's `stdout` bytes to stdout exactly as the
-    guest wrote them — no decode, no added newline — through
-    :func:`_emit_bytes` (spill/--out apply). `text` (the crash report or
-    timeout notice when the command was lost) follows on its own lines. An
-    empty payload prints nothing rather than a blank line, so `qmu exec ...
-    > out.txt` is byte-exact for a silent command too. `notes` go to stderr:
-    `bytes` entries are guest stderr, verbatim; `str` entries (`[exit code:
-    N]`, kernel warnings, follow-up hints) are qmu's lines and start on a
-    fresh line. `exec` used to print all of it on stdout as `[stderr] ...` /
+    guest wrote them — no decode, no added newline — as `Result.raw`
+    (spill/--out apply). `text` (the crash report or timeout notice when the
+    command was lost) follows on its own lines. An empty payload prints
+    nothing rather than a blank line, so `qmu exec ... > out.txt` is
+    byte-exact for a silent command too. `notes` go to stderr: `bytes`
+    entries are guest stderr, verbatim; `str` entries (`[exit code: N]`,
+    kernel warnings, follow-up hints) are qmu's lines and start on a fresh
+    line. `exec` used to print all of it on stdout as `[stderr] ...` /
     `[exit code: N]` lines, so a pipeline or a redirect collected the
     decorations as if the guest had printed them; then it rendered the
     stdout as text, so `printf x` arrived as `x\\n` and a 0xff byte as
     U+FFFD. JSON modes: `data` is the envelope.
     """
-    if getattr(args, "format", "text") != "text":
-        _emit(args, data=data, text="", stem=stem)
-        return
     raw = guest_bytes(stdout)
     if text:
         if raw and not raw.endswith(b"\n"):
@@ -787,51 +773,31 @@ def _emit_guest_result(
         raw += "\n".join(text).encode("utf-8")
         if not raw.endswith(b"\n"):
             raw += b"\n"
-    if raw or getattr(args, "out", None):
-        exit_code = data.get("exit_code")
-        _emit_bytes(
-            args,
-            raw,
-            stem=stem,
-            source_ok=bool(data.get("ok", False)),
-            exit_code=exit_code if isinstance(exit_code, int) else None,
-        )
-    if not notes:
-        return
-    sys.stdout.flush()
-    sys.stderr.flush()
-    err = sys.stderr.buffer
-    at_line_start = True
-    for note in notes:
-        if isinstance(note, bytes):
-            if note:
-                err.write(note)
-                at_line_start = note.endswith(b"\n")
-            continue
-        if not at_line_start:
-            err.write(b"\n")
-        err.write(note.encode("utf-8"))
-        if not note.endswith("\n"):
-            err.write(b"\n")
-        at_line_start = True
-    err.flush()
+    return Result(
+        data=data,
+        stem=stem,
+        exit_code=exit_code,
+        raw=raw,
+        suffix=".txt",
+        notes=tuple(notes),
+    )
 
 
-def _handle_exec(args: argparse.Namespace) -> int:
+def _handle_exec(args: argparse.Namespace) -> Result:
     _require_running_vm(args.vm, "exec")
     inst = choose_instance(args.vm)
     _require_ssh(inst)
-    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="exec")) is not None:
-        return preflight_rc
+    if (refused := _preflight_ssh_guest(inst, stem="exec")) is not None:
+        return refused
     ssh = _make_ssh(inst)
     command = _join_exec_command(args.command)
     status, data, stdout, text, notes = _run_guest_command(
         ssh, command, inst, timeout=args.timeout
     )
-    _emit_guest_result(
-        args, data=data, stdout=stdout, text=text, notes=notes, stem="exec"
+    return _guest_result(
+        data=data, stdout=stdout, text=text, notes=notes, stem="exec",
+        exit_code=status,
     )
-    return status
 
 
 # ---------------------------------------------------------------------------
@@ -930,11 +896,11 @@ def _compile_on_host(
     return 0, result
 
 
-def _handle_compile(args: argparse.Namespace) -> int:
+def _handle_compile(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
-    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="compile")) is not None:
-        return preflight_rc
+    if (refused := _preflight_ssh_guest(inst, stem="compile")) is not None:
+        return refused
     ssh = _make_ssh(inst)
     source = Path(args.source)
 
@@ -955,7 +921,7 @@ def _handle_compile(args: argparse.Namespace) -> int:
             # transferred file is the host-built binary, not the source, and
             # the loss may have happened in the chmod that follows it.
             return _classify_transfer_failure(
-                args, exc, inst=inst, start_offset=delivery_offset, operation="push",
+                exc, inst=inst, start_offset=delivery_offset, operation="push",
                 local=f"{source.name} (host-built binary)", remote=remote_bin,
                 stem="compile",
             )
@@ -971,7 +937,7 @@ def _handle_compile(args: argparse.Namespace) -> int:
             )
         except SSHError as exc:
             return _classify_transfer_failure(
-                args, exc, inst=inst, start_offset=push_offset, operation="push",
+                exc, inst=inst, start_offset=push_offset, operation="push",
                 local=str(source), remote=remote_src, stem="compile",
             )
 
@@ -1004,10 +970,10 @@ def _handle_compile(args: argparse.Namespace) -> int:
             status, data, stdout, text, notes = _with_guest_output(
                 explained, exc.stdout, exc.stderr
             )
-            _emit_guest_result(
-                args, data=data, stdout=stdout, text=text, notes=notes, stem="compile"
+            return _guest_result(
+                data=data, stdout=stdout, text=text, notes=notes, stem="compile",
+                exit_code=status,
             )
-            return status
 
         result = {
             "source": str(source),
@@ -1028,13 +994,12 @@ def _handle_compile(args: argparse.Namespace) -> int:
     if rc != 0:
         result["ok"] = False
         where = "on the host" if args.host_build else "in the guest"
-        _emit(
-            args,
+        return Result(
             data=result,
             text=f"Compilation failed {where}:\n{str(result['compile_stderr']).strip()}",
             stem="compile",
+            exit_code=1,
         )
-        return 1
 
     result["compiled"] = True
 
@@ -1046,13 +1011,12 @@ def _handle_compile(args: argparse.Namespace) -> int:
         # Text mode: the banner is a note (stderr), never stdout — stdout is
         # reserved for program output on every compile path, so a redirect
         # of `compile` with or without --run collects the same thing.
-        _emit_guest_result(
-            args,
+        return _guest_result(
             data=result,
             notes=[f"Compiled {source.name} -> {remote_bin}{built_by}"],
             stem="compile",
+            exit_code=0,
         )
-        return 0
 
     # Run (quoted: the binary path is interpolated into a root shell command).
     if getattr(args, "format", "text") == "text":
@@ -1075,10 +1039,10 @@ def _handle_compile(args: argparse.Namespace) -> int:
         ssh, shlex.quote(remote_bin), inst, timeout=args.timeout
     )
     data = {**result, **_as_run_fields(data)}
-    _emit_guest_result(
-        args, data=data, stdout=stdout, text=text, notes=notes, stem="compile"
+    return _guest_result(
+        data=data, stdout=stdout, text=text, notes=notes, stem="compile",
+        exit_code=status,
     )
-    return status
 
 
 def _as_run_fields(data: dict[str, Any]) -> dict[str, Any]:
@@ -1108,11 +1072,11 @@ def _add_dmesg(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_dmesg)
 
 
-def _handle_dmesg(args: argparse.Namespace) -> int:
+def _handle_dmesg(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     _require_ssh(inst)
-    if (preflight_rc := _preflight_ssh_guest(args, inst, stem="dmesg")) is not None:
-        return preflight_rc
+    if (refused := _preflight_ssh_guest(inst, stem="dmesg")) is not None:
+        return refused
     ssh = _make_ssh(inst)
     cmd = "dmesg"
     if args.tail is not None:
@@ -1145,10 +1109,10 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
         status, data, out, text, notes = _with_guest_output(
             explained, exc.stdout, exc.stderr
         )
-        _emit_guest_result(
-            args, data=data, stdout=out, text=text, notes=notes, stem="dmesg"
+        return _guest_result(
+            data=data, stdout=out, text=text, notes=notes, stem="dmesg",
+            exit_code=status,
         )
-        return status
 
     # A panic during the read drops the connection and ssh exits 255, often
     # with only a banner-exchange timeout on stderr. rc=255 is also a legal
@@ -1168,10 +1132,10 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
             status, data, out, text, notes = _with_guest_output(
                 explained, stdout, stderr
             )
-            _emit_guest_result(
-                args, data=data, stdout=out, text=text, notes=notes, stem="dmesg"
+            return _guest_result(
+                data=data, stdout=out, text=text, notes=notes, stem="dmesg",
+                exit_code=status,
             )
-            return status
 
     # L3: honor the guest exit code; do not silently render stderr as if it were
     # the kernel log. The kernel log is stdout (byte for byte, so `qmu dmesg |
@@ -1194,8 +1158,10 @@ def _handle_dmesg(args: argparse.Namespace) -> int:
         data["text_lossy"] = True
     if guest_lossy(stderr):
         data["stderr_lossy"] = True
-    _emit_guest_result(args, data=data, stdout=stdout, notes=notes, stem="dmesg")
-    return 0 if rc == 0 else 1
+    return _guest_result(
+        data=data, stdout=stdout, notes=notes, stem="dmesg",
+        exit_code=0 if rc == 0 else 1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1217,7 +1183,7 @@ def _add_crash(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_crash)
 
 
-def _handle_crash(args: argparse.Namespace) -> int:
+def _handle_crash(args: argparse.Namespace) -> Result:
     # Already gated: cli.main validates the project/explicit config for every
     # non-exempt verb before dispatching (#37).
     inst = find_instance(args.vm)
@@ -1263,8 +1229,9 @@ def _handle_crash(args: argparse.Namespace) -> int:
         "serial_log": inst.serial_log,
         "crash": crash,
     }
-    _emit(args, data=crash_data, text=text, stem="crash")
-    return 0 if detected else 1
+    return Result(
+        data=crash_data, text=text, stem="crash", exit_code=0 if detected else 1
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1319,7 +1286,7 @@ def _grep_lines(text: str, pattern: str, context: int) -> tuple[str, int]:
     return "\n".join(rendered) + "\n", len(hits)
 
 
-def _handle_log(args: argparse.Namespace) -> int:
+def _handle_log(args: argparse.Namespace) -> Result:
     # Already gated: cli.main validates the project/explicit config for every
     # non-exempt verb before dispatching (#37).
     inst = find_instance(args.vm)
@@ -1329,7 +1296,7 @@ def _handle_log(args: argparse.Namespace) -> int:
     # "no lines matched" for a pattern that is present — a confident false
     # negative, and exactly wrong for crash triage. An explicit --tail still
     # wins, so the window is narrowable on purpose but never by accident.
-    # `--full` is unbounded: the spill path in _emit turns an oversized log
+    # `--full` is unbounded: the spill path in `render` turns an oversized log
     # into an artifact pointer, so this stays agent-safe.
     whole_log = args.full or (args.grep is not None and args.tail is None)
     tail_lines = 50 if args.tail is None else args.tail
@@ -1364,5 +1331,4 @@ def _handle_log(args: argparse.Namespace) -> int:
     else:
         text = "Serial log is empty or missing."
 
-    _emit(args, data=data, text=text, stem="log")
-    return 0
+    return Result(data=data, text=text, stem="log")

@@ -17,6 +17,7 @@ import os
 import signal
 import sys
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +110,56 @@ def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
     )
 
 
+@dataclass(frozen=True)
+class Result:
+    """What a handler returns; :func:`render` writes it and yields the exit code.
+
+    `data` is the JSON-mode payload (a dict carrying `ok`, usually). In text
+    mode one of three things is written to stdout:
+
+    - `text` — a string, or a list rendered one item per line (strings as-is,
+      anything else as compact single-line JSON so a QMP list-of-dicts never
+      raises);
+    - `raw` — a byte payload written verbatim (no decode, no trailing
+      newline), the byte-for-byte promise `exec`/`run`/`dmesg`/`rootfs cat`
+      make. Spill/`--out` files are named `<stem>-…<suffix>` and described by
+      the usual pointer/envelope whose `ok`/`exit_code` come from `data`;
+    - a refusal (`refusal=True`) — `text` lines go to stderr as `[qmu] Error:
+      …`, nothing to stdout, so `eval "$(qmu kbase ...)"` never executes prose.
+
+    `notes` follow on stderr in text mode only: `bytes` entries are guest
+    stderr, verbatim; `str` entries are qmu's own lines and start on a fresh
+    line. `warnings` are stderr text written verbatim after everything else
+    in every mode — the follow-up hints and debugger-coherence warnings that
+    trail a command's output (so a terminal shows them after the result they
+    qualify, and a JSON envelope is never interleaved with them). A `silent`
+    Result renders nothing in any mode: the handler already wrote what it had
+    to (a group's help, an interactive shell, the print-as-you-go skill
+    install) and only the exit code remains. Handlers never write stdout
+    themselves otherwise: `cli.invoke` returns the Result unrendered (the seam
+    for in-process callers) and `cli.main` renders.
+    """
+
+    data: Any
+    text: str | list[Any] | None = None
+    stem: str = "qmu"
+    exit_code: int = 0
+    raw: bytes | None = None
+    suffix: str = ".bin"
+    notes: tuple[str | bytes, ...] = ()
+    warnings: tuple[str, ...] = ()
+    refusal: bool = False
+    silent: bool = False
+
+    @classmethod
+    def silent_exit(cls, exit_code: int) -> Result:
+        return cls(data=None, exit_code=exit_code, silent=True)
+
+    def warn(self, *lines: str) -> Result:
+        """This Result with `lines` appended to its trailing stderr text."""
+        return replace(self, warnings=self.warnings + lines)
+
+
 def _output(
     value: Any,
     args: argparse.Namespace,
@@ -139,34 +190,97 @@ def _output(
         sys.stderr.write(f"[qmu] Output spilled to {result.artifact['artifact_path']}\n")
 
 
-def _emit(
-    args: argparse.Namespace,
-    *,
-    data: Any,
-    text: str | list[str],
-    stem: str,
-) -> None:
-    """Dispatch a handler result through the one ``--format`` fork.
+def _write_bytes(args: argparse.Namespace, result: Result) -> None:
+    """Text-mode delivery of `result.raw` on stdout, verbatim.
 
-    In text mode the ``text`` payload is rendered (a list is joined with "\n");
-    otherwise the ``data`` payload (typically a dict) is rendered. Both paths
-    funnel into the existing :func:`_output`, so spilling / file-out behavior is
-    unchanged. This collapses the per-handler ``if args.format == "text"`` fork
-    into a single place. ``format`` is read defensively so leaf commands that use
-    ``_add_format_opts`` (which may leave the attribute unset before defaults)
-    behave exactly as the prior ``getattr(args, "format", "text")`` checks.
+    Inline output goes to `sys.stdout.buffer` untouched; a payload over the
+    spill budget, or `--out`, is written to the file exactly and described by
+    the usual pointer/envelope, so the artifact is checksum-comparable with
+    what the guest wrote. The envelope's `ok` is the outcome of the operation
+    that produced the bytes (`data["ok"]`), never "the file got written" —
+    with `data["exit_code"]` alongside when known, so a failed guest command
+    looks failed in text `--out`/spill exactly as it does in JSON `--out`.
     """
+    raw = result.raw
+    data = result.data if isinstance(result.data, dict) else {}
+    exit_code = data.get("exit_code")
+    out = getattr(args, "out", None)
+    written = write_bytes_result(
+        raw,
+        out_path=Path(out) if out else None,
+        stem=result.stem,
+        suffix=result.suffix,
+        source_ok=bool(data.get("ok", False)),
+        exit_code=exit_code if isinstance(exit_code, int) else None,
+    )
+    if written.artifact is None:
+        sys.stdout.flush()
+        sys.stdout.buffer.write(raw)
+        sys.stdout.buffer.flush()
+        return
+    sys.stdout.write(written.rendered)
+    if written.spilled:
+        sys.stderr.write(f"[qmu] Output spilled to {written.artifact['artifact_path']}\n")
+
+
+def _write_notes(notes: tuple[str | bytes, ...]) -> None:
+    if not notes:
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    err = sys.stderr.buffer
+    at_line_start = True
+    for note in notes:
+        if isinstance(note, bytes):
+            if note:
+                err.write(note)
+                at_line_start = note.endswith(b"\n")
+            continue
+        if not at_line_start:
+            err.write(b"\n")
+        err.write(note.encode("utf-8"))
+        if not note.endswith("\n"):
+            err.write(b"\n")
+        at_line_start = True
+    err.flush()
+
+
+def render(args: argparse.Namespace, result: Result) -> int:
+    """Write a handler's :class:`Result` through the one ``--format`` fork.
+
+    In text mode the ``text`` payload (or ``raw`` bytes, or a refusal to
+    stderr) is rendered; otherwise the ``data`` payload is rendered. Both paths
+    funnel into :func:`_output`, so spilling / file-out behavior is uniform.
+    ``format`` is read defensively so leaf commands that use
+    ``_add_format_opts`` (which may leave the attribute unset before defaults)
+    behave as ``getattr(args, "format", "text")``. Returns the exit code.
+    """
+    if not result.silent:
+        _write_result(args, result)
+    for line in result.warnings:
+        sys.stderr.write(line)
+    return result.exit_code
+
+
+def _write_result(args: argparse.Namespace, result: Result) -> None:
+    data = result.data
     source_ok = (
         data["ok"]
         if isinstance(data, dict) and isinstance(data.get("ok"), bool)
         else None
     )
-    if getattr(args, "format", "text") == "text":
-        # QMP results can be lists of non-strings (e.g. a list of dicts from
-        # introspection commands). Render one line per item: strings as-is,
-        # anything else (dicts, scalars) as compact single-line JSON so text
-        # mode never raises on a list-of-* payload. JSON mode still receives
-        # `data` untouched below, so its output is byte-identical.
+    if getattr(args, "format", "text") != "text":
+        _output(data, args, stem=result.stem, source_ok=source_ok)
+        return
+    if result.refusal:
+        first, *rest = result.text
+        sys.stderr.write(f"[qmu] Error: {first}\n")
+        for line in rest:
+            sys.stderr.write(f"[qmu] {line}\n")
+    elif result.raw is not None:
+        _write_bytes(args, result)
+    else:
+        text = result.text
         rendered = (
             "\n".join(
                 item
@@ -177,74 +291,21 @@ def _emit(
             if isinstance(text, list)
             else text
         )
-        _output(rendered, args, stem=stem, source_ok=source_ok)
-    else:
-        _output(data, args, stem=stem, source_ok=source_ok)
+        _output(rendered, args, stem=result.stem, source_ok=source_ok)
+    _write_notes(result.notes)
 
 
-def _emit_bytes(
-    args: argparse.Namespace,
-    raw: bytes,
-    *,
-    stem: str,
-    source_ok: bool,
-    exit_code: int | None = None,
-) -> None:
-    """Text-mode delivery of a byte payload on stdout, verbatim.
-
-    `_emit` renders through `render_value`, which decodes and appends a
-    newline, so guest stdout came out as `x\\n` for `printf x` and as U+FFFD
-    for a 0xff byte — against the byte-for-byte promise `exec`/`run` make.
-    Inline output goes to `sys.stdout.buffer` untouched; a payload over the
-    spill budget, or `--out`, is written to the file exactly and described by
-    the usual pointer/envelope, so the artifact is checksum-comparable with
-    what the guest wrote. The envelope's `ok` is `source_ok` — the outcome
-    of the operation that produced the bytes, never "the file got written" —
-    with `exit_code` alongside when known, so a failed guest command looks
-    failed in text `--out`/spill exactly as it does in JSON `--out`.
-    """
-    out = getattr(args, "out", None)
-    result = write_bytes_result(
-        raw,
-        out_path=Path(out) if out else None,
-        stem=stem,
-        suffix=".txt",
-        source_ok=source_ok,
-        exit_code=exit_code,
-    )
-    if result.artifact is None:
-        sys.stdout.flush()
-        sys.stdout.buffer.write(raw)
-        sys.stdout.buffer.flush()
-        return
-    sys.stdout.write(result.rendered)
-    if result.spilled:
-        sys.stderr.write(f"[qmu] Output spilled to {result.artifact['artifact_path']}\n")
-
-
-def _emit_refusal(
-    args: argparse.Namespace,
-    *,
-    data: dict[str, Any],
-    text: list[str],
-    stem: str,
-) -> None:
-    """Emit an operational refusal: JSON envelope on stdout, text on stderr.
+def _refusal(*, data: dict[str, Any], text: list[str], stem: str) -> Result:
+    """An operational refusal: JSON envelope on stdout, text on stderr.
 
     A refusal is prose about why nothing ran, not a result. In text mode it
     must not land on stdout: `eval "$(qmu kbase ...)"` executed the refusal
     as shell commands (`VM: command not found`), destroying the message and
     leaving `KBASE` unset. The skill's text contract — errors print
     `[qmu] Error: ...` to stderr — applies to every refusal path, so the
-    stdout of a text-mode command stays eval-/pipe-safe.
+    stdout of a text-mode command stays eval-/pipe-safe. Exit 1.
     """
-    if getattr(args, "format", "text") == "text":
-        first, *rest = text
-        sys.stderr.write(f"[qmu] Error: {first}\n")
-        for line in rest:
-            sys.stderr.write(f"[qmu] {line}\n")
-        return
-    _emit(args, data=data, text=text, stem=stem)
+    return Result(data=data, text=text, stem=stem, exit_code=1, refusal=True)
 
 
 def _qmp_stopped_status(inst: VMInstance) -> str | None:
@@ -359,11 +420,10 @@ def _panicked_guest_payload(inst: VMInstance) -> tuple[dict[str, Any], list[str]
 
 
 def _preflight_ssh_guest(
-    args: argparse.Namespace,
     inst: VMInstance,
     *,
     stem: str,
-) -> int | None:
+) -> Result | None:
     """Fail fast when the guest demonstrably cannot answer SSH.
 
     Two positive signals, checked in the order `_guest_state` uses:
@@ -379,21 +439,19 @@ def _preflight_ssh_guest(
 
     QMP introspection is best-effort. An unavailable QMP socket must not turn an
     otherwise working guest command into a new outage, so transport failures
-    preserve the existing SSH path. Returns the exit status when it refused,
-    else None.
+    preserve the existing SSH path. Returns the refusal (exit 1) when it
+    refused, else None.
     """
     boot_start = current_boot_offset(inst.serial_log, inst.guest_epoch_serial_offset)
     if has_terminal_panic(inst.serial_log, start_offset=boot_start):
         data, text = _panicked_guest_payload(inst)
-        _emit_refusal(args, data=data, text=text, stem=stem)
-        return 1
+        return _refusal(data=data, text=text, stem=stem)
 
     qemu_status = _qmp_stopped_status(inst)
     if qemu_status is None:
         return None
     data, text = _stopped_guest_payload(inst, qemu_status)
-    _emit_refusal(args, data=data, text=text, stem=stem)
-    return 1
+    return _refusal(data=data, text=text, stem=stem)
 
 
 def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) -> None:
@@ -509,9 +567,9 @@ def _make_group_help_handler(group_parser: argparse.ArgumentParser):
     prints the group's help instead and returns the usage exit code (2).
     """
 
-    def _handler(args: argparse.Namespace) -> int:
+    def _handler(args: argparse.Namespace) -> Result:
         group_parser.print_help(sys.stderr)
-        return 2
+        return Result.silent_exit(2)
 
     return _handler
 

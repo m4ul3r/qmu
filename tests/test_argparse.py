@@ -5,7 +5,8 @@ SKILL.md documents BOTH `qmu --vm X exec ...` (pre-subcommand) and
 order and resolve args.vm == "X" in both. These tests pin that contract.
 
 No VM is launched: the subcommand handler is replaced with a stub that captures
-the parsed Namespace and returns 0, so only argparse resolution is exercised.
+the parsed Namespace and returns a silent exit-0 Result, so only argparse
+resolution is exercised.
 
 Findings exercised: ARG-1 / H5.
 """
@@ -17,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from qmu import cli
+from qmu._cliutil import Result
 from qmu.commands import guest, lifecycle, qmp_cmds
 
 
@@ -29,7 +31,7 @@ def captured_exec_args(monkeypatch):
 
     def _stub(args):
         captured["args"] = args
-        return 0
+        return Result.silent_exit(0)
 
     monkeypatch.setattr(guest, "_handle_exec", _stub)
     return captured
@@ -250,7 +252,7 @@ def captured_kbase_args(monkeypatch):
 
     def _stub(args):
         captured["args"] = args
-        return 0
+        return Result.silent_exit(0)
 
     monkeypatch.setattr(qmp_cmds, "_handle_kbase", _stub)
     return captured
@@ -290,7 +292,7 @@ def captured_crash_args(monkeypatch):
 
     def _capture(args):
         captured["args"] = args
-        return 0
+        return Result.silent_exit(0)
 
     monkeypatch.setattr(guest, "_handle_crash", _capture)
     return captured

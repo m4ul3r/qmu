@@ -29,9 +29,11 @@ from .ssh import SSHError
 from .version import VERSION
 
 from ._cliutil import (
+    Result,
     _add_top_level_common_opts,
     _emit_error,
     _resolve_config_from_args,
+    render,
 )
 from .commands import guest, lifecycle, meta, qmp_cmds, run
 
@@ -260,15 +262,21 @@ def _emit_usage_error(exc: _UsageError, argv: list[str]) -> NoReturn:
     exc.parser.exit(2)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parse(argv: list[str]) -> argparse.Namespace | None:
+    """Parse `argv` into a dispatchable namespace.
+
+    A usage error is reported as argparse would and raises ``SystemExit(2)``
+    (via :func:`_emit_usage_error`). A missing subcommand under ``--format
+    json|ndjson`` is the same usage-error envelope; in text mode the top-level
+    help is printed and ``None`` is returned so the caller decides how to
+    exit 2 (``main`` returns it, ``invoke`` raises it).
+    """
     # Per-command, not per-process: two separate `qmu` invocations must each
     # warn on a broken global config; only resolve_config() calls WITHIN this
     # one dispatch (the gate below plus a handler that resolves again) dedupe.
     reset_global_config_warnings()
     reset_autoselection()
     parser = build_parser()
-    if argv is None:
-        argv = sys.argv[1:]
     try:
         args = parser.parse_args(argv)
     except _UsageError as exc:
@@ -277,14 +285,42 @@ def main(argv: list[str] | None = None) -> int:
     if not args.subcommand or getattr(args, "handler", None) is None:
         if _requested_format(argv) == "text":
             parser.print_help()
-            return 2
+            return None
         _emit_usage_error(_UsageError(parser, "a subcommand is required"), argv)
-    handler = args.handler
+    return args
 
+
+def _dispatch(args: argparse.Namespace) -> Result:
+    """Apply the project-config gate, then run the handler; nothing rendered."""
+    if args.subcommand not in _CONFIG_EXEMPT_SUBCOMMANDS:
+        _resolve_config_from_args(args)
+    return args.handler(args)
+
+
+def invoke(argv: list[str]) -> Result:
+    """Parse `argv`, apply the project-config gate, dispatch; return the Result.
+
+    Nothing is rendered: this is the in-process seam (MCP façade, daemon).
+    Handler exceptions propagate exactly as the handler raised them —
+    :class:`QMUError`, :class:`QMPError`, :class:`SSHError`, anything else —
+    and :func:`main` owns the exception -> exit-code mapping. A usage error
+    (and a missing subcommand) raises ``SystemExit(2)`` after argparse's own
+    report, exactly as :func:`main` lets it escape.
+    """
+    args = _parse(argv)
+    if args is None:
+        raise SystemExit(2)
+    return _dispatch(args)
+
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    args = _parse(argv)
+    if args is None:
+        return 2
     try:
-        if args.subcommand not in _CONFIG_EXEMPT_SUBCOMMANDS:
-            _resolve_config_from_args(args)
-        return handler(args)
+        return render(args, _dispatch(args))
     except QMUError as exc:
         # Exit-code contract: 2 is reserved for argparse usage errors (argparse
         # itself calls sys.exit(2)). Library errors get distinct codes so an

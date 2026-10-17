@@ -654,8 +654,8 @@ def test_spill_preserves_false_source_ok(isolate_spill_runtime, fmt):
 
 
 # ---------------------------------------------------------------------------
-# Text-mode rendering of list-of-* payloads via _emit (QMP results, ERG fix).
-# No VM required: _emit is called directly with a bare Namespace.
+# Text-mode rendering of list-of-* payloads via render (QMP results, ERG fix).
+# No VM required: render is called directly with a bare Namespace.
 # ---------------------------------------------------------------------------
 
 
@@ -663,9 +663,13 @@ def _emit_args(fmt: str = "text") -> argparse.Namespace:
     return argparse.Namespace(format=fmt, out=None)
 
 
-def test_emit_text_renders_list_of_dicts_one_json_object_per_line(capsys):
-    from qmu._cliutil import _emit
+def _emit(args, *, data, text, stem):
+    from qmu._cliutil import Result, render
 
+    return render(args, Result(data=data, text=text, stem=stem))
+
+
+def test_emit_text_renders_list_of_dicts_one_json_object_per_line(capsys):
     payload = ["str", {"a": 1}, {"b": [2, 3]}]
     _emit(_emit_args(), data={"ok": True, "result": payload}, text=payload, stem="qmp")
 
@@ -677,8 +681,6 @@ def test_emit_text_renders_list_of_dicts_one_json_object_per_line(capsys):
 
 
 def test_emit_text_list_of_str_joining_unchanged(capsys):
-    from qmu._cliutil import _emit
-
     _emit(
         _emit_args(),
         data={"ok": True},
@@ -690,8 +692,6 @@ def test_emit_text_list_of_str_joining_unchanged(capsys):
 
 
 def test_emit_text_list_of_scalars_joined_as_today(capsys):
-    from qmu._cliutil import _emit
-
     _emit(_emit_args(), data={"ok": True, "result": [1, 2]}, text=[1, 2], stem="qmp")
 
     assert capsys.readouterr().out == "1\n2\n"
@@ -699,8 +699,6 @@ def test_emit_text_list_of_scalars_joined_as_today(capsys):
 
 def test_emit_json_mode_payload_untouched_for_list_result(capsys):
     """JSON mode must stay byte-identical: `data` is rendered, not `text`."""
-    from qmu._cliutil import _emit
-
     data = {"ok": True, "result": ["str", {"a": 1}]}
     _emit(_emit_args("json"), data=data, text=["str", {"a": 1}], stem="qmp")
 
@@ -712,8 +710,6 @@ def test_emit_json_mode_payload_untouched_for_list_result(capsys):
 def test_emit_text_dict_items_no_longer_raise():
     """Regression pin: a list-of-dict QMP result used to raise TypeError in
     text mode ("\\n".join on non-str items). It must now render cleanly."""
-    from qmu._cliutil import _emit
-
     payload = [{"return": {"status": "running"}}]
     _emit(  # must not raise TypeError
         _emit_args(),

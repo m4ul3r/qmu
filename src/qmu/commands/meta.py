@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import base64
 import shutil
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -32,12 +31,11 @@ from ..paths import (
     skill_install_roots,
 )
 from .. import rootfs as rootfs_mod
-from ..output import write_bytes_result
 from ..version import VERSION
 from .._cliutil import (
+    Result,
     _add_common_opts,
     _add_format_opts,
-    _emit,
     _make_group_help_handler,
 )
 
@@ -154,7 +152,7 @@ def _age_annotation(older_than: float) -> str | None:
     )
 
 
-def _handle_cache_du(args: argparse.Namespace) -> int:
+def _handle_cache_du(args: argparse.Namespace) -> Result:
     older_than = getattr(args, "older_than", 86400.0)
     trees = _validate_trees(getattr(args, "tree", None))
     report = scan_cache(older_than_seconds=older_than, trees=trees)
@@ -210,8 +208,7 @@ def _handle_cache_du(args: argparse.Namespace) -> int:
     if note:
         lines.append(note)
 
-    _emit(args, data=data, text=lines, stem="cache-du")
-    return 0
+    return Result(data=data, text=lines, stem="cache-du")
 
 
 def _group_rows(report, bucket_name: str) -> list[dict]:
@@ -230,7 +227,7 @@ def _group_rows(report, bucket_name: str) -> list[dict]:
     return sorted(rows.values(), key=lambda r: -r["bytes"])
 
 
-def _handle_cache_ls(args: argparse.Namespace) -> int:
+def _handle_cache_ls(args: argparse.Namespace) -> Result:
     older_than = getattr(args, "older_than", 86400.0)
     top = getattr(args, "top", 20)
     if top < 0:
@@ -303,8 +300,7 @@ def _handle_cache_ls(args: argparse.Namespace) -> int:
         lines.append("")
         lines.append("Nothing to reclaim in this bucket.")
 
-    _emit(args, data=data, text=lines, stem="cache-ls")
-    return 0
+    return Result(data=data, text=lines, stem="cache-ls")
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +340,7 @@ def _resolved_path(config: Any, field_name: str) -> dict[str, Any] | None:
     }
 
 
-def _handle_config_show(args: argparse.Namespace) -> int:
+def _handle_config_show(args: argparse.Namespace) -> Result:
     config_path = getattr(args, "config", None)
     config = resolve_config(
         config_path_override=Path(config_path) if config_path else None,
@@ -448,42 +444,36 @@ def _handle_config_show(args: argparse.Namespace) -> int:
     lines.append("  Profiles:")
     for name in config.profiles:
         lines.append(f"    {name}  [{sources[f'profiles.{name}']}]")
-    _emit(args, data=data, text=lines, stem="config-show")
-    return 0
+    return Result(data=data, text=lines, stem="config-show")
 
 
-def _handle_config_init(args: argparse.Namespace) -> int:
+def _handle_config_init(args: argparse.Namespace) -> Result:
     target = Path.cwd() / "qmu.toml"
     # ERG-7: `config init` is idempotent — an existing file is a benign no-op
     # (exit 0), not a failure. The file is never overwritten.
     if target.exists():
         msg = f"{target} already exists, not overwritten"
-        _emit(
-            args,
+        return Result(
             data={"ok": True, "path": str(target), "created": False, "message": msg},
             text=msg,
             stem="config-init",
         )
-        return 0
     target.write_text(render_starter_config())
-    _emit(
-        args,
+    return Result(
         data={"ok": True, "path": str(target), "created": True},
         text=f"Created {target}",
         stem="config-init",
     )
-    return 0
 
 
-def _handle_config_path(args: argparse.Namespace) -> int:
+def _handle_config_path(args: argparse.Namespace) -> Result:
     gpath = global_config_path()
     ppath = find_project_config()
     lines = [
         f"Global config:  {gpath} ({'exists' if gpath.is_file() else 'not found'})",
         f"Project config: {ppath or '(none found — searched up from CWD)'}",
     ]
-    _emit(
-        args,
+    return Result(
         data={
             "ok": True,
             "global_config": str(gpath),
@@ -493,7 +483,6 @@ def _handle_config_path(args: argparse.Namespace) -> int:
         text=lines,
         stem="config-path",
     )
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +593,7 @@ def _add_rootfs(sub: argparse._SubParsersAction) -> None:
     s.set_defaults(handler=_handle_rootfs_shell)
 
 
-def _handle_rootfs_inject(args: argparse.Namespace) -> int:
+def _handle_rootfs_inject(args: argparse.Namespace) -> Result:
     parsed = [rootfs_mod.parse_mapping(m) for m in args.mappings]
     rootfs_mod.inject(
         args.image, parsed, partition=args.partition, mkdir=args.mkdir
@@ -629,14 +618,12 @@ def _handle_rootfs_inject(args: argparse.Namespace) -> int:
     lines = [f"Injected into {args.image} (partition {args.partition}):"]
     for item in injected:
         lines.append(f"  {item['local']} -> {item['path']} (owner 0:0)")
-    _emit(args, data=summary, text=lines, stem="rootfs-inject")
-    return 0
+    return Result(data=summary, text=lines, stem="rootfs-inject")
 
 
-def _handle_rootfs_ls(args: argparse.Namespace) -> int:
+def _handle_rootfs_ls(args: argparse.Namespace) -> Result:
     entries = rootfs_mod.listdir(args.image, args.path, partition=args.partition)
-    _emit(
-        args,
+    return Result(
         data={
             "ok": True,
             "image": args.image,
@@ -647,53 +634,34 @@ def _handle_rootfs_ls(args: argparse.Namespace) -> int:
         text=[rootfs_mod.format_entry(e) for e in entries] if entries else f"{args.path} is empty.",
         stem="rootfs-ls",
     )
-    return 0
 
 
-def _handle_rootfs_cat(args: argparse.Namespace) -> int:
+def _handle_rootfs_cat(args: argparse.Namespace) -> Result:
     raw = rootfs_mod.read_file(args.image, args.path, partition=args.partition)
     try:
         content, encoding = raw.decode("utf-8"), "utf-8"
     except UnicodeDecodeError:
         content, encoding = base64.b64encode(raw).decode("ascii"), "base64"
 
-    if getattr(args, "format", "text") != "text":
-        _emit(
-            args,
-            data={
-                "ok": True,
-                "image": args.image,
-                "partition": args.partition,
-                "path": args.path,
-                "size": len(raw),
-                "encoding": encoding,
-                "content": content,
-            },
-            text="",
-            stem="rootfs-cat",
-        )
-        return 0
-
-    # Text mode is the file's bytes, verbatim: `_emit` would append a newline
-    # (and decode), so a checksum of the output never matched the source.
-    out = getattr(args, "out", None)
-    result = write_bytes_result(
-        raw, out_path=Path(out) if out else None, stem="rootfs-cat"
+    # Text mode is the file's bytes, verbatim (`raw`): rendering `text` would
+    # append a newline (and decode), so a checksum of the output never matched
+    # the source.
+    return Result(
+        data={
+            "ok": True,
+            "image": args.image,
+            "partition": args.partition,
+            "path": args.path,
+            "size": len(raw),
+            "encoding": encoding,
+            "content": content,
+        },
+        stem="rootfs-cat",
+        raw=raw,
     )
-    if result.artifact is None:
-        sys.stdout.flush()
-        sys.stdout.buffer.write(raw)
-        sys.stdout.buffer.flush()
-    else:
-        sys.stdout.write(result.rendered)
-        if result.spilled:
-            sys.stderr.write(
-                f"[qmu] Output spilled to {result.artifact['artifact_path']}\n"
-            )
-    return 0
 
 
-def _handle_rootfs_rm(args: argparse.Namespace) -> int:
+def _handle_rootfs_rm(args: argparse.Namespace) -> Result:
     result = rootfs_mod.remove(
         args.image,
         args.paths,
@@ -712,8 +680,7 @@ def _handle_rootfs_rm(args: argparse.Namespace) -> int:
             f"Nothing to remove: {', '.join(result['missing'])} does not exist "
             "(--force)."
         ]
-    _emit(
-        args,
+    return Result(
         data={
             "ok": True,
             "image": args.image,
@@ -724,11 +691,10 @@ def _handle_rootfs_rm(args: argparse.Namespace) -> int:
         text=lines,
         stem="rootfs-rm",
     )
-    return 0
 
 
-def _handle_rootfs_shell(args: argparse.Namespace) -> int:
-    return rootfs_mod.shell(args.image, partition=args.partition)
+def _handle_rootfs_shell(args: argparse.Namespace) -> Result:
+    return Result.silent_exit(rootfs_mod.shell(args.image, partition=args.partition))
 
 
 # ---------------------------------------------------------------------------
@@ -829,7 +795,7 @@ def _link_skill(src: Path, dst: Path) -> tuple[str, str | None]:
     return status, previous
 
 
-def _handle_skill_install(args: argparse.Namespace) -> int:
+def _handle_skill_install(args: argparse.Namespace) -> Result:
     skill_dirs = all_skill_source_dirs()
     if not skill_dirs:
         raise QMUError("No skill sources found under skills/")
@@ -890,8 +856,7 @@ def _handle_skill_install(args: argparse.Namespace) -> int:
     lines = [*changed, summary]
     lines.extend(f"Skipped {e['path']} ({e['reason']})" for e in skipped)
 
-    _emit(
-        args,
+    return Result(
         data={
             "ok": True,
             "roots": [str(r) for r in roots],
@@ -903,7 +868,6 @@ def _handle_skill_install(args: argparse.Namespace) -> int:
         text=lines,
         stem="skill-install",
     )
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -917,6 +881,5 @@ def _add_version(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_version)
 
 
-def _handle_version(args: argparse.Namespace) -> int:
-    _emit(args, data={"ok": True, "version": VERSION}, text=f"qmu {VERSION}", stem="version")
-    return 0
+def _handle_version(args: argparse.Namespace) -> Result:
+    return Result(data={"ok": True, "version": VERSION}, text=f"qmu {VERSION}", stem="version")

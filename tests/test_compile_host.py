@@ -103,7 +103,7 @@ def wired(monkeypatch, tmp_path):
         monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
         monkeypatch.setattr(guest, "_make_ssh", lambda instance: ssh)
         monkeypatch.setattr(
-            guest, "_preflight_ssh_guest", lambda args, instance, stem: None
+            guest, "_preflight_ssh_guest", lambda instance, *, stem: None
         )
         state["inst"] = inst
         state["ssh"] = ssh
