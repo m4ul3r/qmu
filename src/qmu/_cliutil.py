@@ -96,6 +96,11 @@ def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
     # qmu.toml, exactly as every other launch flag overrides its config key.
     if getattr(args, "no_kvm", False):
         cli_overrides["accel"] = "tcg"
+    # --no-reboot likewise: a store_true flag whose False default must not
+    # shadow a `[machine] no_reboot = true` in qmu.toml, so only a set flag
+    # becomes an override.
+    if getattr(args, "no_reboot", False):
+        cli_overrides["no_reboot"] = True
 
     config_path = getattr(args, "config", None)
     return resolve_config(

@@ -76,6 +76,7 @@ class _FakeInst:
     serial_log = "/tmp/nonexistent.serial.log"
     guest_epoch_serial_offset = 0
     ssh_port = None
+    memory = "4G"
 
 
 def _outcome(msg):
@@ -89,7 +90,7 @@ def _patch_save(monkeypatch, msg):
     snapshot.py does."""
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: _FakeInst())
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(None))
-    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: _outcome(msg))
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _outcome(msg))
 
 
 def _save_args():
@@ -128,7 +129,7 @@ def test_snapshot_save_success_emits_no_hint(monkeypatch, capsys):
 def _patch_load(monkeypatch, msg):
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: _FakeInst())
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(None))
-    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name: _outcome(msg))
+    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name, **kw: _outcome(msg))
 
 
 def _load_args():

@@ -33,7 +33,8 @@ qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only 
 - `--no-reboot` passes `-no-reboot`: a panic under `panic=N` exits QEMU
   instead of rebooting into a fresh boot that buries the report. It changes
   what happens *after* the panic only — bare `wait` returns 3 at the panic
-  line either way. CLI only (no config key).
+  line either way. Config key: `[machine] no_reboot = true` (the flag wins;
+  `qmu config show` names the layer on its `No-reboot:` row).
 - `--inject LOCAL:/guest/dir` (repeatable; `--partition`, `--mkdir`) runs the
   offline injection before boot. Every target — image, local file, guest
   directory — is validated read-only **before** a same-named running VM is
@@ -69,7 +70,14 @@ profile-sourced unknown-parameter note (`apparmor=0`, `selinux=0`) is JSON-only
 
 `launch`/`run` print `[qmu] config: <path>` on stderr when a project or
 `--config` file applied. The first QMP connect after launch retries transient
-resets for up to 3 s while QEMU is alive.
+resets/refusals for up to 3 s while QEMU is alive, and a retry that fired is
+reported — `warnings[]` gains `QMP connect retried N× (ECONNRESET)` (stderr
+`[qmu] QMP connect retried …`) — so it is never absorbed silently. Evidence:
+one field hit (`~/qmu-audit/crashpaths` receipt 2, `[Errno 104] Connection
+reset by peer` with ~10 agents launching at once); 0 retries in 24/24
+`--no-net` + 11 netted concurrent launches (3×8, wave 6). A launch that
+reports it is healthy; three or more in `warnings[]` across a batch means
+the host is saturated.
 
 ## Profiles
 
@@ -120,7 +128,9 @@ crash report waiting: qmu crash --vm X)` / `(logs retained: qmu log --vm X;
 remove with: qmu prune --vm X)` / `(no logs retained)`. Only an absent name
 is exit 1. `list` JSON rows carry the same `ssh` words as `status` (`ready`
 · `down` · `none` · `skipped` · `skipped (debugger attached)` · `n/a
-(harness)`), `logs_retained`, `crash_detected`; a stopped row's `guest` is
+(harness)`), `ssh_probe_ms` (the probe's wall time in ms; null when no
+probe was sent — also on the `status` envelope and in the status text `SSH:
+port N (ready, probe 87 ms)`), `logs_retained`, `crash_detected`; a stopped row's `guest` is
 null.
 
 **Guest usability** (`guest`), in precedence order:
@@ -165,8 +175,7 @@ the key, not for `null`. When not `connected`, `qemu_status` is `unknown` and
 nothing QMP-derived is claimed. `kill` under a held socket skips the graceful
 `quit` after 1 s and signals (≈1 s, not 14 s). `status --vm X` and `list`
 classify a held slot identically (`qmp: "busy"`, `qemu_status: "unknown"`,
-each spending its ~2 s QMP budget); the still-real caveat is latency,
-tracked in #77. `list` row schema: a running row carries `qmp` and
+each spending its ~2 s QMP budget). `list` row schema: a running row carries `qmp` and
 `qemu_status` (the same values `status` reports; `unknown` whenever `qmp`
 is not `connected`); a stopped/orphaned/held-back row has `qmp: "skipped"`
 and **no** `qemu_status` (nor `qmp_socket`) key — never `qemu_status:
@@ -185,7 +194,7 @@ KASAN-detected bugs are terminal under every profile (`kasan.fault=panic`);
 
 ```bash
 qmu list                                 # existence + guest state; probes SSH (ControlMaster=no), a few seconds on a busy host
-qmu status --vm X                        # typically sub-second; ~2 s under a held QMP slot, ~5 s when the SSH port accepts but never answers (#77); exit 0 on a stopped VM (status: "stopped")
+qmu status --vm X                        # typically sub-second; ~2 s under a held QMP slot, ≤ 2.5 s when the SSH port accepts but never answers (`ssh_probe_ms` says how long the probe took); exit 0 on a stopped VM (status: "stopped")
 qmu kill --vm X                          # QMP quit → SIGTERM; `bridge_reaped`, `logs_preserved`; closes the ControlMaster
 qmu kill --vm X --force                  # SIGKILL
 qmu kill --vm X --no-clean               # keep .json + .serial.log

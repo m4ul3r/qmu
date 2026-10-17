@@ -228,6 +228,16 @@ def _watch_child(
     return output, completed, aborted
 
 
+# Margin added to a readiness probe's `ConnectTimeout` before the ssh child is
+# killed. OpenSSH applies ConnectTimeout to the banner exchange as well as to
+# the TCP connect (`Connection timed out during banner exchange`, one of
+# SSH_TRANSPORT_ERROR_MARKERS), so the client itself gives up at `timeout`;
+# this only covers process start and teardown. It used to be 3 s, which made a
+# port that accepts TCP but never speaks (a half-booted guest, a foreign
+# listener) cost `list`/`status` 5 s per VM (#77).
+PROBE_GRACE_SECONDS = 0.5
+
+
 class SSHClient:
     """Wraps system ssh/scp for guest communication."""
 
@@ -277,7 +287,7 @@ class SSHClient:
         return f"{self.user}@{self.host}"
 
     def is_ready(self, timeout: int = 2) -> bool:
-        """Check if SSH is responding.
+        """Check if SSH is responding within `timeout` seconds.
 
         The probe is deliberately NOT multiplexed (`ControlMaster=no`, no
         `ControlPath`): `list`/`status`/launch run it against every serving VM
@@ -285,6 +295,10 @@ class SSHClient:
         persistent `ssh [mux]` master (ControlPersist 60) for VMs the caller
         never commands — including other users' — under the caller's
         QMU_TEMP_DIR. `run`/`push`/`pull` keep the shared master.
+
+        `timeout` is the whole budget: ssh's own ConnectTimeout bounds both the
+        TCP connect and the banner exchange, and the subprocess cap is only
+        PROBE_GRACE_SECONDS beyond it.
         """
         cmd = self._ssh_base(multiplex=False) + [
             "-o", f"ConnectTimeout={timeout}",
@@ -296,7 +310,7 @@ class SSHClient:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                timeout=timeout + 3,
+                timeout=timeout + PROBE_GRACE_SECONDS,
             )
             return result.returncode == 0
         except subprocess.TimeoutExpired:

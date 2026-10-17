@@ -11,6 +11,8 @@ qmu skill install
 
 `qmu skill install` symlinks the bundled skills into `~/.claude/skills/`. It also installs into `~/.codex/skills/` when `~/.codex/` exists and into `~/.agents/skills/` when an OMP/agents install is detected (`~/.agents/`, `~/.omp/agent/`, or an explicit `AGENTS_HOME`). `CLAUDE_HOME`, `CODEX_HOME`, and `AGENTS_HOME` relocate the corresponding root. Restart your agent to pick up the new skills.
 
+Re-running is a no-op on links that already point at this checkout: they are left untouched and reported as `current`. A link that pointed at a *different* checkout is reported as `relinked` together with the target it replaced — the signal that an agent has been reading a stale copy of the skills. `--format json` returns the per-link status and a tally.
+
 ## Quick Start
 
 ```bash

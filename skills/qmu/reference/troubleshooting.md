@@ -63,13 +63,13 @@ registered only on `launch`, `run`, `status`/`show`, `list`, `log`, `crash`,
 TOML settings are table-scoped. The accepted schema is:
 
 - `[boot]`: `kernel`, `initrd`, `cmdline`, `profile`
-- `[machine]`: `arch`, `memory`, `cpus`, `cpu`, `nic_model`, `net_backend`, `accel`, `extra_args`
+- `[machine]`: `arch`, `memory`, `cpus`, `cpu`, `nic_model`, `net_backend`, `accel`, `no_reboot`, `extra_args`
 - `[drive]`: `rootfs`, `format`
 - `[ssh]`: `key`, `user`, `port_start`
 - `[gdb]`: `port_start`
 - `[profiles.<name>]`: `cmdline`; `[profiles] name = "..."` is also accepted
 
-`qmu config init` writes `[boot]` (`kernel` live as the first `# CHANGE ME`; `initrd`/`profile`/`cmdline` commented), `[machine]` (arch/memory/cpus, with commented `cpu`/`accel`/`nic_model`/`net_backend`/`extra_args`), `[drive]` (rootfs/format — rootfs is the second `# CHANGE ME`), `[ssh]` (key — the third `# CHANGE ME` — and user, with commented `port_start`), `[gdb]` (commented `port_start`), three `[profiles.*]` blocks, and a commented harness-mode block. It refuses to overwrite an existing file (`created: false`, exit 0). `[ssh] user` (default `root`) is recorded on the VM at launch, so set it **before** `qmu launch`; SSH/GDB ports start at `10021`/`1234` (`port_start` overrides); `arch` picks the `qemu-system-*` binary and whether KVM is enabled (guest arch == host only), with `extra_args` for machine flags (e.g. aarch64 `-M virt -cpu cortex-a57`); path values accept `~`. Per-user defaults belong in the global file; the starter's uncommented `[ssh] key` overrides it.
+`qmu config init` writes `[boot]` (`kernel` live as the first `# CHANGE ME`; `initrd`/`profile`/`cmdline` commented), `[machine]` (arch/memory/cpus, with commented `cpu`/`accel`/`no_reboot`/`nic_model`/`net_backend`/`extra_args`), `[drive]` (rootfs/format — rootfs is the second `# CHANGE ME`), `[ssh]` (key — the third `# CHANGE ME` — and user, with commented `port_start`), `[gdb]` (commented `port_start`), three `[profiles.*]` blocks, and a commented harness-mode block. It refuses to overwrite an existing file (`created: false`, exit 0). `[ssh] user` (default `root`) is recorded on the VM at launch, so set it **before** `qmu launch`; SSH/GDB ports start at `10021`/`1234` (`port_start` overrides); `arch` picks the `qemu-system-*` binary and whether KVM is enabled (guest arch == host only), with `extra_args` for machine flags (e.g. aarch64 `-M virt -cpu cortex-a57`); path values accept `~`. Per-user defaults belong in the global file; the starter's uncommented `[ssh] key` overrides it.
 
 ## Config validation rules
 
@@ -206,14 +206,13 @@ project/`--config` layer loaded). `doctor --config PATH` checks that file.
 | `config` | `[+]` layers that applied; `[~]` none found / every file rejected |
 | `global config` | `[!]` when `~/.config/qmu/config.toml` exists but is invalid (it was skipped; `qmu config init` writes a *project* file and will not clear it) |
 | `kernel` | `[+]` regular file; `[!]` configured but missing — `<as written> (not found) — resolves to <abs> [<layer>]`, `CHANGE ME placeholder;` when the starter literal is unedited; `[~]` not configured (`--kernel`/`--harness` launches still work) |
+| `initrd` | same shape: `[+]` regular file; `[!]` configured but missing (launch fails with `Initrd not found`); `[i] initrd: not configured` (optional) |
 | `rootfs image`, `SSH key` | `[!]` missing/unconfigured only when `[boot] kernel` is set and the boot is not harness-shaped (`initrd` set, no `rootfs`); otherwise `[~] … not needed for --harness boots` |
 | `SSH key permissions` | `[!]` (blocking, `chmod 600 <key>` hint) when a key you own has any group/other bit (`mode=644 is group/other-accessible — OpenSSH refuses it (UNPROTECTED PRIVATE KEY FILE)`) or is unreadable; `[+]` for `0600`, `0400`, `0700` or a key another user owns |
 | `qemu-system-<arch>`, `KVM` | `[!]` binary missing / `accel=kvm` without `/dev/kvm`; `[i]` disabled by `accel=tcg` |
 | `cross compiler for <arch> (compile --host)`, `gdb-multiarch` | only when `[machine] arch` ≠ host arch; `[~]` when missing, naming `apt install gcc-<triple>` / `apt install gdb-multiarch` |
 | `libguestfs` | `[~]` with the appliance fix (above) |
+| `rootfs sshd policy` | only when `[drive] rootfs` exists: `[+] key-only` (stamp `/etc/qmu-rootfs.json` says `sshd_policy=key-only`); `[~] permissive (image predates key-only sshd; rebuild with tools/mkrootfs.sh)` for a missing/other stamp — root logs in with **any** key (JSON `sshd_policy: "permissive"`, hint `rebuild the image with tools/mkrootfs.sh`); `[i] not checked (<reason>)` when libguestfs cannot open the image (read-only, whole-disk, ~1.5 s) |
 | `running VMs` | `[i] N running [+ M orphaned (no instance record)] under <instances dir>`; JSON `running`/`orphaned` ints, hint `qmu prune --orphans --dry-run` when orphans exist. A snapshot — other agents change it within seconds |
-| `skills` | text `[+] N skills × M roots installed` (or `…: N installed, M missing, K stale … (run: qmu skill install)`) — the JSON `summary`; JSON `detail` keeps the full path list and `detail_paths: {installed, missing, stale}` splits it |
+| `skills` | text `[+] N skills × M roots installed` (or `…: N installed, M missing, K stale … (run: qmu skill install)`) — the JSON `summary`; JSON `detail` keeps the full path list and `detail_paths: {installed, missing, stale}` splits it. `qmu skill install` then reports each link as `installed` (nothing was there), `relinked` (pointed at another checkout — JSON `previous_target` names it), `replaced` (a real dir/file was removed) or `current` (already right; left untouched, tallied not listed); JSON carries `links[]` and `counts` |
 | `pry`, `passt`, `cache` | `[i]`/`[+]`, never gating |
-
-`doctor` does not check `[boot] initrd` existence or whether a cached
-mkrootfs image predates the key-only sshd policy (`guest-commands.md`).

@@ -21,7 +21,7 @@ uv sync                         # install dev deps (pytest) into .venv
 .venv/bin/python -m pytest tests/test_x.py -q          # one file
 .venv/bin/python -m pytest tests/test_x.py::test_y -q  # one test
 
-qmu skill install               # symlink skills/* into ~/.claude/skills (and ~/.codex if present)
+qmu skill install               # symlink skills/* into ~/.claude/skills (and ~/.codex / ~/.agents if present); re-run from the checkout you work in — links pointing at another checkout are reported `relinked` with their old target, links already right as `current` (untouched)
 ```
 
 There is no lint/format config; match surrounding style. `pyproject.toml`
@@ -68,8 +68,9 @@ failed, no crash found, operational QMUError) · `2` usage/argparse ONLY · `3`
 guest kernel crash · `4` infra/internal (QMP/SSH failures, unexpected errors,
 `wait --pattern` on an unreadable log → `inconclusive: true`) · `124` timeout
 (`wait`, `run` never reaching SSH, a guest command outrunning `--timeout` on a
-reachable guest). `QMUError -> 1`, `QMPError`/`SSHError -> 4`, the catch-all
-`-> 4`. Never let a raw traceback escape to the agent.
+reachable guest, `snapshot save` outrunning its budget — result unknown,
+`may_have_landed: true`). `QMUError -> 1`, `QMPError`/`SSHError -> 4`, the
+catch-all `-> 4`. Never let a raw traceback escape to the agent.
 
 **Exit `3` requires a corroborating fresh serial crash report.** A dropped SSH
 or scp connection alone is `4` (guest merely unreachable — a VM running no sshd
@@ -278,6 +279,12 @@ explicit CLI `--profile` clears a config `[boot] cmdline` (otherwise the flag is
 a silent no-op) and names the params that drop out — `nokaslr` especially, whose
 loss moves every kernel address.
 
+Every launch flag has a config key. Boolean flags (`--no-kvm` → `accel=tcg`,
+`--no-reboot` → `[machine] no_reboot`) cannot ride the value `flag_map` —
+copying a store_true's `False` would shadow a `true` in qmu.toml — so
+`_resolve_config_from_args` adds them as overrides only when set. The schema
+kind for such keys is `boolean` (`_validate_value`).
+
 ### Launch warnings and `doctor` taxonomy (`lifecycle.py`)
 
 `_prepare_boot` accumulates every launch-time warning in a `_BootPrep`
@@ -293,9 +300,12 @@ arch/`console=`/`root=` lint; the SSH wait fails early with
 `doctor` rows are `_doctor_row(check, status, detail)` with `status` in
 `ok|fail|warn|info` → glyph `[+] [!] [~] [i]`; `blocking` is `status == "fail"`
 and nothing else, and `ok` ⇔ no `fail` row. Choose the status by consequence:
-`fail` only when launch cannot work (missing configured kernel/rootfs/key,
+`fail` only when launch cannot work (missing configured kernel/initrd/rootfs/key,
 invalid global config); `warn` for optional capabilities (libguestfs, cross
-toolchains, key permissions); `info` for cache/pry/skills.
+toolchains, key permissions, a rootfs whose `/etc/qmu-rootfs.json` lacks
+`sshd_policy=key-only` — read via `rootfs.read_stamp`, guestfish `--ro`, only
+after the libguestfs row is `ok`); `info` for cache/pry/skills and checks that
+could not run (`not checked (<reason>)`).
 
 ### Harness mode
 
@@ -309,7 +319,10 @@ result carries `console_tail` (last 20 lines of the scanned scope) so a
 successful run whose log is about to be auto-cleaned still has a receipt;
 text prints it under `Console tail:` when QEMU exited without a crash. A
 panic is exit 3 at the panic line regardless of `--no-reboot`; the flag only
-keeps a `panic=N` kernel from rebooting over its own report afterwards. The
+keeps a `panic=N` kernel from rebooting over its own report afterwards.
+`--no-reboot` and `[machine] no_reboot` meet on `config.no_reboot` (the flag
+is a store_true, so like `--no-kvm` it becomes an override only when set) and
+`build_qemu_command` reads it from the config, never from a kwarg (#76). The
 launch note names the disk's source (`from --rootfs` vs `from [drive] rootfs
 in project <qmu.toml>`).
 
@@ -373,6 +386,32 @@ envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
   to restore, gated on a capability probe — not a prerequisite. `snapshot
   load` tears down the SSH ControlMaster so the first post-load `exec` does
   not stall on the rewound connection.
+- **A `snapshot save` that outran its budget is an UNKNOWN result, never a
+  failure.** HMP `savevm` runs synchronously on QEMU's main loop; when the
+  client gives up, QEMU keeps writing and the tag usually lands minutes later
+  with every QMP command queued behind it (#73). The default budget is
+  `snapshot.savevm_timeout()`: 60 s + 20 s per GiB of guest RAM, ≥ 3× the
+  measured loaded cost (4 GiB fully-dirty RAM under dd + CPU load: 22 s;
+  into a 19 GB qcow2 with five snapshots: ≈60 s); `--timeout` overrides it.
+  On expiry the handler returns **124** with `may_have_landed: true` and a
+  hint naming `snapshot list --vm X --timeout N` — not 4, which claims the
+  transport broke, and not 1, which claims the save failed. Three
+  `QMPClient` properties make the follow-up safe and must stay: `execute`
+  closes the socket on timeout (`QMPTimeoutError`); every command carries a
+  client-unique `id` and `_recv_response` drops a reply tagged with another
+  client's id — QEMU delivers the abandoned `savevm` reply to whichever
+  client holds the socket next, which made `query-status` return `{}` and
+  `snapshot list` say "No snapshots." (audit D7); and the handshake budget
+  covers `qmp_capabilities`, which a wedged main loop holds after greeting
+  at once (`QMPBusyError`, not a raw socket timeout). `snapshot list
+  --timeout` raises `greeting_timeout` before connecting so the named
+  follow-up outlasts the save.
+- **The SSH readiness probe's cap is `ConnectTimeout + PROBE_GRACE_SECONDS`
+  (2.5 s), and `status`/`list` report it as `ssh_probe_ms`.** OpenSSH bounds
+  the banner exchange by `ConnectTimeout`, but not the key exchange after a
+  banner: a listener that sends `SSH-2.0-…` and then hangs holds `ssh` for
+  60 s+, so the subprocess cap is the only bound there (#77). The old
+  `timeout + 3` made every such port cost `list`/`status` 5 s per VM.
 - **`rootfs inject` treats GUEST as a directory** (with or without a trailing
   slash); the local filename is preserved. A missing GUEST directory is an
   ERROR unless `--mkdir` — silently creating it turns a typo'd destination into

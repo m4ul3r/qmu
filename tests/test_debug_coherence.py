@@ -181,7 +181,7 @@ def _snap_args():
 def test_snapshot_save_warns_int3_when_debugged(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
-    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: _ok("Snapshot 'clean' saved."))
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'clean' saved."))
     rc = qmp_cmds._handle_snapshot_save(_snap_args())
     err = capsys.readouterr().err
     assert rc == 0
@@ -193,7 +193,7 @@ def test_snapshot_save_warns_int3_when_debugged(monkeypatch, capsys):
 def test_snapshot_save_silent_when_not_debugged(monkeypatch, capsys):
     inst = _gdb_inst(None)
     _install_qmp_seams(monkeypatch, inst, present=False)
-    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: _ok("Snapshot 'clean' saved."))
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'clean' saved."))
     rc = qmp_cmds._handle_snapshot_save(_snap_args())
     err = capsys.readouterr().err
     assert rc == 0
@@ -209,7 +209,7 @@ def test_snapshot_save_warns_even_when_client_detached(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=False)
     monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: False)
-    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name: _ok("Snapshot 'clean' saved."))
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'clean' saved."))
     rc = qmp_cmds._handle_snapshot_save(_snap_args())
     err = capsys.readouterr().err
     assert rc == 0
@@ -223,7 +223,7 @@ def test_snapshot_save_failure_does_not_add_int3_warning(monkeypatch, capsys):
     _install_qmp_seams(monkeypatch, inst, present=True)
     monkeypatch.setattr(
         qmp_cmds, "save_snapshot",
-        lambda qmp, name: _failed("Error: Could not open 'savevm' section"),
+        lambda qmp, name, **kw: _failed("Error: Could not open 'savevm' section"),
     )
     rc = qmp_cmds._handle_snapshot_save(_snap_args())
     err = capsys.readouterr().err

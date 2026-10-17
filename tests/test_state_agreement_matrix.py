@@ -3380,3 +3380,196 @@ def test_cont_force_resumes_a_partially_restored_guest(cache, monkeypatch, capsy
     monkeypatch.setattr(lifecycle, "_make_ssh", lambda i: _ServingSSH())
     assert cli.main(["--format", "json", "status", "--vm", VM]) == 0
     assert json.loads(capsys.readouterr().out)["qemu_status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# `snapshot save` whose budget expired (#73). HMP `savevm` keeps running on
+# QEMU's main loop after the client gives up, and usually lands; the window
+# closed, the result is UNKNOWN. Exit 124 (the `wait` timeout code, not 4 —
+# the transport did not break), `may_have_landed: true`, and the hint names
+# the one command that settles it with a budget that outlasts the save. Text
+# and JSON say the same; a proven HMP failure says `may_have_landed: false`.
+# ---------------------------------------------------------------------------
+
+
+class _WedgedSavevmQMP:
+    """QEMU whose `savevm` outlives every budget; `info snapshots` answers."""
+
+    def __init__(self):
+        self.closed = False
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        return {"running": True, "status": "running"}
+
+    def execute_hmp(self, command_line, timeout=30.0):
+        from qmu.qmp import QMPTimeoutError
+
+        if command_line.startswith("savevm "):
+            self.closed = True
+            raise QMPTimeoutError(f"human-monitor-command '{command_line}'", timeout)
+        if command_line == "info snapshots":
+            return (
+                "List of snapshots present on all disks:\r\n"
+                "ID        TAG               VM SIZE                DATE     VM CLOCK     ICOUNT\r\n"
+                "--        clean             325 MiB 2026-10-16 23:24:01 00:00:29.574\r\n"
+            )
+        return ""
+
+
+def _savevm_subject(cache, monkeypatch):
+    from qmu.commands import qmp_cmds
+    import contextlib
+
+    inst = _ssh_capable_instance(cache)
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+    monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: False)
+    qmp = _WedgedSavevmQMP()
+    monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(qmp))
+    return inst, qmp
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_snapshot_save_timeout_is_an_unknown_result_in_text_and_json(
+    fmt, cache, monkeypatch, capsys
+):
+    inst, qmp = _savevm_subject(cache, monkeypatch)
+    rc = cli.main(["--format", fmt, "snapshot", "save", "clean", "--vm", VM, "--timeout", "7"])
+    captured = capsys.readouterr()
+    assert rc == 124, captured.err
+    follow_up = f"qmu snapshot list --vm {VM} --timeout 300"
+    if fmt == "text":
+        assert captured.out == ""
+        assert captured.err.startswith("[qmu] Error: snapshot save 'clean'"), captured.err
+        assert "did not finish within 7s" in captured.err
+        assert "may_have_landed: true" in captured.err
+        assert follow_up in captured.err
+        assert "snapshot save failed" not in captured.err
+    else:
+        payload = json.loads(captured.out)
+        assert payload["ok"] is False
+        assert payload["error_type"] == "SnapshotError"
+        assert payload["name"] == "clean"
+        assert payload["timeout"] == 7.0
+        assert payload["may_have_landed"] is True
+        assert "did not finish within 7s" in payload["error"]
+        assert follow_up in payload["hint"]
+        assert "message" not in payload
+    # No "temporary overlay" lecture: the save did not fail, it is unknown.
+    assert "snapshot=on" not in captured.err
+
+    # The follow-up the hint names works and honours its own budget.
+    rc = cli.main(["--format", "json", "snapshot", "list", "--vm", VM, "--timeout", "300"])
+    listed = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert [s["tag"] for s in listed["snapshots"]] == ["clean"]
+
+
+def test_snapshot_save_default_budget_scales_with_guest_memory(cache, monkeypatch, capsys):
+    from qmu.commands import qmp_cmds
+    from qmu.snapshot import savevm_timeout
+
+    inst, qmp = _savevm_subject(cache, monkeypatch)
+    seen = {}
+
+    def save(qmp, name, timeout):
+        seen["timeout"] = timeout
+        raise __import__("qmu.qmp", fromlist=["QMPTimeoutError"]).QMPTimeoutError("x", timeout)
+
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", save)
+    assert cli.main(["--format", "json", "snapshot", "save", "clean", "--vm", VM]) == 124
+    payload = json.loads(capsys.readouterr().out)
+    assert seen["timeout"] == savevm_timeout("4G") == 140.0
+    assert payload["timeout"] == 140.0
+    # Twice the budget is the follow-up's budget once it exceeds the 300 s floor.
+    assert f"--timeout 300" in payload["hint"]
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_snapshot_save_hmp_failure_is_a_proven_non_landing(fmt, cache, monkeypatch, capsys):
+    from qmu.commands import qmp_cmds
+    from qmu.snapshot import SnapshotResult
+
+    inst, qmp = _savevm_subject(cache, monkeypatch)
+    monkeypatch.setattr(
+        qmp_cmds, "save_snapshot",
+        lambda qmp, name, timeout: SnapshotResult(False, "Error: boom", reason="hmp"),
+    )
+    rc = cli.main(["--format", fmt, "snapshot", "save", "clean", "--vm", VM])
+    captured = capsys.readouterr()
+    assert rc == 1
+    if fmt == "json":
+        payload = json.loads(captured.out)
+        assert payload["may_have_landed"] is False
+        assert "timeout" not in payload
+    else:
+        assert captured.err.startswith("[qmu] Error: snapshot save failed")
+        assert "may_have_landed" not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# The SSH probe's cost is an observable (#77): `status` and `list` report the
+# same `ssh_probe_ms` for the same probe, null whenever no probe was sent, and
+# the status text carries the same number.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ready", [True, False])
+def test_status_and_list_agree_on_the_ssh_probe_duration(ready, cache, monkeypatch, capsys):
+    inst = _ssh_capable_instance(cache)
+    with open(inst.serial_log, "w") as stream:
+        stream.write("[ 0.0] Linux version 6.12.0 (x) #1\nlocalhost login:\n")
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [inst])
+        monkeypatch.setattr(mod, "find_orphan_qemus", lambda: [], raising=False)
+    monkeypatch.setattr(lifecycle, "list_stopped_instances", lambda: [])
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(lifecycle, "_query_qmp", lambda i: lifecycle._QMPProbe(
+        lifecycle.QMP_CONNECTED, status="running", running=True
+    ))
+
+    class SlowSSH:
+        def is_ready(self, timeout=2):
+            time.sleep(0.05)
+            return ready
+
+    monkeypatch.setattr(lifecycle, "_make_ssh", lambda i: SlowSSH())
+
+    assert cli.main(["--format", "json", "status", "--vm", VM]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert cli.main(["--format", "json", "list"]) == 0
+    row = next(r for r in json.loads(capsys.readouterr().out)["vms"] if r["vm_id"] == VM)
+    assert cli.main(["status", "--vm", VM]) == 0
+    text = capsys.readouterr().out
+
+    for payload in (status, row):
+        assert isinstance(payload["ssh_probe_ms"], int)
+        assert payload["ssh_probe_ms"] >= 50
+        assert payload["ssh"] == ("ready" if ready else "down")
+    assert f"SSH:       port 10099 ({status['ssh']}, probe {status['ssh_probe_ms']} ms)" in text
+
+
+def test_ssh_probe_duration_is_null_when_no_probe_was_sent(cache, monkeypatch, capsys):
+    inst = _ssh_capable_instance(cache)
+    with open(inst.serial_log, "w") as stream:
+        stream.write("[ 0.0] Linux version 6.12.0 (x) #1\nKernel panic - not syncing: boom\n")
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [inst])
+        monkeypatch.setattr(mod, "find_orphan_qemus", lambda: [], raising=False)
+    monkeypatch.setattr(lifecycle, "list_stopped_instances", lambda: [])
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(
+        lifecycle, "_make_ssh",
+        lambda i: (_ for _ in ()).throw(AssertionError("SSH probed on a panicked guest")),
+    )
+    assert cli.main(["--format", "json", "status", "--vm", VM]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert cli.main(["--format", "json", "list"]) == 0
+    row = next(r for r in json.loads(capsys.readouterr().out)["vms"] if r["vm_id"] == VM)
+    assert status["guest"] == row["guest"] == "panicked"
+    assert status["ssh_probe_ms"] is None and row["ssh_probe_ms"] is None
+    assert status["ssh"] == row["ssh"] == "skipped"

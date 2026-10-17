@@ -759,16 +759,72 @@ def test_source_layers_name_the_layer_that_set_each_key(isolate_config, monkeypa
     assert layers["machine.nic_model"] == f"project {ppath.resolve()}"
     assert layers["machine.cpus"] == "built-in"
     assert layers["machine.accel"] == "built-in"
+    assert layers["machine.no_reboot"] == "built-in"
     assert layers["profiles.mine"] == f"global {gpath.resolve()}"
     assert layers["profiles.exploit-dev"] == "built-in"
     assert set(layers) >= {
         "boot.kernel", "boot.initrd", "boot.cmdline", "boot.profile",
         "machine.arch", "machine.memory", "machine.cpus", "machine.cpu",
-        "machine.nic_model", "machine.net_backend", "machine.accel",
+        "machine.nic_model", "machine.net_backend", "machine.accel", "machine.no_reboot",
         "machine.extra_args", "drive.rootfs", "drive.format", "ssh.key",
         "ssh.user", "ssh.port_start", "gdb.port_start",
     }
 
+
+def test_no_reboot_key_layers_like_every_other_launch_flag(isolate_config, monkeypatch):
+    """#76: `--no-reboot` was the only launch flag without a config key. The
+    key sets it; a flag set in this shell wins; an unset flag (store_true's
+    False) must NOT shadow the key."""
+    from qmu._cliutil import _resolve_config_from_args
+    import argparse
+
+    project = isolate_config / "proj"
+    project.mkdir()
+    ppath = _write_toml(project / CONFIG_FILENAME, "[machine]\nno_reboot = true\n")
+    monkeypatch.chdir(project)
+
+    assert config_module.QMUConfig().no_reboot is False
+    cfg = resolve_config()
+    assert cfg.no_reboot is True
+    assert cfg.source_layer("no_reboot") == f"project {ppath.resolve()}"
+
+    cfg = _resolve_config_from_args(argparse.Namespace(no_reboot=False))
+    assert cfg.no_reboot is True, "an unset flag must not override the key"
+    cfg = _resolve_config_from_args(argparse.Namespace(no_reboot=True))
+    assert cfg.no_reboot is True and cfg.source_layer("no_reboot") == "flag"
+
+    ppath.write_text("[machine]\nno_reboot = false\n")
+    assert _resolve_config_from_args(argparse.Namespace(no_reboot=True)).no_reboot is True
+    assert _resolve_config_from_args(argparse.Namespace(no_reboot=False)).no_reboot is False
+
+
+def test_no_reboot_must_be_a_boolean(isolate_config):
+    path = _write_toml(isolate_config / "nr.toml", '[machine]\nno_reboot = "yes"\n')
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_config(config_path_override=path)
+    problems = {p.key_path: p.problem for p in excinfo.value.problems()}
+    assert problems == {"machine.no_reboot": "expected boolean (true/false), got string"}
+
+
+@pytest.mark.parametrize("text", [
+    "[boot]\nno_reboot = true\n",
+    "[machine]\nno-reboot = true\n",
+])
+def test_no_reboot_wrong_table_or_spelling_names_the_key(isolate_config, text):
+    path = _write_toml(isolate_config / "nr.toml", text)
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_config(config_path_override=path)
+    assert "[machine] no_reboot" in str(excinfo.value)
+
+
+def test_starter_config_documents_no_reboot_as_a_commented_key():
+    text = config_module.render_starter_config("x86_64")
+    line = next(l for l in text.splitlines() if l.startswith("# no_reboot = true"))
+    assert "-no-reboot" in line
+    # The starter must stay loadable with that line uncommented.
+    import tomllib
+    raw = tomllib.loads(text.replace("# no_reboot = true", "no_reboot = true", 1))
+    assert raw["machine"]["no_reboot"] is True
 
 def test_explicit_config_layer_is_labelled_as_the_flag(isolate_config):
     explicit = _write_toml(isolate_config / "explicit.toml", '[machine]\narch = "aarch64"\n')

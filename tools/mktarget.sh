@@ -74,6 +74,8 @@ Optional:
   --symbols[=MODE]         Fetch debug symbols from ddebs. MODE is vmlinux
                            (default) or full. ~1.9 GB installed.
   --no-modules-extra       Skip linux-modules-extra (default: install it)
+  --modules-extra          Install linux-modules-extra (the default; undoes an
+                           earlier --no-modules-extra, last one wins)
   --headers                Install linux-headers (default: no)
   --initramfs              Generate an initrd and emit INITRD= (default: no;
                            all boot-critical drivers are built in)

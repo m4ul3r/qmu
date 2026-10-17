@@ -15,6 +15,7 @@ because the handlers read these names from this module at call time.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -624,6 +625,7 @@ def _handle_launch(args: argparse.Namespace) -> int:
     prep = _BootPrep()
     config, name = _prepare_boot(args, prep)
 
+    launch_notes: list[str] = []
     inst = launch_vm(
         config=config,
         kernel=config.kernel,
@@ -642,8 +644,12 @@ def _handle_launch(args: argparse.Namespace) -> int:
         nic_model=args.nic_model,
         net_backend=args.net_backend,
         harness=args.harness,
-        no_reboot=getattr(args, "no_reboot", False),
+        notes=launch_notes,
     )
+    # The first-QMP-connect retry (#76): observable, not silently absorbed.
+    for note in launch_notes:
+        sys.stderr.write(f"[qmu] {note}\n")
+        prep.warnings.append(note)
 
     exit_code = 0
     error: str | None = None
@@ -846,6 +852,10 @@ class _GuestObservation:
     has_endpoint: bool = False
     ssh_ready: bool | None = None
     ssh_probed: bool = False
+    # Wall time of the SSH probe, None when none was sent. A port that accepts
+    # TCP but never finishes the banner costs the whole probe budget, and that
+    # cost was invisible until it was measured (#77).
+    ssh_probe_ms: int | None = None
     # The SSH probe was withheld because a gdb client is attached: its login
     # runs `uname`, which fires a user breakpoint on `__x64_sys_newuname`.
     debugger_attached: bool = False
@@ -955,8 +965,11 @@ def _observe_guest(
     )
     ssh_ready: bool | None = None
     ssh_probed = False
+    ssh_probe_ms: int | None = None
     if probe_ssh and has_endpoint and not attached:
+        probe_start = time.monotonic()
         ssh_ready = bool(_make_ssh(inst).is_ready())
+        ssh_probe_ms = int((time.monotonic() - probe_start) * 1000)
         ssh_probed = True
 
     if crash_detected:
@@ -969,8 +982,8 @@ def _observe_guest(
         guest = GUEST_UNKNOWN
     return _GuestObservation(
         guest, start, console_bytes, qmp, has_endpoint,
-        ssh_ready=ssh_ready, ssh_probed=ssh_probed, debugger_attached=attached,
-        crash_detected=crash_detected,
+        ssh_ready=ssh_ready, ssh_probed=ssh_probed, ssh_probe_ms=ssh_probe_ms,
+        debugger_attached=attached, crash_detected=crash_detected,
     )
 
 
@@ -2605,6 +2618,7 @@ def _handle_list(args: argparse.Namespace) -> int:
                 "ssh_port": inst.ssh_port,
                 "ssh": "n/a (harness)" if inst.harness else obs.ssh_state(),
                 "ssh_ready": obs.ssh_ready,
+                "ssh_probe_ms": obs.ssh_probe_ms,
                 "gdb_port": inst.gdb_port,
                 "kernel": inst.kernel,
                 "profile": inst.profile,
@@ -2936,6 +2950,7 @@ def _handle_status(args: argparse.Namespace) -> int:
         "guest_detail": obs.detail(),
         "ssh_port": inst.ssh_port,
         "ssh": ssh_state,
+        "ssh_probe_ms": obs.ssh_probe_ms,
         "gdb_port": inst.gdb_port,
         "kernel": inst.kernel,
         "rootfs": inst.rootfs,
@@ -2969,7 +2984,10 @@ def _handle_status(args: argparse.Namespace) -> int:
     elif inst.ssh_port is None:
         lines.append(f"  SSH:       none (--no-net, no --ssh-port)")
     elif obs.ssh_probed:
-        lines.append(f"  SSH:       port {inst.ssh_port} ({ssh_state})")
+        lines.append(
+            f"  SSH:       port {inst.ssh_port} ({ssh_state}, probe "
+            f"{obs.ssh_probe_ms} ms)"
+        )
     elif obs.debugger_attached:
         lines.append(
             f"  SSH:       port {inst.ssh_port} (not probed: debugger attached; "
@@ -3093,6 +3111,52 @@ def _check_libguestfs() -> dict[str, Any]:
         hint="sudo chmod 0644 /boot/vmlinuz-*  (or: export SUPERMIN_KERNEL="
              "<readable copy> SUPERMIN_KERNEL_VERSION=<ver> SUPERMIN_MODULES="
              "/lib/modules/<ver>)",
+    )
+
+
+def _check_rootfs_sshd_policy(rootfs: str, libguestfs_row: dict[str, Any]) -> dict[str, Any]:
+    """Does the configured rootfs carry mkrootfs's `sshd_policy=key-only`?
+
+    Images `tools/mkrootfs.sh` built before #68 accept root with ANY key —
+    the contributing cause of the cross-VM exec P0 — and nothing else tells
+    them apart from a current build. The stamp is read through libguestfs,
+    read-only, so the row exists only when the appliance check passed;
+    `warn`, never `fail`: launch works, the image is merely permissive.
+    """
+    check = "rootfs sshd policy"
+    rebuild = "rebuild the image with tools/mkrootfs.sh"
+    if libguestfs_row["status"] != "ok":
+        return _doctor_row(
+            check, "info",
+            "not checked (libguestfs is not usable here — see the libguestfs "
+            "row; a tools/mkrootfs.sh image built before key-only sshd "
+            "accepts root with ANY key)",
+            sshd_policy=None,
+        )
+    try:
+        stamp = rootfs_mod.read_stamp(rootfs)
+    except QMUError as exc:
+        reason = str(exc).splitlines()[0]
+        return _doctor_row(
+            check, "info", f"not checked ({reason})", sshd_policy=None,
+        )
+    policy = None
+    if stamp is not None:
+        try:
+            policy = json.loads(stamp).get("sshd_policy")
+        except (ValueError, AttributeError):
+            policy = None
+    if policy == "key-only":
+        return _doctor_row(check, "ok", "key-only", sshd_policy="key-only")
+    if stamp is None:
+        why = f"no {rootfs_mod.STAMP_PATH} stamp"
+    else:
+        why = f"{rootfs_mod.STAMP_PATH} records sshd_policy={policy!r}"
+    return _doctor_row(
+        check, "warn",
+        f"permissive (image predates key-only sshd; rebuild with "
+        f"tools/mkrootfs.sh) — {why}, so sshd accepts root with ANY key",
+        hint=rebuild, sshd_policy="permissive",
     )
 
 
@@ -3322,6 +3386,25 @@ def _handle_doctor(args: argparse.Namespace) -> int:
             hint=_path_hint("[boot] kernel", "--kernel"),
         ))
 
+    # Initrd (#75): same shape as the kernel row. A configured file that is
+    # missing blocks — launch fails on it identically — while "not configured"
+    # is merely informational: most rootfs boots have none.
+    if config.initrd:
+        if Path(config.initrd).expanduser().is_file():
+            checks.append(_doctor_row("initrd", "ok", config.initrd))
+        else:
+            checks.append(_doctor_row(
+                "initrd", "fail",
+                _missing_path_detail(config, "initrd")
+                + "; set [boot] initrd in qmu.toml or pass --initrd — launch "
+                  "will fail with `Initrd not found`.",
+                hint=_path_hint("[boot] initrd", "--initrd"),
+            ))
+    else:
+        checks.append(_doctor_row(
+            "initrd", "info", "not configured (optional; set [boot] initrd or pass --initrd)",
+        ))
+
     # Rootfs and SSH key. "Not configured" gates only when a flagless
     # `qmu launch` would actually fail on it: [boot] kernel is set and the
     # boot is not harness-shaped. A kernel with an initrd and no rootfs is the
@@ -3401,7 +3484,15 @@ def _handle_doctor(args: argparse.Namespace) -> int:
     # /boot/vmlinuz-* mode 0600 and the build runs unprivileged. Reporting only
     # "guestfish: found" sends the reader off to debug an opaque
     # "appliance closed the connection unexpectedly" instead.
-    checks.append(_check_libguestfs())
+    libguestfs_row = _check_libguestfs()
+    checks.append(libguestfs_row)
+
+    # Rootfs sshd policy (#75): only an image that exists can be opened, and
+    # a missing one already has its `[!] rootfs image` row above.
+    if config.rootfs and Path(config.rootfs).expanduser().exists():
+        checks.append(_check_rootfs_sshd_policy(
+            str(Path(config.rootfs).expanduser()), libguestfs_row,
+        ))
 
     # pry (optional — only needed for `qmu gdb`)
     pry = shutil.which("pry")

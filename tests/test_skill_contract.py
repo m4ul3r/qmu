@@ -23,6 +23,10 @@ import pytest
 from qmu.cli import _UsageError, build_parser
 
 SKILL = Path(__file__).resolve().parents[1] / "skills" / "qmu" / "SKILL.md"
+ROOT = SKILL.parents[2]
+README = ROOT / "README.md"
+UBUNTU_SKILL = ROOT / "skills" / "qmu-ubuntu-target" / "SKILL.md"
+MKTARGET = ROOT / "tools" / "mktarget.sh"
 REFERENCE_DIR = SKILL.parent / "reference"
 # #42 split moved the config schema and `config init` enumeration here.
 TROUBLESHOOTING = REFERENCE_DIR / "troubleshooting.md"
@@ -196,9 +200,13 @@ RETIRED_CLAIMS = [
      "stopped status has no qmp key at all; test for presence, not null"),
     (r"concurrent probe may report a held slot as `unreachable`",
      "list and status both classify a held QMP slot as busy (observed agreeing)"),
-    # #77 evidence: the held-QMP budget alone is ~2 s, an unanswering SSH port ~5 s.
+    # #77: the probe cap is ConnectTimeout + 0.5 s now; the 5 s figure is retired.
     (r"status --vm X\s+#.*< ?1 s",
-     "status is typically sub-second but up to ~2 s (held QMP) / ~5 s (SSH accepts, never answers)"),
+     "status is typically sub-second but up to ~2 s (held QMP) / ~2.5 s (SSH accepts, never answers)"),
+    (r"~5 s when the SSH port accepts but never answers",
+     "the probe is capped at ConnectTimeout + 0.5 s (~2.5 s); status/list report ssh_probe_ms"),
+    (r"tracked in #77",
+     "#77 is closed: list/status report the probe's wall time as ssh_probe_ms"),
     # The attach gate refuses a second `qmu gdb` while a client is connected.
     (r"would spawn a second bridge",
      "qmu gdb exits 1 naming the attached bridge pid and spawns nothing"),
@@ -254,6 +262,37 @@ REQUIRED_CLAIMS = [
     (SKILL, "`qemu_status: \"restore-vm\"`"),
     (REFERENCE_DIR / "snapshots.md", "`qmu cont --vm X` enforces this"),
     (REFERENCE_DIR / "output-contract.md", "The pointer envelope's `ok` is the **operation's** result"),
+    # #53: `skill install` statuses — the relink receipt is the whole point.
+    (SKILL, "relinked"),
+    (REFERENCE_DIR / "troubleshooting.md", "`relinked` (pointed at another checkout — JSON `previous_target` names it)"),
+    (REFERENCE_DIR / "troubleshooting.md", "`current` (already right; left untouched"),
+    (README, "reported as `relinked` together with the target it replaced"),
+    (README, "reported as `current`"),
+    # #75: the two new doctor rows; #76: the no_reboot config key.
+    (SKILL, "rootfs sshd policy ([~] permissive"),
+    (REFERENCE_DIR / "troubleshooting.md", "| `initrd` | same shape:"),
+    (REFERENCE_DIR / "troubleshooting.md", "[~] permissive (image predates key-only sshd; rebuild with tools/mkrootfs.sh)"),
+    (REFERENCE_DIR / "troubleshooting.md", "`[i] not checked (<reason>)`"),
+    (REFERENCE_DIR / "guest-commands.md", "[+] rootfs sshd policy: key-only"),
+    (REFERENCE_DIR / "guest-commands.md", "`ls` is one\n  guestfish session"),
+    (REFERENCE_DIR / "launch.md", "Config key: `[machine] no_reboot = true`"),
+    (REFERENCE_DIR / "troubleshooting.md", "`accel`, `no_reboot`, `extra_args`"),
+    # #73: a save that outran its budget is an UNKNOWN result (124), not exit 4.
+    (SKILL, "`snapshot save` outran its budget (result **unknown**, not failed)"),
+    (SKILL, "| `snapshot save` exit 124, `may_have_landed: true` |"),
+    (SKILL, "budget 60 s + 20 s/GiB, `--timeout N` overrides"),
+    (REFERENCE_DIR / "snapshots.md", "**60 s + 20 s per GiB of guest\nRAM**"),
+    (REFERENCE_DIR / "snapshots.md", "`may_have_landed: true`"),
+    (REFERENCE_DIR / "snapshots.md", "`may_have_landed: false`"),
+    (REFERENCE_DIR / "snapshots.md", "a reply tagged with another client's `id` is dropped"),
+    (REFERENCE_DIR / "wait.md", "`124` means the same thing on both commands"),
+    # #77: the probe's cost is an observable on status and list rows.
+    (SKILL, "`ssh_probe_ms` says"),
+    (REFERENCE_DIR / "launch.md", "`ssh_probe_ms` (the probe's wall time in ms; null when no\nprobe was sent"),
+    (REFERENCE_DIR / "launch.md", "≤ 2.5 s when the SSH port accepts but never answers"),
+    # #76: the first-QMP-connect retry is observable and field-evidenced.
+    (REFERENCE_DIR / "launch.md", "`warnings[]` gains `QMP connect retried N× (ECONNRESET)`"),
+    (REFERENCE_DIR / "launch.md", "`~/qmu-audit/crashpaths` receipt 2"),
 ]
 
 
@@ -476,3 +515,62 @@ def test_config_init_table_enumeration_matches_the_generator():
     assert f"{len(profiles)} `[profiles.*]` blocks" in sentence.replace(
         "three", str(len(profiles))
     )
+
+
+def _mktarget_usage_flags() -> list[str]:
+    """Long options listed under `Optional:` in mktarget.sh's usage() heredoc."""
+    text = MKTARGET.read_text()
+    block = text.split("\nOptional:\n", 1)[1].split("\nEnvironment:\n", 1)[0]
+    return re.findall(r"^  (--[a-z-]+)", block, re.MULTILINE)
+
+
+def _mktarget_parsed_flags() -> list[str]:
+    """Long options the `case "$1"` arg parser actually accepts."""
+    text = MKTARGET.read_text()
+    block = text.split("# parse args\n", 1)[1].split("\ndone\n", 1)[0]
+    return re.findall(r"^\s+(--[a-z-]+)(?:=\*)?\)", block, re.MULTILINE)
+
+
+def _ubuntu_skill_flag_rows() -> list[str]:
+    """First-column flag of every row in the ubuntu-target skill's flag table."""
+    rows: list[str] = []
+    in_table = False
+    for raw in UBUNTU_SKILL.read_text().splitlines():
+        if raw.startswith("## "):
+            in_table = raw.startswith("## Flags and environment")
+            continue
+        if in_table and raw.startswith("| `--"):
+            rows.append(raw.split("`", 2)[1].split()[0].split("[", 1)[0])
+    return rows
+
+
+def test_ubuntu_target_flag_table_matches_mktarget_usage_and_parser():
+    """#53 (second half): `--modules-extra` was parsed but absent from usage(),
+    and the installed skill copy described a suite default and an auto-skip the
+    script never had. Three sources describe the flag set — usage(), the arg
+    parser, the skill table — and they must enumerate the same options, in the
+    same order for the two that are tables.
+    """
+    usage = _mktarget_usage_flags()
+    parsed = _mktarget_parsed_flags()
+    skill = _ubuntu_skill_flag_rows()
+
+    assert set(parsed) - {"--help"} == set(usage), (
+        f"parsed but undocumented in usage(): {sorted(set(parsed) - set(usage) - {'--help'})}; "
+        f"documented but not parsed: {sorted(set(usage) - set(parsed))}"
+    )
+    assert skill == usage, (
+        f"skill flag table {skill} != usage() {usage}"
+    )
+
+
+def test_ubuntu_target_skill_default_suite_matches_mktarget():
+    """#53: the installed copy claimed `resolute` was the default suite."""
+    script = MKTARGET.read_text()
+    suite = re.search(r'^SUITE="([a-z]+)"$', script, re.MULTILINE).group(1)
+    assert suite == "noble"
+    assert f"Ubuntu suite (default: {suite})" in script
+    text = UBUNTU_SKILL.read_text()
+    assert f"| `--suite SUITE` | Ubuntu suite (default `{suite}`)" in text
+    assert f"Default target: {suite} (24.04)" in text
+    assert "resolute` | 26.04 LTS | **default**" not in text

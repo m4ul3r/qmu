@@ -33,6 +33,7 @@ class _CapturingQMPServer:
         self.sock.bind(self.sockpath)
         self.sock.listen(1)
         self.requests: list[dict] = []
+        self.ids: list[str] = []
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -59,7 +60,11 @@ class _CapturingQMPServer:
                 if not line.strip():
                     continue
                 if not first:
-                    self.requests.append(json.loads(line))
+                    request = json.loads(line)
+                    # Every command carries a client-unique `id` (reply
+                    # correlation, #73); the wire-shape tests pin the rest.
+                    self.ids.append(request.pop("id"))
+                    self.requests.append(request)
                 first = False
                 conn.sendall(b'{"return": {}}\n')
         except OSError:

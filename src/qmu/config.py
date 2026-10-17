@@ -108,6 +108,7 @@ _FIXED_SCHEMA: dict[str, dict[str, str]] = {
         "nic_model": "string",
         "net_backend": "net_backend",
         "accel": "accel",
+        "no_reboot": "boolean",
         "extra_args": "string_array",
     },
     "drive": {
@@ -146,6 +147,7 @@ _FIELD_TOML_KEYS: dict[str, str] = {
     "nic_model": "machine.nic_model",
     "net_backend": "machine.net_backend",
     "accel": "machine.accel",
+    "no_reboot": "machine.no_reboot",
     "extra_args": "machine.extra_args",
     "rootfs": "drive.rootfs",
     "drive_format": "drive.format",
@@ -186,6 +188,9 @@ _MIGRATION_DESTINATIONS: dict[str, tuple[str, ...]] = {
     "net_backend": ("[machine] net_backend",),
     "accel": ("[machine] accel",),
     "no_kvm": ("[machine] accel",),
+    "no_reboot": ("[machine] no_reboot",),
+    "no-reboot": ("[machine] no_reboot",),
+    "noreboot": ("[machine] no_reboot",),
     "extra_args": ("[machine] extra_args",),
     "rootfs": ("[drive] rootfs",),
     "format": ("[drive] format",),
@@ -246,6 +251,9 @@ def _validate_value(
     elif kind == "integer":
         valid = type(value) is int
         expected = "integer"
+    elif kind == "boolean":
+        valid = isinstance(value, bool)
+        expected = "boolean (true/false)"
     elif kind == "string_array":
         if not isinstance(value, list):
             problems.append(ConfigError(
@@ -472,6 +480,10 @@ class QMUConfig:
     # qemu 8.2.2 + KVM a jiffies watchpoint fired fine — KVM alone is not the
     # cause.)
     accel: str = "auto"
+    # -no-reboot: a panic under `panic=N` exits QEMU instead of rebooting into
+    # a fresh boot that buries the report. The one launch flag that had no
+    # config key (#76); boot-and-die projects set it once here.
+    no_reboot: bool = False
     extra_args: list[str] = field(default_factory=list)
 
     # drive
@@ -866,6 +878,9 @@ cpus = 2
 #                                #   emulation). "tcg" / --no-kvm is a retest lever
 #                                #   if a gdbstub hardware watchpoint misses under
 #                                #   KVM (usually a VA-alias issue — see #39).
+# no_reboot = true               # pass -no-reboot: a panic under `panic=N` exits QEMU
+#                                #   instead of rebooting over its own report (boot-and-die
+#                                #   harnesses). Same as the --no-reboot flag on every launch.
 # nic_model = "virtio-net-pci"   # or "e1000", "rtl8139", ...
 # net_backend = "passt"          # Optional migration-compatible backend. The selected
 #                                #   QEMU must advertise native passt; qmu probes whether it

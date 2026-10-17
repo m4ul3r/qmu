@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,27 @@ class QMPBusyError(QMPError):
     it has to be told apart from "unreachable" — `status` used to stall 10 s
     per connect behind a `wait` and then report `qmp: connected`.
     """
+
+
+class QMPTimeoutError(QMPError):
+    """A command was sent but QEMU did not answer within the budget.
+
+    Raised by `QMPClient.execute` after it has closed the socket: the reply is
+    still owed and may arrive at any time, so a client that kept the
+    connection would read it as the answer to its *next* command. QEMU's main
+    loop is wedged in the command meanwhile (an HMP `savevm` of a large guest
+    under host I/O load is the everyday case, #73), so the operation may
+    still complete after the client gave up — the caller knows the command
+    and decides what that means.
+    """
+
+    def __init__(self, command: str, timeout: float):
+        super().__init__(
+            f"QEMU did not answer `{command}` within {timeout:g}s; the command "
+            "may still be running inside QEMU"
+        )
+        self.command = command
+        self.timeout = timeout
 
 
 # HMP reports its own failures as ordinary result text: `human-monitor-command`
@@ -106,6 +129,8 @@ class QMPClient:
     # healthy server answers in microseconds; a main loop wedged in `savevm`
     # is the only other way to miss this, and that is contention too.
     greeting_timeout: float = 2.0
+    # Floor for the capabilities reply after a greeting; see `connect`.
+    capabilities_timeout: float = 10.0
 
     def __init__(self, socket_path: str | Path):
         self.socket_path = str(socket_path)
@@ -113,6 +138,12 @@ class QMPClient:
         self._buf = b""
         # Buffered async events received while waiting for command responses.
         self._events: list[dict] = []
+        # Every command carries a client-unique `id`; replies are matched on
+        # it so a reply owed to an earlier, abandoned client is never taken
+        # as this one's answer (see `_recv_response`).
+        self._id_prefix = f"qmu-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+        self._seq = 0
+        self.stale_replies = 0
 
     def connect(self) -> dict:
         """Connect to QMP socket and negotiate capabilities. Returns greeting."""
@@ -151,11 +182,25 @@ class QMPClient:
         if "QMP" not in greeting:
             self.close()
             raise QMPError(f"Unexpected QMP greeting: {greeting}")
-        self._sock.settimeout(10.0)
-
-        # Negotiate capabilities
-        self._send_json({"execute": "qmp_capabilities"})
-        self._recv_response()
+        # The greeting is written from accept(), but the capabilities reply is
+        # the first thing QEMU's monitor *dispatches* for this client, so a
+        # main loop wedged in `savevm` greets at once and then holds it (#73).
+        # Same `busy` verdict as a missing greeting; the budget is whichever
+        # of the two is longer, so `greeting_timeout` raised by a caller that
+        # expects to wait (`snapshot list --timeout`) covers the handshake.
+        handshake = max(self.capabilities_timeout, self.greeting_timeout)
+        self._sock.settimeout(handshake)
+        try:
+            msg_id = self._send_command({"execute": "qmp_capabilities"})
+            self._recv_response(msg_id)
+        except (socket.timeout, TimeoutError) as exc:
+            self.close()
+            raise QMPBusyError(
+                f"QMP socket {self.socket_path} greeted the connection but did "
+                f"not answer qmp_capabilities within {handshake:g}s. QEMU's main "
+                "loop is most likely inside a long command such as savevm, or "
+                "the slot is held by another client."
+            ) from exc
         return greeting
 
     def execute(
@@ -164,7 +209,11 @@ class QMPClient:
         arguments: dict | None = None,
         timeout: float = 30.0,
     ) -> Any:
-        """Execute a QMP command and return the result."""
+        """Execute a QMP command and return the result.
+
+        Raises `QMPTimeoutError` — with the socket already closed — when no
+        reply arrives within `timeout`.
+        """
         if self._sock is None:
             raise QMPError("Not connected")
         msg: dict[str, Any] = {"execute": command}
@@ -174,8 +223,17 @@ class QMPClient:
         if arguments is not None:
             msg["arguments"] = arguments
         self._sock.settimeout(timeout)
-        self._send_json(msg)
-        return self._recv_response()
+        try:
+            msg_id = self._send_command(msg)
+            return self._recv_response(msg_id)
+        except (socket.timeout, TimeoutError) as exc:
+            # Never leave the client behind: the late reply would otherwise
+            # be read as the answer to the next command on this socket.
+            self.close()
+            label = command
+            if command == "human-monitor-command" and arguments:
+                label = f"human-monitor-command '{arguments.get('command-line', '')}'"
+            raise QMPTimeoutError(label, timeout) from exc
 
     def execute_hmp(self, command_line: str, timeout: float = 30.0) -> str:
         """Execute an HMP command via QMP's human-monitor-command."""
@@ -231,10 +289,28 @@ class QMPClient:
                 raise QMPError("QMP connection closed unexpectedly")
             self._buf += chunk
 
-    def _recv_response(self) -> Any:
-        """Read responses, buffer async events, return on return/error."""
+    def _recv_response(self, expect_id: str | None = None) -> Any:
+        """Read responses, buffer async events, return on return/error.
+
+        A `return`/`error` tagged with an `id` other than `expect_id` is a
+        stale reply and is dropped: QEMU delivers the answer to a command whose
+        client went away — a `savevm` that outlived `snapshot save --timeout`
+        — to whichever client holds the socket when it finishes, and read as
+        this command's answer it made `query-status` return `{}` and `info
+        snapshots` return "No snapshots." (#73). Replies without an `id` are
+        trusted (test doubles, monitors that do not echo it).
+        """
         while True:
             msg = self._recv_json()
+            if "return" in msg or "error" in msg:
+                reply_id = msg.get("id")
+                if (
+                    expect_id is not None
+                    and reply_id is not None
+                    and reply_id != expect_id
+                ):
+                    self.stale_replies += 1
+                    continue
             if "return" in msg:
                 return msg["return"]
             if "error" in msg:
@@ -250,6 +326,14 @@ class QMPClient:
                 # Buffer for later wait_event() calls.
                 self._events.append(msg)
                 continue
+
+    def _send_command(self, msg: dict[str, Any]) -> str:
+        """Tag `msg` with a client-unique `id`, send it, return the id."""
+        self._seq += 1
+        msg_id = f"{self._id_prefix}:{self._seq}"
+        msg["id"] = msg_id
+        self._send_json(msg)
+        return msg_id
 
     def wait_event(
         self,

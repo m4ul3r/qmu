@@ -33,7 +33,7 @@ def layered(tmp_path, monkeypatch):
     ppath = project / "qmu.toml"
     ppath.write_text(
         '[boot]\nkernel = "./bzImage"\n[ssh]\nkey = "./project_key"\n'
-        '[machine]\nnic_model = "e1000"\naccel = "tcg"\n'
+        '[machine]\nnic_model = "e1000"\naccel = "tcg"\nno_reboot = true\n'
     )
     (project / "bzImage").write_bytes(b"\x00")
     monkeypatch.chdir(project)
@@ -61,6 +61,8 @@ def test_config_show_json_has_per_key_sources_and_resolved_paths(layered, capsys
     assert machine["nic_model"] == "e1000"
     assert machine["net_backend"] == "user"
     assert machine["accel"] == "tcg"
+    assert machine["no_reboot"] is True
+    assert sources["machine.no_reboot"] == f"project {layered['project']}"
     assert machine["kvm"] is False
 
     assert data["paths"]["boot.kernel"] == {
@@ -110,7 +112,8 @@ def test_config_show_text_and_json_agree_on_every_layer(layered, capsys):
 
     rows = {
         "boot.kernel": "Kernel:", "machine.memory": "Memory:", "machine.cpus": "CPUs:",
-        "machine.accel": "Accel:", "ssh.key": "SSH key:", "ssh.user": "SSH user:",
+        "machine.accel": "Accel:", "machine.no_reboot": "No-reboot:",
+        "ssh.key": "SSH key:", "ssh.user": "SSH user:",
     }
     for key, label in rows.items():
         line = next(l for l in text.splitlines() if l.strip().startswith(label))

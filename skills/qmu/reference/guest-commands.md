@@ -189,7 +189,9 @@ qmu rootfs shell ./rootfs.img                                  # interactive gue
 - `rm`: exit 1 on a missing path unless `--force` (reported under `missing`),
   or a directory without `--recursive`.
 - `ls`/`cat` are read-only and work while a VM runs; `inject`/`rm`/`shell`
-  refuse an image a running VM holds and name the VM to kill.
+  refuse an image a running VM holds and name the VM to kill. `ls` is one
+  guestfish session (~1.5 s: the appliance boot is the whole cost; it used
+  to boot twice).
 - `--partition N` defaults to `1`; images from `tools/mkrootfs.sh`,
   `qmu-linux-rootfs` and Debian cloud images are whole-disk ext4 →
   `--partition 0`. A wrong value errors naming the partitions found.
@@ -207,4 +209,10 @@ serial console auto-logs in as root. The image carries `/etc/qmu-rootfs.json`
 (`sshd_policy: "key-only"`) and the build stamp `sshd_policy=key-only`. A
 cached image built before that policy is permissive: rerun
 `tools/mkrootfs.sh` (an unstamped legacy image needs `--no-cache`).
-`--emit-guest-setup PATH` writes the guest setup script for inspection.
+`qmu doctor` reads that stamp from the configured `[drive] rootfs` when
+libguestfs works: `[+] rootfs sshd policy: key-only`, or `[~] rootfs sshd
+policy: permissive (image predates key-only sshd; rebuild with
+tools/mkrootfs.sh)` (JSON `sshd_policy: "permissive"`, non-blocking) for a
+missing or non-key-only stamp — **any** key then logs in as root, so a
+sibling VM's key reaches your guest. `--emit-guest-setup PATH` writes the
+guest setup script for inspection.

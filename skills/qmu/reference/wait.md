@@ -104,6 +104,10 @@ from a `--pattern` wait, is the receipt for a successful harness run.
   such as wait/status, or a debugger bridge), so QEMU's status was not
   observed.`); each busy poll costs the 2 s greeting timeout, so `--timeout`
   can overshoot by up to 2 s, and `--timeout 0` under a held slot is 124.
+  A `savevm` still running after `snapshot save` exited 124 is the other
+  source of `busy` (QEMU greets, then holds `qmp_capabilities` for up to the
+  10 s floor); `124` means the same thing on both commands — the window
+  closed, the operation is not disproved (`snapshots.md`).
   The reported `qemu_status` describes the **last** probe: once that probe
   was busy it is `unknown`, never a `running` carried over from an earlier
   connected poll. Before returning `timeout`, the wait rescans the serial log

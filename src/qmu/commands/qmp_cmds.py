@@ -25,15 +25,18 @@ from ..instance import (
     save_instance,
 )
 from ..snapshot import (
+    SAVEVM_BASE_SECONDS,
+    SAVEVM_SECONDS_PER_GIB,
     SnapshotResult,
     delete_snapshot,
     list_snapshots,
     load_snapshot,
     loadvm_restore_state,
     save_snapshot,
+    savevm_timeout,
 )
 from ..serial import serial_log_offset
-from ..qmp import QMPCommandError, hmp_failed
+from ..qmp import QMPCommandError, QMPTimeoutError, hmp_failed
 from ..debug import (
     bridge_alive,
     debug_session_present,
@@ -70,6 +73,15 @@ def _add_snapshot(sub: argparse._SubParsersAction) -> None:
 
     s = sp.add_parser("save", help="Save a snapshot")
     s.add_argument("name", help="Snapshot name")
+    s.add_argument(
+        "--timeout", type=float, default=None, metavar="SECONDS",
+        help=(
+            "budget for HMP savevm (default: "
+            f"{SAVEVM_BASE_SECONDS:g} s + {SAVEVM_SECONDS_PER_GIB:g} s per GiB "
+            "of guest RAM, e.g. 140 s for 4G). On expiry the result is UNKNOWN: "
+            "exit 124, may_have_landed: true, and QEMU is probably still writing"
+        ),
+    )
     _add_common_opts(s)
     s.set_defaults(handler=_handle_snapshot_save)
 
@@ -79,6 +91,14 @@ def _add_snapshot(sub: argparse._SubParsersAction) -> None:
     s.set_defaults(handler=_handle_snapshot_load)
 
     s = sp.add_parser("list", help="List snapshots")
+    s.add_argument(
+        "--timeout", type=float, default=SNAPSHOT_LIST_TIMEOUT, metavar="SECONDS",
+        help=(
+            f"how long to wait for QEMU to answer (default {SNAPSHOT_LIST_TIMEOUT:g}); "
+            "raise it after a `snapshot save` that expired, QEMU may still be "
+            "writing that snapshot"
+        ),
+    )
     _add_common_opts(s)
     s.set_defaults(handler=_handle_snapshot_list)
 
@@ -114,6 +134,58 @@ def _drop_ssh_master(inst: VMInstance) -> None:
 
 
 _SNAPSHOT_ERROR_TYPE = "SnapshotError"
+# Exit code for a `snapshot save` whose budget expired: the window closed and
+# the result is unknown — the same code `wait` uses — not 4, which claims the
+# transport broke (it did not; QEMU is still inside `savevm`).
+SNAPSHOT_TIMEOUT_EXIT = 124
+
+# `snapshot list` default budget. `info snapshots` answers in microseconds
+# unless QEMU's main loop is still inside a `savevm` that outlived `snapshot
+# save --timeout`; the follow-up the timeout hint names passes a long one.
+SNAPSHOT_LIST_TIMEOUT = 30.0
+
+
+def _emit_snapshot_save_timeout(
+    args: argparse.Namespace, inst: VMInstance, timeout: float
+) -> int:
+    """`snapshot save` outlived its budget: the result is UNKNOWN, not failed.
+
+    HMP `savevm` runs synchronously on QEMU's main loop, so a save that was
+    still writing when the budget expired keeps writing; it usually lands
+    minutes later, and every QMP command until then queues behind it (#73).
+    Reporting that as exit 4 `timed out` told the reader the transport broke
+    and the snapshot was lost — both false. The envelope says what is known
+    (`may_have_landed: true`) and names the one command that settles it with
+    a budget that will outlast the save.
+    """
+    follow_up = max(2 * timeout, 300.0)
+    error = (
+        f"snapshot save '{args.name}' on VM '{inst.vm_id}' did not finish within "
+        f"{timeout:g}s; QEMU is probably still writing it, so the result is "
+        "unknown and every QMP command queues behind it until it completes"
+    )
+    hint = (
+        f"qmu snapshot list --vm {inst.vm_id} --timeout {follow_up:g} waits for "
+        f"QEMU to answer and shows whether '{args.name}' landed. Do not retry the "
+        f"save until it does; next time pass qmu snapshot save {args.name} --vm "
+        f"{inst.vm_id} --timeout {follow_up:g}."
+    )
+    data = {
+        "ok": False,
+        "error": error,
+        "error_type": _SNAPSHOT_ERROR_TYPE,
+        "name": args.name,
+        "timeout": timeout,
+        "may_have_landed": True,
+        "hint": hint,
+    }
+    if getattr(args, "format", "text") == "text":
+        sys.stderr.write(f"[qmu] Error: {error}\n")
+        sys.stderr.write("[qmu] The snapshot may have landed (may_have_landed: true).\n")
+        sys.stderr.write(f"[qmu] {hint}\n")
+    else:
+        _emit(args, data=data, text=error, stem="snapshot-save")
+    return SNAPSHOT_TIMEOUT_EXIT
 
 
 def _snapshot_failure_hint(name: str, vm_id: str, reason: str | None) -> str:
@@ -222,6 +294,11 @@ def _emit_snapshot_result(
         data["resumed"] = result.resumed
         data["guest_paused"] = result.guest_paused
         data["restore_state"] = result.restore_state
+    elif op == "save":
+        # Proven: `save_snapshot` cross-checks `info snapshots`. The one save
+        # outcome that is NOT proven — the budget expired — is exit 124 with
+        # `may_have_landed: true` (`_emit_snapshot_save_timeout`).
+        data["may_have_landed"] = False
     if getattr(args, "format", "text") == "text":
         sys.stderr.write(f"[qmu] Error: {error}\n")
         for note in notes:
@@ -234,12 +311,21 @@ def _emit_snapshot_result(
 
 def _handle_snapshot_save(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
+    timeout = getattr(args, "timeout", None)
+    if timeout is None:
+        timeout = savevm_timeout(inst.memory)
     # A master alive at savevm time is frozen into the image as an established
     # guest sshd session that every later load resurrects as an orphan; close
     # it first so the checkpoint carries no half-open connection.
     _drop_ssh_master(inst)
-    with _qmp_ctx(inst) as qmp:
-        result = save_snapshot(qmp, args.name)
+    try:
+        with _qmp_ctx(inst) as qmp:
+            result = save_snapshot(qmp, args.name, timeout=timeout)
+    except QMPTimeoutError:
+        # The client has already closed its socket (`QMPClient.execute`), so
+        # the next command connects fresh instead of reading savevm's late
+        # reply as its own answer.
+        return _emit_snapshot_save_timeout(args, inst, timeout)
     rc = _emit_snapshot_result(args, "save", inst, result)
     if rc != 0:
         if result.reason != "bad_name":
@@ -304,8 +390,15 @@ def _handle_snapshot_load(args: argparse.Namespace) -> int:
 
 def _handle_snapshot_list(args: argparse.Namespace) -> int:
     inst = choose_instance(args.vm)
-    with _qmp_ctx(inst) as qmp:
-        snaps = list_snapshots(qmp)
+    timeout = getattr(args, "timeout", None)
+    if timeout is None:
+        timeout = SNAPSHOT_LIST_TIMEOUT
+    qmp = _qmp_ctx(inst)
+    # Set before connecting: the greeting is where a QEMU still inside
+    # `savevm` makes a caller wait, so the budget covers connect and reply.
+    qmp.greeting_timeout = timeout
+    with qmp as client:
+        snaps = list_snapshots(client, timeout=timeout)
     if not snaps:
         text: str | list[str] = "No snapshots."
     else:

@@ -33,7 +33,7 @@ The script is not on `PATH`: from a qmu checkout it is `tools/mktarget.sh`
 | Newest kernel in `-updates` | `--kernel-abi latest`; newest that also has symbols: `--kernel-abi latest-with-symbols` |
 | GDB against the target | `eval "$(tools/mktarget.sh --kernel-abi latest-with-symbols --symbols)"` → `VMLINUX` emitted |
 | Add symbols to a target already built | rerun the same command with `--symbols`; only symbols are fetched, the rootfs is untouched |
-| Another suite / HWE kernel | `--suite noble --kernel-abi 7.0.0-14` (noble carries 6.8/6.11/6.14/6.17/7.0); `--suite resolute` for 26.04 |
+| Another suite / HWE kernel | `--suite noble --kernel-abi 7.0.0-14` (noble carries 6.8/6.11/6.14/6.17/7.0); `--suite resolute --no-modules-extra` for 26.04 (no pocket of resolute ships `linux-modules-extra`; the script does not auto-skip it) |
 | arm64 target | `--arch arm64` (needs binfmt; ~15 min first time) |
 | Measure as root vs. unprivileged | the image has user `ubuntu` (uid 1000); `--unpriv-user NAME` renames it |
 | Triage with one clean crash report | `--profile ubuntu-trigger` at launch (`panic_on_oops=1 panic_on_warn=1`) |
@@ -79,7 +79,8 @@ symbols this run". `--list-abis` prints nothing on stdout.
 | `--kernel-version VER` | exact deb version (`6.8.0-31.31`); overrides `--kernel-abi` |
 | `--list-abis` | print the ABI / deb version / pocket / DBGSYM table to stderr and exit 0 |
 | `--symbols[=MODE]` | fetch ddebs symbols: `vmlinux` (default; one file stream-extracted from the ~1.9 GB ddeb) or `full` (also `usr/lib/debug/lib/modules/<rel>/`) |
-| `--no-modules-extra` | skip `linux-modules-extra` (default installs it; `--modules-extra` is accepted and is the default) |
+| `--no-modules-extra` | skip `linux-modules-extra` (default installs it) |
+| `--modules-extra` | install `linux-modules-extra` (the default); undoes an earlier `--no-modules-extra` — last one wins |
 | `--headers` | install `linux-headers-<rel>` |
 | `--initramfs` | generate an initrd and emit `INITRD=`; not needed — the boot drivers are built in |
 | `--relax-hardening` | separate `-relaxed` image with the hardening sysctls off (see below) |

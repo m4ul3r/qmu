@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from .instance import QMUError
 
@@ -472,15 +473,88 @@ def _run_script(
     cmd = [fish, mode, "-a", str(img_path)] + _mount_args(partition)
     proc = _invoke(cmd, script)
     if proc.returncode != 0:
-        out = _failure_text(proc)
-        diagnosis = _diagnose_guestfish_failure(out, image, partition)
-        if diagnosis is None:
-            diagnosis = f"Try `qmu rootfs shell {image} --partition <N>` to inspect."
-        raise QMUError(
-            f"guestfish {action} failed (exit {proc.returncode}).\n{diagnosis}\n\n"
-            f"guestfish said:\n{out}"
+        raise _guestfish_failure(
+            proc.returncode, proc.stderr or proc.stdout or b"", image, partition, action
         )
     return proc.stdout
+
+
+def _guestfish_failure(
+    returncode: int, stderr: bytes, image: str, partition: int, action: str
+) -> QMUError:
+    out = stderr.decode("utf-8", "replace").strip()
+    diagnosis = _diagnose_guestfish_failure(out, image, partition)
+    if diagnosis is None:
+        diagnosis = f"Try `qmu rootfs shell {image} --partition <N>` to inspect."
+    return QMUError(
+        f"guestfish {action} failed (exit {returncode}).\n{diagnosis}\n\n"
+        f"guestfish said:\n{out}"
+    )
+
+
+_PHASE_MARKER = b"qmu-phase-done\n"
+
+
+def _run_session(
+    image: str,
+    partition: int,
+    action: str,
+    first: str,
+    then: Callable[[], str],
+    *,
+    read_only: bool = False,
+) -> bytes:
+    """Run two scripts in ONE guestfish session; return the second's stdout.
+
+    The appliance boot is the whole cost of a guestfish run (~1.3 s), so a
+    command whose second half depends on the first's answer — `ls` needs the
+    names before it can stat them — should not pay it twice. `first` must
+    print nothing to stdout (send its data to a host file); it is followed by
+    an `echo` marker, and `then()` is called once the marker arrives, so it
+    can read that file and build the rest of the script. Keeping stdout
+    silent until the marker is what makes the sync airtight: no guest name
+    can forge a terminator in a stream that carries only the terminator.
+    Same byte-exact transport as `_invoke`; guestfish exits on the first
+    failing command, which surfaces as EOF before the marker.
+    """
+    fish = _require_guestfish()
+    img_path = Path(image)
+    if not img_path.exists():
+        raise QMUError(f"Image not found: {image}")
+    if not read_only:
+        require_image_free(image)
+
+    mode = "--ro" if read_only else "--rw"
+    cmd = [fish, mode, "-a", str(img_path)] + _mount_args(partition)
+    with tempfile.TemporaryFile() as stderr:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr
+        )
+        assert proc.stdin is not None and proc.stdout is not None
+        proc.stdin.write((first + "echo " + _PHASE_MARKER.decode()).encode(
+            "utf-8", "surrogateescape"
+        ))
+        proc.stdin.flush()
+        seen = b""
+        while seen != _PHASE_MARKER:
+            chunk = proc.stdout.read1(len(_PHASE_MARKER) - len(seen))
+            if not chunk:
+                break
+            seen += chunk
+        if seen != _PHASE_MARKER:
+            proc.stdin.close()
+            proc.wait()
+            stderr.seek(0)
+            raise _guestfish_failure(
+                proc.returncode, stderr.read(), image, partition, action
+            )
+        out, _ = proc.communicate(then().encode("utf-8", "surrogateescape"))
+        if proc.returncode != 0:
+            stderr.seek(0)
+            raise _guestfish_failure(
+                proc.returncode, stderr.read(), image, partition, action
+            )
+    return out
 
 
 def _decode_name(raw: bytes) -> tuple[str, str | None]:
@@ -646,23 +720,36 @@ def listdir(image: str, guest_path: str = "/", partition: int = 1) -> list[dict]
     appearing as a target shifted every later entry's target while still
     reporting success. A name or target that is not UTF-8 gets a lossy
     `name`/`target` plus `name_bytes_b64`/`target_bytes_b64`.
+
+    One guestfish session (#76): `ls0` lands in a host temp file, and the
+    readlink/stat script is composed from it once the session reports the
+    listing done — a second appliance boot doubled the cost of every `ls`.
     """
     path = guest_path or "/"
-    names_out = _run_script(
-        image, partition, f"ls0 {guestfish_quote(path)} -\n", "ls", read_only=True
-    )
-    names = sorted(n for n in names_out.split(b"\0") if n)
+    names: list[bytes] = []
+
+    def stat_script() -> str:
+        names[:] = sorted(n for n in names_file.read_bytes().split(b"\0") if n)
+        full = [
+            posixpath.join(path, n.decode("utf-8", "surrogateescape")) for n in names
+        ]
+        # `-readlink` tolerates the error a non-symlink produces (stderr
+        # only) and prints nothing for it. Targets come first and the stat
+        # records last, so the records can be found from the tail regardless
+        # of what the targets contain.
+        return "".join(f"-readlink {guestfish_quote(p)}\n" for p in full) + "".join(
+            f"lstatns {guestfish_quote(p)}\n" for p in full
+        )
+
+    with tempfile.TemporaryDirectory(prefix="qmu-ls-") as tmp:
+        names_file = Path(tmp) / "names"
+        out = _run_session(
+            image, partition, "ls",
+            f"ls0 {guestfish_quote(path)} {guestfish_quote(str(names_file))}\n",
+            stat_script, read_only=True,
+        )
     if not names:
         return []
-
-    full = [posixpath.join(path, n.decode("utf-8", "surrogateescape")) for n in names]
-    # `-readlink` tolerates the error a non-symlink produces (stderr only)
-    # and prints nothing for it. Targets come first and the stat records
-    # last, so the records can be found from the tail regardless of what
-    # the targets contain.
-    script = "".join(f"-readlink {guestfish_quote(p)}\n" for p in full)
-    script += "".join(f"lstatns {guestfish_quote(p)}\n" for p in full)
-    out = _run_script(image, partition, script, "ls", read_only=True)
 
     links_part, stats = _split_tail_stats(out, len(names))
     said = out.decode("utf-8", "replace").strip()
@@ -705,6 +792,29 @@ def read_file(image: str, guest_path: str, partition: int = 1) -> bytes:
         return tmp_path.read_bytes()
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+# Provenance stamp `tools/mkrootfs.sh` writes; its `sshd_policy` records
+# whether sshd was built key-only (#68). Images built earlier carry no stamp
+# (or one without the field) and accept root with ANY key.
+STAMP_PATH = "/etc/qmu-rootfs.json"
+
+
+def read_stamp(image: str, partition: int = 0) -> bytes | None:
+    """The raw `/etc/qmu-rootfs.json` bytes, or None when the image has none.
+
+    Read-only and busy-safe, so `doctor` can ask while a VM holds the image.
+    Whole-disk by default: that is the mkrootfs layout the stamp belongs to.
+    Raises QMUError when guestfish is missing or cannot open the image.
+    """
+    out = _run_script(
+        image, partition,
+        f"exists {STAMP_PATH}\n-cat {STAMP_PATH}\n", "stamp", read_only=True,
+    )
+    answer, _, content = out.partition(b"\n")
+    if answer.strip().lower() != b"true":
+        return None
+    return content
 
 
 def remove(

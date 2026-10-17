@@ -839,3 +839,78 @@ def test_non_transient_qmp_fault_is_not_retried(tmp_path, monkeypatch):
         )
 
     assert _FlakyQMP.seen.count("connect") == 1
+
+
+def test_qmp_connect_retry_is_reported_in_launch_notes(tmp_path, monkeypatch):
+    """#76: a retry that fires is observable — `notes` (mirrored into the
+    launch envelope's `warnings[]`) names the count and the errno — instead
+    of being silently absorbed, so a live reproduction can count it."""
+    kernel = _kernel(tmp_path)
+    proc = FakeProcess(pid=1004)
+    _FlakyQMP.plan = [
+        ConnectionRefusedError(111, "Connection refused"),
+        ConnectionResetError(104, "Connection reset by peer"),
+    ]
+    _FlakyQMP.seen = []
+
+    def fake_popen(*a, **k):
+        qmp_socket_path("flaky-vm").parent.mkdir(parents=True, exist_ok=True)
+        qmp_socket_path("flaky-vm").write_text("x")
+        return proc
+
+    monkeypatch.setattr(vm_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm_module, "proc_pid_start", lambda pid: "1")
+    monkeypatch.setattr(vm_module, "QMPClient", _FlakyQMP)
+    monkeypatch.setattr(vm_module.time, "sleep", lambda _s: None)
+
+    notes: list[str] = []
+    inst = launch_vm(
+        config=QMUConfig(), kernel=str(kernel), harness=True, name="flaky-vm",
+        notes=notes,
+    )
+    assert inst.vm_id == "flaky-vm"
+    # The last fault names the retry; the wrapped form resolves to its errno.
+    assert notes == ["QMP connect retried 2× (ECONNRESET)"]
+
+
+def test_wrapped_qmp_fault_note_names_the_underlying_errno(tmp_path, monkeypatch):
+    kernel = _kernel(tmp_path)
+    proc = FakeProcess(pid=1005)
+    fault = vm_module.QMPError("Cannot connect to QMP socket /x: [Errno 111] Connection refused")
+    fault.__cause__ = ConnectionRefusedError(111, "Connection refused")
+    _FlakyQMP.plan = [fault]
+    _FlakyQMP.seen = []
+
+    def fake_popen(*a, **k):
+        qmp_socket_path("flaky-vm").parent.mkdir(parents=True, exist_ok=True)
+        qmp_socket_path("flaky-vm").write_text("x")
+        return proc
+
+    monkeypatch.setattr(vm_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm_module, "proc_pid_start", lambda pid: "1")
+    monkeypatch.setattr(vm_module, "QMPClient", _FlakyQMP)
+    monkeypatch.setattr(vm_module.time, "sleep", lambda _s: None)
+
+    notes: list[str] = []
+    launch_vm(config=QMUConfig(), kernel=str(kernel), harness=True, name="flaky-vm", notes=notes)
+    assert notes == ["QMP connect retried 1× (ECONNREFUSED)"]
+
+
+def test_clean_first_connect_leaves_no_note(tmp_path, monkeypatch):
+    kernel = _kernel(tmp_path)
+    proc = FakeProcess(pid=1006)
+    _FlakyQMP.plan = []
+    _FlakyQMP.seen = []
+
+    def fake_popen(*a, **k):
+        qmp_socket_path("flaky-vm").parent.mkdir(parents=True, exist_ok=True)
+        qmp_socket_path("flaky-vm").write_text("x")
+        return proc
+
+    monkeypatch.setattr(vm_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm_module, "proc_pid_start", lambda pid: "1")
+    monkeypatch.setattr(vm_module, "QMPClient", _FlakyQMP)
+
+    notes: list[str] = []
+    launch_vm(config=QMUConfig(), kernel=str(kernel), harness=True, name="flaky-vm", notes=notes)
+    assert notes == []

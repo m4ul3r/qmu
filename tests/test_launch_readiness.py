@@ -414,6 +414,8 @@ def test_arm_console_on_x86_warns(launch_env, capsys):
 
 
 def test_no_reboot_flag_reaches_launch_vm(launch_env, capsys, monkeypatch):
+    """`--no-reboot` lands on the resolved config (`[machine] no_reboot`),
+    which is where build_qemu_command reads it (#76)."""
     seen: dict = {}
     inst, _, state = launch_env
     state["ready"] = True
@@ -427,9 +429,9 @@ def test_no_reboot_flag_reaches_launch_vm(launch_env, capsys, monkeypatch):
     monkeypatch.setattr(lifecycle, "launch_vm", launch)
 
     assert cli.main(["launch", "--no-reboot", "--format", "json"]) == 0
-    assert seen["no_reboot"] is True
+    assert seen["config"].no_reboot is True
     assert cli.main(["launch", "--format", "json"]) == 0
-    assert seen["no_reboot"] is False
+    assert seen["config"].no_reboot is False
 
 # ---------------------------------------------------------------------------
 # `--vm` is accepted on launch as an alias for --name. Two different names
@@ -479,3 +481,26 @@ def test_matching_or_lone_vm_selector_still_names_the_launch(
 
     assert rc == 0
     assert seen["name"] == "same"
+
+
+@pytest.mark.parametrize("output_format", ["json", "text"])
+def test_launch_mirrors_the_qmp_retry_note_into_warnings(
+    launch_env, capsys, monkeypatch, output_format
+):
+    """#76: the first-QMP-connect retry is reported, not silently absorbed —
+    `warnings[]` in JSON, a `[qmu]` stderr line in text."""
+    inst, _, state = launch_env
+    state["ready"] = True
+
+    def launch(**kwargs):
+        kwargs["notes"].append("QMP connect retried 2× (ECONNRESET)")
+        save_instance(inst)
+        return inst
+
+    monkeypatch.setattr(lifecycle, "launch_vm", launch)
+    rc = cli.main(["launch", "--format", output_format])
+    output = capsys.readouterr()
+    assert rc == 0
+    assert "[qmu] QMP connect retried 2× (ECONNRESET)" in output.err
+    if output_format == "json":
+        assert json.loads(output.out)["warnings"] == ["QMP connect retried 2× (ECONNRESET)"]
