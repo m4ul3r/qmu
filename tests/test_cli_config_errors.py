@@ -710,6 +710,10 @@ EXEMPT_MINIMAL_ARGV = {
     # project config.
     "rootfs": ["rootfs", "ls", "does-not-exist.img"],
     "skill": ["skill", "install"],
+    # `mcp serve` blocks on stdin for its whole life; the group's own help
+    # handler is the leaf that can run here. Per tool call the façade applies
+    # the gate itself, so the error reaches the agent in that call's envelope.
+    "mcp": ["mcp"],
     "version": ["version"],
 }
 

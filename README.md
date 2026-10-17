@@ -33,6 +33,24 @@ while retaining the VM and serial evidence for `qmu log --vm ID` / `status`.
 Do not equate skipped readiness or infrastructure health with application
 readiness; exercise the intended benign operation after connecting.
 
+## MCP server
+
+```bash
+claude mcp add qmu -- qmu mcp serve
+```
+
+`qmu mcp serve` exposes the same commands as MCP tools over stdio, one per
+subcommand (`qmu_launch`, `qmu_exec`, `qmu_snapshot_save`, … — derived from
+the argparse tree, so a new subcommand is a new tool) plus `qmu_argv` for a
+raw argv. Every tool returns the `--format json` envelope with
+`exit_code` added, errors included (`ok: false`, `error_type`, `hint`), never a protocol
+error; `qmu://vms` and `qmu://vm/{vm_id}/log` are resources; `qmu_wait`
+streams progress. Generic stdio config:
+`{"mcpServers": {"qmu": {"command": "qmu", "args": ["mcp", "serve"]}}}`.
+The server's working directory is where `qmu.toml` is found. Details and
+limits (no byte streaming, spilled results come back as pointers):
+`skills/qmu/reference/mcp.md`.
+
 ## One-shot runs
 
 `qmu run` collapses `launch` → `exec` → `kill` into one command whose exit code

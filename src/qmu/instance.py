@@ -7,6 +7,7 @@ import stat
 import sys
 import tempfile
 import time
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
@@ -518,18 +519,19 @@ def remove_instance(vm_id: str, *, keep_logs: bool = False) -> None:
 # The auto-selection a running command made, consumed by the output layer so
 # the JSON envelope can carry `autoselected: true` without every handler
 # plumbing it. Per-dispatch state: `cli.main` resets it through
-# `reset_autoselection()` before each command.
-_autoselected_vm: str | None = None
+# `reset_autoselection()` before each command. A ContextVar, not a module
+# global, so concurrent in-process dispatches (the MCP façade runs each tool
+# call in its own context) cannot attribute one call's pick to another.
+_autoselected_vm: ContextVar[str | None] = ContextVar("qmu_autoselected_vm", default=None)
 
 
 def reset_autoselection() -> None:
-    global _autoselected_vm
-    _autoselected_vm = None
+    _autoselected_vm.set(None)
 
 
 def autoselected_vm() -> str | None:
     """The vm_id this dispatch auto-selected, or None when `--vm` named one."""
-    return _autoselected_vm
+    return _autoselected_vm.get()
 
 
 def _require_vm_env_set() -> bool:
@@ -544,8 +546,7 @@ def _autoselect(inst: VMInstance, *, running: bool) -> VMInstance:
     may be a peer's. The note goes to stderr so stdout stays the command's
     own payload; JSON readers get `autoselected: true` from the output layer.
     """
-    global _autoselected_vm
-    _autoselected_vm = inst.vm_id
+    _autoselected_vm.set(inst.vm_id)
     which = "only running VM" if running else "only VM (stopped)"
     sys.stderr.write(
         f"[qmu] Auto-selected the {which} '{inst.vm_id}' (pass --vm to pin it).\n"

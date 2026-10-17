@@ -40,6 +40,7 @@ import socket
 import subprocess
 import sys
 import time
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable
 
@@ -61,6 +62,20 @@ CONNECT_TIMEOUT = 1.0
 MODE_OFF = "off"
 MODE_AUTO = "auto"
 MODE_REQUIRE = "require"
+
+# Progress sink for in-process callers (#70, the MCP façade): the
+# daemon-backed `wait` path calls `report_progress(elapsed, scanned_bytes,
+# note)` on each daemon `progress`/QMP event. Default: no sink, no-op — the
+# CLI never sets one.
+progress_sink: ContextVar[Callable[[float, int, str], None] | None] = ContextVar(
+    "qmu_progress_sink", default=None
+)
+
+
+def report_progress(elapsed: float, scanned: int, note: str) -> None:
+    sink = progress_sink.get()
+    if sink is not None:
+        sink(elapsed, scanned, note)
 
 
 class DaemonError(Exception):

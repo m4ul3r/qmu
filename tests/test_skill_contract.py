@@ -196,6 +196,38 @@ def test_daemon_reference_claims_match_the_code():
         assert f"`daemon {verb}`" in page, verb
 
 
+REGISTRATION = "claude mcp add qmu -- qmu mcp serve"
+STDIO_CONFIG = '{"mcpServers": {"qmu": {"command": "qmu", "args": ["mcp", "serve"]}}}'
+
+
+def test_mcp_reference_claims_match_the_code():
+    """#70: mcp.md's registration line, naming rule, envelope rule, resource
+    URIs, exclusions, progress and limits come from the façade, not memory."""
+    from qmu import mcp_server
+
+    page = (REFERENCE_DIR / "mcp.md").read_text()
+    skill = SKILL.read_text()
+    readme = README.read_text()
+    assert "reference/mcp.md" in skill
+    for text, name in ((page, "mcp.md"), (skill, "SKILL.md"), (readme, "README.md")):
+        assert REGISTRATION in text, name
+        assert "`exit_code` added" in text, name
+    assert STDIO_CONFIG in page and STDIO_CONFIG in readme
+    assert "`qmu_<group>_<sub>`" in page and "`qmu_argv`" in page
+    assert "`qmu://vms`" in page
+    assert f"`qmu log --vm {{vm_id}} --tail {mcp_server.LOG_RESOURCE_TAIL}`" in page
+    assert "`qmu://vm/{vm_id}/log`" in page
+    for path in sorted(mcp_server.EXCLUDED):
+        assert f"`{' '.join(path)}" in page, path
+    for phrase in (
+        "error_type: \"UsageError\"", "exit_code: 2", "`notifications/progress`",
+        "no byte streaming", "pointer", "CWD determines `qmu.toml`",
+    ):
+        assert phrase in page, phrase
+    cost = mcp_server.schema_cost()
+    assert f"({cost['tools']} tools)" in page, cost
+    assert cost["tokens"] < 12_000, cost
+
 # Claims a second round of fresh-agent dogfooding proved wrong against the
 # tool. Each regex is the wording that misled; the reason says what is true.
 RETIRED_CLAIMS = [

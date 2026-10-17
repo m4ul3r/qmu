@@ -2273,11 +2273,24 @@ def _daemon_wait_request(
     the moment it is seen, not when the wait ends.
     """
     warned_reset_debug = False
+    started = time.monotonic()
 
     def on_event(event: dict[str, Any]) -> None:
         nonlocal warned_reset_debug
+        kind = event.get("kind")
+        if kind == "progress":
+            daemon_client.report_progress(
+                float(event.get("elapsed", 0.0)), int(event.get("scanned", 0)),
+                f"waiting on {inst.vm_id}",
+            )
+            return
+        if kind == "qmp_event":
+            daemon_client.report_progress(
+                time.monotonic() - started, int(event.get("boot_offset", 0)),
+                f"QMP {event.get('name')} on {inst.vm_id}",
+            )
         if (
-            event.get("kind") == "qmp_event" and event.get("name") == "RESET"
+            kind == "qmp_event" and event.get("name") == "RESET"
             and not warned_reset_debug and debug_session_present(inst)
         ):
             warned_reset_debug = True
