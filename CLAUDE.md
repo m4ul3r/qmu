@@ -681,7 +681,10 @@ envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
   assertion never exercises the "VM 'X' not found. Running: <decoy>" listing
   the real CLI produces on a shared box. The empty-running-set branch has its
   own row: `choose_instance(vm_id)` names the VM there too and only a bare
-  (no `--vm`) lookup answers "No running VMs" (#144).
+  (no `--vm`) lookup answers "No running VMs" (#144). A name `list` shows
+  (stopped/orphaned remnant) is described there, never "not found", for the
+  commands that do not pre-describe through `describe_non_running`
+  (push/pull/dmesg/snapshot/cont/gdb/qmp/monitor).
 
 ## Tests
 

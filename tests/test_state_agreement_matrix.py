@@ -618,6 +618,55 @@ def test_kill_of_an_absent_vm_still_says_not_found(cache, monkeypatch, capsys):
     assert VM in payload["error"]
 
 
+# The commands that need a live VM and do not pre-describe through
+# `describe_non_running` (status/kill/exec/wait do) answer from
+# `choose_instance`. Asked about a VM `list` shows, they must not deny it —
+# with or without another VM running (#144 made the zero-running branch reach
+# the same lookup, so both are rows).
+_RUNNING_ONLY_ARGV = {
+    "push": ["push", "--vm", VM, "/tmp/payload", "/root/"],
+    "pull": ["pull", "--vm", VM, "/root/payload"],
+    "dmesg": ["dmesg", "--vm", VM],
+    "snapshot list": ["snapshot", "list", "--vm", VM],
+    "cont": ["cont", "--vm", VM],
+    "gdb": ["gdb", "--vm", VM],
+    "qmp": ["qmp", "--vm", VM, "query-status"],
+    "monitor": ["monitor", "--vm", VM, "info", "status"],
+}
+
+
+@pytest.mark.parametrize("with_decoy", [False, True], ids=["zero-running", "decoy"])
+@pytest.mark.parametrize("state", [VM_ORPHANED, VM_STOPPED])
+@pytest.mark.parametrize("command", sorted(_RUNNING_ONLY_ARGV))
+def test_running_only_commands_never_deny_a_listed_vm(
+    command, state, with_decoy, cache, monkeypatch, capsys
+):
+    _make_state(state, cache, monkeypatch)
+    if with_decoy:
+        decoy = VMInstance(
+            vm_id="decoy", pid=1, qmp_socket="/tmp/decoy.qmp.sock",
+            ssh_port=None, ssh_key=None, gdb_port=None,
+            serial_log="/tmp/decoy.serial.log", kernel="/boot/bzImage",
+            rootfs=None, memory="4G", cpus=2, cmdline="console=ttyS0",
+            profile="exploit-dev", started_at="2026-08-17T00:00:00Z", harness=True,
+        )
+        for mod in (lifecycle, instance_mod):
+            monkeypatch.setattr(mod, "list_instances", lambda: [decoy], raising=False)
+
+    cli.main(["list"])
+    assert VM in capsys.readouterr().out, "fixture did not produce a listed VM"
+
+    rc = cli.main(["--format", "json", *_RUNNING_ONLY_ARGV[command]])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert "not found" not in payload["error"], (
+        f"`qmu {command}` denies a VM that `qmu list` displays"
+    )
+    assert "No running VMs" not in payload["error"]
+    assert payload["vm_id"] == VM
+    assert f"qmu status --vm {VM}" in payload["hint"]
+
 # The empty-running-set branch (#144): with no VM running — the normal state
 # after an auto-cleaned harness `wait` — status/wait/kill answered "No running
 # VMs. Start one with: qmu launch" without naming the VM, while crash/log
