@@ -3929,11 +3929,11 @@ def _handle_doctor(args: argparse.Namespace) -> Result:
         ))
 
     # libguestfs (required by `rootfs *` and `launch --inject`). Both the
-    # binary and its appliance kernel are checked: guestfish is routinely on
-    # PATH while the appliance cannot build, because Debian/Ubuntu ship
+    # binary and its appliance are checked: guestfish is routinely on PATH
+    # while the appliance cannot build, because Debian/Ubuntu ship
     # /boot/vmlinuz-* mode 0600 and the build runs unprivileged. Reporting only
-    # "guestfish: found" sends the reader off to debug an opaque
-    # "appliance closed the connection unexpectedly" instead.
+    # "guestfish: found" sends the reader off to debug an opaque supermin
+    # failure instead.
     libguestfs_row, appliance_runs = _check_libguestfs()
     checks.append(libguestfs_row)
 
