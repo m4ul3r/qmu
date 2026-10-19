@@ -91,8 +91,10 @@ Progress: `daemon_client.progress_sink` (a ContextVar, default no-op) is
 set per call; the daemon-backed `wait` (`lifecycle._daemon_wait_request`)
 calls `daemon_client.report_progress(elapsed, scanned, note)` on each
 daemon `progress` (≤1/s) or QMP event, and the façade relays it as
-`notifications/progress`. Keep tool descriptions to one sentence:
-`mcp_server.schema_cost()` measures the serialised `tools/list` (~5.4k
+`notifications/progress`. Keep tool descriptions to one sentence
+(`first_sentence` does not break at `e.g.`/`i.e.` or inside parentheses;
+a dest-named property such as `cpu_model` leads with its flag, `--cpu: …`):
+`mcp_server.schema_cost()` measures the serialised `tools/list` (~5.6k
 tokens for 38 tools); trim descriptions, never tools, if it grows past ~12k.
 
 ### Exit-code contract (see the epilog in `cli.py:main`)

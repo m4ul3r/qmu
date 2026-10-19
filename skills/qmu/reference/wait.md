@@ -9,12 +9,19 @@ line/scope rules that decide whether `--pattern` can ever match.
 
 `--pattern` is a Python regex matched per **complete line**:
 
-- **Anchor it.** An unanchored marker (`--pattern "results"`) also matches the
-  kernel's echo of the command line (`[    0.000000] Command line: … run=results`
-  — verified live: that is the line an unanchored wait matched) and any log
-  line that mentions the word. Use
-  `--pattern '^=+ results =+$'` (or `'^=+ QMU-BOOT-DONE =+$'` for the firmware
-  probe template).
+- **Anchor the tail, make the marker distinctive.** An unanchored marker
+  (`--pattern "results"`) also matches the kernel's echo of the command line
+  (`[    0.000000] Command line: … run=results` — verified live: that is the
+  line an unanchored wait matched) and any log line that mentions the word.
+  Use `--pattern '=+ results =+$'` (or `'=+ QMU-BOOT-DONE =+$'` for the
+  firmware probe template). Do **not** add `^` unless the marker is
+  guaranteed to start its own console line: a marker written to
+  `/dev/kmsg` is prefixed by the printk timestamp (`[  279.195305] ===== …`),
+  and the first line printed after boot is prefixed by the newline-less
+  getty prompt (`localhost login: ===== …`), so a `^`-anchored pattern never
+  matches and the wait burns its whole `--timeout` (124) on a marker that is
+  in the log (measured: `'^=+ XARCH MARKER =+$'` → 124, the same marker
+  with the head anchor dropped → exit 0 in 2.7 s).
 - **Fragments match only once the console idles.** A complete line is
   offered to the matcher as soon as its newline arrives. A trailing fragment
   with no newline (`login:`, a `printf` without `\n`) is withheld while the

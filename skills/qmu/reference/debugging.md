@@ -145,11 +145,18 @@ instances running (pids: A, B). Use --instance <pid>`.
   termination signal; reconnect before inspecting or resuming the target`,
   exit 1; the live one reports `stopped`/`running`) → `pry kill --instance
   <stale>`.
-- **`pry kill` (clean) detaches and QEMU resumes the vCPU** — the VM is left
-  `serving`, not paused. An **unclean** bridge death (`kill -9`, a crash)
-  does not detach, and the vCPU stays halted: `qmu status` then shows
-  `Guest: paused` with no reason and `pry doctor` lists nothing. `qmu cont
-  --vm <id>` resumes it.
+- **A clean `pry kill` detaches, but do not assume it resumed the vCPU.**
+  From an ordinary breakpoint stop the detach lets QEMU resume and the VM
+  is `serving` again. After a `qmu snapshot load` into a debug stop the
+  outcome is not fixed: a clean kill (`Killed GDB`, `pry doctor` →
+  `instances: none`) has left the VM `Guest: paused`, `qemu_status:
+  "paused"` (#133), and on QEMU 8.2.2 it has also resumed the rewound guest
+  straight into whatever the load restored (a baked-in `int3` → `guest:
+  "panicked"`, see the table below). An **unclean** bridge death (`kill
+  -9`, a crash) does not detach, so the vCPU stays halted and looks the same
+  — `paused` with an empty `pry doctor` is therefore **not** proof of an
+  unclean death. Either way: **check `qmu status --vm <id>` after `pry
+  kill`**; `qmu cont --vm <id>` resumes a paused one.
 - **Reconnect after a bridge death** with `pry launch --connect
   localhost:<gdb_port> --symbols "$VMLINUX" --instance-id <name>` (the port
   is in `qmu status`); that attach halts the guest again, so finish with
@@ -179,7 +186,7 @@ breakpoint.**
 
 | You run | What silently breaks | Recover |
 |---|---|---|
-| `qmu snapshot load` | The bridge's connection survives the rewind but its view is the **pre-load** vCPU state (stale `$rip`/stop reason) and stale breakpoint/memory bookkeeping, presented as current. The stderr warning says exactly this. | Do what the warning says: tear the stale bridge down first (`pry kill --instance qmu-<vm>`), then reconnect with `pry launch --connect localhost:<gdb_port> --symbols "$VMLINUX" --instance-id qmu-<vm>` — or a fresh `qmu gdb`, which is refused with exit 1 (`A debugger client is already attached to port N (pry bridge pid P)`) until the stale bridge is gone — and re-arm every breakpoint before trusting a register or memory read. |
+| `qmu snapshot load` | The bridge's connection survives the rewind but its view is the **pre-load** vCPU state (stale `$rip`/stop reason) and stale breakpoint/memory bookkeeping, presented as current. The stderr warning says exactly this. | Do what the warning says: tear the stale bridge down first (`pry kill --instance qmu-<vm>`), then reconnect with `pry launch --connect localhost:<gdb_port> --symbols "$VMLINUX" --instance-id qmu-<vm>` — or a fresh `qmu gdb`, which is refused with exit 1 (`A debugger client is already attached to port N (pry bridge pid P)`) until the stale bridge is gone — and re-arm every breakpoint before trusting a register or memory read. A load into a debug stop leaves the VM `paused` even after a clean `pry kill`: check `qmu status --vm <id>` and `qmu cont --vm <id>` (after a fresh `qmu gdb`, `qmu cont` is its documented next step anyway). |
 | `qmu snapshot save` (breakpoints armed) | Software breakpoints are `int3` (`0xCC`) bytes; the save **bakes them into the image**. A later `load` + run traps at that address with no live breakpoint → `Oops: int3` at the breakpointed symbol, `Kernel panic - not syncing: Fatal exception in interrupt` — mimicking your PoC crashing the kernel (reproduced live). | Clear breakpoints before saving a clean image; treat a post-load `int3` crash at a breakpointed function as a debugger artifact, not an exploit result. This warning fires on **every** save of a `--gdb` VM, attached client or not (see below) — it is not a bug when no debugger is connected. |
 | `qmu qmp system_reset` / `qmu monitor system_reset` (or a guest reboot) | The gdbstub's breakpoint/watchpoint set is **dropped**; the client still lists them `[enabled]` but they never fire again (`hits=0`). **KASLR re-slides on the reboot**, so the symbols loaded in pry are wrong too — re-arming by symbol name without reloading lands on the old address, silently (`hits=0`, no error). | `qmu kbase` again → `pry load "$VMLINUX" --base "$KBASE"` again → then re-set every breakpoint; confirm with a canary you can prove is hit. |
 | A **hardware watchpoint** doesn't fire on a write you can prove happened | Wrong virtual address (alias), see above. | Watch the VA the write goes through; `--no-kvm` only to rule out a KVM guest-debug limitation. |

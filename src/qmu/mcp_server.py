@@ -66,8 +66,10 @@ MANAGED_VALUES: dict[str, Any] = {"format": "json", "out": None}
 
 # Tool/argument descriptions are the first sentence of the argparse help:
 # the full help lives in `qmu <sub> --help` and the skill, and the listing is
-# paid for on every session (see `schema_cost`).
-_FIRST_SENTENCE = re.compile(r"^(.*?[.;])(?:\s|$)")
+# paid for on every session (see `schema_cost`). A sentence ends at a `.`/`;`
+# followed by whitespace (or the end), outside parentheses, and not closing
+# an abbreviation (#131: splitting on every `.` cut "e.g." examples off).
+_ABBREVIATIONS = frozenset({"e.g", "i.e", "cf", "etc", "vs", "approx"})
 
 ProgressFn = Callable[[float, int, str], None]
 
@@ -91,8 +93,18 @@ class ToolSpec:
 
 def first_sentence(text: str | None) -> str:
     text = " ".join((text or "").split())
-    m = _FIRST_SENTENCE.match(text)
-    return (m.group(1) if m else text).rstrip(";")
+    depth = 0
+    for i, ch in enumerate(text):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(depth - 1, 0)
+        elif ch in ".;" and depth == 0 and (i + 1 == len(text) or text[i + 1] == " "):
+            word = text[:i].rsplit(" ", 1)[-1].lstrip("(\"'`").lower()
+            if ch == "." and word in _ABBREVIATIONS:
+                continue
+            return text[: i + 1].rstrip(";")
+    return text.rstrip(";")
 
 
 def _iter_leaves(
@@ -137,6 +149,13 @@ def _property(action: argparse.Action) -> dict[str, Any]:
     if action.choices:
         prop["enum"] = list(action.choices)
     desc = first_sentence(action.help)
+    if action.option_strings:
+        # A property named after an argparse dest that is not its flag
+        # (`cpu_model` for `--cpu`) names the flag, so a host can map it
+        # back for `qmu_argv` (#131).
+        flag = _long_flag(action.option_strings)
+        if flag.lstrip("-").replace("-", "_") != action.dest:
+            desc = f"{flag}: {desc}" if desc else flag
     if desc:
         prop["description"] = desc
     if action.default not in (None, argparse.SUPPRESS, False) and action.nargs not in ("*",):

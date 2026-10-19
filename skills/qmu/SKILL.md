@@ -22,7 +22,7 @@ every launch — the host is shared. `qmu <sub> --help` is authoritative.
 | copy a file in / out | `qmu push --vm X ./f /root/` · `qmu pull --vm X /root/out ./` | exit 0; 1 = caller error (`SCPFileError`), 3 = the guest panicked mid-transfer (fresh `crash`), 4 = transport |
 | see what a VM is doing | `qmu status --vm X` (`qmu list` for all) | `status` (existence) and `guest` (usability); a stopped VM is exit 0, `status: "stopped"`, `guest: null` |
 | get the crash report | `qmu crash --vm X` | `crash_detected: true`; else `qmu log --vm X --tail 200`. Save it: `qmu crash --vm X --format text --out report.txt` |
-| block until a serial marker | `qmu wait --vm X --pattern '^=+ results =+$' --timeout 120` | 0 match · 3 panic · 1 VM died · 124 timeout |
+| block until a serial marker | `qmu wait --vm X --pattern '=+ results =+$' --timeout 120` | 0 match · 3 panic · 1 VM died · 124 timeout |
 | boot-and-die kernel (no SSH) | `qmu launch --harness --no-reboot --name X --no-replace --kernel ./bzImage --initrd ./rd.img --rootfs ./rootfs.img` → `qmu wait --vm X` | 0 exited (`console_tail[]` is the receipt) · 3 panic (`crash`) |
 | put files into an image offline | `qmu rootfs inject ./rootfs.img ./exploit:/root/ --partition 0` → `qmu rootfs ls ./rootfs.img /root --partition 0` | the file is listed. Pass the same `--partition` to **both** commands: `0` = whole-disk image with no partition table (the mkrootfs/cloud default); the default `1` = `/dev/sda1` of a partitioned image, and `ls` without it exits 1 (`Partition /dev/sda1 was not found`) after a successful inject |
 | rewind instead of rebooting | `qmu snapshot save clean --vm X` … `qmu snapshot load clean --vm X` | exit 0; `SnapshotError` → `reference/snapshots.md` |
@@ -40,7 +40,7 @@ Branch on the exit code and `ok`, never on the presence of `error`.
 | `0` | success; for `wait --pattern` the regex matched, for bare `wait` QEMU exited | `ok: true`; `matched_line`, `reason` | continue |
 | `1` | operation failed: guest command non-zero, no/bad `--vm` (or `--vm` omitted under `QMU_REQUIRE_VM=1`), `doctor` unhealthy, `SnapshotError`, `SCPFileError`, `ConfigError`, paused/panicked guest refusal, `wait --pattern` outlived the VM, `crash` found nothing | `error_type` (exception paths) or domain keys (`exit_code`, `guest_state`, `crash_detected`, `reason`) | run the `hint` (every `ok: false` envelope has one, result-specific: guest exit N → its `stderr`, `qmu exec --vm X 'dmesg \| tail -n 30'`; `crash` none → `qmu log --vm X --tail 200` / `--full-history`; `doctor` → fix the `[!]` rows, each `checks[]` row carries its own `hint`); for a refusal, `qmu crash --vm X` / `qmu cont --vm X` |
 | `2` | usage error (argparse) ONLY; `error_type: "UsageError"` under JSON | `usage`, `hint` | fix the flags — e.g. quote the guest command |
-| `3` | guest kernel crash, always corroborated by a fresh serial crash report | `crash`, `crash_detected: true`, `guest: "panicked"` | `qmu crash --vm X` → `qmu kill --vm X` |
+| `3` | guest kernel crash, always corroborated by a fresh serial crash report | `crash`, `crash_detected: true`. The guest axis (`guest` on `wait`/`status`) can be either: `"panicked"` for a terminal `Kernel panic - not syncing`, `"crashed"` when the report was **survived** (KASAN `fault=report`, an Oops) but the SSH transport dropped | `qmu crash --vm X`, then `qmu status --vm X`: `qmu kill --vm X` only on `guest: "panicked"`; on `"crashed"` do **not** reap |
 | `4` | transport/infra: `SSHError`/`QMPError`, `no-console-output`, dropped SSH with NO fresh crash, `wait --pattern` `inconclusive`, internal error | `error_type` + `hint` (exception paths); a guest-command envelope has **no** `error_type` — read `ssh_error: true`, `crash_detected: false`, `hint`; `inconclusive`, `ssh_status` | `qmu status --vm X`, `qmu log --vm X --tail 200` |
 | `124` | timeout: `wait` elapsed, `launch`/`run` `--ssh-timeout` expired before SSH answered (`launch` keeps the VM, `ssh_status: "timeout"`), `exec`/`run`/`compile --run` outran `--timeout` on a reachable guest, `snapshot save` outran its budget (result **unknown**, not failed) | `timed_out: true`, `error_type: "TimeoutError"` + `hint` on an SSH timeout, `reason: "timeout"`, partial `stdout`/`stderr`; `may_have_landed: true` + `hint` on a save; `hint` on every one | raise `--timeout`/`--ssh-timeout` (the `hint` names which); `qmu log --vm X --tail 50` after a launch or `wait` timeout; check `crash` on a bare `wait`; after a save, `qmu snapshot list --vm X --timeout 300` |
 
@@ -52,12 +52,12 @@ Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `
 |---|---|---|
 | `guest: "panicked"` (`[running — GUEST PANICKED]`) | terminal `Kernel panic - not syncing`; the guest is gone, QEMU still runs | `qmu crash --vm X`, then `qmu kill --vm X` (logs kept); `list` later shows `[stopped — crash report retained]` |
 | `guest: "crashed"` | an Oops killed one task; the guest still serves | `qmu crash --vm X`; do **not** reap |
-| `guest: "paused"`, `qemu_status: "paused"` / `"debug"` | vCPU halted by `qmu gdb`, a debugger stop, or an unclean bridge death; `crash_detected` is independent — `paused` + `crash_detected: true` means a report is waiting | `qmu cont --vm X` (or `pry continue`); `qmu crash --vm X` if `crash_detected` |
+| `guest: "paused"`, `qemu_status: "paused"` / `"debug"` | vCPU halted by `qmu gdb`, a debugger stop, a `snapshot load` into a debug stop (can survive a *clean* `pry kill`), or an unclean bridge death; `crash_detected` is independent — `paused` + `crash_detected: true` means a report is waiting | `qmu cont --vm X` (or `pry continue`); `qmu crash --vm X` if `crash_detected` |
 | `guest: "paused"`, `qemu_status: "restore-vm"` (after a `snapshot load` with `restore_state: "partial"` / `"unknown"`) | the load failed mid-restore: disks already rewound under un-restored devices/RAM; qmu left it paused on purpose | **never** `cont` (`qmu cont` refuses this state, exit 1); recover with `qmu snapshot load <known-good> --vm X` (resumes it) or `qmu kill --vm X` + relaunch. `qmu cont --force --vm X` only if you accept an inconsistent machine |
 | `guest: "unknown"` + `guest_detail` | no positive evidence of a serving guest (`SSH down, 0 bytes of console output`) | `qmu log --vm X --tail 50`; wrong `console=`/arch? see `warnings[]` |
 | `qmp: "busy"`, `qemu_status: "unknown"` | another client holds QEMU's single QMP slot (debugger bridge; a `savevm` still running after `snapshot save` exited 124; bare `wait` never holds it) | wait for it; `qmu kill --vm X` still works (signals after 1 s) |
 | `qmp: "unreachable"` with pid alive | socket gone or hung | `qmu status --vm X` again; `qmu kill --vm X` falls back to signals |
-| `ssh: "none"` / SSH command refuses naming no endpoint | `--harness` or `--no-net` without `--ssh-port` | use `log`/`wait`/`crash`/`qmp`; relaunch with `--ssh-port N` |
+| `ssh: "n/a (harness)"` / `ssh: "none"` (launch `ssh_status` says the same) / SSH command refuses naming no endpoint | `n/a (harness)`: `--harness`, no SSH port by design. `none`: `--no-net` without `--ssh-port` | use `log`/`wait`/`crash`/`qmp`; for SSH relaunch **without** `--harness` (it ignores `--ssh-port`), or add `--ssh-port N` to a `--no-net` launch |
 | `ssh: "skipped"` / `"skipped (debugger attached)"` | guest paused/panicked, or a gdb client is attached (the probe's `uname` would trip breakpoints), so SSH was not probed | see the `guest` row above; `pry wait` for the stop |
 | `snapshot save` exit 124, `may_have_landed: true` | the save outran its budget (default 60 s + 20 s/GiB RAM); QEMU is probably still writing it and QMP queues behind it | `qmu snapshot list --vm X --timeout 300` (waits, shows whether the tag landed); do not retry the save until it answers; next time `--timeout N` |
 | `ssh_status: "no-console-output"` (launch exit 4) | serial log still empty after 10 s: wrong `console=` or `-M`/`-cpu` for the arch | VM is retained: `qmu log --vm X`; fix the cmdline (`ttyS0` x86, `ttyAMA0` arm) |
@@ -149,30 +149,31 @@ crash report retained]`; its JSON rows carry `ssh`, `logs_retained`,
 VMs only; `null` once QEMU has exited): `serving` · `paused` · `crashed` ·
 `panicked` · `unknown`. `serving` needs positive evidence (sshd answered, or
 — with no SSH endpoint, e.g. harness — console output in this boot);
-otherwise `unknown` with a `guest_detail`. Under the default `exploit-dev`
-profile a KASAN-detected bug is terminal (`kasan.fault=panic` →
-`panicked`); a plain non-KASAN Oops lands on `crashed` and must not be
-reaped (`sysrq-c` is a direct `panic()`, never `crashed`). `--profile
-exploit-test` makes every Oops terminal; `--append kasan.fault=report`
-survives KASAN reports.
+otherwise `unknown` with a `guest_detail`. Under the default `exploit-dev` profile
+a KASAN-detected bug is terminal (`kasan.fault=panic` → `panicked`); a plain
+non-KASAN Oops lands on `crashed` and must not be reaped (`sysrq-c` is a
+direct `panic()`, never `crashed`). `--profile exploit-test` makes every Oops
+terminal; `--append kasan.fault=report` survives KASAN reports.
 
 ## Iterate loop (no working SSH needed)
 
 ```bash
 qmu launch --name poc --no-replace --inject ./exploit:/root/ --append "slub_debug=-"
-qmu wait --vm poc --pattern '^=+ results =+$' --timeout 120   # 0 match, 3 panic, 1 died, 124 timeout
+qmu wait --vm poc --pattern '=+ results =+$' --timeout 120    # 0 match, 3 panic, 1 died, 124 timeout
 qmu log --vm poc --grep "leaked|OOB|UAF" --context 3           # --grep searches the WHOLE log
 qmu log --vm poc --full --out ./evidence.log                   # whole log to a file
 ```
 
 Never hand-poll the serial log (`until grep …; do sleep; done` hangs on a
-panic or a dead VM). Anchor the marker (`'^=+ results =+$'`): an unanchored
-word also matches the kernel's echo of the cmdline. The scan starts at the
+panic or a dead VM). Anchor the marker's **tail** (`'=+ results =+$'`): an
+unanchored word also matches the kernel's echo of the cmdline, and `^` never
+matches a marker sharing its line with a printk timestamp (`/dev/kmsg`) or
+the newline-less `login:` prompt — a spurious 124. The scan starts at the
 latest boot banner (`scan_offset`/`scan_scope`). An unterminated fragment
 (`login:`) matches once the console idles for one poll. A *survived* Oops
 does not abort the wait; `--ignore-crash` suppresses even the terminal
-abort — do not paste it reflexively. Exit 0 proves the regex matched, not the
-claim in its text (`reference/evidence-contract.md`). Full rules:
+abort — do not paste it reflexively. Exit 0 proves the regex matched, not
+the claim in its text (`reference/evidence-contract.md`). Full rules:
 `reference/wait.md`.
 
 ## Guest commands
@@ -236,11 +237,10 @@ qmu kill --vm X                  # after reading; .json + logs stay (logs_preser
 qmu prune --vm X                 # finally drop the retained state (no age gate)
 ```
 
-`crash` exit 0/`crash_detected: true` means a report was found, not that the
-VM is healthy; "no crash" is exit 1 with `crash_detected: false` and no
-`error`. Detects KASAN, BUG/Oops, panic, GPF, UBSAN, slab UAF and more.
-Command-attributed crashes (`exec`, `compile --run`) use only bytes appended
-after the command began.
+`crash` exit 0/`crash_detected: true` means a report was found, not that the VM
+is healthy; "no crash" is exit 1 with `crash_detected: false` and no `error`.
+Detects KASAN, BUG/Oops, panic, GPF, UBSAN, slab UAF and more. Command-
+attributed crashes (`exec`, `compile --run`) use only bytes after it began.
 
 ## Harness mode (boot-and-die kernels)
 
@@ -248,7 +248,7 @@ after the command began.
 qmu launch --harness --no-reboot --name X --no-replace --kernel ./bzImage --initrd ./ramdisk.img \
   --rootfs ./rootfs.img --cmdline 'console=ttyS0 root=/dev/sda ro init=/run.sh'
 qmu wait --vm X --timeout 300          # 0 QEMU exited (console_tail[]), 3 panic while QEMU runs (crash), 124, 4
-qmu wait --vm X --pattern '^=+ DONE =+$' --timeout 300   # explicit success receipt (matched_line)
+qmu wait --vm X --pattern '=+ DONE =+$' --timeout 300    # explicit success receipt (matched_line)
 qmu wait --vm X --no-clean             # keep .json + .serial.log after a confirmed exit
 qmu log --vm X --tail 100              # SSH commands refuse; serial/QMP commands work
 qmu kill --vm X && qmu prune --vm X    # reap a panicked-but-running VM, then drop its remnant

@@ -751,10 +751,11 @@ def _handle_gdb(args: argparse.Namespace) -> Result:
     # moment qmu is on the debug path — but only when the VM was actually
     # launched under KVM (recorded on the instance). Kept in the stdout
     # payload alongside the other gdb warnings so the JSON envelope carries
-    # it and stderr stays clean.
-    if getattr(inst, "kvm", None) is True:
+    # it and stderr stays clean. `kvm` itself is always present with the
+    # recorded value, exactly as `launch`/`status`/`list` report it (#134).
+    data["kvm"] = getattr(inst, "kvm", None)
+    if data["kvm"] is True:
         kvm_warning = kvm_watchpoint_warning(inst.vm_id)
-        data["kvm"] = True
         data["kvm_watchpoint_warning"] = kvm_warning
         text = f"{text}\n{kvm_warning}"
     return Result(data=data, text=text, stem="gdb")

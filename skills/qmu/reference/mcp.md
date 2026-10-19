@@ -50,8 +50,11 @@ argparse name with `-` as `_` and the leading `--` dropped:
 
 `--format` and `--out` are not arguments: the façade always runs
 `--format json` and returns the result inline. Descriptions are the first
-sentence of each `--help` line; `qmu <sub> --help` and this skill remain
-the full reference.
+sentence of each `--help` line (a sentence never ends at `e.g.`/`i.e.` or
+inside parentheses); a property named after an argparse dest rather than its
+flag (`cpu_model`, `host_build`, `prune_all`) leads with the flag spelling
+(`--cpu: …`) so it maps back for `qmu_argv`. `qmu <sub> --help` and this
+skill remain the full reference.
 
 `qmu_argv` takes `argv: [...]` (everything after `qmu`) for anything the
 derived tools do not express, or when you already know the CLI syntax.
@@ -91,10 +94,15 @@ error, because there is none:
 
 
 A result larger than the spill threshold comes back as the same **pointer
-envelope** the CLI prints (`spilled: true`, `artifact_path`, a preview):
-read the file. There is no byte streaming over MCP — `exec`/`run` output is
-delivered when the command ends, and `ndjson` chunk events do not exist
-here.
+envelope** the CLI's `--format json` prints: `ok` (the operation's result,
+not "the file was written"), `artifact_path`, `format`, `bytes`, `sha256`,
+`token_estimate`, `estimator`, `summary` (the shape of the spilled value —
+`summary.keys` lists its top-level key names, it is **not** the result),
+plus `qmu_exit`. There is no `spilled` key and no preview: the head-of-output
+preview is a `--format text` feature only (`reference/output-contract.md`).
+Branch on the presence of `artifact_path` and read the file.
+There is no byte streaming over MCP — `exec`/`run` output is delivered when
+the command ends, and `ndjson` chunk events do not exist here.
 
 ## Resources
 
@@ -132,5 +140,5 @@ Tool calls run concurrently (a `qmu_exec` can write the marker a
   same lines ride in the envelope's `warnings[]` where the CLI puts them.
 - Interactive leaves (`rootfs shell`) and the foreground daemon are not tools.
 
-Schema cost: the serialised `tools/list` (38 tools) is ~21.6k characters,
-roughly 5.4k tokens — a third of this skill — and is paid once per session.
+Schema cost: the serialised `tools/list` (38 tools) is ~22.6k characters,
+roughly 5.6k tokens — a third of this skill — and is paid once per session.
