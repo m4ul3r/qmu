@@ -8,23 +8,33 @@ and the `doctor` rows.
 
 Everything that edits an image offline needs libguestfs (`guestfish`), and it
 is frequently broken out of the box: Debian/Ubuntu ship `/boot/vmlinuz-*` as
-mode `0600`, the supermin appliance builds unprivileged, and the resulting
-failure is reported as an opaque "appliance closed the connection
-unexpectedly". **Run `qmu doctor` first** — it checks both `guestfish` and
-whether an appliance kernel is readable, and prints the fix:
+mode `0600` and the supermin appliance builds unprivileged. With no cached
+appliance the build fails as `libguestfs: error: /usr/bin/supermin exited with
+error status 1`; `rootfs *`/`launch --inject` then carry the fix in the error
+and the envelope `hint` (`export SUPERMIN_KERNEL=…`). A cached appliance
+(`$LIBGUESTFS_CACHEDIR`, else `$TMPDIR`, else `/var/tmp`, under
+`.guestfs-<uid>/appliance.d`) keeps working with unreadable kernels until it
+goes stale (a host package update) — or until you run under another `TMPDIR`.
+**Run `qmu doctor`** — when no kernel is readable it starts the appliance
+once (`guestfish -a /dev/null run`, ~3 s) and reports what happened. The fix,
+no root needed first (any readable kernel for the host's arch with virtio
+built in, e.g. a `tools/kbuild.sh` one, works with an empty `modules.dep`):
 
 ```bash
+mkdir -p /var/tmp/qmu-supermin-modules && touch /var/tmp/qmu-supermin-modules/modules.dep
+export SUPERMIN_KERNEL=~/.cache/qmu/kernels/6.6.75/x86_64/bzImage \
+       SUPERMIN_KERNEL_VERSION=6.6.75 \
+       SUPERMIN_MODULES=/var/tmp/qmu-supermin-modules
+# or, system-wide (needs root):
 sudo chmod 0644 /boot/vmlinuz-*
-# or, leaving system permissions alone:
-sudo install -m 0644 /boot/vmlinuz-$(uname -r) /var/tmp/vmlinuz
-export SUPERMIN_KERNEL=/var/tmp/vmlinuz \
-       SUPERMIN_KERNEL_VERSION=$(uname -r) \
-       SUPERMIN_MODULES=/lib/modules/$(uname -r)
 ```
 
 The `libguestfs` row is a non-blocking **warning** (`[~]`): `qmu doctor` exits
 0 on a host where everything but offline inject works, and the row still names
-the fix.
+the fix. Its detail says which case you are in: *the appliance runs from its
+cache … but supermin cannot rebuild it* (inject works now; the `rootfs sshd
+policy` row is still read), or *the appliance does not start* (inject fails;
+the policy row is `[i] not checked`).
 
 `qmu rootfs ls` and `cat` are read-only (they open the image `--ro`) and work
 while a VM is running. `inject`, `rm`, and `shell` write, so they refuse an
@@ -212,8 +222,8 @@ project/`--config` layer loaded). `doctor --config PATH` checks that file.
 | `SSH key permissions` | `[!]` (blocking, `chmod 600 <key>` hint) when a key you own has any group/other bit (`mode=644 is group/other-accessible — OpenSSH refuses it (UNPROTECTED PRIVATE KEY FILE)`) or is unreadable; `[+]` for `0600`, `0400`, `0700` or a key another user owns |
 | `qemu-system-<arch>`, `KVM` | `[!]` binary missing / `accel=kvm` without `/dev/kvm`; `[i]` disabled by `accel=tcg` |
 | `cross compiler for <arch> (compile --host)`, `gdb-multiarch` | only when `[machine] arch` ≠ host arch; `[~]` when missing, naming `apt install gcc-<triple>` / `apt install gdb-multiarch` |
-| `libguestfs` | `[~]` with the appliance fix (above) |
-| `rootfs sshd policy` | only when `[drive] rootfs` exists: `[+] key-only` (stamp `/etc/qmu-rootfs.json` says `sshd_policy=key-only`); `[~] permissive (image predates key-only sshd; rebuild with tools/mkrootfs.sh)` for a missing/other stamp — root logs in with **any** key (JSON `sshd_policy: "permissive"`, hint `rebuild the image with tools/mkrootfs.sh`); `[i] not checked (<reason>)` when libguestfs cannot open the image (read-only, whole-disk, ~1.5 s) |
+| `libguestfs` | `[+]` when a kernel is readable (or `SUPERMIN_KERNEL` is); otherwise `[~]` after one appliance start: *runs from its cache … cannot rebuild it* (inject works now) or *does not start* (inject fails), hint `export SUPERMIN_KERNEL=…` first (above) |
+| `rootfs sshd policy` | only when `[drive] rootfs` exists; one read-only whole-disk guestfish session (~1.5 s) reads both qmu stamps, root's `/etc/shadow` entry and `sshd_config` (+ the `sshd_config.d` it includes). `[~] permissive — root's password is empty and sshd_config sets PermitEmptyPasswords yes and PermitRootLogin yes, so sshd accepts root with ANY key (or none)` — measured, whatever a stamp says (JSON `sshd_policy: "permissive"`; hint `rebuild the image with tools/mkrootfs.sh --no-cache …`, or `tools/mktarget.sh` for a target); `[+] key-only` (`/etc/qmu-rootfs.json` says `sshd_policy=key-only`) or `[+] key-only (tools/mktarget.sh target, /etc/qmu-target.json)`; `[i] unknown — no qmu stamp …` for any other image (JSON `sshd_policy: "unknown"`, no hint, no claim about which keys work); `[i] not checked (<reason>)` (JSON `null`) when guestfish is missing, the appliance does not start, or the whole-disk mount fails |
 | `running VMs` | `[i] N running [+ M orphaned (no instance record)] under <instances dir>`; JSON `running`/`orphaned` ints, hint `qmu prune --orphans --dry-run` when orphans exist. A snapshot — other agents change it within seconds |
 | `skills` | text `[+] N skills × M roots installed` (or `…: N installed, M missing, K stale … (run: qmu skill install)`) — the JSON `summary`; JSON `detail` keeps the full path list and `detail_paths: {installed, missing, stale}` splits it. `qmu skill install` then reports each link as `installed` (nothing was there), `relinked` (pointed at another checkout — JSON `previous_target` names it), `replaced` (a real dir/file was removed) or `current` (already right; left untouched, tallied not listed); JSON carries `links[]` and `counts` |
 | `pry`, `passt`, `cache` | `[i]`/`[+]`, never gating |

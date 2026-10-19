@@ -29,7 +29,7 @@ form used below); from this skill's directory, `../../tools/mkrootfs.sh`.
 | Put the image somewhere specific | `tools/mkrootfs.sh --outdir /data/rootfs/bookworm` |
 | Inspect the in-guest setup (sshd policy, keys) without Docker | `tools/mkrootfs.sh --emit-guest-setup ./setup.sh` |
 | Put files into the image offline (no boot) | `qmu rootfs inject "$ROOTFS" ./exploit:/root --partition 0` or `qmu launch --inject ./exploit:/root --partition 0` |
-| Check whether a cached image is key-only | `qmu rootfs cat "$ROOTFS" /etc/qmu-rootfs.json --partition 0` (missing file ⇒ legacy, any key works) |
+| Check whether a cached image is key-only | `qmu doctor` with that `ROOTFS` as `[drive] rootfs` (`rootfs sshd policy` row: measured), or `qmu rootfs cat "$ROOTFS" /etc/qmu-rootfs.json --partition 0` (missing file on a mkrootfs image ⇒ legacy, any key works) |
 
 ## Output contract
 
@@ -188,13 +188,16 @@ key = "/home/user/.cache/qmu/rootfs/bookworm/x86_64/id_ed25519"
   once per host boot. Missing ⇒ exit 2 naming that command.
 - **libguestfs with a readable appliance kernel** only for offline edits
   (`qmu rootfs inject|ls|cat|rm`, `qmu launch --inject`). Debian/Ubuntu ship
-  `/boot/vmlinuz-*` as `0600`, which fails with "appliance closed the
-  connection unexpectedly"; `qmu doctor` reports it. Fix: `sudo chmod 0644
-  /boot/vmlinuz-*`, or point supermin at a copy:
-  `sudo install -m 0644 /boot/vmlinuz-$(uname -r) /var/tmp/vmlinuz && export
-  SUPERMIN_KERNEL=/var/tmp/vmlinuz SUPERMIN_KERNEL_VERSION=$(uname -r)
-  SUPERMIN_MODULES=/lib/modules/$(uname -r)`. Building the image needs none
-  of this.
+  `/boot/vmlinuz-*` as `0600`, so a fresh appliance build fails with
+  `/usr/bin/supermin exited with error status 1` (a cached appliance keeps
+  working until it goes stale); `qmu doctor` starts the appliance once and
+  reports which. Fix without root: point supermin at any readable kernel for
+  the host's arch with virtio built in — `mkdir -p /var/tmp/qmu-supermin-modules
+  && touch /var/tmp/qmu-supermin-modules/modules.dep && export
+  SUPERMIN_KERNEL=<readable kernel, e.g. a tools/kbuild.sh bzImage>
+  SUPERMIN_KERNEL_VERSION=<its version>
+  SUPERMIN_MODULES=/var/tmp/qmu-supermin-modules`; or system-wide `sudo
+  chmod 0644 /boot/vmlinuz-*`. Building the image needs none of this.
 
 ## Recovery
 
@@ -208,5 +211,5 @@ key = "/home/user/.cache/qmu/rootfs/bookworm/x86_64/id_ed25519"
 | `Kernel panic … VFS: Unable to mount root fs` | wrong `root=` for the arch | x86: `root=/dev/sda`; arm64/arm32 virtio: `root=/dev/vda` in `--cmdline` |
 | SSH never ready but `QMU-NET-READY` absent from `qmu log` | guest networking did not come up (wrong kernel NIC config or `--no-net`) | kernel needs `E1000`/`VIRTIO_NET` built in (kbuild does this); don't pair `--no-net` with SSH use |
 | apt `No space left on device` in the build / packages missing | image too small | `tools/mkrootfs.sh --size 4G --packages …` |
-| `qmu rootfs inject` → "appliance closed the connection unexpectedly" | libguestfs cannot read `/boot/vmlinuz-*` | see Prerequisites; `qmu doctor` |
+| `qmu rootfs inject` → `supermin exited with error status 1` | libguestfs cannot read a kernel and has no cached appliance | the error's `hint`; see Prerequisites; `qmu doctor` |
 | `qmu rootfs …` → image/partition errors on a mkrootfs image | default `--partition 1` on a partitionless image | add `--partition 0` |

@@ -446,27 +446,106 @@ def test_listdir_guestfish_exit_before_names_is_the_guestfish_error(tmp_path, mo
     assert "opendir: /nope" in msg
 
 
-@pytest.mark.parametrize(("stdout", "expected"), [
-    (b'true\n{"sshd_policy": "key-only"}\n', b'{"sshd_policy": "key-only"}\n'),
-    (b"false\n", None),
-])
-def test_read_stamp_is_read_only_whole_disk_and_tolerates_a_missing_file(
-    tmp_path, monkeypatch, stdout, expected
+def test_read_sshd_evidence_is_read_only_whole_disk_and_tells_absent_from_present(
+    tmp_path, monkeypatch
 ):
     image = tmp_path / "rootfs.img"
     image.write_text("disk")
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
+    mark = rootfs_mod._EVIDENCE_MARK
+    # What guestfish prints for an mktarget image: no mkrootfs stamp (the
+    # `-cat` error goes to stderr), a target stamp, a locked root, a stock
+    # sshd_config whose Include pulls in sshd_config.d.
+    stdout = (
+        f"false\ntrue\n{mark} rootfs\n{mark} target\n"
+        '{"mktarget_version": "2"}\n\n'
+        f"{mark} shadow\nroot:!*:20664:0:99999:7:::\n"
+        f"{mark} sshd\nInclude /etc/ssh/sshd_config.d/*.conf\nUsePAM yes\n\n"
+        f"{mark} sshd.d\nPermitRootLogin prohibit-password\n\n"
+    ).encode()
     seen = {}
 
     def fake_run(cmd, input=None, capture_output=None):
-        seen["cmd"], seen["script"] = cmd, input
+        seen["cmd"] = cmd
         return mock.Mock(returncode=0, stderr=b"", stdout=stdout)
 
     monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
-    assert rootfs_mod.read_stamp(str(image)) == expected
+    evidence = rootfs_mod.read_sshd_evidence(str(image))
     assert seen["cmd"][1:2] == ["--ro"] and seen["cmd"][-2:] == ["-m", "/dev/sda"]
-    # `-cat`: a missing stamp must not abort the script before `exists` answers.
-    assert seen["script"] == b"exists /etc/qmu-rootfs.json\n-cat /etc/qmu-rootfs.json\n"
+    assert evidence == rootfs_mod.SshdEvidence(
+        rootfs_stamp=None,
+        target_stamp='{"mktarget_version": "2"}',
+        root_shadow="root:!*:20664:0:99999:7:::",
+        sshd_config="Include /etc/ssh/sshd_config.d/*.conf\nUsePAM yes",
+        sshd_config_d="PermitRootLogin prohibit-password",
+    )
+
+
+_EMPTY_ROOT = "root::20627:0:99999:7:::"
+_LEGACY = "PermitRootLogin yes\nPermitEmptyPasswords yes\n"
+
+
+@pytest.mark.parametrize(("shadow", "main", "included", "expected"), [
+    # the legacy tools/mkrootfs.sh setup
+    (_EMPTY_ROOT, "Include /etc/ssh/sshd_config.d/*.conf\n" + _LEGACY, "", True),
+    # `Keyword=value` and mixed case parse like sshd does
+    (_EMPTY_ROOT, "permitrootlogin=yes\nPERMITEMPTYPASSWORDS  yes\n", "", True),
+    # a locked root closes it whatever sshd says
+    ("root:!*:1:0:99999:7:::", _LEGACY, "", False),
+    # sshd keeps the FIRST value: an included override wins over the main file
+    (_EMPTY_ROOT, "Include /etc/ssh/sshd_config.d/*.conf\n" + _LEGACY,
+     "PermitEmptyPasswords no\n", False),
+    # ...but sshd_config.d is read only where the main file includes it
+    (_EMPTY_ROOT, _LEGACY + "Include /etc/ssh/sshd_config.d/*.conf\n",
+     "PermitEmptyPasswords no\n", True),
+    (_EMPTY_ROOT, _LEGACY, "PermitEmptyPasswords no\n", True),
+    # a Match block is conditional, not global
+    (_EMPTY_ROOT, "PermitRootLogin yes\nMatch User root\n  PermitEmptyPasswords yes\n", "", False),
+    # OpenSSH defaults: PermitRootLogin prohibit-password, no empty passwords
+    (_EMPTY_ROOT, "PermitEmptyPasswords yes\n", "", False),
+    (_EMPTY_ROOT, _LEGACY + "PasswordAuthentication no\n", "", False),
+    # nothing to decide from
+    (None, _LEGACY, "", None),
+    (_EMPTY_ROOT, "", "", None),
+])
+def test_root_login_without_key_follows_sshd_resolution(shadow, main, included, expected):
+    evidence = rootfs_mod.SshdEvidence(
+        rootfs_stamp=None, target_stamp=None, root_shadow=shadow,
+        sshd_config=main, sshd_config_d=included,
+    )
+    assert rootfs_mod.root_login_without_key(evidence)[0] is expected
+
+
+def test_supermin_build_failure_envelope_carries_the_kernel_hint(
+    tmp_path, monkeypatch, capsys
+):
+    """#147: the real failure text has no "Permission denied", and the
+    envelope fell back to `qmu status --vm <vm_id>` for an offline image."""
+    from qmu import cli
+
+    image = tmp_path / "rootfs.img"
+    image.write_text("disk")
+    local = tmp_path / "probe.txt"
+    local.write_text("probe")
+    monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
+    monkeypatch.setattr(
+        rootfs_mod, "appliance_kernel_problem",
+        lambda: "no /boot/vmlinuz-* is readable (they are mode 0600)",
+    )
+    monkeypatch.setattr(rootfs_mod, "_invoke", lambda cmd, script: mock.Mock(
+        returncode=1, stdout=b"",
+        stderr=b"libguestfs: error: /usr/bin/supermin exited with error status 1.\n",
+    ))
+
+    rc = cli.main([
+        "--format", "json", "rootfs", "inject", str(image), f"{local}:/root/",
+        "--partition", "0",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1 and payload["ok"] is False
+    assert payload["hint"] == rootfs_mod.SUPERMIN_ENV_HINT
+    assert rootfs_mod.SUPERMIN_KERNEL_HINT in payload["error"]
 
 
 def _fake_download(payload: bytes):

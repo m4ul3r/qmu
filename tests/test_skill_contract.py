@@ -329,9 +329,10 @@ REQUIRED_CLAIMS = [
     # #75: the two new doctor rows; #76: the no_reboot config key.
     (SKILL, "rootfs sshd policy ([~] permissive"),
     (REFERENCE_DIR / "troubleshooting.md", "| `initrd` | same shape:"),
-    (REFERENCE_DIR / "troubleshooting.md", "[~] permissive (image predates key-only sshd; rebuild with tools/mkrootfs.sh)"),
+    (REFERENCE_DIR / "troubleshooting.md", "`[~] permissive — root's password is empty and sshd_config sets PermitEmptyPasswords yes and PermitRootLogin yes"),
+    (REFERENCE_DIR / "troubleshooting.md", "`[+] key-only (tools/mktarget.sh target, /etc/qmu-target.json)`"),
     (REFERENCE_DIR / "troubleshooting.md", "`[i] not checked (<reason>)`"),
-    (REFERENCE_DIR / "guest-commands.md", "[+] rootfs sshd policy: key-only"),
+    (REFERENCE_DIR / "guest-commands.md", "`[i] unknown — no qmu stamp …`"),
     (REFERENCE_DIR / "guest-commands.md", "`ls` is one\n  guestfish session"),
     (REFERENCE_DIR / "launch.md", "Config key: `[machine] no_reboot = true`"),
     (REFERENCE_DIR / "troubleshooting.md", "`accel`, `no_reboot`, `extra_args`"),
