@@ -628,26 +628,35 @@ def _handle_launch(args: argparse.Namespace) -> Result:
     config, name = _prepare_boot(args, prep)
 
     launch_notes: list[str] = []
-    inst = launch_vm(
-        config=config,
-        kernel=config.kernel,
-        profile=config.profile,
-        cmdline=config.cmdline,
-        append=args.append,
-        gdb=args.gdb,
-        name=name,
-        ssh_port=args.ssh_port,
-        gdb_port=args.gdb_port,
-        extra_args=args.extra or None,
-        ssh_timeout=args.ssh_timeout,
-        initrd=config.initrd,
-        drives=args.drives,
-        no_net=args.no_net,
-        nic_model=args.nic_model,
-        net_backend=args.net_backend,
-        harness=args.harness,
-        notes=launch_notes,
-    )
+    try:
+        inst = launch_vm(
+            config=config,
+            kernel=config.kernel,
+            profile=config.profile,
+            cmdline=config.cmdline,
+            append=args.append,
+            gdb=args.gdb,
+            name=name,
+            ssh_port=args.ssh_port,
+            gdb_port=args.gdb_port,
+            extra_args=args.extra or None,
+            ssh_timeout=args.ssh_timeout,
+            initrd=config.initrd,
+            drives=args.drives,
+            no_net=args.no_net,
+            nic_model=args.nic_model,
+            net_backend=args.net_backend,
+            harness=args.harness,
+            notes=launch_notes,
+        )
+    except QMUError as exc:
+        # The lint already printed on stderr (`console=ttyS0` on aarch64) is
+        # usually the explanation of a failed boot; a JSON reader must get it
+        # in the failure envelope too, not only on success (#157).
+        for note in launch_notes:
+            sys.stderr.write(f"[qmu] {note}\n")
+        exc.warnings = [*prep.warnings, *launch_notes, *exc.warnings]
+        raise
     # The first-QMP-connect retry (#76): observable, not silently absorbed.
     for note in launch_notes:
         sys.stderr.write(f"[qmu] {note}\n")

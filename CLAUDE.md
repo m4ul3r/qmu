@@ -118,6 +118,12 @@ recovery; `_emit_error` writes it, else the `error_type` default from
 `qmu <sub> --help` in `cli._emit_usage_error`). Text mode prints `[qmu]
 Hint:` only for a site-specific hint so text stays quiet. Give a new `raise
 QMUError(` a hint when the SKILL.md recovery table has a matching row.
+An error about a known VM also sets `vm_id=` (the envelope's `vm_id`, as the
+success path carries it — `SCPFileError` from push/pull, #159), and
+`exc.warnings` rides as `warnings[]` (`QMUError.envelope_fields`): `launch`
+attaches its lint there when `launch_vm` raises (#157), because the lint is
+usually why the boot failed. Every envelope keys the VM `vm_id` — `crash`/
+`log` once said `vm` (#160).
 
 **Exit `3` requires a corroborating fresh serial crash report.** A dropped SSH
 or scp connection alone is `4` (guest merely unreachable — a VM running no sshd
@@ -212,6 +218,15 @@ free ports under `vm.PortAllocationLock` — an `flock` on
 `ssh_port_start` cannot pick the same port (#113). The 3× retry on a bind
 failure stays as a backstop for a foreign listener; its exhaustion message
 names the lock so the reader does not blame qmu's own concurrency.
+
+The first QMP handshake of a fresh VM can never be contention — no record
+exists yet, so no `wait`, daemon or bridge can hold the slot — so a
+`QMPBusyError` there means QEMU has not reached its main loop (host load, a
+slow TCG start). `_validate_qmp_with_retry` waits for it (paced, up to
+`QMP_STARTUP_SECONDS`) and past that **retains** the live VM with a warning;
+the SSH wait then decides the exit. It used to roll the VM back, exit 1, and
+blame "another qmu command such as `wait`" (#157). Post-spawn failures that
+do roll back carry `vm_id` and a hint saying the VM is gone.
 
 ### VM state has TWO orthogonal axes
 
@@ -577,7 +592,12 @@ envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
   the banner exchange by `ConnectTimeout`, but not the key exchange after a
   banner: a listener that sends `SSH-2.0-…` and then hangs holds `ssh` for
   60 s+, so the subprocess cap is the only bound there (#77). The old
-  `timeout + 3` made every such port cost `list`/`status` 5 s per VM.
+  `timeout + 3` made every such port cost `list`/`status` 5 s per VM. The
+  budget is accel-aware: `_make_ssh` marks a `kvm: false` record `emulated`
+  and `is_ready` floors it at `EMULATED_PROBE_SECONDS` (8 s) — an emulated
+  sshd takes 4–6 s to log in on a loaded host, and the KVM budget reported a
+  serving TCG guest `ssh: down` / `guest: unknown` (#161). `kvm: null` (a
+  pre-#39 record) keeps the KVM budget.
 - **`rootfs inject` treats GUEST as a directory** (with or without a trailing
   slash); the local filename is preserved. A missing GUEST directory is an
   ERROR unless `--mkdir` — silently creating it turns a typo'd destination into
@@ -657,9 +677,11 @@ envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
   four axes: preview vs real, branch vs branch, text vs JSON, subcommand vs
   subcommand. Per-fix rules do not catch it; the matrix does. Adding an
   observable state, or a command that reports on one, means adding a row. Its
-  fixtures must include a *decoy running VM*: without one `choose_instance`
-  short-circuits to "No running VMs" and the invariant assertion never exercises
-  the "VM 'X' not found. Running: …" branch the real CLI produces.
+  fixtures must include a *decoy running VM*: without one the invariant
+  assertion never exercises the "VM 'X' not found. Running: <decoy>" listing
+  the real CLI produces on a shared box. The empty-running-set branch has its
+  own row: `choose_instance(vm_id)` names the VM there too and only a bare
+  (no `--vm`) lookup answers "No running VMs" (#144).
 
 ## Tests
 

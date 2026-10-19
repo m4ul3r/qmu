@@ -56,10 +56,10 @@ def cache(tmp_path, monkeypatch):
 def _decoy_running(monkeypatch):
     """A second, healthy VM.
 
-    Without one, `choose_instance` short-circuits to "No running VMs" and the
-    invariant assertion never exercises the "VM 'X' not found. Running: ..."
-    branch — the exact message the real CLI produced on a shared box. A double
-    with an empty instance list hides the bug the matrix exists to catch.
+    Without one the invariant assertion never exercises the "VM 'X' not
+    found. Running: decoy" listing — the exact message the real CLI produced
+    on a shared box. The zero-running branch has its own row
+    (`test_absent_name_with_zero_running_vms_is_named_by_every_command`).
     """
     decoy = VMInstance(
         vm_id="decoy", pid=1, qmp_socket="/tmp/decoy.qmp.sock",
@@ -616,6 +616,70 @@ def test_kill_of_an_absent_vm_still_says_not_found(cache, monkeypatch, capsys):
     assert rc == 1
     assert "not found" in payload["error"]
     assert VM in payload["error"]
+
+
+# The empty-running-set branch (#144): with no VM running — the normal state
+# after an auto-cleaned harness `wait` — status/wait/kill answered "No running
+# VMs. Start one with: qmu launch" without naming the VM, while crash/log
+# answered the question asked. One answer for every command, both formats.
+_ABSENT_NAME_ARGV = {
+    "status": ["status", "--vm", "ghost"],
+    "wait": ["wait", "--vm", "ghost", "--timeout", "0"],
+    "wait --pattern": ["wait", "--vm", "ghost", "--pattern", "x", "--timeout", "0"],
+    "kill": ["kill", "--vm", "ghost"],
+    "crash": ["crash", "--vm", "ghost"],
+    "log": ["log", "--vm", "ghost"],
+    "exec": ["exec", "--vm", "ghost", "true"],
+    "push": ["push", "--vm", "ghost", "/tmp/payload", "/root/"],
+    "pull": ["pull", "--vm", "ghost", "/root/payload"],
+    "dmesg": ["dmesg", "--vm", "ghost"],
+}
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+@pytest.mark.parametrize("command", sorted(_ABSENT_NAME_ARGV))
+def test_absent_name_with_zero_running_vms_is_named_by_every_command(
+    command, output_format, cache, monkeypatch, capsys
+):
+    _stopped_with_report(cache, monkeypatch)
+    expected = f"VM 'ghost' not found. Running: none; Stopped: {VM}."
+
+    rc = cli.main(["--format", output_format, *_ABSENT_NAME_ARGV[command]])
+    captured = capsys.readouterr()
+
+    assert rc == 1, command
+    if output_format == "json":
+        payload = json.loads(captured.out)
+        assert payload["error"] == expected, command
+        assert payload["hint"] == "qmu list", command
+    else:
+        assert captured.out == ""
+        assert f"[qmu] Error: {expected}" in captured.err, command
+        assert "No running VMs" not in captured.err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["status", "--vm", VM],
+        ["wait", "--vm", VM, "--timeout", "0"],
+        ["kill", "--vm", VM],
+        ["crash", "--vm", VM],
+        ["log", "--vm", VM],
+    ],
+    ids=lambda argv: argv[0],
+)
+def test_every_envelope_about_a_vm_keys_it_vm_id(argv, cache, monkeypatch, capsys):
+    """#160: `crash`/`log` keyed the VM `vm` while every other command used
+    `vm_id` — and in harness mode those two plus `wait` are the only result
+    channels, so `d["vm_id"]` on a crash envelope silently read None."""
+    _stopped_with_report(cache, monkeypatch)
+
+    cli.main(["--format", "json", *argv])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["vm_id"] == VM
+    assert "vm" not in payload
 
 
 # ---------------------------------------------------------------------------

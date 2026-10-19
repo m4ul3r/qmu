@@ -110,7 +110,7 @@ qmu launch --name X --no-replace --gdb --memory 8G --cpus 4 --cpu host
 qmu launch --name X --no-replace --inject ./exploit:/root/ --partition 0   # bake a file in first
 qmu launch --name X --no-replace --no-reboot                        # panic exits QEMU instead of rebooting
 qmu list                                   # existence + guest state for every VM (a snapshot, not a diff base)
-qmu status --vm X                          # typically sub-second (~2 s under a held QMP slot, ≤ 2.4 s wall when the SSH port accepts but never answers (probe capped at 2.25 s) — `ssh_probe_ms` says); `qmu show` is an alias; exit 0 on a stopped VM too
+qmu status --vm X                          # typically sub-second (~2 s under a held QMP slot, ≤ 2.4 s wall when the SSH port accepts but never answers (probe capped at 2.25 s; 8.25 s for a TCG `kvm: false` guest) — `ssh_probe_ms` says); `qmu show` is an alias; exit 0 on a stopped VM too
 qmu kill --vm X                            # QMP quit, then SIGTERM; keeps .json + logs when a report is waiting
 qmu kill --vm X --no-clean                 # keep .json + .serial.log for forensics
 qmu prune --vm X --dry-run                 # preview; then drop --dry-run (kill-preserved logs go at any age)

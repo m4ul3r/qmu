@@ -84,6 +84,20 @@ reset by peer` with ~10 agents launching at once); 0 retries in 24/24
 reports it is healthy; three or more in `warnings[]` across a batch means
 the host is saturated.
 
+A QEMU that accepts the QMP connection but has not reached its main loop
+(host load, a slow TCG start — no greeting in 2 s, or no `qmp_capabilities`
+answer in 10 s) is waited for, up to 30 s: a fresh VM has no other QMP
+client, so this is never contention. A handshake that completed late adds
+`QMP connect retried N× over Ts (no QMP answer yet: QEMU still
+initialising)`; one that never completed **retains** the live VM with `QMP
+did not complete its handshake within 30s of launch, but QEMU (pid N) is
+alive …` in `warnings[]`, and the SSH wait decides the exit as usual
+(`ready`, `no-console-output` 4, timeout 124 — VM kept in each). A launch that
+fails after QEMU started (exited immediately, QMP refused) is rolled back;
+its `ok: false` envelope still carries `vm_id`, every lint already printed in
+`warnings[]`, and a hint that says the VM is gone (never `qmu status --vm
+<vm_id>`).
+
 ## Profiles
 
 All three disable LSMs and carry `kasan.fault=panic`: `exploit-dev`
@@ -205,7 +219,7 @@ KASAN-detected bugs are terminal under every profile (`kasan.fault=panic`);
 
 ```bash
 qmu list                                 # existence + guest state; probes SSH (ControlMaster=no), a few seconds on a busy host
-qmu status --vm X                        # typically sub-second; ~2 s under a held QMP slot, ≤ 2.4 s wall when the SSH port accepts but never answers (probe capped at 2.25 s; `ssh_probe_ms` says how long the probe took); exit 0 on a stopped VM (status: "stopped")
+qmu status --vm X                        # typically sub-second; ~2 s under a held QMP slot, ≤ 2.4 s wall when the SSH port accepts but never answers (probe capped at 2.25 s; `ssh_probe_ms` says how long the probe took). A TCG guest (`kvm: false`) gets an 8 s probe (8.25 s cap): an emulated sshd takes 4–6 s to log in on a loaded host and read as `down` under the KVM budget. Exit 0 on a stopped VM (status: "stopped")
 qmu kill --vm X                          # QMP quit → SIGTERM; `bridge_reaped`, `logs_preserved`; closes the ControlMaster
 qmu kill --vm X --force                  # SIGKILL
 qmu kill --vm X --no-clean               # keep .json + .serial.log

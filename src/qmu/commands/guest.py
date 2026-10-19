@@ -141,14 +141,17 @@ def _scp_file_hint(
 def _rethrow_scp_file_error(
     exc: SCPFileError, *, inst: VMInstance, operation: str, remote: str
 ) -> None:
-    """Attach a path-specific hint to a filesystem refusal and re-raise it.
+    """Attach a path-specific hint and the VM to a filesystem refusal; re-raise.
 
     The exit-1 / `error_type: SCPFileError` contract is untouched; only the
     `hint` gains the guest path and the command that inspects it. A hint the
-    raiser already set (a missing local file) is kept.
+    raiser already set (a missing local file) is kept. `vm_id` rides in the
+    envelope as it does on the success path and every other guest-command
+    failure (#159).
     """
     if exc.hint is None:
         exc.hint = _scp_file_hint(exc, inst=inst, operation=operation, remote=remote)
+    exc.vm_id = inst.vm_id
     raise exc
 
 
@@ -1595,7 +1598,7 @@ def _handle_crash(args: argparse.Namespace) -> Result:
 
     crash_data = {
         "ok": detected,
-        "vm": inst.vm_id,
+        "vm_id": inst.vm_id,
         "crash_detected": detected,
         "scope": scope,
         "reason": reason,
@@ -1686,7 +1689,7 @@ def _handle_log(args: argparse.Namespace) -> Result:
     available = bool(value)
     data = {
         "ok": True,
-        "vm": inst.vm_id,
+        "vm_id": inst.vm_id,
         "log": value,
         "available": available,
         "empty": not available,

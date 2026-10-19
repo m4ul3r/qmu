@@ -18,7 +18,7 @@ from .config import QMUConfig
 from .instance import QMUError, VMInstance, proc_pid_start, save_instance
 from .paths import instances_dir, qmp_socket_path, qemu_log_path, serial_log_path
 from .qemu import native_passt_problem, probe_qemu_netdevs
-from .qmp import QMPClient, QMPError
+from .qmp import QMPBusyError, QMPClient, QMPError
 
 
 def _resolve_boot_file(value: str, label: str, source: str = "") -> Path:
@@ -100,6 +100,25 @@ def _validate_qmp(socket_path: Path) -> None:
 QMP_CONNECT_RETRY_SECONDS = 3.0
 _QMP_CONNECT_RETRY_INTERVAL = 0.25
 
+# How long a freshly launched QEMU may take to complete its first QMP
+# handshake. A fresh vm_id has no instance record yet, so no `wait`, daemon
+# or debugger bridge can be holding the one QMP slot: an accepted connection
+# that is not greeted (2 s) or not answered (`qmp_capabilities`, 10 s) means
+# QEMU has not reached its main loop yet — host load, a slow TCG start. Two
+# lanes booting TCG guests at load 3.5 hit that, were told a phantom client
+# held the socket and had the VM rolled back, logs and all, while the same
+# command succeeded seconds later (#157). Past this budget the live QEMU is
+# retained (see `_validate_qmp_with_retry`), never killed.
+QMP_STARTUP_SECONDS = 30.0
+
+# A post-spawn launch failure rolls the attempt back, so the generic
+# "qmu status --vm <vm_id>" default would point at a VM that no longer exists.
+_ROLLED_BACK_HINT = (
+    "VM '{vm}' was rolled back (nothing left to inspect): the QEMU output in "
+    "the error is the evidence. Relaunch with the same flags; if it repeats, "
+    "qmu doctor checks the host"
+)
+
 
 def _transient_qmp_failure(exc: BaseException) -> bool:
     """A connect-time fault worth retrying while QEMU is still alive.
@@ -120,6 +139,8 @@ def _transient_qmp_failure(exc: BaseException) -> bool:
 
 def _fault_name(exc: BaseException) -> str:
     """`ECONNRESET`-style name for a transient connect fault, for the note."""
+    if isinstance(exc, QMPBusyError):
+        return "no QMP answer yet: QEMU still initialising"
     err: BaseException | None = exc
     if not isinstance(err, OSError) and isinstance(exc.__cause__, OSError):
         err = exc.__cause__
@@ -130,17 +151,24 @@ def _fault_name(exc: BaseException) -> str:
 
 def _validate_qmp_with_retry(
     socket_path: Path, proc: subprocess.Popen
-) -> tuple[bool, Exception | None, str | None]:
+) -> tuple[bool, Exception | None, str | None, bool]:
     """Connect to a freshly launched QEMU's QMP socket.
 
-    Returns ``(exited, error, note)``: ``exited`` when QEMU died meanwhile
-    (its log carries the reason, so no QMP error is reported), else ``error``
-    is the final non-transient or budget-exhausting failure, or None on
-    success. ``note`` names how many retries a successful connect needed
+    Returns ``(exited, error, note, pending)``: ``exited`` when QEMU died
+    meanwhile (its log carries the reason, so no QMP error is reported), else
+    ``error`` is the final non-transient or budget-exhausting failure, or None
+    on success. ``note`` names how many retries a successful connect needed
     (`QMP connect retried 2× (ECONNRESET)`) so the retry is observable in
     the launch's `warnings[]` instead of silently absorbed (#76).
+
+    ``pending`` is a live QEMU that still had not completed the handshake
+    after `QMP_STARTUP_SECONDS` (`QMPBusyError` on every attempt): not an
+    error, because nothing else can hold a fresh VM's QMP slot — QEMU is still
+    initialising. The caller retains the VM and says so (#157).
     """
-    deadline = time.monotonic() + QMP_CONNECT_RETRY_SECONDS
+    start = time.monotonic()
+    deadline = start + QMP_CONNECT_RETRY_SECONDS
+    startup_deadline = start + QMP_STARTUP_SECONDS
     retries = 0
     last_fault: BaseException | None = None
     while True:
@@ -148,8 +176,11 @@ def _validate_qmp_with_retry(
             _validate_qmp(socket_path)
             note = None
             if retries and last_fault is not None:
-                note = f"QMP connect retried {retries}× ({_fault_name(last_fault)})"
-            return False, None, note
+                note = f"QMP connect retried {retries}×"
+                if isinstance(last_fault, QMPBusyError):
+                    note += f" over {time.monotonic() - start:.1f}s"
+                note += f" ({_fault_name(last_fault)})"
+            return False, None, note, False
         except Exception as exc:  # noqa: BLE001 — classified below
             # QEMU creates the QMP listener before it applies -netdev hostfwd
             # rules or opens -drive files, so a failure there (port already
@@ -157,7 +188,19 @@ def _validate_qmp_with_retry(
             # image) leaves the socket on disk and the connect refused. That
             # is a dead QEMU whose reason is in its log, not a QMP problem.
             if proc.poll() is not None:
-                return True, None, None
+                return True, None, None, False
+            if isinstance(exc, QMPBusyError):
+                # A silent greeting already waited out its budget, but a full
+                # listen backlog (EAGAIN) fails at once — pace the retries so
+                # a QEMU still in its init never sees a connect storm.
+                retries += 1
+                last_fault = exc
+                if time.monotonic() < startup_deadline:
+                    time.sleep(_QMP_CONNECT_RETRY_INTERVAL)
+                    continue
+                if _exits_within(proc, 1.0):
+                    return True, None, None, False
+                return False, None, None, True
             if _transient_qmp_failure(exc) and time.monotonic() < deadline:
                 # Each retry interval is also the grace an exiting QEMU gets:
                 # the poll above catches it on the next pass.
@@ -167,8 +210,8 @@ def _validate_qmp_with_retry(
                 continue
             # Give the exit a moment to land before deciding which it was.
             if _exits_within(proc, 1.0):
-                return True, None, None
-            return False, exc, None
+                return True, None, None, False
+            return False, exc, None, False
 
 
 def _exits_within(proc: subprocess.Popen, grace: float) -> bool:
@@ -781,14 +824,19 @@ def launch_vm(
                     primary = QMUError(
                         f"{primary}\nCommand: {' '.join(cmd)}\nQEMU output:\n{log_text}"
                     )
+                primary.vm_id = vm_id
+                primary.hint = _ROLLED_BACK_HINT.format(vm=vm_id)
                 raise primary
 
             qmp_error: Exception | None = None
+            qmp_pending = False
             if not exited:
                 # QMP socket appeared — verify connectivity. A transient reset or
                 # refusal on this first connect is retried while QEMU lives; a
                 # QEMU that dies meanwhile is reported from its own log.
-                exited, qmp_error, qmp_note = _validate_qmp_with_retry(qmp_path, proc)
+                exited, qmp_error, qmp_note, qmp_pending = _validate_qmp_with_retry(
+                    qmp_path, proc
+                )
                 if qmp_note is not None and notes is not None:
                     notes.append(qmp_note)
         finally:
@@ -833,7 +881,12 @@ def launch_vm(
                 f"QEMU exited immediately (code {proc.returncode})."
                 f"{lock_note}\n"
                 f"Command: {' '.join(cmd)}\n"
-                f"Output:\n{log_text[-2000:]}"
+                f"Output:\n{log_text[-2000:]}",
+                vm_id=vm_id,
+                hint=(
+                    "QEMU's own reason is in the Output lines of the error; fix "
+                    "the flag, path or port it names and relaunch"
+                ),
             )
             try:
                 attempt.rollback()
@@ -852,7 +905,23 @@ def launch_vm(
                 primary = QMUError(
                     f"{primary}\nCommand: {' '.join(cmd)}\nQEMU output:\n{log_text}"
                 )
+            primary.vm_id = vm_id
+            primary.hint = _ROLLED_BACK_HINT.format(vm=vm_id)
             raise primary from qmp_error
+
+        if qmp_pending and notes is not None:
+            # Retained, never rolled back: the process is alive and its serial
+            # and QEMU logs are the only evidence of why it is slow. The SSH
+            # readiness wait that follows decides the launch's outcome — ready,
+            # `no-console-output` (4) or a timeout (124), the VM kept in each.
+            notes.append(
+                f"QMP did not complete its handshake within "
+                f"{QMP_STARTUP_SECONDS:g}s of launch, but QEMU (pid {proc.pid}) "
+                f"is alive. A fresh VM has no other QMP client, so QEMU is still "
+                f"initialising (host load or a slow TCG start); VM '{vm_id}' is "
+                f"retained — `qmu status --vm {vm_id}` re-checks QMP, "
+                f"`qmu log --vm {vm_id}` shows the console"
+            )
 
         # Build and save instance under the attempt transaction.
         inst = VMInstance(
