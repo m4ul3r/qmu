@@ -215,6 +215,9 @@ def test_rc255_ssh_down_ignores_precommand_crash(patch_exec, capsys):
 
 
 def test_exec_timeout_ignores_precommand_crash(patch_exec, capsys):
+    """An expired --timeout is 124 whether or not the guest still answers
+    (#142); `ssh_error` says it does not, and a crash already in the log
+    before the command is not attributed to it."""
     patch_exec(
         255,
         ready=False,
@@ -223,8 +226,9 @@ def test_exec_timeout_ignores_precommand_crash(patch_exec, capsys):
     )
     rc = cli.main(["--format", "json", "exec", "trigger"])
     payload = json.loads(capsys.readouterr().out)
-    assert rc == 4
+    assert rc == 124
     assert payload["ok"] is False
+    assert payload["timed_out"] is True
     assert payload["ssh_error"] is True
     assert payload["crash_detected"] is False
     assert payload["crash"] is None
@@ -267,8 +271,7 @@ def test_rc255_ssh_up_is_normal_nonzero_exit1(patch_exec, capsys):
     assert payload["exit_code"] == 255
     assert payload["ssh_error"] is False
     assert payload["crash_detected"] is False
-    assert payload["kernel_warning_detected"] is False
-    assert payload["kernel_warning"] is None
+    assert payload["crash"] is None
 
 
 def test_rc255_ssh_down_text_mode_reports_crash(patch_exec, capsys):
@@ -298,7 +301,10 @@ REPORT_KASAN = (
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
-def test_exec_report_mode_kasan_success_is_nonfatal_warning(patch_exec, capsys, fmt):
+def test_exec_report_mode_kasan_success_is_a_survived_crash(patch_exec, capsys, fmt):
+    """#136: the report the command provoked is `crash_detected` — the key the
+    skill says to gate on and the one `status`/`crash` use for the same
+    event — while the exit stays the guest command's (it completed)."""
     patch_exec(
         0,
         ready=True,
@@ -315,10 +321,9 @@ def test_exec_report_mode_kasan_success_is_nonfatal_warning(patch_exec, capsys, 
     assert rc == 0
     assert payload["ok"] is True
     assert payload["exit_code"] == 0
-    assert payload["kernel_warning_detected"] is True
-    assert "BUG: KASAN" in payload["kernel_warning"]
+    assert payload["crash_detected"] is True
+    assert "BUG: KASAN" in payload["crash"]
     assert payload["ssh_error"] is False
-    assert payload["crash_detected"] is False
 
 
 def test_exec_report_mode_kasan_text_warns_without_failing(patch_exec, capsys):
@@ -335,11 +340,10 @@ def test_exec_report_mode_kasan_text_warns_without_failing(patch_exec, capsys):
     assert rc == 0
     # Guest stdout is the whole of stdout; the survived report is a stderr note.
     assert captured.out == "STILL_ALIVE\n"
-    assert "Kernel warning from command serial output:" in captured.err
     assert "BUG: KASAN" in captured.err
 
 
-def test_exec_clean_success_has_stable_empty_warning_fields(patch_exec, capsys):
+def test_exec_clean_success_has_stable_empty_crash_fields(patch_exec, capsys):
     patch_exec(
         0,
         ready=True,
@@ -352,14 +356,14 @@ def test_exec_clean_success_has_stable_empty_warning_fields(patch_exec, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert payload["ok"] is True
-    assert payload["kernel_warning_detected"] is False
-    assert payload["kernel_warning"] is None
+    assert payload["crash_detected"] is False
+    assert payload["crash"] is None
 
 
-def test_exec_success_ignores_stale_precommand_crash_in_warning(patch_exec, capsys):
-    """On the normal rc==0 path, kernel_warning is fresh-scoped: a crash that
-    was already in the serial log BEFORE the command must not surface as a
-    warning (start_offset is captured before ssh.run). Pins #12's fresh-scoping
+def test_exec_success_ignores_stale_precommand_crash(patch_exec, capsys):
+    """On the normal rc==0 path, the crash attribution is fresh-scoped: a crash
+    that was already in the serial log BEFORE the command must not surface
+    (start_offset is captured before ssh.run). Pins #12's fresh-scoping
     for the success path, not just the transport-loss branch."""
     patch_exec(
         0,
@@ -373,8 +377,7 @@ def test_exec_success_ignores_stale_precommand_crash_in_warning(patch_exec, caps
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert payload["ok"] is True
-    assert payload["kernel_warning_detected"] is False
-    assert payload["kernel_warning"] is None
+    assert payload["crash"] is None
     assert payload["crash_detected"] is False
 
 
@@ -392,8 +395,8 @@ def test_exec_guest_nonzero_with_warning_preserves_remote_authority(patch_exec, 
     assert rc == 1
     assert payload["ok"] is False
     assert payload["exit_code"] == 7
-    assert payload["kernel_warning_detected"] is True
-    assert "BUG: KASAN" in payload["kernel_warning"]
+    assert payload["crash_detected"] is True
+    assert "BUG: KASAN" in payload["crash"]
     assert payload["ssh_error"] is False
 
     # text path

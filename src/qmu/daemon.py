@@ -28,7 +28,8 @@ Newline-delimited JSON over a Unix stream socket. Request `{"id": n, "op":
 ..., ...params}`; reply `{"id": n, "ok": true, "result": {...}}` or `{"id":
 n, "ok": false, "error": ..., "error_type": ...}`; a streaming op emits
 `{"id": n, "event": {...}}` lines before its reply. Ops: `ping`, `watch`,
-`unwatch`, `vm_state`, `qmp`, `wait`, `shutdown`.
+`unwatch`, `vm_state`, `epoch` (a boundary a command persisted without a
+RESET, e.g. `snapshot load`), `qmp`, `wait`, `shutdown`.
 
 Two state axes, as everywhere in qmu: `exited` is the existence axis (the
 recorded process is gone); `running`/`panicked` describe the guest.
@@ -302,16 +303,31 @@ class VMWatch:
     scanned: int = 0
     log_size: int = -1
     needs_refresh: bool = False
+    # A command a client proxied through this connection (`op_qmp`) is
+    # executing; QEMU runs it on its main loop, so nothing else is answered
+    # until it returns. `status_stale`: QEMU stopped the vCPUs under such a
+    # command (`savevm`/`loadvm` emit STOP) and no `query-status` has
+    # answered since — the cached run state is unknown, not `paused` (#137).
+    qmp_inflight: str | None = None
+    status_stale: bool = False
     watched_at: float = field(default_factory=time.time)
 
     def state(self) -> dict[str, Any]:
         observed = self.epoch_source == "observed" and self.banners_since_epoch <= 1
+        # Busy is what the standalone path reports for the same condition
+        # (QEMU greets but does not answer): the run state is unknown until
+        # QEMU answers again. Synthesising `paused` from the STOP handed every
+        # concurrent `status`/`list` the debugger-halt signature and its
+        # `qmu cont` recovery for the length of a save.
+        busy = self.status_stale
         return {
             "watched": True,
             "vm_id": self.vm_id,
             "pid": self.inst.pid,
-            "running": self.running,
-            "qemu_status": self.qemu_status,
+            "running": None if busy else self.running,
+            "qemu_status": "unknown" if busy else self.qemu_status,
+            "qmp_busy": busy,
+            "qmp_inflight": self.qmp_inflight,
             "panicked": self.panicked,
             "last_event": self.last_event,
             "last_event_at": self.last_event_at,
@@ -563,6 +579,33 @@ class Daemon:
                 return {"watched": False, "vm_id": vm_id}
             return watch.state()
 
+    def adopt_epoch(self, vm_id: str, offset: int) -> dict[str, Any]:
+        """A guest boundary a qmu command persisted with no RESET to show for it.
+
+        `loadvm` rewinds the guest without a QMP RESET, so the event stream
+        never sees the generation change `snapshot load` records: the watch
+        kept the epoch it copied at adoption, and daemon-backed `status`/
+        `list` went on attributing the rewound-away crash while `qmu crash`,
+        reading the record, found none (#135). The command hands the offset
+        it just persisted to the daemon; only a forward move within the
+        current log is taken, so a stale or foreign offset cannot rewind an
+        epoch the daemon itself observed later.
+        """
+        with self.cond:
+            watch = self.watches.get(vm_id)
+            if watch is None or watch.exited:
+                return {"watched": False, "vm_id": vm_id}
+        size = serial_log_offset(watch.inst.serial_log)
+        with self.cond:
+            adopted = watch.epoch_offset < offset <= size
+            if adopted:
+                self._advance_epoch(watch, offset)
+                self.cond.notify_all()
+            state = watch.state()
+        if adopted:
+            _log(f"{vm_id}: epoch -> {offset} (recorded by a qmu command)")
+        return state
+
     def _apply_status(self, watch: VMWatch, status: Any) -> None:
         if not isinstance(status, dict):
             return
@@ -573,7 +616,22 @@ class Daemon:
                 watch.running = running
             if isinstance(name, str):
                 watch.qemu_status = name
+            watch.status_stale = False
             self.cond.notify_all()
+
+    def _advance_epoch(self, watch: VMWatch, epoch: int) -> None:
+        """Under `self.cond`: the guest's current generation starts at `epoch`.
+
+        Everything before it belongs to a guest that no longer exists — a
+        reset rebooted it, a `loadvm` rewound it — so a panic seen there no
+        longer describes this one.
+        """
+        watch.epoch_offset = epoch
+        watch.epoch_source = "observed"
+        watch.banners_since_epoch = 0
+        watch.boot_offset = max(watch.boot_offset, epoch)
+        watch.scanned = max(watch.scanned, epoch)
+        watch.panicked = False
 
     # --- QMP events --------------------------------------------------------------
 
@@ -591,24 +649,27 @@ class Daemon:
         with self.cond:
             self._record_event(watch, name, data)
             if name == "RESET":
-                epoch = serial_log_offset(watch.inst.serial_log)
-                watch.epoch_offset = epoch
-                watch.epoch_source = "observed"
-                watch.banners_since_epoch = 0
-                watch.boot_offset = max(watch.boot_offset, epoch)
-                watch.scanned = max(watch.scanned, epoch)
-                watch.panicked = False
+                self._advance_epoch(watch, serial_log_offset(watch.inst.serial_log))
                 watch.running = True
                 watch.qemu_status = "running"
+                watch.status_stale = False
                 watch.needs_refresh = True
             elif name == "STOP":
                 watch.running = False
-                if watch.qemu_status == "running":
+                if watch.qmp_inflight is not None:
+                    # QEMU stopped the vCPUs itself to run the command a
+                    # client proxied through us (`savevm` does this for the
+                    # whole save) and answers nothing else until it returns:
+                    # the run state is unknown, and the refresh below waits
+                    # behind the command.
+                    watch.status_stale = True
+                elif watch.qemu_status == "running":
                     watch.qemu_status = "paused"
                 watch.needs_refresh = True
             elif name == "RESUME":
                 watch.running = True
                 watch.qemu_status = "running"
+                watch.status_stale = False
             elif name == "GUEST_PANICKED":
                 watch.panicked = True
                 watch.needs_refresh = True
@@ -743,6 +804,12 @@ class Daemon:
             try:
                 status = watch.qmp.command("query-status", None, 5.0)
             except QMPError:
+                # A run state left unknown under a proxied command stays
+                # unknown until QEMU answers: a client that gave up on a
+                # `savevm` (exit 124) leaves QEMU saving, and the next tick
+                # asks again rather than freezing `busy` (or a guess) forever.
+                if watch.status_stale:
+                    watch.needs_refresh = True
                 return
         self._apply_status(watch, status)
 
@@ -797,7 +864,12 @@ class Daemon:
             raise _OpError(f"VM '{vm_id}' QMP connection is gone", "QMPError")
         if not isinstance(execute, str) or not execute:
             raise _OpError("qmp: 'execute' must be a non-empty string", "ValueError")
+        label = execute
+        if execute == "human-monitor-command" and isinstance(arguments, dict):
+            label = f"{execute} {str(arguments.get('command-line', '')).split(' ', 1)[0]}".rstrip()
         with watch.lock:
+            with self.cond:
+                watch.qmp_inflight = label
             try:
                 result = watch.qmp.command(
                     execute, arguments if isinstance(arguments, dict) else None, timeout
@@ -808,6 +880,10 @@ class Daemon:
                 raise _OpError(str(exc), "QMPTimeoutError") from exc
             except QMPError as exc:
                 raise _OpError(str(exc), "QMPError") from exc
+            finally:
+                with self.cond:
+                    watch.qmp_inflight = None
+                    self.cond.notify_all()
         return {"return": result}
 
     def op_wait(
@@ -906,12 +982,15 @@ class Daemon:
             # The terminal transition an explicit `unwatch` owes every
             # subscriber: the client finishes standalone (#118).
             stream({"kind": "released"})
+        with self.cond:
+            snapshot = watch.state()
         return {
             "stopped": stopped,
             "reason": reason,
             "elapsed": round(time.monotonic() - start, 3),
-            "running": watch.running,
-            "qemu_status": watch.qemu_status,
+            "running": snapshot["running"],
+            "qemu_status": snapshot["qemu_status"],
+            "qmp_busy": snapshot["qmp_busy"],
             "last_event": watch.last_event,
             "event_data": watch.event_data,
             "boot_offset": watch.boot_offset,
@@ -1111,7 +1190,7 @@ class _ClientSession(threading.Thread):
             daemon.stop.set()
             return {"stopping": True}
         vm_id = request.get("vm_id")
-        if op in ("watch", "unwatch", "vm_state", "qmp", "wait") and not isinstance(vm_id, str):
+        if op in ("watch", "unwatch", "vm_state", "epoch", "qmp", "wait") and not isinstance(vm_id, str):
             raise _OpError(f"{op}: 'vm_id' is required", "ValueError")
         if op == "watch":
             return daemon.watch(vm_id)
@@ -1119,6 +1198,11 @@ class _ClientSession(threading.Thread):
             return {"released": daemon.unwatch(vm_id)}
         if op == "vm_state":
             return daemon.vm_state(vm_id)
+        if op == "epoch":
+            offset = request.get("offset")
+            if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+                raise _OpError("epoch: 'offset' must be a non-negative integer", "ValueError")
+            return daemon.adopt_epoch(vm_id, offset)
         if op == "qmp":
             timeout = request.get("qmp_timeout", 30.0)
             return daemon.op_qmp(

@@ -471,11 +471,13 @@ def _ssh_lost_payload(
 ) -> tuple[int, dict[str, Any], list[str]]:
     """Build the SSH-lost (status, data, text) triple; status 3 only on a crash.
 
-    Used for both an SSH timeout (TimeoutExpired -> SSHError) and a transport
-    disconnect (rc=255 + ssh transport marker). A dropped connection alone does
-    NOT prove a panic: a guest with no sshd produces one on every exec, and
-    returning 3 there reports a missing daemon in the kernel-crash class —
-    against the contract that a tooling fault is never mistaken for a panic.
+    Used for a transport disconnect (rc=255 + no answer to the re-probe), a
+    terminal panic under the command, and `dmesg`'s own expired budget on an
+    unreachable guest (`exec`'s `--timeout` is :func:`_command_timeout_payload`).
+    A dropped connection alone does NOT prove a panic: a guest with no sshd
+    produces one on every exec, and returning 3 there reports a missing daemon
+    in the kernel-crash class — against the contract that a tooling fault is
+    never mistaken for a panic.
     Status 3 requires a corroborating fresh serial crash; otherwise the guest is
     merely unreachable and this is transport-layer (4). This matches the
     discrimination `_transfer_transport_lost` already applied to scp, so
@@ -549,8 +551,23 @@ def _explain_lost_transport(
         data, text = _stopped_guest_payload(inst, qemu_status)
         data["exit_code"] = None
         data["command"] = command
-        return 1, data, [f"SSH connection lost while running: {command}", *text]
+        # #143: the abort closes the command's SSH session — and a halt longer
+        # than the keepalive window (ServerAlive 5 s x 3) drops the shared
+        # connection anyway — so the guest process dies of SIGPIPE on its
+        # next write once the vCPU runs again. The debugging loop must not
+        # assume the trigger is still there after `pry continue`.
+        data["hint"] += " " + _HALT_KILLS_SESSION
+        return 1, data, [
+            f"SSH connection lost while running: {command}", *text, _HALT_KILLS_SESSION,
+        ]
     return None
+
+
+_HALT_KILLS_SESSION = (
+    "The command's SSH session is closed: once the vCPU runs again it dies on "
+    "its next stdout/stderr write (SIGPIPE). Start a trigger that must outlive "
+    "a debugger stop detached: setsid nohup CMD > /root/out.log 2>&1 < /dev/null &"
+)
 
 
 # How long a watcher poll may wait for a QMP answer. Bounds the drain loop's
@@ -645,33 +662,75 @@ def _command_timeout_payload(
     command: str,
     inst: VMInstance,
     timeout: float,
+    *,
+    start_offset: int,
+    answering: bool,
 ) -> tuple[int, dict[str, Any], list[str]]:
-    """The guest is alive and answering; the command just outlived --timeout.
+    """qmu's own `--timeout` ended the command, and nothing explains it sooner.
 
-    Exit 124 is the contract's wait-timeout code, and it is what this is: no
-    crash, no transport loss, nothing to reap. Keeping the L1 booleans present
-    and false is what lets a caller branch on `crash_detected` without first
-    checking which envelope shape it received.
+    Exit 124 is the contract's timeout code, and it is what this is whatever
+    the guest looks like afterwards: qmu cut the session at the deadline, so
+    no transport was "lost". A terminal panic or a halted vCPU since the
+    command began is already reported by :func:`_explain_lost_transport`
+    before this is reached. It used to probe SSH twice (≈7 s past the
+    deadline) and take the crash/transport-loss path when the guest did not
+    answer, so a guest wedged printing a `kasan_multi_shot` report flood
+    returned exit 3 — the "kernel crashed" class — 7.7 s after `--timeout
+    120`, without `timed_out` and with no panic in the log (#142).
+
+    `answering` is ONE readiness probe, the one `status` runs (≤2.25 s): it
+    decides `ssh_error` and the hint, never the exit code. A report the
+    kernel printed while the command ran is `crash_detected`/`crash` here as
+    on every other path (the newest event, not the flood). Keeping the L1
+    booleans present is what lets a caller branch on `crash_detected` without
+    first checking which envelope shape it received.
     """
+    crash = extract_crash(inst.serial_log, start_offset=start_offset)
+    vm = inst.vm_id
+    if answering:
+        reach = "guest still reachable"
+        hint = (
+            f"Guest command exceeded --timeout ({timeout:g}s) but the guest is "
+            "still answering SSH. "
+        )
+    else:
+        reach = "guest no longer answers SSH"
+        hint = (
+            f"Guest command exceeded --timeout ({timeout:g}s) and the guest no "
+            "longer answers SSH (it did not panic). "
+        )
+    if crash is not None:
+        hint += (
+            "The kernel printed a crash report while the command ran (crash); "
+            f"read it with: qmu crash --vm {vm}"
+        )
+        detail = f"\nCrash from serial log (no panic):\n{crash}"
+    elif answering:
+        hint += "Raise --timeout, or check what the command is waiting on."
+        detail = "No crash detected. Raise --timeout if the command needs longer."
+    else:
+        hint += (
+            f"No fresh crash report in the serial log. Check: qmu status --vm {vm}; "
+            f"qmu log --vm {vm} --tail 100"
+        )
+        detail = "No fresh crash detected in serial log. Check: qmu log --tail 100"
     return (
         124,
         {
             "ok": False,
-            "vm_id": inst.vm_id,
+            "vm_id": vm,
             "exit_code": None,
-            "ssh_error": False,
-            "crash_detected": False,
+            "ssh_error": not answering,
+            "crash_detected": crash is not None,
+            "crash": crash,
             "timed_out": True,
             "command": command,
             "timeout": timeout,
-            "hint": f"Guest command exceeded --timeout ({timeout:g}s) but the "
-                    "guest is still answering SSH. Raise --timeout, or check "
-                    "what the command is waiting on.",
+            "hint": hint,
         },
         [
-            f"Guest command timed out after {timeout:g}s (guest still reachable): "
-            f"{command}",
-            "No crash detected. Raise --timeout if the command needs longer.",
+            f"Guest command timed out after {timeout:g}s ({reach}): {command}",
+            detail,
         ],
     )
 
@@ -963,24 +1022,24 @@ def _run_guest_command(
             on_chunk=sink.on_chunk if sink is not None else None,
         )
     except SSHError as exc:
-        # qmu stopped the child: the watcher saw a panic, or --timeout expired.
-        # The latter is NOT by itself a crash: a guest that still answers SSH
-        # merely ran longer than --timeout, and reporting exit 3 there told the
-        # caller a healthy kernel had died (reproduced live with
-        # `qmu run --timeout 1 -- 'sleep 10'`). The serial log and QMP are
-        # consulted first (instant, and authoritative); only then probe, and
-        # only an unreachable guest takes the crash/transport-loss path.
+        # qmu stopped the child: the watcher saw a panic or a halted vCPU, or
+        # --timeout expired. The serial log and QMP explain the first two
+        # (instant, and authoritative); what is left is qmu's own deadline,
+        # which is a timeout (124) whether or not the guest still answers —
+        # one readiness probe only says which, for the hint (#142). Probing
+        # first and taking the crash/transport-loss path on no answer told the
+        # caller a healthy kernel had died for a slow command (reproduced live
+        # with `qmu run --timeout 1 -- 'sleep 10'`), and a guest wedged by a
+        # report flood "crashed" 7 s after the deadline.
         explained = _explain_lost_transport(
             command, inst, start_offset=command_start_offset,
             halted_status=watcher.halted_status,
         )
         if explained is None:
-            if not _transport_lost(ssh):
-                explained = _command_timeout_payload(command, inst, timeout)
-            else:
-                explained = _ssh_lost_payload(
-                    command, inst, start_offset=command_start_offset
-                )
+            explained = _command_timeout_payload(
+                command, inst, timeout,
+                start_offset=command_start_offset, answering=ssh.is_ready(),
+            )
         return _with_guest_output(
             explained, exc.stdout, exc.stderr, note_stderr=note_stderr
         )
@@ -1004,18 +1063,22 @@ def _run_guest_command(
         if explained is not None:
             return _with_guest_output(explained, stdout, stderr, note_stderr=note_stderr)
 
-    kernel_warning = extract_crash(
-        inst.serial_log, start_offset=command_start_offset
-    )
+    # A report the kernel printed while the command ran is a crash the guest
+    # survived (under `exploit-dev` an Oops kills only the faulting task), and
+    # `crash_detected` is the key every reader gates on: it used to be filed
+    # under `kernel_warning` with `crash_detected: false`, while the `status`
+    # right after called the same event `crashed` and `qmu crash` returned it
+    # (#136). The exit code stays the guest command's: the session completed.
+    crash = extract_crash(inst.serial_log, start_offset=command_start_offset)
     notes: list[str | bytes] = []
     if stderr and note_stderr:
         notes.append(guest_bytes(stderr))
     if rc != 0:
         notes.append(f"[exit code: {rc}]")
-    if kernel_warning is not None:
+    if crash is not None:
         notes.append(
-            "Kernel warning from command serial output:\n"
-            + kernel_warning.rstrip()
+            "Kernel crash report from command serial output (the guest kept "
+            "running):\n" + crash.rstrip()
         )
     # L1: always include ssh_error/crash_detected so consumers have a stable,
     # explicit contract (not an implicit "key omitted on success").
@@ -1025,12 +1088,11 @@ def _run_guest_command(
         "exit_code": rc,
         **_stream_fields(stdout, stderr),
         "ssh_error": False,
-        "crash_detected": False,
-        "kernel_warning_detected": kernel_warning is not None,
-        "kernel_warning": kernel_warning,
+        "crash_detected": crash is not None,
+        "crash": crash,
     }
     if rc != 0:
-        data["hint"] = _guest_exit_hint(inst, rc, kernel_warning is not None)
+        data["hint"] = _guest_exit_hint(inst, rc, crash is not None)
     return (0 if rc == 0 else 1), data, stdout, [], notes
 
 
@@ -1044,8 +1106,8 @@ def _guest_exit_hint(inst: VMInstance, rc: int, kernel_report: bool) -> str:
     """
     if kernel_report:
         return (
-            f"The guest command exited {rc} and the kernel printed a report "
-            f"during it (kernel_warning); read it in full with: qmu crash --vm "
+            f"The guest command exited {rc} and the kernel printed a crash "
+            f"report during it (crash); read it in full with: qmu crash --vm "
             f"{inst.vm_id}, or qmu log --vm {inst.vm_id} --tail 100"
         )
     return (
