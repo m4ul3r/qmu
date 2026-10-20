@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import selectors
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -35,7 +36,17 @@ class SSHError(RuntimeError):
 
 
 class SSHAborted(SSHError):
-    """`SSHClient.run` stopped the child because `abort_when` fired."""
+    """`SSHClient.run` stopped waiting because `abort_when` fired.
+
+    Normally the child was killed. `detached_output` is set when the caller
+    asked to detach instead (`detach_to`): the ssh child — and with it the
+    remote command's session — was left running, and a detached helper
+    drains the command's further output into that file.
+    """
+
+    def __init__(self, message: str, *, detached_output: Path | None = None, **kwargs):
+        super().__init__(message, **kwargs)
+        self.detached_output = detached_output
 
 
 class GuestText(str):
@@ -138,6 +149,49 @@ def is_transport_failure(rc: int, stderr: str) -> bool:
     return any(m in stderr for m in SSH_TRANSPORT_ERROR_MARKERS)
 
 
+# Bytes a detached command's drainer keeps; past this it reads and discards,
+# so a chatty command neither fills the disk nor blocks on a full pipe.
+DETACHED_OUTPUT_CAP = 16 * 1024 * 1024
+
+# The drainer: argv is (output path, cap, fd...). It owns the read ends of the
+# ssh child's stdout/stderr pipes after qmu has gone, so the session stays
+# open — the remote command never sees its stdout close — until the command
+# ends (EOF on every pipe). Raw bytes, both streams interleaved in arrival
+# order, as a terminal would show them.
+_DRAIN_SOURCE = r"""
+import os, select, sys
+path, cap, fds = sys.argv[1], int(sys.argv[2]), [int(a) for a in sys.argv[3:]]
+for fd in fds:
+    os.set_blocking(fd, True)
+written = 0
+with open(path, "ab") as out:
+    while fds:
+        for fd in select.select(fds, [], [])[0]:
+            data = os.read(fd, 65536)
+            if not data:
+                fds.remove(fd)
+                os.close(fd)
+                continue
+            keep = data[: max(cap - written, 0)]
+            if keep:
+                out.write(keep)
+                out.flush()
+                written += len(keep)
+"""
+
+
+def _spawn_drainer(fds: list[int], path: Path) -> None:
+    subprocess.Popen(
+        [sys.executable, "-c", _DRAIN_SOURCE, str(path), str(DETACHED_OUTPUT_CAP),
+         *(str(fd) for fd in fds)],
+        pass_fds=tuple(fds),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 def _watch_child(
     proc: subprocess.Popen,
     pipes: list,
@@ -146,10 +200,12 @@ def _watch_child(
     abort_when: Callable[[], bool] | None,
     poll_interval: float = 0.5,
     on_chunk: Callable[[str, bytes], None] | None = None,
-) -> tuple[list[bytes], bool, bool]:
+    detach_to: Callable[[], Path | None] | None = None,
+) -> tuple[list[bytes], bool, bool, Path | None]:
     """Drain `pipes` until the child exits, the budget expires or `abort_when`
-    fires. Returns (raw output per pipe, completed, aborted); a child that
-    did not complete has been killed. `completed` means the child exited
+    fires. Returns (raw output per pipe, completed, aborted, detached); a
+    child that did not complete has been killed — unless the abort detached
+    it. `completed` means the child exited
     *within* the budget: the deadline is checked first, so a child that
     finished while the loop was blocked in `abort_when` after the deadline
     had already passed still counts as timed out (its output is kept).
@@ -174,6 +230,12 @@ def _watch_child(
     before the exception carries it. A callback that raises (a reader that
     closed the pipe) kills the child first: the drain loop is the only thing
     reaping it.
+
+    `detach_to` is asked once when `abort_when` fires: a path means "do not
+    kill". The child is left running and a detached drainer
+    (:func:`_spawn_drainer`) takes over the pipes and appends whatever else
+    arrives to that file, so the remote command keeps its session instead of
+    dying of SIGPIPE on its next write. `detached` is that path, or None.
     """
     names = {pipe.fileno(): "stdout" if pipe is proc.stdout else "stderr" for pipe in pipes}
     chunks: dict[int, list[bytes]] = {pipe.fileno(): [] for pipe in pipes}
@@ -199,6 +261,7 @@ def _watch_child(
     next_poll = time.monotonic() + poll_interval
     aborted = False
     timed_out = False
+    detached: Path | None = None
     try:
         while sel.get_map():
             now = time.monotonic()
@@ -208,6 +271,8 @@ def _watch_child(
             if abort_when is not None and now >= next_poll:
                 if abort_when():
                     aborted = True
+                    if detach_to is not None:
+                        detached = detach_to()
                     break
                 # The predicate may have blocked (a bounded QMP probe against
                 # a held socket): re-sample before trusting the budget. The
@@ -228,11 +293,21 @@ def _watch_child(
             except subprocess.TimeoutExpired:
                 pass
         completed = not timed_out and proc.poll() is not None
-        if not completed:
+        if not completed and detached is not None:
+            # Whatever already arrived is the caller's; the rest is the
+            # drainer's, which inherits the read ends still open.
+            drain(0.0)
+            _spawn_drainer([key.fd for key in sel.get_map().values()], detached)
+        elif not completed:
             proc.kill()
             proc.wait()
             # Whatever is already in the pipes is still the guest's output.
             drain(0.0)
+        elif detached is not None:
+            # The command finished on its own before the abort could act:
+            # nothing left to detach.
+            detached.unlink(missing_ok=True)
+            detached = None
     except BaseException:
         if proc.poll() is None:
             proc.kill()
@@ -245,7 +320,7 @@ def _watch_child(
 
     # `chunks` preserves the order of `pipes`.
     output = [b"".join(parts) for parts in chunks.values()]
-    return output, completed, aborted
+    return output, completed, aborted, detached
 
 
 # Margin added to a readiness probe's `ConnectTimeout` before the ssh child is
@@ -367,6 +442,7 @@ class SSHClient:
         abort_when: Callable[[], bool] | None = None,
         poll_interval: float = 0.5,
         on_chunk: Callable[[str, bytes], None] | None = None,
+        detach_to: Callable[[], Path | None] | None = None,
     ) -> tuple[int, GuestText, GuestText]:
         """Run a command in the guest. Returns (exit_code, stdout, stderr).
 
@@ -379,7 +455,10 @@ class SSHClient:
         serial log and QMP with it: a guest that panics mid-command drops the
         transport, but ssh only notices after the keepalive window
         (`ServerAliveInterval × ServerAliveCountMax` = 15 s) while the panic
-        is on disk within ~100 ms; a halted vCPU never drops it at all. A
+        is on disk within ~100 ms; a halted vCPU never drops it at all. When
+        `detach_to` returns a path at that moment the child is left running
+        instead (see :func:`_watch_child`) and the exception carries the path
+        as `detached_output`. A
         `--timeout` overrun raises :class:`SSHError` carrying the partial
         output the same way. `on_chunk` relays each drained read as it
         arrives (see :func:`_watch_child`); the returned/raised output is the
@@ -387,13 +466,14 @@ class SSHClient:
         """
         cmd = self._ssh_base() + [self._target(), command]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        (stdout_raw, stderr_raw), completed, aborted = _watch_child(
+        (stdout_raw, stderr_raw), completed, aborted, detached = _watch_child(
             proc,
             [proc.stdout, proc.stderr],
             timeout=timeout,
             abort_when=abort_when,
             poll_interval=poll_interval,
             on_chunk=on_chunk,
+            detach_to=detach_to,
         )
         stdout, stderr = GuestText(stdout_raw), GuestText(stderr_raw)
         if aborted:
@@ -401,6 +481,7 @@ class SSHClient:
                 f"SSH command aborted by qmu (guest panicked or halted): {command}",
                 stdout=stdout,
                 stderr=stderr,
+                detached_output=detached,
             )
         if not completed:
             raise SSHError(
@@ -485,7 +566,7 @@ class SSHClient:
         """
         timeout = self.scp_timeout
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        (stderr_raw,), completed, aborted = _watch_child(
+        (stderr_raw,), completed, aborted, _ = _watch_child(
             proc, [proc.stderr], timeout=timeout, abort_when=abort_when
         )
         stderr = GuestText(stderr_raw)

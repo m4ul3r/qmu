@@ -157,8 +157,9 @@ def _boot_failure_payload(
     agent wants the report, while a guest that merely never started sshd is an
     operational failure (124/1) and must not be dressed up as a panic. A
     survived WARNING or KASAN splat sits between the two — it is reported in the
-    envelope and preserved on disk, but it does not by itself promote a boot
-    timeout to a crash, because the guest that emitted it is still alive.
+    envelope (`crash_detected: true`, `crash`, the same keys `exec` and `status`
+    use for it) and preserved on disk, but it does not by itself promote a boot
+    timeout to a crash exit, because the guest that emitted it is still alive.
 
     ``start_offset=0`` is the whole log because the VM was launched by this
     command — every byte belongs to this boot.
@@ -201,8 +202,8 @@ def _boot_failure_payload(
             {
                 "ok": False,
                 "ssh_error": True,
-                "crash_detected": False,
-                "crash": None,
+                "crash_detected": warned,
+                "crash": report,
                 "kernel_warning_detected": warned,
                 "kernel_warning": report,
                 "hint": "QEMU exited before the guest was reachable. Check: "
@@ -228,8 +229,8 @@ def _boot_failure_payload(
             "error_type": "TimeoutError",
             "timed_out": True,
             "ssh_error": True,
-            "crash_detected": False,
-            "crash": None,
+            "crash_detected": warned,
+            "crash": report,
             "kernel_warning_detected": warned,
             "kernel_warning": report,
             "hint": f"Guest did not answer SSH within {timeout:g}s and did not "
@@ -305,13 +306,12 @@ def _handle_run(args: argparse.Namespace) -> Result:
     # normal edit-run loop.
     # A survived kernel report counts: under the default exploit-dev profile an
     # Oops kills only the faulting task, so a command can trigger a KASAN splat
-    # and still exit 0. Reaping there would delete the splat the run just
-    # produced, which is the whole reason the caller ran it.
+    # and still exit 0 (`crash_detected: true`). Reaping there would delete the
+    # splat the run just produced, which is the whole reason the caller ran it.
     preserve = (
         outcome != "ready"
         or status not in (0, 1)
         or data.get("crash_detected") is True
-        or data.get("kernel_warning_detected") is True
     )
     if args.keep:
         # --keep means "do not kill it", which is not the same as "it is up":

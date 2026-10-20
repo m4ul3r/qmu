@@ -92,6 +92,10 @@ class FakeQMPServer:
                     self._send(conn, {"return": {}, "id": req.get("id")})
                     return
                 reply = self.replies.get(cmd, {})
+                if callable(reply):
+                    # A command QEMU runs for a while (savevm): the callable
+                    # may emit events and block before its return value.
+                    reply = reply(req)
                 if isinstance(reply, Exception):
                     self._send(conn, {"error": {"class": "GenericError", "desc": str(reply)}, "id": req.get("id")})
                 else:
@@ -358,6 +362,103 @@ def test_status_with_the_layer_off_has_no_daemon_keys(daemon_env, vm, monkeypatc
     assert payload["qmp"] == "connected"
     assert "guest_epoch_source" not in payload
     assert "boot_offset" not in payload
+
+
+def test_status_during_a_proxied_savevm_is_busy_not_the_debugger_halt(
+    daemon_env, vm, monkeypatch, capsys
+):
+    """#137: `savevm` stops the vCPUs (QMP STOP) and holds QEMU's main loop for
+    the whole save. The daemon used to synthesise `paused` from the STOP, so a
+    concurrent `status`/`list` showed the debugger-halt signature and its
+    `qmu cont` recovery; the standalone path says `qmp: "busy"`."""
+    daemon_client.watch("fake-vm")
+    started, release = threading.Event(), threading.Event()
+
+    def savevm(req):
+        vm["server"].emit("STOP")
+        started.set()
+        release.wait(10)
+        vm["server"].emit("RESUME")
+        return ""
+
+    vm["server"].replies["human-monitor-command"] = savevm
+
+    def save() -> None:
+        with lifecycle._qmp_ctx(vm["inst"]) as qmp:
+            qmp.execute_hmp("savevm s1", timeout=15)
+
+    saver = threading.Thread(target=save)
+    saver.start()
+    try:
+        assert started.wait(5)
+        _wait_until(
+            lambda: daemon_client.vm_state("fake-vm")["qmp_busy"] is True,
+            what="STOP under the proxied savevm",
+        )
+        monkeypatch.setattr(lifecycle, "choose_instance", lambda vm_id=None: vm["inst"])
+        monkeypatch.setattr(lifecycle, "list_instances", lambda: [vm["inst"]])
+        assert cli.main(["--format", "json", "status", "--vm", "fake-vm"]) == 0
+        status = json.loads(capsys.readouterr().out)
+        assert cli.main(["--format", "json", "list"]) == 0
+        row = json.loads(capsys.readouterr().out)["vms"][0]
+        for payload in (status, row):
+            assert payload["qmp"] == "busy"
+            assert payload["guest"] != lifecycle.GUEST_PAUSED
+        assert status["qemu_status"] == "unknown"
+    finally:
+        release.set()
+        saver.join(timeout=10)
+    _wait_until(
+        lambda: daemon_client.vm_state("fake-vm")["qemu_status"] == "running",
+        what="the run state once the save returned",
+    )
+    assert daemon_client.vm_state("fake-vm")["qmp_busy"] is False
+
+
+def test_snapshot_load_moves_the_daemon_scope_with_the_record(
+    daemon_env, vm, monkeypatch, capsys
+):
+    """#135: `loadvm` emits no QMP RESET. `snapshot load` records the new
+    generation, and daemon-backed `status` must scope to it exactly as
+    `qmu crash` (which reads the record) does — not go on attributing the
+    rewound-away Oops."""
+    from qmu.commands import guest, qmp_cmds
+
+    log: Path = vm["log"]
+    with log.open("a") as f:
+        f.write(
+            "[   36.048967] Unable to handle kernel NULL pointer dereference at virtual address 0\n"
+            "[   36.054270] Internal error: Oops: 0000000096000044 [#1] PREEMPT SMP\n"
+            "[   36.069966] ---[ end trace 0000000000000000 ]---\n"
+        )
+    daemon_client.watch("fake-vm")
+    current = lambda vm_id=None: load_instance("fake-vm")  # noqa: E731
+    for module in (lifecycle, qmp_cmds):
+        monkeypatch.setattr(module, "choose_instance", current)
+    monkeypatch.setattr(guest, "find_instance", current)
+    listing = (
+        "List of snapshots present on all disks:\n"
+        "ID        TAG               VM SIZE                DATE       VM CLOCK     ICOUNT\n"
+        "--        s1                486 MiB 2026-05-28 23:11:52 0000:01:01.992\n"
+    )
+    vm["server"].replies["human-monitor-command"] = lambda req: (
+        listing if req["arguments"]["command-line"] == "info snapshots" else ""
+    )
+
+    assert cli.main(["--format", "json", "status", "--vm", "fake-vm"]) == 0
+    assert json.loads(capsys.readouterr().out)["crash_detected"] is True
+
+    assert cli.main(["--format", "json", "snapshot", "load", "s1", "--vm", "fake-vm"]) == 0
+    capsys.readouterr()
+    loaded_at = log.stat().st_size
+
+    assert cli.main(["--format", "json", "status", "--vm", "fake-vm"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["crash_detected"] is False
+    assert status["guest_epoch_serial_offset"] == loaded_at
+    assert status["guest_epoch_source"] == "observed"
+    assert cli.main(["--format", "json", "crash", "--vm", "fake-vm"]) == 1
+    assert json.loads(capsys.readouterr().out)["crash_detected"] is False
 
 
 # ---------------------------------------------------------------------------
