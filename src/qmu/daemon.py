@@ -308,6 +308,9 @@ class VMWatch:
     # until it returns. `status_stale`: QEMU stopped the vCPUs under such a
     # command (`savevm`/`loadvm` emit STOP) and no `query-status` has
     # answered since — the cached run state is unknown, not `paused` (#137).
+    # `op_qmp` asks `query-status` itself the moment the command is answered,
+    # so the window ends with the command: a proxied `stop`, whose STOP is
+    # the halt it asked for, reads `paused` as soon as it returns (#170).
     qmp_inflight: str | None = None
     status_stale: bool = False
     watched_at: float = field(default_factory=time.time)
@@ -801,16 +804,20 @@ class Daemon:
         if watch.qmp is None:
             return
         with watch.lock:
-            try:
-                status = watch.qmp.command("query-status", None, 5.0)
-            except QMPError:
-                # A run state left unknown under a proxied command stays
-                # unknown until QEMU answers: a client that gave up on a
-                # `savevm` (exit 124) leaves QEMU saving, and the next tick
-                # asks again rather than freezing `busy` (or a guess) forever.
-                if watch.status_stale:
-                    watch.needs_refresh = True
-                return
+            self._requery_status(watch)
+
+    def _requery_status(self, watch: VMWatch) -> None:
+        """Under `watch.lock`: replace the cached run state with QEMU's word."""
+        try:
+            status = watch.qmp.command("query-status", None, 5.0)
+        except QMPError:
+            # A run state left unknown under a proxied command stays
+            # unknown until QEMU answers: a client that gave up on a
+            # `savevm` (exit 124) leaves QEMU saving, and the next tick
+            # asks again rather than freezing `busy` (or a guess) forever.
+            if watch.status_stale:
+                watch.needs_refresh = True
+            return
         self._apply_status(watch, status)
 
     def _check_idle(self, now: float) -> None:
@@ -870,11 +877,14 @@ class Daemon:
         with watch.lock:
             with self.cond:
                 watch.qmp_inflight = label
+            answered = False
             try:
                 result = watch.qmp.command(
                     execute, arguments if isinstance(arguments, dict) else None, timeout
                 )
+                answered = True
             except QMPCommandError as exc:
+                answered = True
                 raise _OpError(str(exc), "QMPCommandError", qmp_class=exc.qmp_class) from exc
             except QMPTimeoutError as exc:
                 raise _OpError(str(exc), "QMPTimeoutError") from exc
@@ -883,7 +893,16 @@ class Daemon:
             finally:
                 with self.cond:
                     watch.qmp_inflight = None
+                    stale = watch.status_stale
                     self.cond.notify_all()
+                # QEMU answered, so its main loop is free again: settle a run
+                # state a STOP under the command left unknown before the
+                # client hears back, rather than one tick later. Without it a
+                # `status` right after a proxied `stop` said `qmp: busy` and
+                # SSH-probed the halted guest (#170). A command that outlived
+                # its budget is still running in QEMU and stays unknown.
+                if answered and stale:
+                    self._requery_status(watch)
         return {"return": result}
 
     def op_wait(

@@ -34,6 +34,7 @@ from qmu.instance import (
     classify_vm,
 )
 from qmu.ssh import GuestText, SSHAborted, SSHError
+from tests.test_daemon import FakeQMPServer, daemon_env  # noqa: F401 — fixture
 
 
 VM = "subject"
@@ -1694,6 +1695,121 @@ def test_daemon_keys_are_absent_on_the_standalone_path(cache, monkeypatch, capsy
     assert row["qmp"] == payload["qmp"] == "connected"
     for key in ("guest_epoch_source", "boot_offset", "guest_epoch_serial_offset"):
         assert key not in row and key not in payload, key
+
+
+# ---------------------------------------------------------------------------
+# Axis 2, daemon vs standalone, after `snapshot load` rewound a panicked guest
+# (#162, #163). `loadvm` emits STOP/RESUME but no RESET, so the daemon learns
+# the new generation only from the epoch the command hands it. Daemon-backed
+# `status`/`list` kept the cached `panicked` (skipping the SSH probe that
+# disproves it) and bare `wait` exited 3 on the pre-load report, while
+# `QMU_DAEMON=off` said serving / 124 and `crash` found nothing this epoch.
+# The daemon here is the real one, in-process: the bug lived in its cache.
+# ---------------------------------------------------------------------------
+
+
+class _ReadySSH:
+    def is_ready(self, timeout=2):
+        return True
+
+    def close_control_master(self):
+        pass
+
+
+_AFTER_LOAD_ARGV = {
+    "status": ["status", "--vm", VM],
+    "list": ["list"],
+    "wait": ["wait", "--vm", VM, "--timeout", "1"],
+    "crash": ["crash", "--vm", VM],
+}
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_status_list_wait_and_crash_agree_after_a_snapshot_load_daemon_on_and_off(
+    fmt, cache, daemon_env, monkeypatch, capsys
+):
+    from qmu import daemon_client
+    from qmu.commands import qmp_cmds
+
+    idir = cache / "instances"
+    serial = idir / f"{VM}.serial.log"
+    serial.write_text("[ 0.0] Linux version 6.12.0 (x) #1\n[ 1.0] serving\n")
+    server = FakeQMPServer(cache / "q.sock")
+    instance_mod.save_instance(VMInstance(
+        vm_id=VM, pid=os.getpid(), qmp_socket=str(server.path), ssh_port=10022,
+        ssh_key="/k", gdb_port=None, serial_log=str(serial), kernel="/boot/bzImage",
+        rootfs=None, memory="1G", cpus=1, cmdline="console=ttyS0",
+        profile="exploit-dev", started_at="2026-08-17T00:00:00Z", harness=False,
+    ))
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "find_orphan_qemus", lambda: [], raising=False)
+    for mod in (lifecycle, qmp_cmds):
+        monkeypatch.setattr(mod, "_make_ssh", lambda inst: _ReadySSH())
+    monkeypatch.setattr(lifecycle, "_CRASH_SETTLE_MAX", 0.0)
+
+    def hmp(req):
+        line = req["arguments"]["command-line"]
+        if line == "info snapshots":
+            return (
+                "List of snapshots present on all disks:\n"
+                "ID        TAG               VM SIZE                DATE       VM CLOCK     ICOUNT\n"
+                "--        clean             486 MiB 2026-05-28 23:11:52 0000:01:01.992\n"
+            )
+        if line.startswith("loadvm"):
+            server.emit("STOP")
+            server.emit("RESUME")
+        return ""
+
+    server.replies["human-monitor-command"] = hmp
+    try:
+        daemon_client.watch(VM)
+        with serial.open("a") as stream:
+            stream.write(TERMINAL_PANIC)
+        server.emit("GUEST_PANICKED", {"action": "pause"})
+        deadline = time.monotonic() + 5
+        while not daemon_client.vm_state(VM)["panicked"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert cli.main(["--format", "json", "status", "--vm", VM]) == 0
+        assert json.loads(capsys.readouterr().out)["guest"] == "panicked"
+
+        assert cli.main(["--format", "json", "snapshot", "load", "clean", "--vm", VM]) == 0
+        capsys.readouterr()
+
+        readings = {}
+        for mode in ("daemon", "standalone"):
+            if mode == "standalone":
+                monkeypatch.setenv("QMU_DAEMON", "off")
+                daemon_client.reset()
+                _qmp(monkeypatch, True)  # the daemon still holds the fake's one slot
+            readings[mode] = {}
+            for name, argv in _AFTER_LOAD_ARGV.items():
+                rc = cli.main(["--format", fmt, *argv])
+                readings[mode][name] = (rc, capsys.readouterr().out)
+    finally:
+        server.close()
+
+    for mode, got in readings.items():
+        codes = {name: rc for name, (rc, _) in got.items()}
+        assert codes == {"status": 0, "list": 0, "wait": 124, "crash": 1}, (mode, got)
+        if fmt == "text":
+            for name in ("status", "list", "wait"):
+                assert "panicked" not in got[name][1].lower(), (mode, name, got[name][1])
+    if fmt == "json":
+        parsed = {
+            mode: {name: json.loads(out) for name, (_, out) in got.items()}
+            for mode, got in readings.items()
+        }
+        for mode, p in parsed.items():
+            row = p["list"]["vms"][0]
+            assert p["status"]["guest"] == row["guest"] == "serving", mode
+            assert p["status"]["crash_detected"] is row["crash_detected"] is False, mode
+            assert p["status"]["ssh"] == "ready", mode
+            assert p["wait"]["reason"] == "timeout" and p["wait"]["crash"] is None, mode
+            assert p["crash"]["crash_detected"] is False, mode
+        on, off = parsed["daemon"], parsed["standalone"]
+        assert on["wait"]["guest"] == off["wait"]["guest"]
+        assert set(on["wait"]) == set(off["wait"])
+        assert on["status"]["qmp"] == "daemon" and off["status"]["qmp"] == "connected"
 
 # ---------------------------------------------------------------------------
 # The SSH readiness probe logs in, and a login runs `uname`. With a gdb

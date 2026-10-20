@@ -549,6 +549,12 @@ that is the contract, and `tests/test_state_agreement_matrix.py` pins that
   `qmp: "busy"` probe until a `query-status` answers (re-armed while it
   fails). Synthesising `paused` there handed concurrent readers the
   debugger-halt signature and its `qmu cont` recovery for a whole save (#137).
+  The window ends with the command: once QEMU answers it, `op_qmp` asks
+  `query-status` itself before replying, so a proxied `qmp stop`/`monitor
+  stop` — whose STOP is the halt it asked for — reads `paused` the moment it
+  returns; settling one tick later let an MCP client's next `status` say
+  `qmp: busy` and SSH-probe the halted guest (#170). A command that outran
+  its budget is still running in QEMU and stays stale.
 - **Ownership rule (#118, #119): a subscribed `wait` is never stranded, and
   release is complete when answered.** The daemon keeps a watch until the
   recorded PID identity is gone — `instance_alive` is the only authority for
