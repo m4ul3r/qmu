@@ -140,8 +140,9 @@ def _drop_ssh_master(inst: VMInstance) -> None:
     `snapshot load` and `system_reset` replace the guest's TCP state under a
     master connection that outlives the command which opened it
     (`ControlPersist=60`). The next SSH command then reuses the dead master
-    and stalls for the whole keepalive window (ServerAliveInterval 5 x
-    CountMax 3 = 15 s) before `Broken pipe` — which made the documented
+    and stalls — once for the keepalive window, now (#182: the keepalive no
+    longer gives up on a silent peer) until its own `--timeout` — or fails
+    with `Broken pipe`, which made the documented
     rewind loop's first `exec` slower than a full relaunch (snapshot audit
     #3, contract #1). Closing before AND after the mutation guarantees no
     master straddles it. Best-effort and silent: harness VMs have no SSH.

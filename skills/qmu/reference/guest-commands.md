@@ -107,10 +107,15 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
   `/root/poc.log`.
 - A kernel panic while the command runs is reported as exit 3 as soon as the
   serial log shows `Kernel panic - not syncing` (sub-second), with the partial
-  `stdout`/`stderr` on the crash envelope — not after the SSH keepalive
-  (15 s) and re-probes.
+  `stdout`/`stderr` on the crash envelope — without waiting on ssh or a
+  re-probe.
 - A dropped transport with no fresh crash report is exit 4 (`ssh_error:
-  true`, `crash_detected: false`).
+  true`, `crash_detected: false`). So is ssh never reaching the guest at all
+  (`Connection timed out during banner exchange` right after a boot or
+  reboot): `exit_code: null`, text `SSH could not connect; the command was
+  not started`, safe to re-run — never "the guest command exited 255".
+- A guest that stops answering without a panic or a halt (wedged) holds the
+  command until `--timeout` (124); ssh itself never gives up on silence.
 - sshd refusing the VM's recorded `[ssh] user`/key (`Permission denied
   (publickey,…)`) is exit 4 `error_type: "SSHAuthError"` with `ssh_status:
   "auth-failed"`, `ssh_user`, `ssh_key` and a relaunch `hint` — on `exec`,
@@ -121,14 +126,14 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
   --vm X` (for `qemu_status: "restore-vm"` the hint is a known-good `snapshot
   load` or `kill` + relaunch instead — never `cont`). A debugger stop that
   fires mid-command returns within ~1 s with the same `paused` envelope —
-  never the 15–20 s keepalive wait — and the output that reached the host
+  never a keepalive wait — and the output that reached the host
   before the stop (bytes the guest wrote just before it may still be in the
   guest). For `exec`, `run` and `compile --run` the command is **left
   running**: qmu keeps its SSH session open (`text`: `vCPU halted while
   running (command left running)`) and a detached helper appends its further
   output to the file named by `detached_output`, so the trigger continues
-  after `pry continue` / `qmu cont` (measured with a 120 s halt; the
-  connection stays up while the vCPU is stopped, at most 16 MiB of output is
+  after `pry continue` / `qmu cont` (measured with a 130 s halt; the
+  connection stays up however long the vCPU is stopped, at most 16 MiB of output is
   kept). What still ends it is the SSH connection going away: `snapshot
   load`, a reset and `kill` drop the ControlMaster — use the `setsid nohup`
   form for a trigger that must survive those. `compile`'s gcc step and

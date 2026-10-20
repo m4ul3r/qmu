@@ -467,3 +467,24 @@ def test_an_emulated_guest_probe_gets_the_tcg_budget(monkeypatch):
                 timeout=10,
             ).stdout
             assert f"connecttimeout {budget}\n" in resolved, kvm
+
+
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="needs the OpenSSH client")
+@pytest.mark.parametrize("tool", ["ssh", "scp"])
+def test_a_debugger_halt_of_any_length_cannot_drop_the_guest_connection(tool):
+    """#182: the ControlMaster (opened by whichever of ssh/scp runs first)
+    carries a detached trigger's session through a debugger stop. A halted
+    vCPU answers no keepalive, and `ServerAliveCountMax=3` dropped the
+    master — and the trigger's output — 15 s into the stop. Read through
+    `ssh -G`, so what is checked is the bound OpenSSH will actually apply."""
+    client = ssh.SSHClient(10021, "/nonexistent-key")
+    argv = client._ssh_base() if tool == "ssh" else client._scp_base()
+    opts = [arg for i, a in enumerate(argv) if a == "-o" for arg in ("-o", argv[i + 1])]
+    resolved = subprocess.run(
+        ["ssh", "-G", "-F", "/dev/null", *opts, "localhost"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    conf = dict(line.split(" ", 1) for line in resolved.splitlines() if " " in line)
+    interval = int(conf["serveraliveinterval"])
+    count = int(conf["serveralivecountmax"])
+    assert interval == 0 or interval * count >= 365 * 24 * 3600

@@ -594,7 +594,8 @@ def _prepare_boot(
 # first second on every supported machine, so silence this long means it is
 # writing to a console device that does not exist (`console=ttyS0` on an ARM
 # virt machine) or never started (wrong -M/-cpu). Waiting out the whole
-# --ssh-timeout only adds a minute of nothing to the same answer.
+# --ssh-timeout only adds a minute of nothing to the same answer. The window
+# counts from when QMP first says the vCPUs run, never from before (#176).
 NO_CONSOLE_OUTPUT_SECONDS = 10.0
 _SSH_POLL_INTERVAL = 1.0
 # How long sshd must keep refusing the login before the wait gives up on it.
@@ -614,18 +615,46 @@ def _serial_log_empty(path: str | None) -> bool:
         return True
 
 
+def _vcpus_started(inst: Any) -> bool | None:
+    """Whether QEMU is running its vCPUs, for the no-console verdict.
+
+    True once QMP answers `running: true`. False while QEMU provably has not
+    got there: its QMP accepts but does not greet (`busy` — not yet in its
+    main loop, the slow start `launch_vm` retains, #157) or it answers with
+    the vCPUs stopped. None when QMP cannot say at all (unreachable), which
+    leaves the verdict as it always was.
+    """
+    probe = _query_qmp(inst)
+    if probe.state == QMP_BUSY:
+        return False
+    if probe.state in (QMP_CONNECTED, QMP_DAEMON):
+        return probe.running is not False
+    return None
+
+
 def _wait_for_ssh_or_console(ssh: Any, inst: Any, timeout: float) -> str:
-    """Block for SSH; returns 'ready', 'timeout', 'no-console-output' or
-    'auth-failed'.
+    """Block for SSH; returns 'ready', 'timeout', 'no-console-output',
+    'auth-failed' or 'qemu-not-running'.
 
     Polls `SSHClient.is_ready` alongside the empty-serial-log check, because
     the non-ready outcomes need different explanations: a slow boot may
     still answer, a silent console never will, and an sshd that refuses the
     recorded user/key has booted and will keep refusing (#158).
+
+    An empty console only indicts `console=`/-M once the vCPUs have run: the
+    no-console window opens when :func:`_vcpus_started` first stops saying
+    False. A QEMU that has not reached its main loop has written nothing
+    because nothing has executed yet, and calling that `no-console-output`
+    told the reader to change a correct cmdline (#176). Such a wait ends at
+    the deadline as 'qemu-not-running' instead. QMP is asked only while the
+    log is empty and until it has said the vCPUs run.
     """
     start = time.monotonic()
     deadline = start + timeout
     refused_since: float | None = None
+    # When the no-console window opened; None until QEMU is seen running.
+    console_window_from: float | None = None
+    first_look = True
     while True:
         if ssh.is_ready(timeout=2):
             return "ready"
@@ -637,14 +666,25 @@ def _wait_for_ssh_or_console(ssh: Any, inst: Any, timeout: float) -> str:
                 return "auth-failed"
         else:
             refused_since = None
+        console_empty = _serial_log_empty(inst.serial_log)
+        if console_empty and console_window_from is None:
+            if _vcpus_started(inst) is not False:
+                # The first look follows launch_vm's completed handshake, so
+                # a normal boot's window counts from the start of the wait;
+                # a QEMU first seen running later counts from that moment.
+                console_window_from = start if first_look else now
+            first_look = False
         if (
-            now - start >= NO_CONSOLE_OUTPUT_SECONDS
-            and _serial_log_empty(inst.serial_log)
+            console_empty
+            and console_window_from is not None
+            and now - console_window_from >= NO_CONSOLE_OUTPUT_SECONDS
         ):
             return "no-console-output"
         # Deadline is checked AFTER a probe, so the guest is always given at
         # least one chance to answer (`--ssh-timeout 0` means "probe once").
         if now >= deadline:
+            if console_empty and console_window_from is None:
+                return "qemu-not-running"
             return "timeout"
         time.sleep(_SSH_POLL_INTERVAL)
 
@@ -752,19 +792,35 @@ def _handle_launch(args: argparse.Namespace) -> Result:
             # The window closed with the guest still booting: the timeout
             # code (124), the same `run` exits for the same condition, not
             # the transport class (4) — nothing broke, the VM is retained
-            # and the SSH may still come up (#72).
+            # and the SSH may still come up (#72). When QEMU itself never
+            # got its vCPUs running, that — not the guest — is what is slow,
+            # and the empty console says nothing about console= (#176).
             ssh_status = "timeout"
             exit_code = 124
             error_type = "TimeoutError"
-            error = (
-                f"SSH did not become ready within {args.ssh_timeout}s; the VM "
-                "may still be booting. VM state retained."
-            )
-            hint = (
-                f"qmu log --vm {inst.vm_id} --tail 50 shows how far the boot "
-                f"got; qmu status --vm {inst.vm_id} re-probes SSH; or relaunch "
-                "with a longer --ssh-timeout."
-            )
+            if outcome == "qemu-not-running":
+                error = (
+                    f"SSH did not become ready within {args.ssh_timeout}s: QEMU "
+                    "has not started running the guest yet (its QMP does not "
+                    "answer, or reports the vCPUs stopped), so the empty serial "
+                    "log is not a console= problem — QEMU is still initialising "
+                    "(host load or a slow TCG start). VM state retained."
+                )
+                hint = (
+                    f"qmu status --vm {inst.vm_id} re-checks QMP and SSH; qmu "
+                    f"log --vm {inst.vm_id} --tail 50 once the console has "
+                    "output; or relaunch with a longer --ssh-timeout."
+                )
+            else:
+                error = (
+                    f"SSH did not become ready within {args.ssh_timeout}s; the VM "
+                    "may still be booting. VM state retained."
+                )
+                hint = (
+                    f"qmu log --vm {inst.vm_id} --tail 50 shows how far the boot "
+                    f"got; qmu status --vm {inst.vm_id} re-probes SSH; or relaunch "
+                    "with a longer --ssh-timeout."
+                )
     else:
         ssh_status = "skipped"
 
