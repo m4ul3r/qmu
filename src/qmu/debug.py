@@ -51,7 +51,12 @@ from .instance import (
     proc_pid_start,
     save_instance,
 )
-from .serial import count_boot_banners, last_boot_offset, serial_log_offset
+from .serial import (
+    count_boot_banners,
+    kernel_init_done,
+    last_boot_offset,
+    serial_log_offset,
+)
 
 # TCP states from include/net/tcp_states.h as they appear (hex, upper-case) in
 # field 4 of /proc/net/tcp{,6}. An attached gdb client shows up as the gdbstub
@@ -393,11 +398,11 @@ def bridge_stopped(inst: Any) -> bool | None:
 # for the CLI start and the stop/resume around the op.
 PRY_RESYNC_TIMEOUT = 20
 _PRY_CALL_SLACK = 15.0
-# How long a reset of a nokaslr guest waits for the new kernel's text before
-# its last re-sync (measured on KVM: armed ≈4 s after the reset, on the second
-# re-sync); TCG boots several times slower.
+# How long a reset of a nokaslr guest waits for the new kernel to finish init
+# (the end of its boot-time text patching) before it re-syncs; past it, qmu
+# does not re-sync at all. Measured on KVM: init done ≈1.3 s after the reset;
+# TCG boots several times slower.
 RESET_KERNEL_WAIT_SECONDS = 30.0
-_RESYNC_RETRY_SECONDS = 1.0
 
 # pry's resync statuses that leave a location unable to fire (`not_armed`).
 _NOT_ARMED = frozenset({"pending", "unreadable", "insert-failed", "not-resident"})
@@ -519,7 +524,18 @@ def _resynced(
         e for e in entries
         if e.get("elf_match") is False and e.get("status") not in _NOT_ARMED
     ]
-    if not_armed or mismatch:
+    kaslr = not _kaslr_off(inst)
+    if mismatch and not kaslr:
+        # A nokaslr kernel cannot have moved: memory that differs from the
+        # ELF is the kernel's own boot-time patching (alternatives, return
+        # thunks, static keys), and the breakpoint sits where it was set.
+        notes.append(
+            f"[qmu] {len(mismatch)} armed location(s) hold code the kernel "
+            "patched at boot (`elf_match: false`; alternatives, return thunks, "
+            "static keys) — this nokaslr kernel did not move, so they trap "
+            "where they were set, unless the symbol file is not this kernel's."
+        )
+    if not_armed or (mismatch and kaslr):
         parts = [
             f"[qmu] WARNING: VM '{inst.vm_id}': the pry bridge {ident} re-synced "
             f"after {event}, but its breakpoints are not all live."
@@ -529,25 +545,33 @@ def _resynced(
                 f" {len(not_armed)} location(s) are not armed and will not fire: "
                 + "; ".join(_entry_line(e) for e in not_armed) + "."
             )
-        if mismatch:
+        if mismatch and kaslr:
             parts.append(
                 f" {len(mismatch)} armed location(s) hold code that differs from "
-                "the symbol file (`elf_match: false`), so they trap wherever "
-                "the stale symbols point: "
+                "the symbol file (`elf_match: false`): either the kernel patched "
+                "that code at boot (alternatives, return thunks, static keys) and "
+                "the breakpoint is where you set it, or the symbols are stale (a "
+                "KASLR re-slide, a snapshot from another boot) and it traps "
+                "inside other code: "
                 + "; ".join(_entry_line(e) for e in mismatch) + "."
             )
         parts.append(
-            f" Re-run `pry --instance {ident} resync` once that code is mapped; "
-            f"if the kernel re-slid, `eval \"$(qmu kbase --vm {inst.vm_id} "
-            f"--symbols <vmlinux>)\"` then `pry --instance {ident} resync --base "
-            "$KBASE`."
+            f" Re-run `pry --instance {ident} resync` once that code is mapped"
+            + (
+                f"; if the kernel re-slid, `eval \"$(qmu kbase --vm {inst.vm_id} "
+                f"--symbols <vmlinux>)\"` then `pry --instance {ident} resync "
+                "--base $KBASE`."
+                if kaslr else "."
+            )
         )
         warnings.append("".join(parts) + "\n")
     data = {"action": "resynced", "event": event, **_owned_ref(inst), **extra, "resync": report}
     return BridgeDrive(data=data, notes=tuple(notes), warnings=tuple(warnings))
 
 
-def _torn_down(inst: Any, event: str, happened: str, reason: str) -> BridgeDrive:
+def _torn_down(
+    inst: Any, event: str, happened: str, reason: str, *, first: str = ""
+) -> BridgeDrive:
     """Reap the owned bridge and say what was lost and how to get it back.
 
     The breakpoint list is read first so the envelope names what went away;
@@ -582,17 +606,46 @@ def _torn_down(inst: Any, event: str, happened: str, reason: str) -> BridgeDrive
     warning = (
         f"[qmu] WARNING: VM '{inst.vm_id}' was {happened} under the pry bridge "
         f"`qmu gdb` spawned ({ident}, pid {ref['bridge_pid']}); {fate} because "
-        f"{reason}. {lost} Reattach once the guest is up: `qmu gdb --vm "
+        f"{reason}. {lost} {first}Reattach once the guest is up: `qmu gdb --vm "
         f"{inst.vm_id} --symbols <vmlinux>`, `qmu cont --vm {inst.vm_id}`, on a "
         f"KASLR guest `eval \"$(qmu kbase --vm {inst.vm_id} --symbols "
         f"<vmlinux>)\"` and `pry --instance {ident} load <vmlinux> --base "
-        "$KBASE`, then set the breakpoints again and prove one with a canary hit.\n"
+        f"$KBASE`, set the breakpoints again, then `pry --instance {ident} "
+        "continue --background` (the first pry command after `qmu cont` halts "
+        "the guest again, and GDB arms breakpoints only when it resumes) and "
+        "prove one with a canary hit.\n"
     )
     data = {
         "action": "torn_down", "event": event, **ref, "reason": reason,
         "bridge_reaped": reaped, "breakpoints_dropped": dropped,
     }
     return BridgeDrive(data=data, warnings=(warning,))
+
+
+def _not_resynced(inst: Any, event: str, reason: str, recovery: str) -> BridgeDrive:
+    """Leave the owned bridge as it is and say why, with the manual recovery.
+
+    For when qmu could not re-sync for reasons that say nothing about the
+    bridge (pry missing from qmu's PATH, a boot whose end of init never
+    showed): tearing a healthy bridge down there would lose its breakpoints
+    for nothing.
+    """
+    ref = _owned_ref(inst)
+    lead = (
+        f"[qmu] WARNING: VM '{inst.vm_id}': qmu did not re-sync the pry bridge "
+        f"`qmu gdb` spawned ({ref['bridge_instance_id']}, pid "
+        f"{ref['bridge_pid']}) after {event} because {reason}; the bridge is "
+        "left as it is.\n"
+    )
+    data = {"action": "not_resynced", "event": event, **ref, "reason": reason}
+    return BridgeDrive(data=data, warnings=(lead, recovery))
+
+
+def _pry_missing() -> bool:
+    return shutil.which("pry") is None
+
+
+_NO_PRY = "`pry` is not on qmu's PATH"
 
 
 def drive_bridge_after_loadvm(inst: Any, event: str) -> BridgeDrive:
@@ -602,6 +655,10 @@ def drive_bridge_after_loadvm(inst: Any, event: str) -> BridgeDrive:
     one `pry resync` re-reads the stop state and re-arms every breakpoint at
     once. A re-sync that fails leaves a view nobody can correct: tear down.
     """
+    if _pry_missing():
+        return _not_resynced(
+            inst, event, _NO_PRY, loadvm_stale_session_warning(inst) + "\n"
+        )
     report, error = _pry_resync(inst)
     if error is not None:
         return _torn_down(
@@ -615,12 +672,16 @@ def drive_bridge_after_reset(
 ) -> BridgeDrive:
     """Re-sync the owned bridge after a qmu-issued `system_reset`, or tear it down.
 
-    A reset reboots the kernel, so nothing can be armed until the new
-    kernel's text is mapped: on a running nokaslr guest qmu waits for the new
-    boot's banner (bounded by `RESET_KERNEL_WAIT_SECONDS`), re-syncs, and
-    re-syncs again while a location is still `unreadable` and time remains.
-    `qemu_status` is QEMU's run state right after the reset. Two cases
-    cannot be made true and are torn down instead:
+    A reset reboots the kernel, and the new kernel patches its own text at
+    boot (alternatives, return thunks, static keys): a breakpoint armed before
+    that is overwritten, or trips the patcher into a WARNING (`missing return
+    thunk` from `apply_returns`) that reads as a guest crash. So on a running
+    nokaslr guest qmu waits until the new boot's console shows the end of
+    kernel init (`serial.kernel_init_done`, bounded by
+    `RESET_KERNEL_WAIT_SECONDS`), then re-syncs once. If that never shows (a
+    `quiet` cmdline hides it, a slow boot, QEMU gone) qmu does not re-sync and
+    says so. `qemu_status` is QEMU's run state right after the reset. Two
+    cases cannot be made true and are torn down instead:
 
     - KASLR: the kernel re-slides and its new base is readable only from the
       rebooted guest (`/proc/kallsyms` over SSH); a re-sync now would re-arm
@@ -650,31 +711,43 @@ def drive_bridge_after_reset(
             f"{why}: a halted reset guest sits at the reset vector, where no "
             "kernel address is readable, so no breakpoint can be re-armed and "
             "GDB cannot resume it past breakpoints it cannot insert",
+            first=(
+                "A clean detach lets QEMU boot it; if `qmu status --vm "
+                f"{inst.vm_id}` still says `paused`, boot it with `qmu cont --vm "
+                f"{inst.vm_id}` first. "
+            ),
+        )
+    recovery = reset_dropped_breakpoints_warning(inst, qemu_status=qemu_status) + "\n"
+    if _pry_missing():
+        return _not_resynced(inst, event, _NO_PRY, recovery)
+    if epoch is None:
+        # Without the pre-reset log size, the previous boot's end-of-init
+        # lines would satisfy the wait at once.
+        return _not_resynced(
+            inst, event,
+            "the serial log size before the reset is unknown, so the new boot's "
+            "end of kernel init cannot be told from the previous one's",
+            recovery,
         )
     started = time.monotonic()
     deadline = started + RESET_KERNEL_WAIT_SECONDS
-    if epoch is not None:
-        while (
-            count_boot_banners(inst.serial_log, start_offset=epoch) == 0
-            and time.monotonic() < deadline
-            and instance_alive(inst)
-        ):
-            time.sleep(0.1)
-    attempts = 0
-    while True:
-        report, error = _pry_resync(inst)
-        attempts += 1
-        if error is not None:
-            return _torn_down(
-                inst, event, "reset", f"`pry resync` failed: {error}"
+    while not kernel_init_done(inst.serial_log, start_offset=epoch):
+        if time.monotonic() >= deadline or not instance_alive(inst):
+            return _not_resynced(
+                inst, event,
+                "the new kernel did not show the end of its init on the "
+                f"console within {time.monotonic() - started:.0f} s (a `quiet` "
+                "cmdline hides it, or the boot is slow or stuck), and arming "
+                "a breakpoint before the kernel has patched its own text can "
+                "trip that patching",
+                recovery,
             )
-        unreadable = any(e.get("status") == "unreadable" for e in _entries(report))
-        if not unreadable or time.monotonic() >= deadline:
-            break
-        time.sleep(_RESYNC_RETRY_SECONDS)
+        time.sleep(0.1)
+    report, error = _pry_resync(inst)
+    if error is not None:
+        return _torn_down(inst, event, "reset", f"`pry resync` failed: {error}")
     return _resynced(
-        inst, event, report,
-        attempts=attempts, waited_seconds=round(time.monotonic() - started, 2),
+        inst, event, report, waited_seconds=round(time.monotonic() - started, 2),
     )
 
 

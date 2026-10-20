@@ -670,19 +670,27 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   a successful `snapshot load` and in `_after_mutation` (raw `loadvm`/
   `system_reset` routes), and calls `debug.drive_bridge_after_loadvm` /
   `drive_bridge_after_reset`. The returned `BridgeDrive` becomes the
-  envelope's `debugger` object (`action: resynced|torn_down`; `resync` is
-  pry's `--format json` report verbatim — never reshape it), text-mode stderr
-  notes (the receipt; stdout stays the command's own) and warnings only when
-  there is something to act on (not-armed / `elf_match: false` locations, a
-  teardown). The operation's exit code never changes. A load is re-synced at
+  envelope's `debugger` object (`action: resynced|torn_down|not_resynced`;
+  `resync` is pry's `--format json` report verbatim — never reshape it),
+  text-mode stderr notes (the receipt; stdout stays the command's own) and
+  warnings only when there is something to act on (not-armed locations,
+  `elf_match: false` on a KASLR kernel — on a nokaslr one that is the
+  kernel's own boot-time patching and only a note — a teardown, a skipped
+  re-sync). The operation's exit code never changes. A load is re-synced at
   once. A reset is re-synced only on a `nokaslr` guest QEMU reports `running`
-  right after it (the `_status_after_mutation` read), after the new boot's
-  banner, retried while a location is `unreadable` (`RESET_KERNEL_WAIT_
-  SECONDS`); a KASLR reset (new base readable only from the booted guest, and
-  the old base would arm int3s into unrelated code) and a reset at a debugger
-  stop (`prelaunch`; GDB cannot even resume it) are torn down, listing
-  `breakpoints_dropped`. A load that failed mid-restore drives nothing and
-  gets `loadvm_failed_restore_warning` instead of the re-arm recovery: a
+  right after it (the `_status_after_mutation` read), and only once the new
+  boot's console shows the end of kernel init (`serial.kernel_init_done`,
+  bounded by `RESET_KERNEL_WAIT_SECONDS`): the banner is too early, because
+  the kernel still patches its own text (alternatives, return thunks) and a
+  breakpoint on a patched site makes `apply_returns` WARN, which qmu then
+  reports as a crash it caused. No end of init in time (`quiet`), or no `pry`
+  on qmu's PATH: `not_resynced`, the bridge is left alone with the manual
+  recovery — never tear down a healthy bridge for a qmu-side reason. A KASLR
+  reset (new base readable only from the booted guest, and the old base would
+  arm int3s into unrelated code) and a reset at a debugger stop (`prelaunch`;
+  GDB cannot even resume it) are torn down, listing `breakpoints_dropped`. A
+  load that failed mid-restore drives nothing and gets
+  `loadvm_failed_restore_warning` instead of the re-arm recovery: a
   continue, a resync or a detach can resume the half-restored machine (#87).
   A failed `pry resync` tears down.
 - `debug_session_present(inst)` is the gate for divergences a *live* client

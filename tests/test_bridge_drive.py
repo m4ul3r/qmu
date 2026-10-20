@@ -14,6 +14,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -63,6 +65,12 @@ spec = os.environ["FAKE_PRY_DIR"]
 argv = sys.argv[1:]
 with open(os.path.join(spec, "calls.jsonl"), "a") as log:
     log.write(json.dumps(argv) + "\n")
+if argv[0] == "resync" and os.environ.get("FAKE_PRY_SERIAL"):
+    # Was the new boot's end of kernel init on the console when qmu armed?
+    with open(os.environ["FAKE_PRY_SERIAL"]) as serial:
+        seen = "as init process" in serial.read()
+    with open(os.path.join(spec, "init_seen.jsonl"), "a") as log:
+        log.write(json.dumps(seen) + "\n")
 cmd = argv[0]
 if cmd == "kill":
     os.kill(int(argv[2]), signal.SIGTERM)
@@ -115,21 +123,43 @@ def pry(tmp_path, monkeypatch):
         def ran(self, cmd):
             return [c for c in self.calls() if c[0] == cmd]
 
+        def init_seen_at_resync(self):
+            log = spec / "init_seen.jsonl"
+            if not log.exists():
+                return []
+            return [json.loads(line) for line in log.read_text().splitlines()]
+
     fake = Pry()
     fake.answers(break_=[{"result": BREAK_LIST}])
     return fake
 
 
-class _QMP:
-    """QEMU double: a reset appends the new boot's banner to the console."""
+INIT_DONE = "[    1.353989] Run /sbin/init as init process\n"
 
-    def __init__(self, inst, *, running=True):
+
+class _QMP:
+    """QEMU double: a reset appends the new boot's banner to the console at
+    once and, `init_after` seconds later, the end of kernel init (`None`: a
+    `quiet` boot that never prints it)."""
+
+    def __init__(self, inst, *, running=True, init_after=0.3):
         self.inst = inst
         self.running = running
+        self.init_after = init_after
 
     def _reset(self):
         with open(self.inst.serial_log, "a") as log:
             log.write(BANNER)
+        if self.init_after is None:
+            return
+
+        def finish_init():
+            time.sleep(self.init_after)
+            with open(self.inst.serial_log, "a") as log:
+                log.write("[    0.216847] Freeing SMP alternatives memory: 44K\n")
+                log.write(INIT_DONE)
+
+        threading.Thread(target=finish_init, daemon=True).start()
 
     def execute(self, command, arguments=None, timeout=30.0):
         if command == "query-status":
@@ -153,9 +183,13 @@ class _QMP:
         return False
 
 
-def _vm(tmp_path, monkeypatch, bridge, *, cmdline="console=ttyS0 nokaslr", running=True):
+def _vm(
+    tmp_path, monkeypatch, bridge, *, cmdline="console=ttyS0 nokaslr",
+    running=True, init_after=0.3,
+):
     serial = tmp_path / f"{VM}.serial.log"
     serial.write_text(BANNER + "login: \n")
+    monkeypatch.setenv("FAKE_PRY_SERIAL", str(serial))
     inst = VMInstance(
         vm_id=VM, pid=os.getpid(), pid_start=proc_pid_start(os.getpid()),
         qmp_socket=str(tmp_path / "q.sock"), ssh_port=None, ssh_key=None,
@@ -167,13 +201,16 @@ def _vm(tmp_path, monkeypatch, bridge, *, cmdline="console=ttyS0 nokaslr", runni
     )
     save_instance(inst)
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm=None: load_instance(VM))
-    monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: _QMP(inst, running=running))
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx",
+        lambda inst: _QMP(inst, running=running, init_after=init_after),
+    )
     monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
     monkeypatch.setattr(
         qmp_cmds, "load_snapshot",
         lambda qmp, name: SnapshotResult(True, f"Snapshot '{name}' loaded."),
     )
-    monkeypatch.setattr(debug, "_RESYNC_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(debug, "RESET_KERNEL_WAIT_SECONDS", 5.0)
     # The sleeper owns no socket: model "the recorded bridge holds the stub"
     # as "it is alive" (the hand-started tests record no bridge at all).
     monkeypatch.setattr(debug, "bridge_holds_stub", debug.bridge_alive)
@@ -336,38 +373,83 @@ def test_a_load_that_failed_mid_restore_never_drives_the_bridge(
 
 
 @pytest.mark.parametrize("route", sorted(_RESET_ROUTES))
-def test_every_reset_route_resyncs_a_nokaslr_bridge_once_the_new_kernel_is_up(
+def test_every_reset_route_resyncs_a_nokaslr_bridge_only_after_kernel_init(
     route, tmp_path, monkeypatch, capsys, bridge, pry
 ):
-    _vm(tmp_path, monkeypatch, bridge)
-    armed = _report(_entry("armed", trap_resident=True, reseated=True))
-    pry.answers(resync=[{"result": _report(_entry("unreadable"))}, {"result": armed}])
+    """The new kernel patches its own text at boot (alternatives, return
+    thunks); a breakpoint armed before that trips the patcher, so the banner
+    alone is not enough — qmu arms once the end of kernel init is on the
+    console."""
+    _vm(tmp_path, monkeypatch, bridge, init_after=0.4)
+    armed = _report(_entry("armed", trap_resident=True))
+    pry.answers(resync=[{"result": armed}])
 
     rc, payload = _json(capsys, _RESET_ROUTES[route])
 
     assert rc == 0
     drive = payload["debugger"]
     assert drive["action"] == "resynced"
-    assert drive["attempts"] == 2, "an unreadable site is retried until it maps"
     assert drive["resync"] == armed
+    assert pry.init_seen_at_resync() == [True], "armed once, after kernel init"
     assert "warnings" not in payload
     assert bridge.poll() is None
 
 
-def test_a_reset_whose_sites_never_map_keeps_the_bridge_and_says_so(
+def test_a_reset_whose_kernel_never_shows_init_is_not_resynced_and_says_so(
     tmp_path, monkeypatch, capsys, bridge, pry
 ):
-    _vm(tmp_path, monkeypatch, bridge)
-    monkeypatch.setattr(debug, "RESET_KERNEL_WAIT_SECONDS", 0.2)
-    pry.answers(resync=[{"result": _report(_entry("unreadable"))}])
+    """A `quiet` boot never prints the end of init: qmu cannot prove the
+    boot-time patching is over, so it arms nothing and keeps the bridge."""
+    _vm(tmp_path, monkeypatch, bridge, init_after=None)
+    monkeypatch.setattr(debug, "RESET_KERNEL_WAIT_SECONDS", 0.3)
 
     rc, payload = _json(capsys, ["qmp", "system_reset"])
 
     assert rc == 0
-    assert payload["debugger"]["action"] == "resynced"
-    (warning,) = payload["warnings"]
-    assert "#1.1 unreadable" in warning
+    assert payload["debugger"]["action"] == "not_resynced"
+    assert pry.ran("resync") == []
     assert bridge.poll() is None
+    assert len(payload["warnings"]) == 2, "why, then the manual recovery"
+
+
+@pytest.mark.parametrize("route", [["snapshot", "load", "clean"], ["qmp", "system_reset"]])
+def test_pry_missing_from_qmus_path_leaves_a_healthy_bridge_alone(
+    route, tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Nothing is wrong with the bridge when qmu cannot find `pry`: tearing
+    it down would lose its breakpoints for nothing."""
+    _vm(tmp_path, monkeypatch, bridge)
+    monkeypatch.setattr(debug.shutil, "which", lambda name: None)
+
+    rc, payload = _json(capsys, route)
+
+    assert rc == 0
+    assert payload["debugger"]["action"] == "not_resynced"
+    assert bridge.poll() is None
+    assert load_instance(VM).gdb_bridge_pid == bridge.pid
+    assert len(payload["warnings"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("cmdline", "warned"),
+    [("console=ttyS0 nokaslr", False), ("console=ttyS0", True)],
+)
+def test_boot_patched_code_under_a_breakpoint_warns_only_where_symbols_can_be_stale(
+    cmdline, warned, tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """`elf_match: false` on a nokaslr kernel is the kernel's own boot-time
+    patching (the breakpoint is where it was set); only a kernel that can
+    re-slide makes it a possible stale-symbols problem."""
+    _vm(tmp_path, monkeypatch, bridge, cmdline=cmdline)
+    patched = _entry("armed", trap_resident=True, elf_match=False,
+                     guest_bytes="c3", elf_bytes="e9")
+    pry.answers(resync=[{"result": _report(patched)}])
+
+    rc, payload = _json(capsys, ["snapshot", "load", "clean"])
+
+    assert rc == 0
+    assert payload["debugger"]["action"] == "resynced"
+    assert ("warnings" in payload) is warned
 
 
 def test_a_kaslr_reset_tears_the_bridge_down_without_resyncing_it(

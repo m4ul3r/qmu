@@ -274,29 +274,37 @@ never driven: it gets the warnings above. The routes are `snapshot load`,
 
 | Event | qmu's action |
 |---|---|
-| load succeeded | `pry resync` at once (the restored image is mapped). If it fails, the bridge is torn down. |
+| load succeeded | `pry resync` at once (the restored image is mapped). If it fails, the bridge is torn down; if qmu cannot find `pry` on its own PATH, the bridge is left alone (`not_resynced`) with the manual recovery. |
 | load failed mid-restore (`restore_state: "partial"`/`"unknown"`) | Nothing, to any client: `pry continue`, a re-sync of a target pry believes running, or a detach can each resume the half-restored machine. The warning says so; load a known-good snapshot first (that re-syncs), or `qmu kill`. |
-| reset, `nokaslr` on the recorded cmdline, QEMU `running` after it | qmu waits for the new boot's banner on the console, runs `pry resync`, and repeats it (1 s apart) while a location is still `unreadable`, up to 30 s. Measured on KVM: armed after ≈4 s on the second attempt, and the canary fired in the new boot. A boot-time hit of the canary (e.g. `__x64_sys_newuname`, which systemd calls) stops the guest in the debugger like any hit. |
+| reset, `nokaslr` on the recorded cmdline, QEMU `running` after it | qmu waits until the new boot's console shows the **end of kernel init** (`Freeing unused kernel image (initmem) memory` / `Write protecting the kernel read-only data` / `Run /sbin/init as init process`), then runs `pry resync` once. The banner alone is too early: the new kernel still patches its own text (alternatives, return thunks, static keys), and a breakpoint armed on a patched site trips the patcher (`missing return thunk` WARNING from `apply_returns`, which then reads as a guest crash). Measured on KVM: init done and armed ≈2 s after the reset, the canary fired in the new boot. If the end of init never shows within 30 s (a `quiet` cmdline hides those lines, a slow or stuck boot) or `pry` is not on qmu's PATH, qmu arms nothing and leaves the bridge alone (`not_resynced`) with the manual recovery. A boot-time hit of the canary (e.g. `__x64_sys_newuname`, which systemd calls) stops the guest in the debugger like any hit. |
 | reset, KASLR (no `nokaslr`) | **Torn down, not re-synced.** The new base is readable only from the rebooted guest (`/proc/kallsyms` over SSH): a reset command cannot know it without blocking for the whole boot, and a re-sync against the previous boot's base would re-arm every breakpoint at the old addresses, inside unrelated code of the re-slid kernel or nowhere. Rebasing is yours (`qmu kbase`, then reattach as the warning says). |
-| reset of a guest the debugger had halted (QEMU not `running` after it) | **Torn down.** The vCPU sits at the reset vector (`prelaunch`), where no kernel address is readable: `pry resync` reports every breakpoint `unreadable` and `pry continue` fails (`Command aborted`, measured). The teardown's detach lets QEMU run the guest, so it boots normally. |
+| reset of a guest the debugger had halted (QEMU not `running` after it) | **Torn down.** The vCPU sits at the reset vector (`prelaunch`), where no kernel address is readable: `pry resync` reports every breakpoint `unreadable` and `pry continue` fails (`Command aborted`, measured). A clean detach lets QEMU run the guest, so it boots (measured 7 of 8 times); once it stayed halted until `qmu cont`, and the warning says to `qmu cont` it first when `qmu status` shows it `paused`. |
 
 JSON (`--format json`): `debugger` carries `action` (`resynced` /
-`torn_down`), `event`, `bridge_pid`, `bridge_instance_id`, and
+`torn_down` / `not_resynced`), `event`, `bridge_pid`, `bridge_instance_id`, and
 
 - `resynced`: `resync` — `pry resync --format json` exactly as pry returns it
   (`state`, `run_state`, `breakpoints[]` with per-location `status`/`detail`,
-  `summary.{armed,not_armed,elf_mismatch,…}`); a reset adds `attempts` and
-  `waited_seconds`. Locations not armed, or armed over code that differs from
-  the symbol file (`elf_match: false`, e.g. a snapshot from another KASLR
-  boot), also produce one `warnings[]` entry naming them and the `qmu kbase` +
-  `pry resync --base` recovery; otherwise there is no warning. Text mode
-  prints the receipt (`Re-synced the pry bridge qmu-<vm> …: N armed, M not
-  armed; target S.` plus one line per location) on stderr, never on stdout.
-  `state: "stopped"` (a load into a debug stop) means resume with `pry
-  --instance qmu-<vm> continue --background`; qmu does not resume it.
+  `summary.{armed,not_armed,elf_mismatch,…}`); a reset adds
+  `waited_seconds`. Locations not armed produce one `warnings[]` entry naming
+  them. Armed locations over code that differs from the symbol file
+  (`elf_match: false`) are, on a `nokaslr` kernel, its own boot-time patching
+  (the breakpoint is where you set it): a text note only. On a KASLR kernel
+  they may also be stale symbols (a snapshot from another boot), so they get
+  a warning naming both causes and the `qmu kbase` + `pry resync --base`
+  recovery. Text mode prints the receipt (`Re-synced the pry bridge
+  qmu-<vm> …: N armed, M not armed; target S.` plus one line per location) on
+  stderr, never on stdout. `state: "stopped"` (a load into a debug stop)
+  means resume with `pry --instance qmu-<vm> continue --background`; qmu does
+  not resume it.
 - `torn_down`: `reason`, `bridge_reaped`, and `breakpoints_dropped` (`pry break
   list --format json` as read just before the teardown, `null` if the bridge
-  could not answer), plus a `warnings[]` entry with the reattach steps.
+  could not answer), plus a `warnings[]` entry with the reattach steps (ending
+  in `pry --instance qmu-<vm> continue --background`: the first pry command
+  after `qmu cont` halts the guest again, and GDB arms breakpoints only when
+  it resumes).
+- `not_resynced`: `reason`; the bridge is untouched, and `warnings[]` carries
+  why plus the same recovery a client qmu does not drive gets.
 
 The operation's own result and exit code are unchanged either way: a load or
 reset that succeeded is `ok: true`, exit 0, whatever happened to the bridge.
