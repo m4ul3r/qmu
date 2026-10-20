@@ -69,7 +69,7 @@ MANAGED_VALUES: dict[str, Any] = {"format": "json", "out": None}
 # paid for on every session (see `schema_cost`). A sentence ends at a `.`/`;`
 # followed by whitespace (or the end), outside parentheses, and not closing
 # an abbreviation (#131: splitting on every `.` cut "e.g." examples off).
-_ABBREVIATIONS = frozenset({"e.g", "i.e", "cf", "etc", "vs", "approx"})
+_ABBREVIATIONS = frozenset({"e.g", "i.e", "cf", "vs", "approx"})
 
 ProgressFn = Callable[[float, int, str], None]
 

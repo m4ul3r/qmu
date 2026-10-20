@@ -32,7 +32,7 @@ below):
 | command finished (any guest code) | 0 / 1 | `stdout`, `stderr`, `kernel_warning_detected`, `kernel_warning` (the kernel report the command produced — a *survived* KASAN/WARNING/Oops — or `null`), `hint` only when non-zero |
 | `--timeout` expired, guest still answers | 124 | `timed_out: true`, `timeout`, `command`, partial `stdout`/`stderr`, `hint` |
 | transport lost / terminal panic | 3 (fresh report) / 4 | `command`, `crash` (report or `null`), `hint`, partial `stdout`/`stderr` |
-| vCPU halted mid-command | 1 | `command`, `guest_state`, `qemu_status`, `hint` |
+| vCPU halted mid-command | 1 | `command`, `guest_state`, `qemu_status`, `hint`, partial `stdout`/`stderr` |
 
 A report the guest **survived** is attributed to the command only through
 `kernel_warning_detected`/`kernel_warning`: on that path `crash_detected` is
