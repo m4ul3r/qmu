@@ -220,22 +220,57 @@ def test_kill_on_a_stopped_vm_never_signals_a_recycled_bridge_pid(
 # --- the reset warning names the KASLR re-slide (debug audit F9, #183) ------
 
 
-def test_reset_recovery_rebases_while_running_then_reloads_at_a_stop(tmp_path):
-    """Run as written against live pry (#183): `kbase` needs the guest
-    running, `pry load` on a running target leaves the breakpoints
-    <PENDING>, so the order is kbase → interrupt → load → continue."""
+def test_kaslr_reset_recovery_rebases_then_resyncs_with_or_without_ssh(tmp_path):
+    """Run as written against live pry (#193, #203): `pry kbase` finds the
+    re-slid base with no SSH and rebases the loaded vmlinux, `pry resync`
+    re-arms; or `qmu kbase` over SSH feeds `resync --base`. Both stop a
+    running target themselves, so no separate interrupt."""
     w = debug.reset_dropped_breakpoints_warning(_inst(tmp_path, vm_id="vm"))
-    steps = ("qmu kbase --vm vm", "interrupt`", "load <vmlinux> --base $KBASE", "continue --background")
+    steps = (
+        "pry --instance <id> kbase`", "pry --instance <id> resync`",
+        "qmu kbase --vm vm", "pry --instance <id> resync --base $KBASE`",
+    )
     positions = [w.index(step) for step in steps]
     assert positions == sorted(positions)
+    assert "interrupt`" not in w and "<PENDING>" not in w
+
+
+def test_kaslr_reset_of_a_halted_guest_resumes_after_the_rebase(tmp_path):
+    """After `qmu cont` the debugger still believes the guest stopped, so
+    `pry kbase`/`pry resync` halt it again: the recovery ends resuming it."""
+    w = debug.reset_dropped_breakpoints_warning(
+        _inst(tmp_path, vm_id="vm"), qemu_status="prelaunch"
+    )
+    assert w.index("qmu cont --vm vm") < w.index("kbase`") < w.index("continue --background")
 
 
 def test_reset_recovery_skips_the_rebase_on_a_nokaslr_guest(tmp_path):
     """Addresses did not move: interrupt + continue re-inserts in place."""
     inst = _inst(tmp_path, vm_id="vm", cmdline="console=ttyS0 nokaslr")
     w = debug.reset_dropped_breakpoints_warning(inst, guest_initiated=True)
-    assert "qmu kbase" not in w and "--base" not in w
+    assert "kbase" not in w and "--base" not in w
     assert w.index("interrupt`") < w.index("continue --background")
+
+
+# --- the load warning: an image from another boot (#200) ---------------------
+
+
+@pytest.mark.parametrize("kvm", [True, False])
+def test_kaslr_load_recovery_rebases_instead_of_assuming_nothing_moved(tmp_path, kvm):
+    """Live (#200): an image saved before a reset or reboot restores the
+    kernel at that boot's base, so re-arming in place left the canary dead;
+    `pry kbase` + `pry resync` made it fire. Under TCG too."""
+    w = debug.loadvm_stale_session_warning(_inst(tmp_path, vm_id="vm", kvm=kvm))
+    assert "did not move" not in w and "no re-arm" not in w
+    assert w.index("pry --instance <id> kbase`") < w.index("pry --instance <id> resync`")
+    assert "pry --instance <id> resync --base $KBASE`" in w
+
+
+@pytest.mark.parametrize("kvm", [True, False])
+def test_nokaslr_load_recovery_keeps_the_addresses(tmp_path, kvm):
+    inst = _inst(tmp_path, vm_id="vm", kvm=kvm, cmdline="console=ttyS0 nokaslr")
+    w = debug.loadvm_stale_session_warning(inst)
+    assert "kbase" not in w and "--base" not in w
 
 
 @pytest.fixture
@@ -276,7 +311,7 @@ def test_recoveries_name_qmu_bridge_only_while_it_holds_the_stub(
         debug.loadvm_stale_session_warning,
         lambda inst: debug.savevm_breakpoint_warning(inst, "running"),
     ):
-        assert "pry --instance qmu-bridge-vm interrupt" in build(ours)
+        assert "`pry --instance qmu-bridge-vm " in build(ours)
         for foreign in (no_bridge, disconnected):
             assert "qmu-bridge-vm" not in build(foreign)
             assert "pry doctor" in build(foreign)

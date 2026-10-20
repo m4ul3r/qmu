@@ -162,10 +162,13 @@ with it in the table.
 
 `snapshot save` taken while a debugger has the guest running bakes its
 breakpoints' `int3` bytes into the image (under KVM); a save at a debugger
-stop is clean. On a `--gdb` VM the save's envelope says which as
-`breakpoints_in_image` (`possible` with a warning / `lifted` with a note /
-`never` under TCG). `snapshot load` leaves an attached debugger with a stale
-view: qmu re-syncs the bridge `qmu gdb` spawned (`pry resync`, reported as
-`debugger` in the envelope) and warns about any other client. See the
-coherence table in `skill://qmu/reference/debugging.md` before mixing
-snapshots and pry.
+stop is clean, and with the bridge `qmu gdb` spawned attached qmu stops it
+for the save and resumes it after (`breakpoints_lifted: true`). On a `--gdb`
+VM the save's envelope says what the image holds as `breakpoints_in_image`
+(`possible` with a warning / `lifted` with a note / `never` under TCG).
+`snapshot load` leaves an attached debugger with a stale view, and on a KASLR
+guest an image from an earlier boot restores that boot's kernel base: qmu
+rebases (`pry kbase`) and re-syncs (`pry resync`) the bridge `qmu gdb`
+spawned, reported as `debugger` in the envelope, and warns about any other
+client. See the coherence table in `skill://qmu/reference/debugging.md`
+before mixing snapshots and pry.

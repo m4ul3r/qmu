@@ -1,11 +1,14 @@
-"""Driving the pry bridge qmu owns after a rewind or reset (#187).
+"""Driving the pry bridge qmu owns after a rewind or reset (#187, #200) and
+around a save (#201).
 
 After a `snapshot load` (or a raw `loadvm`) or a qmu-issued `system_reset`,
-the bridge `qmu gdb` spawned is re-synced with `pry resync` or torn down with
-the reason and the breakpoints it lost; a client qmu did not spawn is only
-warned about. The bridge here is a throwaway `sleep` (so `bridge_alive` runs
-for real) and `pry` is a fake on PATH that answers from a scripted queue and
-logs its argv; the `pry resync` report shape is the one pry ships (pry #61).
+the bridge `qmu gdb` spawned is re-synced with `pry resync` (on a KASLR guest
+after `pry kbase` rebased it) or torn down with the reason and the
+breakpoints it lost; a client qmu did not spawn is only warned about. A save
+of a running KVM guest stops that bridge across the savevm. The bridge here
+is a throwaway `sleep` (so `bridge_alive` runs for real) and `pry` is a fake
+on PATH that answers from a scripted queue and logs its argv; the `pry
+resync`/`pry kbase` report shapes are the ones pry ships (pry #61, #66).
 """
 
 from __future__ import annotations
@@ -59,13 +62,21 @@ BREAK_LIST = [{
     "kind": "breakpoint", "hits": 2, "address": "0xffffffff810881d0",
 }]
 
+KBASE = {
+    "base": "0xffffffff92000000", "slide": "0x11000000", "method": "idt",
+    "apply": {"path": "/vmlinux", "applied": True, "previous_slide": "0x4e00000"},
+}
+
 _FAKE_PRY = r'''
 import json, os, signal, sys
 spec = os.environ["FAKE_PRY_DIR"]
 argv = sys.argv[1:]
+if argv[:1] == ["--instance"]:
+    # `pry --instance ID status` → log it as `status --instance ID`.
+    argv = argv[2:3] + argv[:2] + argv[3:]
 with open(os.path.join(spec, "calls.jsonl"), "a") as log:
     log.write(json.dumps(argv) + "\n")
-if argv[0] == "resync" and os.environ.get("FAKE_PRY_SERIAL"):
+if argv[0] in ("resync", "kbase") and os.environ.get("FAKE_PRY_SERIAL"):
     # Was the new boot's end of kernel init on the console when qmu armed?
     with open(os.environ["FAKE_PRY_SERIAL"]) as serial:
         seen = "as init process" in serial.read()
@@ -76,6 +87,12 @@ if cmd == "kill":
     os.kill(int(argv[2]), signal.SIGTERM)
     print(json.dumps({"killed": True}))
     sys.exit(0)
+# The debugger's stop: `interrupt` takes one (QEMU then reports `paused`),
+# `continue` ends it, `status` reads it.
+stopped = os.path.join(spec, "stopped")
+if cmd == "status":
+    print(json.dumps({"state": "stopped" if os.path.exists(stopped) else "running"}))
+    sys.exit(0)
 path = os.path.join(spec, cmd + ".json")
 queue = json.load(open(path))
 answer = queue.pop(0) if len(queue) > 1 else queue[0]
@@ -83,6 +100,10 @@ json.dump(queue, open(path, "w"))
 if answer.get("rc", 0):
     print(json.dumps({"ok": False, "error": answer["error"]}), file=sys.stderr)
     sys.exit(answer["rc"])
+if cmd == "interrupt" and answer["result"].get("stopped"):
+    open(stopped, "w").close()
+elif cmd == "continue" and os.path.exists(stopped):
+    os.remove(stopped)
 print(json.dumps(answer["result"]))
 '''
 
@@ -108,11 +129,18 @@ def pry(tmp_path, monkeypatch):
     monkeypatch.setattr(debug.shutil, "which", lambda name: str(exe))
 
     class Pry:
-        def answers(self, *, resync=None, break_=None):
-            if resync is not None:
-                (spec / "resync.json").write_text(json.dumps(resync))
-            if break_ is not None:
-                (spec / "break.json").write_text(json.dumps(break_))
+        def answers(self, *, resync=None, break_=None, kbase=None, interrupt=None,
+                    continue_=None):
+            for cmd, queue in (
+                ("resync", resync), ("break", break_), ("kbase", kbase),
+                ("interrupt", interrupt), ("continue", continue_),
+            ):
+                if queue is not None:
+                    (spec / f"{cmd}.json").write_text(json.dumps(queue))
+
+        def stopped(self):
+            """Whether the fake bridge is at a debugger stop now."""
+            return (spec / "stopped").exists()
 
         def calls(self):
             log = spec / "calls.jsonl"
@@ -130,7 +158,15 @@ def pry(tmp_path, monkeypatch):
             return [json.loads(line) for line in log.read_text().splitlines()]
 
     fake = Pry()
-    fake.answers(break_=[{"result": BREAK_LIST}])
+    fake.answers(
+        break_=[{"result": BREAK_LIST}],
+        kbase=[{"result": KBASE}],
+        interrupt=[{"result": {
+            "interrupted": True, "stopped": True, "state": "stopped",
+            "reason": {"kind": "signal", "signal": "SIGINT"},
+        }}],
+        continue_=[{"result": {"state": "running"}}],
+    )
     return fake
 
 
@@ -140,12 +176,25 @@ INIT_DONE = "[    1.353989] Run /sbin/init as init process\n"
 class _QMP:
     """QEMU double: a reset appends the new boot's banner to the console at
     once and, `init_after` seconds later, the end of kernel init (`None`: a
-    `quiet` boot that never prints it)."""
+    `quiet` boot that never prints it). A running guest reads `paused` while
+    the fake bridge is at a debugger stop; `saves` records the run state
+    each savevm ran in."""
+
+    saves: list[str] = []
 
     def __init__(self, inst, *, running=True, init_after=0.3):
         self.inst = inst
         self.running = running
         self.init_after = init_after
+
+    def _status(self):
+        if not self.running:
+            return "prelaunch"
+        stopped = os.path.join(os.environ.get("FAKE_PRY_DIR", "/nonexistent"), "stopped")
+        return "paused" if os.path.exists(stopped) else "running"
+
+    def savevm(self):
+        _QMP.saves.append(self._status())
 
     def _reset(self):
         with open(self.inst.serial_log, "a") as log:
@@ -163,7 +212,8 @@ class _QMP:
 
     def execute(self, command, arguments=None, timeout=30.0):
         if command == "query-status":
-            return {"running": self.running, "status": "running" if self.running else "prelaunch"}
+            status = self._status()
+            return {"running": status == "running", "status": status}
         if command == "system_reset":
             self._reset()
             return {}
@@ -172,8 +222,11 @@ class _QMP:
         return {}
 
     def execute_hmp(self, command_line, timeout=30.0):
-        if command_line.split()[0] == "system_reset":
+        verb = command_line.split()[0]
+        if verb == "system_reset":
             self._reset()
+        elif verb == "savevm":
+            self.savevm()
         return ""
 
     def __enter__(self):
@@ -185,7 +238,7 @@ class _QMP:
 
 def _vm(
     tmp_path, monkeypatch, bridge, *, cmdline="console=ttyS0 nokaslr",
-    running=True, init_after=0.3,
+    running=True, init_after=0.3, kvm=True,
 ):
     serial = tmp_path / f"{VM}.serial.log"
     serial.write_text(BANNER + "login: \n")
@@ -195,7 +248,7 @@ def _vm(
         qmp_socket=str(tmp_path / "q.sock"), ssh_port=None, ssh_key=None,
         gdb_port=1234, serial_log=str(serial), kernel="/k", rootfs=None,
         memory="1G", cpus=1, cmdline=cmdline, profile="exploit-dev",
-        started_at="2026-01-01T00:00:00+00:00", arch="x86_64", kvm=True,
+        started_at="2026-01-01T00:00:00+00:00", arch="x86_64", kvm=kvm,
         gdb_bridge_pid=bridge.pid if bridge else None,
         gdb_bridge_pid_start=proc_pid_start(bridge.pid) if bridge else None,
     )
@@ -210,6 +263,13 @@ def _vm(
         qmp_cmds, "load_snapshot",
         lambda qmp, name: SnapshotResult(True, f"Snapshot '{name}' loaded."),
     )
+    monkeypatch.setattr(_QMP, "saves", [])
+
+    def save_snapshot(qmp, name, timeout=None):
+        qmp.savevm()
+        return SnapshotResult(True, f"Snapshot '{name}' saved.")
+
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", save_snapshot)
     monkeypatch.setattr(debug, "RESET_KERNEL_WAIT_SECONDS", 5.0)
     # The sleeper owns no socket: model "the recorded bridge holds the stub"
     # as "it is alive" (the hand-started tests record no bridge at all).
@@ -229,6 +289,13 @@ _RESET_ROUTES = {
     "monitor system_reset": ["monitor", "system_reset"],
     "qmp hmp system_reset": [
         "qmp", "human-monitor-command", "--args", '{"command-line": "system_reset"}',
+    ],
+}
+_SAVE_ROUTES = {
+    "snapshot save": ["snapshot", "save", "clean"],
+    "monitor savevm": ["monitor", "savevm", "clean"],
+    "qmp hmp savevm": [
+        "qmp", "human-monitor-command", "--args", '{"command-line": "savevm clean"}',
     ],
 }
 
@@ -430,16 +497,13 @@ def test_pry_missing_from_qmus_path_leaves_a_healthy_bridge_alone(
     assert len(payload["warnings"]) == 2
 
 
-@pytest.mark.parametrize(
-    ("cmdline", "warned"),
-    [("console=ttyS0 nokaslr", False), ("console=ttyS0", True)],
-)
-def test_boot_patched_code_under_a_breakpoint_warns_only_where_symbols_can_be_stale(
-    cmdline, warned, tmp_path, monkeypatch, capsys, bridge, pry
+@pytest.mark.parametrize("cmdline", ["console=ttyS0 nokaslr", "console=ttyS0"])
+def test_boot_patched_code_under_a_breakpoint_is_no_warning_once_the_base_is_known(
+    cmdline, tmp_path, monkeypatch, capsys, bridge, pry
 ):
-    """`elf_match: false` on a nokaslr kernel is the kernel's own boot-time
-    patching (the breakpoint is where it was set); only a kernel that can
-    re-slide makes it a possible stale-symbols problem."""
+    """`elf_match: false` where the symbols sit at the kernel's base — a
+    nokaslr kernel, or the base `pry kbase` validated on a KASLR one — is the
+    kernel's own boot-time patching: the breakpoint is where it was set."""
     _vm(tmp_path, monkeypatch, bridge, cmdline=cmdline)
     patched = _entry("armed", trap_resident=True, elf_match=False,
                      guest_bytes="c3", elf_bytes="e9")
@@ -449,24 +513,180 @@ def test_boot_patched_code_under_a_breakpoint_warns_only_where_symbols_can_be_st
 
     assert rc == 0
     assert payload["debugger"]["action"] == "resynced"
-    assert ("warnings" in payload) is warned
+    assert "warnings" not in payload
 
 
-def test_a_kaslr_reset_tears_the_bridge_down_without_resyncing_it(
+@pytest.mark.parametrize("route", sorted(_LOAD_ROUTES))
+def test_a_kaslr_load_rebases_the_bridge_before_it_resyncs(
+    route, tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Live (#200): an image saved before a reset or reboot restores the
+    kernel at that boot's base; a re-sync at the bridge's base armed the
+    breakpoint where nothing ran. `pry kbase` first rebases to the restored
+    kernel."""
+    _vm(tmp_path, monkeypatch, bridge, cmdline="console=ttyS0")
+    report = _report(_entry("armed", trap_resident=True, elf_match=True))
+    pry.answers(resync=[{"result": report}])
+
+    rc, payload = _json(capsys, _LOAD_ROUTES[route])
+
+    assert rc == 0
+    assert [c[0] for c in pry.calls()] == ["kbase", "resync"]
+    drive = payload["debugger"]
+    assert drive["action"] == "resynced"
+    assert drive["kbase"] == KBASE and drive["resync"] == report
+    assert bridge.poll() is None
+
+
+@pytest.mark.parametrize("route", [["snapshot", "load", "clean"], ["qmp", "system_reset"]])
+def test_a_kaslr_base_pry_cannot_validate_leaves_the_bridge_unarmed_and_alone(
+    route, tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Without a validated base, re-arming at the bridge's base could plant
+    int3s inside unrelated code; the bridge itself is fine, so it stays."""
+    _vm(tmp_path, monkeypatch, bridge, cmdline="console=ttyS0")
+    pry.answers(kbase=[{"rc": 1, "error": "could not determine the kernel base"}])
+
+    rc, payload = _json(capsys, route)
+
+    assert rc == 0
+    drive = payload["debugger"]
+    assert drive["action"] == "not_resynced"
+    assert "could not determine the kernel base" in drive["reason"]
+    assert pry.ran("resync") == []
+    assert bridge.poll() is None
+    assert len(payload["warnings"]) == 2, "why, then the manual recovery"
+
+
+def test_a_kaslr_reset_rebases_and_resyncs_after_kernel_init(
     tmp_path, monkeypatch, capsys, bridge, pry
 ):
-    """Re-syncing against the previous boot's base would arm breakpoints at
-    addresses the re-slid kernel uses for other code."""
+    """`pry kbase` reads the re-slid base with no SSH (pry #66), so the
+    bridge is kept: rebased and re-armed once the new kernel finished
+    patching its own text."""
     _vm(tmp_path, monkeypatch, bridge, cmdline="console=ttyS0 root=/dev/sda")
+    report = _report(_entry("armed", trap_resident=True, elf_match=True))
+    pry.answers(resync=[{"result": report}])
 
     rc, payload = _json(capsys, ["qmp", "system_reset"])
 
     assert rc == 0
+    assert [c[0] for c in pry.calls()] == ["kbase", "resync"]
+    assert pry.init_seen_at_resync() == [True, True]
     drive = payload["debugger"]
-    assert drive["action"] == "torn_down"
-    assert drive["breakpoints_dropped"] == BREAK_LIST
-    assert pry.ran("resync") == []
-    assert bridge.wait(timeout=5) is not None
+    assert drive["action"] == "resynced"
+    assert drive["kbase"] == KBASE
+    assert bridge.poll() is None
+
+
+@pytest.mark.parametrize("route", sorted(_SAVE_ROUTES))
+def test_a_save_of_a_running_guest_stops_the_owned_bridge_across_it(
+    route, tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Live (#201): with qmu's bridge running the guest under KVM, a save
+    baked its int3s into the image. qmu stops the bridge (GDB lifts them),
+    saves at that stop and resumes it."""
+    _vm(tmp_path, monkeypatch, bridge)
+
+    rc, payload = _json(capsys, _SAVE_ROUTES[route])
+
+    assert rc == 0
+    assert _QMP.saves == ["paused"], "the savevm ran at the debugger's stop"
+    assert [c[0] for c in pry.calls() if c[0] != "status"] == ["interrupt", "continue"]
+    assert not pry.stopped(), "the bridge is resumed after the save"
+    drive = payload["debugger"]
+    assert drive["action"] == "stopped_for_save"
+    assert drive["interrupted"] is True and drive["resumed"] is True
+    if route == "snapshot save":
+        assert payload["breakpoints_in_image"] == "lifted"
+        assert payload["breakpoints_lifted"] is True
+
+
+def test_a_save_that_found_the_bridge_stopped_by_itself_leaves_that_stop(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """A breakpoint hit between QEMU's `running` and qmu's interrupt is the
+    operator's stop: the save is taken there and nothing resumes it."""
+    _vm(tmp_path, monkeypatch, bridge)
+    pry.answers(interrupt=[{"result": {
+        "interrupted": False, "stopped": True, "state": "stopped",
+        "reason": {"kind": "breakpoint-hit", "number": 1},
+    }}])
+
+    rc, payload = _json(capsys, ["snapshot", "save", "clean"])
+
+    assert rc == 0
+    assert pry.ran("continue") == []
+    assert pry.stopped()
+    assert payload["debugger"]["resumed"] is False
+    assert payload["breakpoints_in_image"] == "lifted"
+
+
+def test_a_save_that_outran_its_budget_leaves_the_bridge_stopped_and_says_so(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """QEMU may still be writing the image: resuming would put the
+    breakpoints back into RAM being saved."""
+    _vm(tmp_path, monkeypatch, bridge)
+
+    def expired(qmp, name, timeout=None):
+        raise qmp_cmds.QMPTimeoutError("human-monitor-command", timeout)
+
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", expired)
+
+    rc, payload = _json(capsys, ["snapshot", "save", "clean"])
+
+    assert rc == 124 and payload["may_have_landed"] is True
+    assert pry.ran("continue") == []
+    assert pry.stopped()
+    assert any(f"pry --instance qmu-{VM} continue --background" in w for w in payload["warnings"])
+
+
+def test_a_failed_save_still_resumes_the_bridge(tmp_path, monkeypatch, capsys, bridge, pry):
+    _vm(tmp_path, monkeypatch, bridge)
+    monkeypatch.setattr(
+        qmp_cmds, "save_snapshot",
+        lambda qmp, name, timeout=None: SnapshotResult(
+            False, "Error: no block device can store vmstate", reason="drive"
+        ),
+    )
+
+    rc, payload = _json(capsys, ["snapshot", "save", "clean"])
+
+    assert rc == 1
+    assert not pry.stopped()
+    assert payload["debugger"]["resumed"] is True
+
+
+def test_a_bridge_that_cannot_be_stopped_saves_running_and_warns(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    _vm(tmp_path, monkeypatch, bridge)
+    pry.answers(interrupt=[{"rc": 1, "error": "bridge not responding"}])
+
+    rc, payload = _json(capsys, ["snapshot", "save", "clean"])
+
+    assert rc == 0
+    assert _QMP.saves == ["running"]
+    assert payload["breakpoints_in_image"] == "possible"
+    assert "breakpoints_lifted" not in payload
+    assert any("bridge not responding" in w for w in payload["warnings"])
+
+
+@pytest.mark.parametrize(
+    ("kvm", "owned"), [(False, True), (True, False)], ids=["tcg", "foreign-client"],
+)
+def test_a_save_drives_no_bridge_under_tcg_or_for_another_client(
+    kvm, owned, tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """TCG breakpoints never reach guest RAM; another client is never driven."""
+    _vm(tmp_path, monkeypatch, bridge if owned else None, kvm=kvm)
+
+    rc, payload = _json(capsys, ["snapshot", "save", "clean"])
+
+    assert rc == 0
+    assert pry.ran("interrupt") == []
+    assert "debugger" not in payload and "breakpoints_lifted" not in payload
 
 
 def test_a_reset_of_a_halted_guest_tears_the_bridge_down(

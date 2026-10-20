@@ -305,26 +305,26 @@ trap: `reference/snapshots.md`.
 ```bash
 qmu launch --kernel "$KERNEL" --gdb --name dbg --no-replace
 qmu gdb --vm dbg --symbols "$VMLINUX"           # spawns a pry bridge (bridge_pid); vCPU HALTED
-qmu cont --vm dbg                               # resume so SSH works
-eval "$(qmu kbase --vm dbg --symbols "$VMLINUX")"   # KBASE, LINK_BASE, SLIDE
-pry load "$VMLINUX" --base "$KBASE"             # first pry touch after qmu cont halts again
-pry break set __x64_sys_newuname
-pry continue --background                       # REQUIRED before any qmu exec
+pry --instance qmu-dbg kbase                    # validated KASLR base, no SSH; rebases the loaded vmlinux
+pry --instance qmu-dbg break set __x64_sys_newuname
+pry --instance qmu-dbg continue --background    # REQUIRED before any qmu exec
 qmu exec --vm dbg "uname -r"
-pry wait --timeout 10
-pry backtrace
+pry --instance qmu-dbg wait --timeout 10
+pry --instance qmu-dbg backtrace
 ```
 
 Attaching halts the vCPU; SSH commands against a halted guest refuse (exit 1,
 `guest_state: "paused"`), and one stopped mid-command aborts within ~1 s with
-the same envelope. `qmu kbase` needs only SSH and `/proc/kallsyms` — no
-`--gdb`, no bridge. While a gdb client is attached, `status`/`list` skip their
+the same envelope. The SSH route to the base: `qmu cont`, `eval "$(qmu kbase
+--vm dbg --symbols "$VMLINUX")"` (only SSH and `/proc/kallsyms` — no `--gdb`,
+no bridge), `pry load "$VMLINUX" --base "$KBASE"` (the first pry touch after
+`qmu cont` halts again). While a gdb client is attached, `status`/`list` skip their
 SSH probe (`ssh: "skipped (debugger attached)"`): that probe runs `uname`,
 which would trip `__x64_sys_newuname`. Address your bridge with `pry --instance
 qmu-<vm>` (`bridge_instance_id`; `bridge_pid` also works) on a shared host.
-`snapshot load`/`system_reset` re-sync the `qmu gdb` bridge (`pry resync`, JSON `debugger`) or tear
-it down saying why; other clients, `snapshot save` (`breakpoints_in_image`), a guest reboot, `kill`
-warn — coherence, KASLR, KVM watchpoints: `reference/debugging.md`. ARM: `reference/cross-arch.md`.
+`snapshot load`/`system_reset` rebase (`pry kbase`, KASLR) and re-sync (`pry resync`) the `qmu gdb` bridge
+(JSON `debugger`) or tear it down saying why; `snapshot save` stops it across the save; other clients,
+a guest reboot, `kill` warn: `reference/debugging.md`. ARM: `reference/cross-arch.md`.
 
 ## Raw QEMU access
 
