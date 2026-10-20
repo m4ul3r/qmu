@@ -1466,8 +1466,10 @@ def _handle_kill(args: argparse.Namespace) -> Result:
             f"[qmu] Note: VM '{inst.vm_id}' had an attached debugger on GDB port "
             f"{inst.gdb_port}. That pry bridge now points at a dead stub; qmu does "
             "not manage it. If a later `pry` command reports \"Multiple bridge "
-            "instances\", this is the stale one — clean it up (`pry doctor`, then "
-            "kill it).\n"
+            "instances\", this is the stale one — clean it up: `pry doctor` lists "
+            "it as `status=ok` like any other, so ask each with `pry --instance "
+            "<id> status` (the stale one says `exited (code 0)`; QEMU sends that "
+            "on an orderly quit), then `pry kill --instance <id>`.\n"
         )
     return res
 
@@ -2211,7 +2213,7 @@ def _handle_wait(args: argparse.Namespace) -> Result:
             return _wait_already_stopped(args, info["instance"])
         if info["state"] == VM_ORPHANED:
             _require_running(args.vm, "wait")
-    inst = choose_instance(args.vm)
+    inst = debug_mod.check_unwarned_reboot(choose_instance(args.vm))
     start = time.monotonic()
     deadline: float | None = (
         start + args.timeout if args.timeout is not None else None
@@ -2256,7 +2258,7 @@ def _wait_standalone(
     # guest burn half a core (r2-shared: 10 s user CPU); each tick now reads
     # only what QEMU appended since the last one.
     scanned = boot_offset
-    reset_warning = reset_dropped_breakpoints_warning(inst.vm_id) + "\n"
+    reset_warning = reset_dropped_breakpoints_warning(inst) + "\n"
 
     def scan_console() -> bool:
         """One incremental console scan; adopts a moved boot boundary.
@@ -2279,8 +2281,13 @@ def _wait_standalone(
             last_event = "RESET"
             event_data = {"source": source, "offset": banner}
             inst = save_guest_epoch_serial_offset(inst, banner)
+            if inst.gdb_port is not None:
+                # This wait is what tells the debugger (#184): the next
+                # command must not announce the same reboot again.
+                inst = debug_mod.mark_debugger_epoch(inst, banner, banners=1)
             # #46: a reset drops the gdbstub breakpoint set without telling the
-            # client. `wait` is the one place qmu sees a reset it did not issue.
+            # client. A reset qmu did not issue is seen here mid-wait (between
+            # commands, `debug.check_unwarned_reboot` catches it, #184).
             # Collected once for the Result (#121): `render` writes it to
             # stderr exactly once and the envelope carries it in `warnings[]`.
             if reset_warning not in warnings and debug_session_present(inst):
@@ -2426,7 +2433,7 @@ def _daemon_wait_request(
     the connection is lost: the caller finishes the wait standalone.
     """
     started = time.monotonic()
-    reset_warning = reset_dropped_breakpoints_warning(inst.vm_id) + "\n"
+    reset_warning = reset_dropped_breakpoints_warning(inst) + "\n"
 
     def on_event(event: dict[str, Any]) -> None:
         kind = event.get("kind")
@@ -2446,12 +2453,18 @@ def _daemon_wait_request(
                 time.monotonic() - started, int(event.get("boot_offset", 0)),
                 f"QMP {event.get('name')} on {inst.vm_id}",
             )
-        if (
-            kind == "qmp_event" and event.get("name") == "RESET"
-            and warnings is not None and reset_warning not in warnings
-            and debug_session_present(inst)
-        ):
-            warnings.append(reset_warning)
+        if kind == "qmp_event" and event.get("name") == "RESET":
+            # The reset's boot banner is at or past the scope the daemon
+            # reports for the event; it belongs to the generation warned
+            # about here, not to a later unannounced reboot (#184).
+            offset = event.get("boot_offset")
+            if inst.gdb_port is not None and isinstance(offset, int):
+                debug_mod.mark_debugger_epoch(inst, offset, banners=1)
+            if (
+                warnings is not None and reset_warning not in warnings
+                and debug_session_present(inst)
+            ):
+                warnings.append(reset_warning)
 
     conn = daemon_client.connect()
     if conn is None:
@@ -2744,9 +2757,11 @@ def _wait_for_pattern(args: argparse.Namespace) -> Result:
         info = classify_vm(args.vm, orphan_pids=_orphan_serial_logs())
         if info["state"] in (VM_RUNNING, VM_STOPPED, VM_HELD_BACK):
             inst = info["instance"]
+            if info["state"] == VM_RUNNING:
+                inst = debug_mod.check_unwarned_reboot(inst)
     if inst is None:
         _require_running(args.vm, "wait")
-        inst = choose_instance(args.vm)
+        inst = debug_mod.check_unwarned_reboot(choose_instance(args.vm))
 
     try:
         matcher = re.compile(args.pattern)
@@ -3446,7 +3461,7 @@ def _handle_status(args: argparse.Namespace) -> Result:
         info = _classify(args.vm)
         if info["state"] in (VM_STOPPED, VM_HELD_BACK, VM_ORPHANED):
             return _status_non_running(args, info)
-    inst = choose_instance(args.vm)
+    inst = debug_mod.check_unwarned_reboot(choose_instance(args.vm))
 
     # One QMP round trip, shared with the guest axis: `status` used to connect
     # twice, so a socket held by a `wait` cost it 2 × 10 s and it still said

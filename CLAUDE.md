@@ -79,7 +79,8 @@ install`, `rootfs shell`. A call becomes argv (options, then `--`, then
 positionals in order — one string is one token, the `exec`/`run` rule) and
 runs `cli.main(["--format", "json", *argv])` with `sys.stdout` captured
 per worker thread (`_ThreadStdout`); the captured JSON, parsed back and
-given `exit_code`, is the result. That is why the envelope, the `UsageError`
+given `qmu_exit` (the qmu process exit code; `exit_code` stays the guest
+command's, #122), is the result. That is why the envelope, the `UsageError`
 shape, spill pointers and `warnings[]` are byte-identical to the CLI's:
 they *are* the CLI's. Errors are results (`isError` mirrors `ok`), never
 protocol errors. `qmu_argv` passes a raw argv through (refusing the managed
@@ -160,11 +161,13 @@ code: N]`); `warnings` are stderr text written after the output in every
 mode (debugger-coherence warnings, follow-up hints — `result.warn(...)`) AND,
 under json/ndjson, the envelope's `warnings: [str]` (#74) — prefix-stripped
 (`envelope_warning`), merged with any `warnings` the handler put in `data`
-(launch's), deduplicated. A warning that fires before the handler — the
-broken-global-config notice in the dispatch gate — is recorded by
-`config.global_config_warnings()` (never written there) and attached by
-`cli._dispatch` (`result.warn(...)`) or `_emit_error` on the failure path, so
-`invoke()` callers get it on the Result and nothing is lost to stderr-only.
+(launch's), deduplicated. A warning that fires outside the handler's Result —
+the broken-global-config notice in the dispatch gate, a guest reboot the VM's
+debugger was not told about (found while the VM is resolved, #184) — is
+recorded (`config.global_config_warnings()`, `debug.coherence_warnings()`,
+never written there) and attached by `cli._dispatch` (`result.warn(...)`) or
+`_emit_error` on the failure path, both through `_cliutil.dispatch_warnings`,
+so `invoke()` callers get it on the Result and nothing is lost to stderr-only.
 Debugger-coherence warnings on the raw `qmp`/`monitor` routes travel the same
 way (`_after_mutation(..., warnings)`); never `sys.stderr.write` a warning
 from a handler. `Result.silent_exit(n)` renders nothing (group help, `rootfs
@@ -624,7 +627,14 @@ the crash/transport and state-axis bugs above. qmu owns the lifecycle events and
 knows a VM has a stub (`gdb_port is not None`), so `debug.py` enforces the half
 of the contract the protocol doesn't: **invalidate loudly.** It does NOT drive
 pry, so it warns rather than auto re-syncing/re-arming (that is a pry-side
-capability).
+capability, #187); the one thing it asks the bridge is `pry status`, below.
+Every recovery a warning names was run as written against a live bridge
+(#183): GDB lifts its breakpoints at a stop and re-inserts them on resume, so
+`pry interrupt` → `pry continue --background` re-arms in place, and a KASLR
+re-slide needs `kbase` (guest running) → `interrupt` → `load --base` →
+`continue`. A recovery names `qmu-<vm>` only while the bridge `qmu gdb`
+recorded is alive (`_bridge_ref`; `qmu gdb`'s own refusal too, #186) — a
+hand-started client has no such name.
 
 - `debug_session_present(inst)` is the gate for divergences a *live* client
   would see: true when `gdb_port` is set AND `gdb_client_attached()` cannot
@@ -637,16 +647,35 @@ capability).
   only; `None` falls through so an unreadable `/proc` never locks the debugger
   out.
 - `snapshot save` deliberately uses the weaker `debug_stub_present(inst)`
-  (`gdb_port` alone): a debugger that already detached can have left `int3`
+  (`gdb_port` alone): a debugger that detached uncleanly can have left `int3`
   bytes behind, and the save captures them whether or not anyone is attached
-  now. A save on a `--gdb` VM therefore always warns; the skill documents this
-  as the one exception to attached-client suppression — do not "fix" it by
-  switching that call to the session gate.
+  now — do not "fix" it by switching that call to the session gate. What it
+  reports is decided by QEMU's run state at the save (#188,
+  `debug.savevm_breakpoint_state` → `breakpoints_in_image`): `never` under
+  TCG (breakpoints never touch guest RAM there; silent), `lifted` at a
+  debugger stop — QEMU `debug`, or `paused` AND the recorded bridge's `pry
+  status` says `stopped` (a `[qmu] Note:`), else `possible` (the warning,
+  recovery: save at a `pry interrupt` stop). `paused` alone proves nothing: a
+  QMP `stop` behind a running GDB leaves the int3s in RAM. `pry status` is
+  asked only while QEMU is already paused — a pry command against a target
+  GDB believes stopped halts a running VM.
+- Guest reboots nobody issued (#184): `VMInstance.debugger_epoch_offset`/
+  `_banners` record the generation the debugger was last told about (`qmu
+  gdb` attach, a reset — whose own banner is still to come, so `banners=1` —
+  a load, a `wait` that reported a RESET). `check_unwarned_reboot` runs where
+  a running VM is resolved (`_choose_running` in guest/qmp_cmds, `exec`,
+  `status`, `wait`): one more boot banner past that point is a reboot, warned
+  once through `coherence_warnings()` and the epoch moved past it — also
+  silently when no client is attached, so a later attach is not told about a
+  boot it saw. Banner-based, so it works the same with the daemon off.
 - Warnings fire on exactly the mutation events, via `Result.warn(...)` — stderr
   in every mode plus the envelope's `warnings[]` under json/ndjson (#74), so
   the stdout JSON stays one object: `snapshot save` (#45, baked-in `int3`s),
-  `snapshot load` (#44, stale vCPU/bookkeeping), `qmp`/`monitor system_reset`
-  (#46, dropped breakpoint set), and `kill` (#40, stranded pry bridge). The
+  `snapshot load` (#44, stale stop reason, breakpoints gone from RAM),
+  `qmp`/`monitor system_reset` (#46, dropped breakpoint set; with QEMU's
+  post-reset run state — a reset at a debugger stop leaves the vCPU in
+  `prelaunch`, which `pry continue` cannot start, so the warning says `qmu
+  cont` first), a guest reboot (#184), and `kill` (#40, stranded pry bridge). The
   KVM-watchpoint warning (#39) is the exception: it rides in the `qmu gdb`
   **stdout** payload next to the existing symbol warnings, keyed on the recorded
   `VMInstance.kvm`, so `gdb`'s clean-stderr contract holds.
@@ -658,9 +687,8 @@ capability).
 A warning keyed on `gdb_port` alone would be noisy on the snapshot-rewind fast
 path when no debugger is attached; the attach probe is what keeps it quiet in
 that common case while still warning whenever a client is (or might be) present.
-Guest-*initiated* reboots are invisible to a one-shot command, so those stay
-doc-only (skill: *Debugger↔VM coherence*). This is the qmu-side stopgap layer of
-umbrella #48; auto re-sync/re-arm and true pry-bridge reap need pry-side work.
+This is the qmu-side stopgap layer of umbrella #48; auto re-sync/re-arm and
+true pry-bridge reap need pry-side work.
 `exec`/`compile --run`/`dmesg` watch QMP while the SSH command runs and abort
 within ~1 s of `running:false` (a breakpoint stop), emitting the same paused
 envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.

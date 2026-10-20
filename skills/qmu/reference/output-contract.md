@@ -71,11 +71,13 @@ prints the report and its `[exit code: N]`/follow-up notes).
 
 **`warnings: [str]`** rides in every json/ndjson envelope that has
 something to warn about — launch-time lints, the debugger-coherence warnings
-(`snapshot save`/`load`, `qmp`/`monitor system_reset`, `kill` with a stranded
-pry bridge), the `ignoring global config` notice from a broken
+(`snapshot save`/`load`, `qmp`/`monitor system_reset`, a guest reboot the
+next command on a `--gdb` VM announces once, `kill` with a stranded pry
+bridge), the `ignoring global config` notice from a broken
 `~/.config/qmu/config.toml` (it fires in the config gate before the handler,
 and still lands in the envelope — on success and on an `ok: false` one
-alike). The same lines go to stderr in every mode, `[qmu] Warning:`-prefixed,
+alike; so does the guest-reboot announcement, made while the VM is
+resolved). The same lines go to stderr in every mode, `[qmu] Warning:`-prefixed,
 for a human tailing the terminal; the envelope entries are the bare
 messages, deduplicated, in the order they fired. A clean command has no
 `warnings` key (launch always has the list, `[]` when clean).

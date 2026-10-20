@@ -51,11 +51,13 @@ def qmp(monkeypatch):
     )
     # Default: no debugger attached, so the #46 warning stays out of the way.
     monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: False)
-    # A qmu-issued system_reset persists the guest epoch; _FakeInst is not a
-    # record, so pin the persistence seam to a no-op here.
+    # A qmu-issued system_reset persists the guest epoch (and, on a --gdb VM,
+    # the debugger's); _FakeInst is not a record, so pin both persistence
+    # seams to no-ops here.
     monkeypatch.setattr(
         qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst
     )
+    monkeypatch.setattr(qmp_cmds, "mark_debugger_epoch", lambda inst, off, **kw: inst)
     return fake
 
 
@@ -133,7 +135,8 @@ def test_reset_warning_follows_the_normalized_method(qmp, monkeypatch, capsys):
     envelope form of system_reset silently skipped it."""
     monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: True)
     assert cli.main(["qmp", '{"execute":"system_reset"}']) == 0
-    assert qmp.calls == [("system_reset", None)]
+    # The reset is sent as normalized; qmu then reads the run state (#183).
+    assert qmp.calls[0] == ("system_reset", None)
     err = capsys.readouterr().err
     assert "breakpoint" in err.lower()
 
@@ -392,9 +395,7 @@ def test_hmp_reset_via_human_monitor_command_warns(qmp, monkeypatch, capsys):
         '"arguments":{"command-line":"system_reset"}}',
     ]
     assert cli.main(argv) == 0
-    assert qmp.calls == [
-        ("human-monitor-command", {"command-line": "system_reset"})
-    ]
+    assert qmp.calls[0] == ("human-monitor-command", {"command-line": "system_reset"})
     assert "breakpoint" in capsys.readouterr().err.lower()
 
 

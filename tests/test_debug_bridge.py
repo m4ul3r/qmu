@@ -215,14 +215,39 @@ def test_kill_on_a_stopped_vm_never_signals_a_recycled_bridge_pid(
     assert load_instance("bridge-vm").gdb_bridge_pid == sleeper.pid
 
 
-# --- the reset warning names the KASLR re-slide (debug audit F9) -----------
+# --- the reset warning names the KASLR re-slide (debug audit F9, #183) ------
 
 
-def test_reset_warning_tells_the_agent_to_rebase_before_rearming():
-    w = debug.reset_dropped_breakpoints_warning("vm")
-    assert "hits stay 0" in w
-    assert "KASLR" in w
-    assert "qmu kbase --vm vm" in w
-    assert "pry load <vmlinux> --base $KBASE" in w
-    # Order matters: rebase, reload, THEN re-arm.
-    assert w.index("qmu kbase") < w.index("pry load") < w.index("re-set (re-arm)")
+def test_reset_recovery_rebases_while_running_then_reloads_at_a_stop(tmp_path):
+    """Run as written against live pry (#183): `kbase` needs the guest
+    running, `pry load` on a running target leaves the breakpoints
+    <PENDING>, so the order is kbase → interrupt → load → continue."""
+    w = debug.reset_dropped_breakpoints_warning(_inst(tmp_path, vm_id="vm"))
+    steps = ("qmu kbase --vm vm", "interrupt`", "load <vmlinux> --base $KBASE", "continue --background")
+    positions = [w.index(step) for step in steps]
+    assert positions == sorted(positions)
+
+
+def test_reset_recovery_skips_the_rebase_on_a_nokaslr_guest(tmp_path):
+    """Addresses did not move: interrupt + continue re-inserts in place."""
+    inst = _inst(tmp_path, vm_id="vm", cmdline="console=ttyS0 nokaslr")
+    w = debug.reset_dropped_breakpoints_warning(inst, guest_initiated=True)
+    assert "qmu kbase" not in w and "--base" not in w
+    assert w.index("interrupt`") < w.index("continue --background")
+
+
+def test_recoveries_name_qmu_bridge_only_when_qmu_spawned_it(tmp_path, sleeper):
+    """#186: `qmu-<vm>` exists only for the bridge `qmu gdb` recorded; a
+    hand-started client gets a placeholder and where to look it up."""
+    foreign = _inst(tmp_path)
+    ours = _inst(
+        tmp_path, gdb_bridge_pid=sleeper.pid, gdb_bridge_pid_start=proc_pid_start(sleeper.pid)
+    )
+    for build in (
+        debug.reset_dropped_breakpoints_warning,
+        debug.loadvm_stale_session_warning,
+        lambda inst: debug.savevm_breakpoint_warning(inst, "running"),
+    ):
+        assert "pry --instance qmu-bridge-vm interrupt" in build(ours)
+        assert "qmu-bridge-vm" not in build(foreign)
+        assert "pry doctor" in build(foreign)

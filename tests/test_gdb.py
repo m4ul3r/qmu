@@ -327,13 +327,16 @@ def test_gdb_refuses_when_a_client_is_already_attached(
 def test_gdb_refusal_without_a_known_bridge_points_at_pry_doctor(
     monkeypatch, gdb_vm, capsys
 ):
+    """#186: a hand-started client has no `qmu-<vm>` instance; offering that
+    name for reuse sent the reader to `No running GDB bridge instance`."""
     calls = _install_gdb_seams(monkeypatch, gdb_vm, attached=True)
-    rc = cli.main(["gdb", "--vm", "debug-vm"])
-    err = capsys.readouterr().err
+    rc = cli.main(["--format", "json", "gdb", "--vm", "debug-vm"])
+    payload = json.loads(capsys.readouterr().out)
     assert rc == 1
     assert calls == []
-    assert "already attached to port 1234" in err
-    assert "pry doctor" in err
+    assert "already attached to port 1234" in payload["error"]
+    assert "pry doctor" in payload["hint"]
+    assert "qmu-debug-vm" not in payload["error"] + payload["hint"]
 
 
 def test_gdb_timeout_is_an_operational_error_and_reaps_the_attempt(
