@@ -502,13 +502,15 @@ class LostSSH:
     """SSH whose dmesg read fails the way a panicked guest makes it fail."""
 
     def __init__(self, serial_path, *, rc=255, stderr="", ready=False,
-                 append="", run_error=None):
+                 append="", run_error=None, client_log=None):
         self._serial_path = serial_path
         self._rc = rc
         self._stderr = stderr
         self._ready = ready
         self._append = append
         self._run_error = run_error
+        # What the real client's `-E` log would hold for this run (#199).
+        self.last_client_log = client_log
         self.runs: list[str] = []
         self.is_ready_calls = 0
 
@@ -555,8 +557,10 @@ def test_dmesg_transport_loss_without_fresh_crash_is_exit4(
     ran: an sshd that answers by the time qmu would re-probe does not turn
     it into "dmesg exited 255" (#177).
     """
+    banner_timeout = "Connection timed out during banner exchange\r\n"
     dmesg_ssh(
-        stderr="Connection timed out during banner exchange\r\n",
+        stderr=banner_timeout,
+        client_log=banner_timeout,
         ready=sshd_up_by_probe,
     )
 

@@ -69,7 +69,7 @@ qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only 
   the expected `console=` for the arch. An sshd that answers and refuses the
   recorded `[ssh] user`/key (`Permission denied`) ends the wait after ~5 s
   with `ssh_status: "auth-failed"`, exit 4, `error_type: "SSHAuthError"`,
-  `ssh_user`, VM retained — the guest booted; relaunch with a user/key the
+  `ssh_user`, `ssh_key`, VM retained — the guest booted; relaunch with a user/key the
   image accepts (`root` for qmu rootfs; run unprivileged with `exec --user`).
 - `--harness` implies `--no-wait-ssh --no-net`, skips the rootfs/SSH-key
   requirement, allocates no SSH port (`wait.md`). A config `[drive] rootfs`

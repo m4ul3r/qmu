@@ -493,6 +493,7 @@ def test_refused_ssh_user_is_auth_failed_not_a_boot_timeout(
         assert payload["ssh_status"] == "auth-failed"
         assert payload["error_type"] == "SSHAuthError"
         assert payload["ssh_user"] == "lowpriv"
+        assert payload["ssh_key"] == inst.ssh_key
         assert payload["ssh_error"] is True
         assert "timed_out" not in payload
         assert "lowpriv" in payload["error"]

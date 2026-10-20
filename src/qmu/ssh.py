@@ -5,6 +5,7 @@ import re
 import selectors
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -58,7 +59,9 @@ class SSHAuthError(SSHError):
     match the image. Reporting it as a boot timeout or a lost transport sent
     the reader to `qmu log` (a healthy boot) or to a longer `--ssh-timeout`,
     neither of which can help. Exit 4 like every SSHError; the envelope names
-    the user and key and says `ssh_status: "auth-failed"`.
+    the user and key and says `ssh_status: "auth-failed"`. `vm_id` is set by
+    whoever knows the VM (`_cliutil._auth_refused_error`, the transfer
+    classifier) so the envelope keys the VM like every other one (#196).
     """
 
     def __init__(
@@ -69,19 +72,24 @@ class SSHAuthError(SSHError):
         key_path: str | None,
         stderr: str = "",
         hint: str | None = None,
+        vm_id: str | None = None,
     ) -> None:
         super().__init__(message, returncode=255, stderr=stderr)
         self.user = user
         self.key_path = key_path
         self.hint = hint
+        self.vm_id = vm_id
 
     def envelope_fields(self) -> dict[str, object]:
-        return {
+        fields: dict[str, object] = {
             "ssh_status": PROBE_AUTH_FAILED,
             "ssh_error": True,
             "ssh_user": self.user,
             "ssh_key": self.key_path,
         }
+        if self.vm_id is not None:
+            fields["vm_id"] = self.vm_id
+        return fields
 
 
 class GuestText(str):
@@ -175,6 +183,14 @@ _KEEPALIVE_OPTS = (
     "-o", "ServerAliveCountMax=2147483647",
 )
 
+# Key-only, never a prompt (#195). qmu authenticates with its key alone; an
+# account sshd refuses must end in ssh's `Permission denied (publickey,…)`.
+# Without BatchMode ssh fell through to password/keyboard-interactive: under
+# a terminal it sat at `user@localhost's password:` until `--timeout` (124,
+# "no longer answers SSH"), and without one it spent ~10 s on three password
+# attempts before the refusal (~2 s with BatchMode, measured).
+_BATCH_OPTS = ("-o", "BatchMode=yes")
+
 
 # Markers written by the *local* ssh/scp client (not the guest) when the
 # transport is lost or was never established — the guest's sshd is down, or
@@ -202,9 +218,9 @@ def is_transport_failure(rc: int, stderr: str) -> bool:
     return any(m in stderr for m in SSH_TRANSPORT_ERROR_MARKERS)
 
 
-# What ssh prints when it never got as far as a session: the TCP connect
-# failed, or sshd did not complete the banner/key exchange. A 255 with only
-# these on stderr proves the command was never started (#177).
+# What ssh logs when it never got as far as a session: the TCP connect
+# failed, or sshd did not complete the banner/key exchange. A 255 whose
+# client log holds only these proves the command was never started (#177).
 _NOT_CONNECTED_PATTERNS = (
     re.compile(r"Connection timed out during banner exchange"),
     re.compile(r"^kex_exchange_identification: "),
@@ -212,21 +228,30 @@ _NOT_CONNECTED_PATTERNS = (
 )
 
 
-def never_connected(rc: int, stdout: str, stderr: str) -> bool:
-    """True if (rc, stdout, stderr) prove ssh never reached the guest, so the
+def never_connected(rc: int, client_log: str) -> bool:
+    """True if (rc, client_log) prove ssh never reached the guest, so the
     remote command did not run.
 
-    Stricter than :func:`is_transport_failure`: guest output and ssh's own
-    lines share stderr, so every non-empty stderr line must be one of ssh's
-    pre-session failures and nothing may have arrived on stdout — a guest
-    command that itself runs `ssh` and exits 255 is not mistaken for one.
+    `client_log` is qmu's own ssh client's diagnostics (`SSHClient.run`
+    logs them with `-E`, apart from the remote stderr), never the guest's
+    stderr: a guest command whose last step is a failing inner `ssh` writes
+    exactly these lines to its stderr and exits 255, and reading stderr
+    reported a command that ran — side effects and all — as never started
+    and "safe to re-run" (#199). Every line of the log must be one of the
+    pre-session failures.
     """
-    if rc != 255 or stdout:
+    if rc != 255:
         return False
-    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    lines = [line.strip() for line in client_log.splitlines() if line.strip()]
     return bool(lines) and all(
         any(p.search(line) for p in _NOT_CONNECTED_PATTERNS) for line in lines
     )
+
+
+def client_log(ssh: object) -> str | None:
+    """What qmu's ssh client itself logged during `ssh`'s last `run`, or None
+    when that is unknown (no run yet, or a test double without the log)."""
+    return getattr(ssh, "last_client_log", None)
 
 
 # What `ssh` itself prints when sshd answered and every authentication method
@@ -480,6 +505,9 @@ class SSHClient:
     # ssh's stderr from it, which names the refused methods on auth-failed.
     last_probe: str | None = None
     last_probe_stderr: str = ""
+    # What the ssh client itself logged during the last `run` (`-E`), kept
+    # apart from the remote command's stderr; None before any run.
+    last_client_log: str | None = None
 
     def __init__(
         self,
@@ -521,6 +549,7 @@ class SSHClient:
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", f"ConnectTimeout={connect_timeout}",
             *_KEEPALIVE_OPTS,
+            *_BATCH_OPTS,
             "-o", f"LogLevel={log_level}",
         ]
         if multiplex:
@@ -537,6 +566,7 @@ class SSHClient:
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "ConnectTimeout=5",
             *_KEEPALIVE_OPTS,
+            *_BATCH_OPTS,
             "-o", "LogLevel=ERROR",
         ] + _control_opts()
 
@@ -575,7 +605,6 @@ class SSHClient:
         cmd = self._ssh_base(
             multiplex=False, connect_timeout=timeout, log_level="DEBUG1"
         ) + [
-            "-o", "BatchMode=yes",
             self._target(),
             "true",
         ]
@@ -674,19 +703,39 @@ class SSHClient:
         output the same way. `on_chunk` relays each drained read as it
         arrives (see :func:`_watch_child`); the returned/raised output is the
         same bytes in full.
+
+        The ssh client logs its own diagnostics (`-E`) apart from the remote
+        command's stderr, and keeps them on `last_client_log`: a 255 is the
+        guest's own exit code as often as it is ssh's, and only the client's
+        log says which of the two failed to connect (#199). They are still
+        appended to the returned `stderr`, where ssh used to print them, so
+        the reader sees why a session failed; an empty log appends nothing.
         """
-        cmd = self._ssh_base() + [self._target(), command]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        (stdout_raw, stderr_raw), completed, aborted, detached = _watch_child(
-            proc,
-            [proc.stdout, proc.stderr],
-            timeout=timeout,
-            abort_when=abort_when,
-            poll_interval=poll_interval,
-            on_chunk=on_chunk,
-            detach_to=detach_to,
-        )
-        stdout, stderr = GuestText(stdout_raw), GuestText(stderr_raw)
+        fd, log_name = tempfile.mkstemp(prefix="qmu-ssh-", suffix=".log")
+        os.close(fd)
+        log_path = Path(log_name)
+        cmd = self._ssh_base() + ["-E", log_name, self._target(), command]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            (stdout_raw, stderr_raw), completed, aborted, detached = _watch_child(
+                proc,
+                [proc.stdout, proc.stderr],
+                timeout=timeout,
+                abort_when=abort_when,
+                poll_interval=poll_interval,
+                on_chunk=on_chunk,
+                detach_to=detach_to,
+            )
+        finally:
+            # A detached child still holds the file open and may log to it;
+            # what it has written so far is all this run can attribute.
+            try:
+                log_raw = log_path.read_bytes()
+            except OSError:
+                log_raw = b""
+            log_path.unlink(missing_ok=True)
+        self.last_client_log = log_raw.decode("utf-8", errors="replace")
+        stdout, stderr = GuestText(stdout_raw), GuestText(stderr_raw + log_raw)
         if aborted:
             raise SSHAborted(
                 f"SSH command aborted by qmu (guest panicked or halted): {command}",
