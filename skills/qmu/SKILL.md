@@ -184,7 +184,7 @@ qmu exec --vm X "uname -a"                           # quote the command
 qmu exec --vm X -- uname -a                          # or put -- before it
 qmu exec --vm X "./exploit" --timeout 120            # flags before or after; default 30 s
 qmu compile --vm X exploit.c --run --timeout 120     # push + gcc in guest + run (CFLAGS -static -lpthread)
-qmu compile --vm X exploit.c --host --run            # cross-compile on the host, push the binary
+qmu compile --vm X poc.c --host --run -- /tmp/t 1 A # host cross-compile, push, run with argv
 qmu push --vm X exploit.c /tmp/exploit.c             # one regular file; trailing / = into that dir
 qmu pull --vm X /root/output.txt ./results/
 qmu dmesg --vm X --tail 50                           # guest dmesg over SSH; no SSH → qmu log

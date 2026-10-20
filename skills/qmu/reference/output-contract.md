@@ -167,7 +167,12 @@ spill root — `$QMU_TEMP_DIR/spills`, else `$XDG_RUNTIME_DIR/qmu/spills`, else
   stdout when the budget is crossed, so there the pointer and `Preview: …
   streamed above` trailer come **last** (see *Streaming*).
 - **json/ndjson**: a pointer envelope `{"ok", "artifact_path", "format",
-  "bytes", "sha256", "token_estimate", "estimator": "chars/4", "summary"}`.
+  "bytes", "sha256", "token_estimate", "estimator": "chars/4", "summary"}`
+  plus, copied from the result when it has them, its outcome keys `vm_id`,
+  `exit_code`, `compile_exit`, `run_exit`, `timed_out`, `crash_detected`,
+  `ssh_error`, `inconclusive`, `may_have_landed`, `error_type` and `hint` —
+  so a spilled `ok: false` still tells exit 7 from a panic, a lost transport
+  or a timeout, and still names the next command, without opening the file.
 
 Both also print `[qmu] Output spilled to <path>` on stderr. Always consume the
 printed path / `artifact_path`; never reconstruct spill names. `--out PATH`
@@ -181,8 +186,8 @@ envelope above; **text prints one line**, `[qmu] Output written to <path>
 The pointer's `ok`/exit is the **operation's** result, never "the file was
 written": a guest command that exited non-zero rendered through text `--out`
 says `exit 7`, the process exit stays 1 (`[exit code: N]` still on stderr),
-and JSON `--out` carries `ok: false` plus `exit_code` (present only when
-known — omitted on a timeout, where it is null) next to the artifact keys —
+and JSON `--out` carries `ok: false` plus the same outcome keys (`exit_code`
+is `null` on a timeout, as in the result) next to the artifact keys —
 the artifact still holds the exact captured bytes either way. An automatic
 text spill prints only the `[qmu] Output spilled to …` pointer and preview
 (no envelope), so there the failure is the process exit plus the stderr

@@ -87,6 +87,12 @@ class _QMUArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
         raise _UsageError(self, message)
 
+    def parse_args(self, args=None, namespace=None):  # type: ignore[override]
+        parsed, extras = self.parse_known_args(args, namespace)
+        if extras:
+            _absorb_trailing_positionals(self, parsed, extras)
+        return parsed
+
 
 class _VersionAction(argparse.Action):
     """`qmu --version`: the same answer as `qmu version`, exit 0.
@@ -299,6 +305,40 @@ def _parse(argv: list[str]) -> argparse.Namespace | None:
             return None
         _emit_usage_error(_UsageError(parser, "a subcommand is required"), argv)
     return args
+
+
+def _absorb_trailing_positionals(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, extras: list[str]
+) -> None:
+    """Append positional leftovers to a leaf's `nargs='*'` list, else refuse.
+
+    Before Python 3.12 a `*` positional after another positional
+    (`compile SOURCE [ARG ...]`) only takes words contiguous with the first
+    one: `compile poc.c --run -- /tmp/t 1` left `-- /tmp/t 1` unrecognized
+    (exit 2) there while 3.12+ parsed it. A leaf names the list in
+    `set_defaults(trailing_positionals=<dest>)`; what follows `--` and any
+    non-option word is appended in order. Anything else is the usage error
+    `parse_args` would have raised, word for word.
+    """
+    dest = getattr(args, "trailing_positionals", None)
+    absorbed: list[str] = []
+    if dest is not None:
+        rest = list(extras)
+        while rest:
+            word = rest.pop(0)
+            if word == "--":
+                absorbed.extend(rest)
+                rest = []
+            elif word.startswith("-") and word != "-":
+                absorbed = []
+                break
+            else:
+                absorbed.append(word)
+        else:
+            setattr(args, dest, [*(getattr(args, dest) or []), *absorbed])
+            return
+    raise _UsageError(parser, f"unrecognized arguments: {' '.join(extras)}")
+
 
 
 def _dispatch(args: argparse.Namespace) -> Result:

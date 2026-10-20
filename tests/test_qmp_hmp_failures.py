@@ -17,6 +17,7 @@ import pytest
 from qmu import cli
 from qmu.commands import qmp_cmds
 from qmu.qmp import hmp_failed
+from qmu import snapshot as snapshot_mod
 from qmu.snapshot import SnapshotResult
 
 
@@ -336,6 +337,35 @@ def test_snapshot_other_hmp_failure_hint_points_at_info_snapshots(monkeypatch, c
     assert payload["hint"] == (
         "Inspect the image's snapshot table with: qmu monitor 'info snapshots' --vm dev"
     )
+
+
+def test_snapshot_save_refused_by_a_writable_raw_drive_names_it_and_the_fix(
+    monkeypatch, capsys
+):
+    """#153: QEMU names the drive it refused; the hint used to send the
+    reader to `info snapshots` (empty by construction) and the warning to
+    the rootfs overlay, which was not the problem."""
+
+    class _DriveRefusingQMP:
+        def execute_hmp(self, command, timeout=None):
+            if command.startswith("savevm"):
+                return "Error: Device 'virtio1' is writable but does not support snapshots\r\n"
+            return "There is no snapshot available.\r\n"
+
+    _snapshot_seams(monkeypatch, "save", None)
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", snapshot_mod.save_snapshot)
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(_DriveRefusingQMP())
+    )
+    rc = cli.main(["--format", "json", "snapshot", "save", "clean", "--vm", "dev"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["error_type"] == "SnapshotError"
+    assert "'virtio1'" in payload["hint"]
+    assert "snapshot=on" in payload["hint"] and "readonly=on" in payload["hint"]
+    assert "info snapshots" not in payload["hint"]
+    assert "qmu monitor 'info block' --vm dev" in payload["hint"]
+    assert not any("rootfs" in w for w in payload.get("warnings", []))
 
 
 def test_snapshot_success_envelope_is_unchanged(monkeypatch, capsys):
