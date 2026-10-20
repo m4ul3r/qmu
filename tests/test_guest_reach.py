@@ -125,6 +125,27 @@ def test_status_reports_a_refused_login_as_serving_with_the_user(
     assert payload["ssh_user"] == "lowpriv"
 
 
+def test_list_text_names_the_forwards_json_reports(monkeypatch, tmp_path, capsys):
+    """#197: text `list` dropped the `--forward` ports every other view shows."""
+    serial = tmp_path / "reach-vm.serial.log"
+    serial.write_text("Linux version 6.1.0\n")
+    inst = _instance(str(serial))
+    inst.forwards = [{"host": "127.0.0.1", "host_port": 12345, "guest_port": 2345}]
+    monkeypatch.setattr(lifecycle, "list_instances", lambda: [inst])
+    monkeypatch.setattr(lifecycle, "list_stopped_instances", lambda: [])
+    monkeypatch.setattr(lifecycle, "_orphan_serial_logs", lambda: {})
+    monkeypatch.setattr(
+        lifecycle, "_query_qmp",
+        lambda i: _QMPProbe(QMP_CONNECTED, status="running", running=True),
+    )
+    monkeypatch.setattr(lifecycle, "_make_ssh", lambda i: _RefusingSSH(i.ssh_port, i.ssh_key, user=i.ssh_user))
+
+    assert cli.main(["list"]) == 0
+    assert "forward=127.0.0.1:12345->guest:2345" in capsys.readouterr().out
+    assert cli.main(["list", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["vms"][0]["forwards"] == inst.forwards
+
+
 # ---------------------------------------------------------------------------
 # #148 — a guest without an SFTP server gets the legacy protocol (scp -O)
 # ---------------------------------------------------------------------------

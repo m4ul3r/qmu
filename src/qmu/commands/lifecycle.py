@@ -3324,11 +3324,15 @@ def _handle_list(args: argparse.Namespace) -> Result:
             else ""
         )
         kernel_str = f"kernel={Path(inst.kernel).name}" if inst.kernel else ""
+        # Same forwards `list --format json`/`status`/`launch` report (#197).
+        fwd_str = "".join(
+            f" forward={forward_label(f).replace(' ', '')}" for f in inst.forwards
+        )
         # Report the guest axis alongside the existence axis.
         note = _guest_note(obs)
         state_str = f"[running — {note}]" if note else "[running]"
         lines.append(
-            f"  {inst.vm_id}  pid={inst.pid}  {ssh_str}{gdb_str}{qmp_str}  "
+            f"  {inst.vm_id}  pid={inst.pid}  {ssh_str}{fwd_str}{gdb_str}{qmp_str}  "
             f"profile={inst.profile}  {kernel_str}  {state_str}"
         )
     for inst in stopped:

@@ -1100,15 +1100,31 @@ def remove(
 
     present = list(guest_paths)
     missing: list[str] = []
-    script = "".join(f"exists {guestfish_quote(p)}\n" for p in guest_paths)
+    # The ancestors ride the same appliance run: the missing-path hint names
+    # the nearest one that exists, since a parent missing too would make the
+    # suggested `rootfs ls` fail as well (#202).
+    ancestors: list[str] = []
+    for p in guest_paths:
+        a = posixpath.dirname(p.rstrip("/")) or "/"
+        while a not in ancestors and a != "/":
+            ancestors.append(a)
+            a = posixpath.dirname(a) or "/"
+    probed = list(guest_paths) + ancestors
+    script = "".join(f"exists {guestfish_quote(p)}\n" for p in probed)
     out = _run_script(image, partition, script, "rm")
     answers = out.split()
-    if len(answers) == len(guest_paths):
+    exists: dict[str, bool] = {"/": True}
+    if len(answers) == len(probed):
+        exists.update(
+            (p, a.strip().lower() == b"true") for p, a in zip(probed, answers)
+        )
         present = []
-        for guest_path, answer in zip(guest_paths, answers):
-            (present if answer.strip().lower() == b"true" else missing).append(guest_path)
+        for guest_path in guest_paths:
+            (present if exists[guest_path] else missing).append(guest_path)
     if missing and not force:
         parent = posixpath.dirname(missing[0].rstrip("/")) or "/"
+        while not exists.get(parent, True):
+            parent = posixpath.dirname(parent) or "/"
         raise QMUError(
             f"Not found in {image}: {', '.join(missing)}. "
             f"Nothing was removed. Pass --force to ignore missing paths, "

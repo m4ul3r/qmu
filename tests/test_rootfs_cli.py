@@ -691,15 +691,21 @@ def test_format_entry_keeps_one_line_per_entry(tmp_path, monkeypatch):
 # recovery, never the VM default `qmu status --vm <vm_id>`.
 
 
-def test_rm_of_a_missing_path_hints_the_listing_of_its_directory(
+def test_rm_of_a_missing_path_hints_the_listing_of_an_existing_ancestor(
     tmp_path, monkeypatch, capsys
 ):
+    """#202: `/no` is missing too, so the hint must list `/`, which exists."""
     from qmu import cli
 
     image = tmp_path / "rootfs.img"
     image.write_text("disk")
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
-    monkeypatch.setattr(rootfs_mod, "_run_script", lambda *a, **k: b"false\n")
+    scripts: list[str] = []
+    monkeypatch.setattr(
+        rootfs_mod, "_run_script",
+        lambda img, part, script, action: scripts.append(script)
+        or b"false\n" * script.count("exists "),
+    )
 
     rc = cli.main([
         "--format", "json", "rootfs", "rm", str(image), "/no/such", "--partition", "0",
@@ -707,8 +713,30 @@ def test_rm_of_a_missing_path_hints_the_listing_of_its_directory(
 
     payload = json.loads(capsys.readouterr().out)
     assert rc == 1 and payload["ok"] is False
-    assert payload["hint"].startswith(f"qmu rootfs ls {image} /no --partition 0")
+    assert payload["hint"].startswith(f"qmu rootfs ls {image} / --partition 0")
     assert "--force" in payload["hint"]
+    assert len(scripts) == 1  # the ancestors ride the one appliance run
+
+
+def test_rm_of_a_missing_path_hints_its_directory_when_that_exists(
+    tmp_path, monkeypatch, capsys
+):
+    from qmu import cli
+
+    image = tmp_path / "rootfs.img"
+    image.write_text("disk")
+    monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
+    # Probed: /root/a/x, then ancestors /root/a, /root.
+    monkeypatch.setattr(
+        rootfs_mod, "_run_script", lambda *a, **k: b"false\ntrue\ntrue\n"
+    )
+
+    cli.main([
+        "--format", "json", "rootfs", "rm", str(image), "/root/a/x", "--partition", "0",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hint"].startswith(f"qmu rootfs ls {image} /root/a --partition 0")
 
 
 @pytest.mark.parametrize("spec, corrected", [
