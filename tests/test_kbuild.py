@@ -100,6 +100,9 @@ for index, arg in enumerate(args):
         continue
     host, container, mode = args[index + 1].rsplit(":", 2)
     mounts[container] = Path(host)
+if "/src" not in mounts:
+    # a qmu-kmake module build: logged above, nothing to produce
+    raise SystemExit(0)
 source = mounts["/src"]
 output = mounts["/output"]
 output.mkdir(parents=True, exist_ok=True)
@@ -132,6 +135,9 @@ def write_artifact(relative, content):
 write_artifact("bzImage", "kernel image\\n")
 write_artifact("vmlinux", "ELF symbols\\n")
 write_artifact("System.map", "ffffffff81000000 T _text\\n")
+write_artifact("build/Makefile", "VERSION = 7\\nPATCHLEVEL = 0\\n")
+write_artifact("build/.config", "CONFIG_DEBUG_INFO=y\\n")
+write_artifact("build/Module.symvers", "0x00000000\\t_printk\\tvmlinux\\tEXPORT_SYMBOL\\t\\n")
 
 # The real build leaves intermediates in the bind-mounted source tree, plus the
 # artifacts kbuild copies out. clean_build_residue runs host-side, after this.
@@ -202,18 +208,26 @@ def _use_real_helper_targets(kbuild_env, mode):
     config.chmod(0o755)
     helper_target = "scripts_gdb" if mode == "modern" else "prepare"
     makefile = """
-.PHONY: mrproper defconfig kvm_guest.config olddefconfig bzImage prepare scripts_gdb
+.PHONY: mrproper defconfig kvm_guest.config olddefconfig bzImage modules_prepare prepare scripts_gdb
 mrproper:
-\trm -f .config vmlinux System.map vmlinux-gdb.py scripts/gdb/linux/constants.py
+\trm -f .config vmlinux System.map vmlinux-gdb.py scripts/gdb/linux/constants.py Module.symvers vmlinux.symvers
 defconfig:
 \tprintf 'CONFIG_DEBUG_INFO=y\\nCONFIG_GDB_SCRIPTS=y\\n' > .config
 kvm_guest.config olddefconfig:
 \t@:
+modules_prepare:
+\tmkdir -p include/generated arch/x86/include/generated
+\tprintf '#define CONFIG_X86_64 1\\n' > include/generated/autoconf.h
+\tprintf '/* asm-offsets */\\n' > arch/x86/include/generated/asm-offsets.h
+modules:
+\ttest -n "$(M)" && test -f include/generated/autoconf.h
+\tif test "$$KBUILD_TEST_KDIR_BROKEN" != 1; then touch $(M)/kdircheck.ko; fi
 bzImage:
 \tmkdir -p arch/x86/boot
 \tprintf 'kernel image\\n' > arch/x86/boot/bzImage
 \tprintf 'ELF symbols\\n' > vmlinux
 \tprintf 'ffffffff81000000 T _text\\n' > System.map
+\tprintf '0x00000000\\t_printk\\tvmlinux\\tEXPORT_SYMBOL\\t\\n' > vmlinux.symvers
 \tln -fsn "$(CURDIR)/scripts/gdb/vmlinux-gdb.py" vmlinux-gdb.py
 """
     # In legacy trees there must be no scripts_gdb rule, including a phony
@@ -244,7 +258,14 @@ def test_container_build_exports_helpers_for_upstream_capabilities(kbuild_env, m
     result = kbuild_env.run()
     assert result.returncode == 0, result.stderr
     values = _parse_assignments(result.stdout)
-    assert list(values) == ["KERNEL", "VMLINUX", "CONFIG", "KERNEL_SRC", "VMLINUX_GDB"]
+    assert list(values) == ["KERNEL", "VMLINUX", "CONFIG", "KERNEL_SRC", "VMLINUX_GDB", "KDIR"]
+    # The module build dir is this build's prepared tree, exported from the
+    # container: vmlinux.symvers becomes the Module.symvers modpost reads.
+    kdir = Path(values["KDIR"])
+    assert (kdir / "Module.symvers").read_text().startswith("0x00000000\t_printk\tvmlinux")
+    assert (kdir / "include/generated/autoconf.h").is_file()
+    assert (kdir / "arch/x86/include/generated/asm-offsets.h").is_file()
+    assert (kdir / "Makefile").is_file() and (kdir / ".config").is_file()
     assert (source / "helper-called").is_file()
     loader = Path(values["VMLINUX_GDB"])
     # The copied loader must resolve its module relative to the exported build
@@ -286,6 +307,18 @@ def test_helper_target_failure_is_fatal_without_fallback(kbuild_env, mode):
     assert (source / "arch/x86/boot/bzImage").is_file()
 
 
+def test_module_dir_that_cannot_build_a_module_fails_the_build(kbuild_env):
+    """A KDIR missing a header a module needs (4.x arm64 lacked arm's
+    asm/opcodes.h) was served as a complete cache; the build now proves it."""
+    _use_real_helper_targets(kbuild_env, "modern")
+    kbuild_env.env["KBUILD_TEST_KDIR_BROKEN"] = "1"
+    result = kbuild_env.run()
+    assert result.returncode != 0
+    assert result.stdout == ""
+    kbuild_env.env.pop("KBUILD_TEST_KDIR_BROKEN")
+    assert kbuild_env.run(fail_if_docker_runs=True).returncode != 0, "broken KDIR was cached"
+
+
 @pytest.mark.parametrize("mode", ["modern", "legacy"])
 def test_successful_helper_target_without_required_constants_is_rejected(
     kbuild_env, mode
@@ -315,7 +348,7 @@ def test_fresh_build_generates_gdb_helpers_and_exports_debug_paths(kbuild_env):
     values = _parse_assignments(result.stdout)
     assert result.returncode == 0, result.stderr
     assert list(values) == [
-        "KERNEL", "VMLINUX", "CONFIG", "KERNEL_SRC", "VMLINUX_GDB"
+        "KERNEL", "VMLINUX", "CONFIG", "KERNEL_SRC", "VMLINUX_GDB", "KDIR"
     ]
     assert Path(values["KERNEL"]).is_file()
     assert Path(values["VMLINUX"]).is_file()
@@ -346,6 +379,8 @@ def test_complete_cache_hit_matches_fresh_output_without_docker(kbuild_env):
         "vmlinux-gdb.py",
         "scripts/gdb/vmlinux-gdb.py",
         "scripts/gdb/linux/constants.py",
+        "build/Module.symvers",
+        "build/qmu-kmake",
     ],
 )
 def test_incomplete_debug_cache_is_repaired(kbuild_env, missing):
@@ -422,7 +457,7 @@ def test_fresh_output_is_shell_evaluable_in_stable_order(kbuild_env):
             "bash",
             "-c",
             'set -eu; eval "$1"; printf "%s\\n" '
-            '"$KERNEL" "$VMLINUX" "$CONFIG" "$KERNEL_SRC" "$VMLINUX_GDB"',
+            '"$KERNEL" "$VMLINUX" "$CONFIG" "$KERNEL_SRC" "$VMLINUX_GDB" "$KDIR"',
             "bash",
             result.stdout,
         ],
@@ -434,7 +469,7 @@ def test_fresh_output_is_shell_evaluable_in_stable_order(kbuild_env):
     assert evaluated.returncode == 0, evaluated.stderr
     assert evaluated.stdout.splitlines() == list(values.values())
     assert list(values) == [
-        "KERNEL", "VMLINUX", "CONFIG", "KERNEL_SRC", "VMLINUX_GDB"
+        "KERNEL", "VMLINUX", "CONFIG", "KERNEL_SRC", "VMLINUX_GDB", "KDIR"
     ]
 
 
@@ -457,7 +492,7 @@ def _evaluate_build_output(stdout, cwd):
             "bash",
             "-c",
             'set -u; eval "$1"; printf "%s\\n" '
-            '"$KERNEL" "$VMLINUX" "$CONFIG" "$KERNEL_SRC" "$VMLINUX_GDB"',
+            '"$KERNEL" "$VMLINUX" "$CONFIG" "$KERNEL_SRC" "$VMLINUX_GDB" "$KDIR"',
             "bash",
             stdout,
         ],
@@ -495,6 +530,7 @@ def test_fresh_output_shell_quotes_literal_hostile_paths(kbuild_env, tmp_path):
         str(output / ".config"),
         str(hostile.cache / "kernels/src/linux-7.0"),
         str(output / "vmlinux-gdb.py"),
+        str(output / "build"),
     ]
 
 
@@ -522,7 +558,33 @@ def test_cached_output_shell_quotes_literal_hostile_paths(kbuild_env, tmp_path):
         str(output / ".config"),
         str(hostile.cache / "kernels/src/linux-7.0"),
         str(output / "vmlinux-gdb.py"),
+        str(output / "build"),
     ]
+
+
+def test_module_wrapper_builds_in_the_kernel_toolchain_image(kbuild_env, tmp_path):
+    """#154: a module built by the host's GCC instead of the kernel's is a
+    silent ABI risk; `qmu-kmake` runs make in the image that built it."""
+    result = kbuild_env.run()
+    assert result.returncode == 0, result.stderr
+    kdir = Path(_parse_assignments(result.stdout)["KDIR"])
+    module = tmp_path / "oops-mod"
+    module.mkdir()
+    kbuild_env.clear_docker_log()
+
+    built = subprocess.run(
+        [str(kdir / "qmu-kmake"), "modules"], cwd=module, env=kbuild_env.env,
+        text=True, capture_output=True, check=False,
+    )
+
+    assert built.returncode == 0, built.stderr
+    run = kbuild_env.last_docker_run()
+    image = run.index("make") - 1
+    assert run[image] == "qmu-kbuild:noble-x86_64"
+    assert run[image + 1:] == [
+        "make", "-C", str(kdir), f"M={module}", "ARCH=x86_64", "CROSS_COMPILE=", "modules",
+    ]
+    assert f"{kdir}:{kdir}:ro" in run and f"{module}:{module}:rw" in run
 
 
 def test_config_only_output_shell_quotes_literal_hostile_cache_path(

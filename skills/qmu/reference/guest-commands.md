@@ -264,10 +264,13 @@ serial console auto-logs in as root. The image carries `/etc/qmu-rootfs.json`
 (`sshd_policy: "key-only"`) and the build stamp `sshd_policy=key-only`. A
 cached image built before that policy is permissive: rerun
 `tools/mkrootfs.sh` (an unstamped legacy image needs `--no-cache`).
-`qmu doctor` reads that stamp from the configured `[drive] rootfs` when
-libguestfs works: `[+] rootfs sshd policy: key-only`, or `[~] rootfs sshd
-policy: permissive (image predates key-only sshd; rebuild with
-tools/mkrootfs.sh)` (JSON `sshd_policy: "permissive"`, non-blocking) for a
-missing or non-key-only stamp — **any** key then logs in as root, so a
-sibling VM's key reaches your guest. `--emit-guest-setup PATH` writes the
-guest setup script for inspection.
+`qmu doctor` checks the configured `[drive] rootfs` when libguestfs works,
+by measurement rather than by the stamp alone: `[~] rootfs sshd policy:
+permissive — root's password is empty and sshd_config sets
+PermitEmptyPasswords yes and PermitRootLogin yes, …` (JSON `sshd_policy:
+"permissive"`, non-blocking) is the legacy setup — **any** key then logs in
+as root, so a sibling VM's key reaches your guest. A current image is `[+]
+key-only`; a `tools/mktarget.sh` target (`/etc/qmu-target.json`) is `[+]
+key-only (tools/mktarget.sh target, …)`; an image neither tool built is
+`[i] unknown — no qmu stamp …`, with no claim either way. `--emit-guest-setup
+PATH` writes the guest setup script for inspection.

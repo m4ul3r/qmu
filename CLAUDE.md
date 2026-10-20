@@ -459,10 +459,16 @@ arch/`console=`/`root=` lint; the SSH wait fails early with
 and nothing else, and `ok` ⇔ no `fail` row. Choose the status by consequence:
 `fail` only when launch cannot work (missing configured kernel/initrd/rootfs/key,
 invalid global config); `warn` for optional capabilities (libguestfs, cross
-toolchains, key permissions, a rootfs whose `/etc/qmu-rootfs.json` lacks
-`sshd_policy=key-only` — read via `rootfs.read_stamp`, guestfish `--ro`, only
-after the libguestfs row is `ok`); `info` for cache/pry/skills and checks that
-could not run (`not checked (<reason>)`).
+toolchains, key permissions, a rootfs whose sshd lets root in with an empty
+password — *measured* by `rootfs.read_sshd_evidence` + `root_login_without_key`,
+one guestfish `--ro` session reading both qmu stamps, root's shadow entry and
+the sshd config); `info` for cache/pry/skills, for what could not be decided
+(an image with no qmu stamp and no open path is `unknown`, never a key
+claim — a missing stamp means "not built by a qmu tool", #145) and checks
+that could not run (`not checked (<reason>)`). Test the capability, not one of
+its inputs: an unreadable `/boot` kernel only starts one appliance probe
+(`rootfs.probe_appliance`) — a cached appliance works without it (#146), and
+the sshd row is skipped only when that probe positively failed.
 
 ### The daemon layer (`daemon.py`, `daemon_client.py`, `commands/daemon_cmds.py`)
 
@@ -669,9 +675,13 @@ envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
   ERROR unless `--mkdir` — silently creating it turns a typo'd destination into
   a reported success while the stale binary stays put. It shells out to
   `guestfish`; if libguestfs can't build its appliance (e.g. mode-600 `/boot`
-  kernels), point it at a fixed appliance via `SUPERMIN_KERNEL` or
-  `LIBGUESTFS_PATH`. `qmu doctor` checks both the binary and appliance-kernel
-  readability. Ownership normalization is `lchown` over exactly the paths the
+  kernels), point it at a readable kernel via `SUPERMIN_KERNEL` or
+  `LIBGUESTFS_PATH`. `qmu doctor` checks the binary and, when no kernel is
+  readable, starts the appliance once. A supermin failure — libguestfs only
+  prints `supermin exited with error status 1` without `LIBGUESTFS_DEBUG` —
+  carries `rootfs.SUPERMIN_ENV_HINT` as the envelope `hint` when the host has
+  no readable kernel; every guestfish failure path takes its hint from
+  `rootfs.Diagnosis` (#147). Ownership normalization is `lchown` over exactly the paths the
   injection landed (enumerated from the *source* tree), followed by a `chmod`
   back to the source mode on every non-link — `chown` follows symlinks and
   clears setuid/setgid, and a merge must not re-own pre-existing guest files

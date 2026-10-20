@@ -46,7 +46,7 @@ from pathlib import Path
 
 import pytest
 
-from qmu import daemon_client
+from qmu import daemon_client, rootfs
 from qmu.config import reset_global_config_warnings
 
 
@@ -80,6 +80,16 @@ def isolate_qmu_env(tmp_path_factory, monkeypatch):
     for var in ("CLAUDE_HOME", "CODEX_HOME", "AGENTS_HOME", "PI_CODING_AGENT_DIR"):
         monkeypatch.delenv(var, raising=False)
     daemon_client.reset()
+
+    # `qmu doctor` starts a real libguestfs appliance (`guestfish -a /dev/null
+    # run`) when no host kernel is readable (#146). Every test that runs
+    # doctor for real would then boot one — seconds each, and up to the probe
+    # timeout where the appliance cannot boot — so the suite reports it as
+    # positively unable to run. Tests about the libguestfs row patch it.
+    monkeypatch.setattr(
+        rootfs, "probe_appliance",
+        lambda fish, timeout=None: (False, "not probed: the test suite never starts an appliance"),
+    )
 
     # TMPDIR is honored by tempfile.gettempdir() when tests exercise the
     # platform-temp fallback.
