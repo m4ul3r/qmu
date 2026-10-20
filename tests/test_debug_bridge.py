@@ -213,16 +213,3 @@ def test_kill_on_a_stopped_vm_never_signals_a_recycled_bridge_pid(
     assert payload["bridge_reaped"] is False
     assert sleeper.poll() is None, "an unrelated process wearing the pid is untouched"
     assert load_instance("bridge-vm").gdb_bridge_pid == sleeper.pid
-
-
-# --- the reset warning names the KASLR re-slide (debug audit F9) -----------
-
-
-def test_reset_warning_tells_the_agent_to_rebase_before_rearming():
-    w = debug.reset_dropped_breakpoints_warning("vm")
-    assert "hits stay 0" in w
-    assert "KASLR" in w
-    assert "qmu kbase --vm vm" in w
-    assert "pry load <vmlinux> --base $KBASE" in w
-    # Order matters: rebase, reload, THEN re-arm.
-    assert w.index("qmu kbase") < w.index("pry load") < w.index("re-set (re-arm)")

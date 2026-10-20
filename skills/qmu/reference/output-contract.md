@@ -72,7 +72,9 @@ prints the report and its `[exit code: N]`/follow-up notes).
 **`warnings: [str]`** rides in every json/ndjson envelope that has
 something to warn about — launch-time lints, the debugger-coherence warnings
 (`snapshot save`/`load`, `qmp`/`monitor system_reset`, `kill` with a stranded
-pry bridge), the `ignoring global config` notice from a broken
+pry bridge; after a load or reset under qmu's own bridge, a teardown or
+breakpoints left unarmed — the `debugger` object says what qmu did, see
+`reference/debugging.md`), the `ignoring global config` notice from a broken
 `~/.config/qmu/config.toml` (it fires in the config gate before the handler,
 and still lands in the envelope — on success and on an `ok: false` one
 alike). The same lines go to stderr in every mode, `[qmu] Warning:`-prefixed,

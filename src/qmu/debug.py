@@ -17,32 +17,39 @@ gdbstub protocol does not:
   won't work — either re-sync automatically, or invalidate loudly. Never
   silently diverge.
 
-This module implements the "invalidate loudly" half: it does not drive pry
-(auto re-sync/re-arm is a pry-side capability), so it emits actionable warnings
-naming exactly what diverged and how to recover. The warnings are worded so they
-are correct whether or not a client is currently attached, and the attach probe
-below only *suppresses* them when qmu can positively determine no client is
-connected — on any uncertainty it warns, because a missed divergence is the
-failure this subsystem exists to prevent.
+This module implements both halves for the bridge qmu itself spawned (`qmu
+gdb` records its pid): after a mutation qmu issued, it re-syncs that bridge
+with pry's `pry resync`, or tears it down and says why when no re-sync can
+make the bridge's view true (#187). A client qmu did not spawn is never
+driven: for it qmu emits actionable warnings naming exactly what diverged and
+how to recover. The warnings are worded so they are correct whether or not a
+client is currently attached, and the attach probe below only *suppresses*
+them when qmu can positively determine no client is connected — on any
+uncertainty it warns, because a missed divergence is the failure this
+subsystem exists to prevent.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .instance import (
+    instance_alive,
     instance_json_path,
     is_pid_alive,
     load_instance,
     proc_pid_start,
     save_instance,
 )
+from .serial import count_boot_banners
 
 # TCP states from include/net/tcp_states.h as they appear (hex, upper-case) in
 # field 4 of /proc/net/tcp{,6}. An attached gdb client shows up as the gdbstub
@@ -243,6 +250,322 @@ def reap_bridge_on_exit(vm_id: str) -> bool:
     return reap_bridge(inst)
 
 
+# --- Driving the bridge qmu owns (#187) --------------------------------------
+#
+# A bridge `qmu gdb` spawned, which `bridge_alive` still identifies, is qmu's:
+# after a snapshot load or a reset qmu itself issued, it runs `pry resync`
+# (pry #59) on it and puts pry's report in the envelope, or tears the bridge
+# down and says why when a re-sync cannot make its view true. A client qmu did
+# not spawn is never driven; it keeps the warnings further down.
+
+# pry's own transport budget for one `pry resync`, and the headroom over it
+# for the CLI start and the stop/resume around the op.
+PRY_RESYNC_TIMEOUT = 20
+_PRY_CALL_SLACK = 15.0
+# How long a reset of a nokaslr guest waits for the new kernel's text before
+# its last re-sync (measured on KVM: armed ≈4 s after the reset, on the second
+# re-sync); TCG boots several times slower.
+RESET_KERNEL_WAIT_SECONDS = 30.0
+_RESYNC_RETRY_SECONDS = 1.0
+
+# pry's resync statuses that leave a location unable to fire (`not_armed`).
+_NOT_ARMED = frozenset({"pending", "unreadable", "insert-failed", "not-resident"})
+
+
+def bridge_instance_id(vm_id: str) -> str:
+    """The pry `--instance-id` `qmu gdb` gives the bridge it spawns for `vm_id`."""
+    return f"qmu-{vm_id}"
+
+
+def kaslr_disabled(inst: Any) -> bool:
+    """Whether the recorded cmdline pins the kernel base (`nokaslr`).
+
+    Anything else is treated as able to re-slide on a reboot, including a
+    kernel built without RANDOMIZE_BASE: the host cannot tell, and guessing
+    wrong that way re-arms breakpoints inside unrelated code.
+    """
+    return "nokaslr" in (getattr(inst, "cmdline", None) or "").split()
+
+
+@dataclass(frozen=True)
+class BridgeDrive:
+    """What qmu did to the bridge it owns: the envelope's `debugger` object,
+    the text-mode receipt (stderr notes), and warnings for every mode."""
+
+    data: dict[str, Any]
+    notes: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+def _pry_error(proc: subprocess.CompletedProcess) -> str:
+    """pry's own message: `--format json` errors are `{"ok": false, "error"}`
+    on stderr."""
+    for stream in (proc.stderr, proc.stdout):
+        for line in reversed((stream or "").strip().splitlines()):
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+                return payload["error"]
+    text = (proc.stderr or "").strip() or (proc.stdout or "").strip()
+    return text or f"exit {proc.returncode} with no diagnostic"
+
+
+def _pry_json(argv: list[str], *, timeout: float) -> tuple[Any, str | None]:
+    """Run `pry ARGV` (which must ask for `--format json`); (payload, error)."""
+    pry = shutil.which("pry")
+    if pry is None:
+        return None, "pry is not on PATH"
+    try:
+        proc = subprocess.run(
+            [pry, *argv], capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"`pry {argv[0]}` did not answer within {timeout:.0f} s"
+    except OSError as exc:
+        return None, f"could not run pry: {exc}"
+    if proc.returncode != 0:
+        return None, _pry_error(proc)
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None, f"`pry {argv[0]}` printed no JSON: {_pry_error(proc)}"
+    # A result past pry's token limit is spilled: stdout is then a pointer
+    # envelope and the result itself is the file it names.
+    if isinstance(payload, dict) and isinstance(payload.get("artifact_path"), str):
+        try:
+            payload = json.loads(Path(payload["artifact_path"]).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            return None, f"could not read pry's spilled result: {exc}"
+    return payload, None
+
+
+def _pry_resync(inst: Any) -> tuple[dict[str, Any] | None, str | None]:
+    report, error = _pry_json(
+        [
+            "resync", "--instance", str(inst.gdb_bridge_pid), "--format", "json",
+            "--timeout", str(PRY_RESYNC_TIMEOUT),
+        ],
+        timeout=PRY_RESYNC_TIMEOUT + _PRY_CALL_SLACK,
+    )
+    if error is None and not (isinstance(report, dict) and report.get("resynced") is True):
+        return None, "`pry resync` answered without a resync report"
+    return report, error
+
+
+def _entries(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return [e for e in report.get("breakpoints") or [] if isinstance(e, dict)]
+
+
+def _entry_line(entry: dict[str, Any]) -> str:
+    """One resync entry the way `pry resync` prints it in text."""
+    parts = [f"#{entry.get('location') or entry.get('number', '?')}", str(entry.get("status", "?"))]
+    if entry.get("address"):
+        parts.append(f"@ {entry['address']}")
+    what = entry.get("function") or entry.get("expression")
+    if what:
+        parts.append(str(what))
+    line = " ".join(parts)
+    if entry.get("detail"):
+        line += f": {entry['detail']}"
+    return line
+
+
+def _ref(inst: Any) -> dict[str, Any]:
+    return {
+        "bridge_pid": inst.gdb_bridge_pid,
+        "bridge_instance_id": bridge_instance_id(inst.vm_id),
+    }
+
+
+def _rebase_steps(vm_id: str, ident: str) -> str:
+    return (
+        f"`eval \"$(qmu kbase --vm {vm_id} --symbols <vmlinux>)\"` then "
+        f"`pry --instance {ident} resync --base $KBASE`"
+    )
+
+
+def _resynced(
+    inst: Any, event: str, report: dict[str, Any], **extra: Any
+) -> BridgeDrive:
+    ident = bridge_instance_id(inst.vm_id)
+    summary = report.get("summary") or {}
+    state = report.get("state", "unknown")
+    entries = _entries(report)
+    notes = [
+        f"[qmu] Re-synced the pry bridge {ident} (pid {inst.gdb_bridge_pid}) "
+        f"after {event}: {summary.get('armed', 0)} armed, "
+        f"{summary.get('not_armed', 0)} not armed; target {state}.",
+        *(f"  {_entry_line(e)}" for e in entries),
+    ]
+    if state == "stopped":
+        notes.append(
+            f"[qmu] The target is stopped in the debugger: resume it with "
+            f"`pry --instance {ident} continue --background`."
+        )
+    warnings: list[str] = []
+    not_armed = [e for e in entries if e.get("status") in _NOT_ARMED]
+    mismatch = [
+        e for e in entries
+        if e.get("elf_match") is False and e.get("status") not in _NOT_ARMED
+    ]
+    if not_armed or mismatch:
+        parts = [
+            f"[qmu] WARNING: VM '{inst.vm_id}': the pry bridge {ident} re-synced "
+            f"after {event}, but its breakpoints are not all live."
+        ]
+        if not_armed:
+            parts.append(
+                f" {len(not_armed)} location(s) are not armed and will not fire: "
+                + "; ".join(_entry_line(e) for e in not_armed) + "."
+            )
+        if mismatch:
+            parts.append(
+                f" {len(mismatch)} armed location(s) hold code that differs from "
+                "the symbol file (`elf_match: false`), so they trap wherever "
+                "the stale symbols point: "
+                + "; ".join(_entry_line(e) for e in mismatch) + "."
+            )
+        parts.append(
+            f" Re-run `pry --instance {ident} resync` once that code is mapped; "
+            f"if the kernel re-slid, {_rebase_steps(inst.vm_id, ident)}."
+        )
+        warnings.append("".join(parts) + "\n")
+    data = {"action": "resynced", "event": event, **_ref(inst), **extra, "resync": report}
+    return BridgeDrive(data=data, notes=tuple(notes), warnings=tuple(warnings))
+
+
+def _torn_down(inst: Any, event: str, happened: str, reason: str) -> BridgeDrive:
+    """Reap the owned bridge and say what was lost and how to get it back.
+
+    The breakpoint list is read first so the envelope names what went away;
+    `None` when the bridge could not even answer that.
+    """
+    ref = _ref(inst)
+    ident = ref["bridge_instance_id"]
+    dropped, _ = _pry_json(
+        ["break", "list", "--instance", str(inst.gdb_bridge_pid), "--format", "json"],
+        timeout=15.0,
+    )
+    if not isinstance(dropped, list):
+        dropped = None
+    reaped = reap_bridge(inst)
+    if dropped:
+        lost = "; ".join(
+            f"#{b.get('number', '?')} {b.get('location') or b.get('expression') or '?'}"
+            + ("" if b.get("enabled", True) else " (disabled)")
+            for b in dropped if isinstance(b, dict)
+        )
+        lost = f"Its breakpoints are gone: {lost}."
+    elif dropped == []:
+        lost = "It had no breakpoints."
+    else:
+        lost = "Its breakpoint list could not be read before the teardown."
+    fate = (
+        "qmu tore that bridge down"
+        if reaped
+        else "qmu tried to tear that bridge down and could not confirm it exited "
+        "(check `pry doctor`)"
+    )
+    warning = (
+        f"[qmu] WARNING: VM '{inst.vm_id}' was {happened} under the pry bridge "
+        f"`qmu gdb` spawned ({ident}, pid {ref['bridge_pid']}); {fate} because "
+        f"{reason}. {lost} Reattach once the guest is up: `qmu gdb --vm "
+        f"{inst.vm_id} --symbols <vmlinux>`, `qmu cont --vm {inst.vm_id}`, on a "
+        f"KASLR guest `eval \"$(qmu kbase --vm {inst.vm_id} --symbols "
+        f"<vmlinux>)\"` and `pry --instance {ident} load <vmlinux> --base "
+        "$KBASE`, then set the breakpoints again and prove one with a canary hit.\n"
+    )
+    data = {
+        "action": "torn_down", "event": event, **ref, "reason": reason,
+        "bridge_reaped": reaped, "breakpoints_dropped": dropped,
+    }
+    return BridgeDrive(data=data, warnings=(warning,))
+
+
+def drive_bridge_after_loadvm(inst: Any, event: str) -> BridgeDrive:
+    """Re-sync the owned bridge after a successful `loadvm` (`event` names it).
+
+    The restored image is the boot it was saved from, mapped and ready, so
+    one `pry resync` re-reads the stop state and re-arms every breakpoint at
+    once. A re-sync that fails leaves a view nobody can correct: tear down.
+    """
+    report, error = _pry_resync(inst)
+    if error is not None:
+        return _torn_down(
+            inst, event, f"rewound by {event}", f"`pry resync` failed: {error}"
+        )
+    return _resynced(inst, event, report)
+
+
+def drive_bridge_after_reset(
+    inst: Any, *, epoch: int | None, guest_running: bool | None
+) -> BridgeDrive:
+    """Re-sync the owned bridge after a qmu-issued `system_reset`, or tear it down.
+
+    A reset reboots the kernel, so nothing can be armed until the new
+    kernel's text is mapped: on a running nokaslr guest qmu waits for the new
+    boot's banner (bounded by `RESET_KERNEL_WAIT_SECONDS`), re-syncs, and
+    re-syncs again while a location is still `unreadable` and time remains.
+    Two cases cannot be made true and are torn down instead:
+
+    - KASLR: the kernel re-slides and its new base is readable only from the
+      rebooted guest (`/proc/kallsyms` over SSH); a re-sync now would re-arm
+      every breakpoint at the previous boot's addresses.
+    - A guest halted when it was reset stays at the reset vector, where no
+      kernel address is readable, and GDB cannot resume it past breakpoints
+      it cannot insert (measured: `pry continue` → `Command aborted`).
+    """
+    event = "system_reset"
+    if not kaslr_disabled(inst):
+        return _torn_down(
+            inst, event, "reset",
+            "the kernel re-slides on a reboot (no `nokaslr` on its cmdline) "
+            "and its new base is only readable from the rebooted guest "
+            "(`/proc/kallsyms` over SSH, `qmu kbase`): a re-sync now would "
+            "re-arm every breakpoint at the previous boot's addresses, inside "
+            "unrelated code of the re-slid kernel or nowhere",
+        )
+    if guest_running is not True:
+        why = (
+            "the guest was halted when it was reset"
+            if guest_running is False
+            else "QEMU's run state could not be read after the reset"
+        )
+        return _torn_down(
+            inst, event, "reset",
+            f"{why}: a halted reset guest sits at the reset vector, where no "
+            "kernel address is readable, so no breakpoint can be re-armed and "
+            "GDB cannot resume it past breakpoints it cannot insert",
+        )
+    started = time.monotonic()
+    deadline = started + RESET_KERNEL_WAIT_SECONDS
+    if epoch is not None:
+        while (
+            count_boot_banners(inst.serial_log, start_offset=epoch) == 0
+            and time.monotonic() < deadline
+            and instance_alive(inst)
+        ):
+            time.sleep(0.1)
+    attempts = 0
+    while True:
+        report, error = _pry_resync(inst)
+        attempts += 1
+        if error is not None:
+            return _torn_down(
+                inst, event, "reset", f"`pry resync` failed: {error}"
+            )
+        unreadable = any(e.get("status") == "unreadable" for e in _entries(report))
+        if not unreadable or time.monotonic() >= deadline:
+            break
+        time.sleep(_RESYNC_RETRY_SECONDS)
+    return _resynced(
+        inst, event, report,
+        attempts=attempts, waited_seconds=round(time.monotonic() - started, 2),
+    )
+
+
 # --- Warning builders ------------------------------------------------------
 #
 # Each names the divergence event, what silently diverges, and the recovery
@@ -251,16 +574,39 @@ def reap_bridge_on_exit(vm_id: str) -> bool:
 
 
 def loadvm_stale_session_warning(vm_id: str) -> str:
-    """#44 — `snapshot load` rewound the guest but the debugger did not."""
+    """#44 — `snapshot load` rewound the guest under a client qmu does not own.
+
+    The bridge `qmu gdb` spawned is re-synced instead (#187); this is for a
+    hand-started client, which qmu never drives.
+    """
     return (
         f"[qmu] WARNING: VM '{vm_id}' has a GDB stub and was just rewound by "
-        "snapshot load. An attached debugger does NOT re-sync: it keeps its "
-        "pre-load vCPU state (stale $rip and stop reason) and stale "
-        "breakpoint/memory bookkeeping, presenting them as current. Tear the "
-        "stale pry bridge down first (its connection survived the rewind, so a "
-        f"fresh `qmu gdb --vm {vm_id}` would spawn a SECOND one — see #40), then "
-        "reconnect and re-arm breakpoints before trusting any register or "
-        "memory read."
+        "snapshot load. An attached debugger does NOT re-sync by itself: it "
+        "keeps its pre-load vCPU state (stale $rip and stop reason) and stale "
+        "breakpoint/memory bookkeeping, presenting them as current. qmu "
+        "re-syncs only a pry bridge `qmu gdb` spawned, and none is alive for "
+        "this VM, so re-sync this client before trusting any register, memory "
+        "read or breakpoint: `pry --instance <id> resync` (`pry doctor` lists "
+        "the bridges), then check its `summary.not_armed`."
+    )
+
+
+def loadvm_failed_restore_warning(vm_id: str) -> str:
+    """#44 x #87 — a load that failed mid-restore under an attached debugger.
+
+    The machine is inconsistent and left paused on purpose. Every way of
+    re-syncing or dropping the debugger can resume it — a resync of a target
+    pry believes running stops and resumes it, a detach lets QEMU continue —
+    so qmu drives no bridge here, its own included.
+    """
+    return (
+        f"[qmu] WARNING: VM '{vm_id}' has a GDB stub and its snapshot load "
+        "failed after the restore began, so an attached debugger's view is "
+        "stale. Do NOT re-sync, continue or detach (`pry kill`) it now: each "
+        "can resume the half-restored machine. Load a known-good snapshot "
+        "first (qmu then re-syncs the bridge `qmu gdb` spawned; re-sync any "
+        f"other client with `pry resync`), or `qmu kill --vm {vm_id}`, which "
+        "reaps qmu's bridge."
     )
 
 
@@ -279,8 +625,10 @@ def savevm_breakpoint_warning(vm_id: str) -> str:
 
 
 def reset_dropped_breakpoints_warning(vm_id: str) -> str:
-    """#46 — a VM reset drops the gdbstub breakpoint set without telling anyone.
+    """#46 — a VM reset invalidates breakpoints without telling the client.
 
+    For a client qmu does not own (the bridge `qmu gdb` spawned is re-synced
+    or torn down instead, #187), and for resets qmu only observes (`wait`).
     Re-arming by symbol is not enough on its own: KASLR re-slides the kernel on
     every boot, so the symbol file pry loaded against the old base now resolves
     to addresses nothing executes, and the re-armed breakpoint sits at a stale
@@ -288,17 +636,17 @@ def reset_dropped_breakpoints_warning(vm_id: str) -> str:
     re-derive the base first.
     """
     return (
-        f"[qmu] WARNING: VM '{vm_id}' has a GDB stub and was just reset. A "
-        "machine reset drops the gdbstub's breakpoint/watchpoint set without "
+        f"[qmu] WARNING: VM '{vm_id}' has a GDB stub and was just reset. The "
+        "reboot reloads the kernel over the breakpoints' int3 bytes without "
         "notifying the client: an attached debugger will still list them as "
         "[enabled] but they will not fire (hits stay 0). KASLR also re-slides "
         "the kernel on reboot, so symbols loaded against the old base now "
         "resolve to stale addresses and a breakpoint re-set by symbol lands "
         "where nothing runs. After the guest comes back up: re-derive the base "
-        f"with `eval \"$(qmu kbase --vm {vm_id} --symbols <vmlinux>)\"`, reload "
-        "symbols with `pry load <vmlinux> --base $KBASE`, THEN re-set (re-arm) "
-        "all breakpoints; a canary breakpoint you can prove is hit confirms "
-        "trapping is live again."
+        f"with `eval \"$(qmu kbase --vm {vm_id} --symbols <vmlinux>)\"`, then "
+        "`pry --instance <id> resync --base $KBASE` (a nokaslr guest: `pry "
+        "resync` alone) and check its `summary.not_armed`; a canary breakpoint "
+        "you can prove is hit confirms trapping is live again."
     )
 
 

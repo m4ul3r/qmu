@@ -322,9 +322,9 @@ the same envelope. `qmu kbase` needs only SSH and `/proc/kallsyms` — no
 SSH probe (`ssh: "skipped (debugger attached)"`): that probe runs `uname`,
 which would trip `__x64_sys_newuname`. Address your bridge with `pry --instance
 qmu-<vm>` (`bridge_instance_id`; `bridge_pid` also works) on a shared host.
-`snapshot save/load`, `system_reset` and `kill` invalidate debugger state
-(stderr warnings) — the coherence table, KASLR re-slide, watchpoints under KVM:
-`reference/debugging.md`. ARM guests: `reference/cross-arch.md`.
+`snapshot load`/`system_reset` re-sync the `qmu gdb` bridge (JSON `debugger`) or
+tear it down saying why; other clients, `snapshot save`, `kill` warn — coherence,
+KASLR, KVM watchpoints: `reference/debugging.md`. ARM: `reference/cross-arch.md`.
 
 ## Raw QEMU access
 

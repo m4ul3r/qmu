@@ -161,6 +161,8 @@ with it in the table.
 ## Debugger interaction
 
 `snapshot save` with software breakpoints armed bakes their `int3` bytes into
-the image, and `snapshot load` leaves an attached debugger with a stale view.
-See the coherence table in `skill://qmu/reference/debugging.md` before mixing
+the image, and `snapshot load` leaves an attached debugger with a stale view:
+qmu re-syncs the bridge `qmu gdb` spawned (`pry resync`, reported as
+`debugger` in the envelope) and warns about any other client. See the
+coherence table in `skill://qmu/reference/debugging.md` before mixing
 snapshots and pry.

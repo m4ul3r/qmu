@@ -622,9 +622,28 @@ changed underneath it, so qmu operations that mutate VM reality make the
 debugger's view silently diverge — the same wrong-answer-with-no-error class as
 the crash/transport and state-axis bugs above. qmu owns the lifecycle events and
 knows a VM has a stub (`gdb_port is not None`), so `debug.py` enforces the half
-of the contract the protocol doesn't: **invalidate loudly.** It does NOT drive
-pry, so it warns rather than auto re-syncing/re-arming (that is a pry-side
-capability).
+of the contract the protocol doesn't. For the bridge **qmu itself spawned**
+(`qmu gdb` records its pid; `bridge_alive` re-checks the identity) it acts:
+re-sync with pry's `pry resync`, or tear down and say why (#187). For any
+other client it **invalidates loudly** and never drives it.
+
+- **Owned bridge (#187).** `qmp_cmds` checks `bridge_alive(inst)` after a
+  successful `snapshot load` and after the raw `loadvm`/`system_reset` routes
+  (`_after_mutation`), and calls `debug.drive_bridge_after_loadvm` /
+  `drive_bridge_after_reset`. The returned `BridgeDrive` becomes the envelope's
+  `debugger` object (`action: resynced|torn_down`; `resync` is pry's
+  `--format json` report verbatim — never reshape it), text-mode stderr notes
+  (the receipt; stdout stays the command's own) and warnings only when there
+  is something to act on (not-armed / `elf_match: false` locations, a
+  teardown). The operation's exit code never changes. A load is re-synced at
+  once. A reset is re-synced only on a running `nokaslr` guest, after the new
+  boot's banner, retried while a location is `unreadable`
+  (`RESET_KERNEL_WAIT_SECONDS`); a KASLR reset (new base readable only from the
+  booted guest, and the old base would arm int3s into unrelated code) and a
+  reset of a debugger-halted guest (stuck at the reset vector; GDB cannot even
+  resume it) are torn down, listing `breakpoints_dropped`. A load that failed
+  mid-restore drives nothing: a resync or a detach can resume the
+  half-restored machine (#87). A failed `pry resync` tears down.
 
 - `debug_session_present(inst)` is the gate for divergences a *live* client
   would see: true when `gdb_port` is set AND `gdb_client_attached()` cannot
@@ -645,8 +664,11 @@ capability).
 - Warnings fire on exactly the mutation events, via `Result.warn(...)` — stderr
   in every mode plus the envelope's `warnings[]` under json/ndjson (#74), so
   the stdout JSON stays one object: `snapshot save` (#45, baked-in `int3`s),
-  `snapshot load` (#44, stale vCPU/bookkeeping), `qmp`/`monitor system_reset`
-  (#46, dropped breakpoint set), and `kill` (#40, stranded pry bridge). The
+  `snapshot load` (#44, stale vCPU/bookkeeping; a mid-restore failure gets
+  `loadvm_failed_restore_warning`, which forbids the resync), `qmp`/`monitor
+  system_reset` (#46, breakpoints overwritten + KASLR), and `kill` (#40,
+  stranded pry bridge). The load/reset warnings are for clients qmu does not
+  own and name `pry resync` as the recovery. The
   KVM-watchpoint warning (#39) is the exception: it rides in the `qmu gdb`
   **stdout** payload next to the existing symbol warnings, keyed on the recorded
   `VMInstance.kvm`, so `gdb`'s clean-stderr contract holds.
@@ -659,8 +681,8 @@ A warning keyed on `gdb_port` alone would be noisy on the snapshot-rewind fast
 path when no debugger is attached; the attach probe is what keeps it quiet in
 that common case while still warning whenever a client is (or might be) present.
 Guest-*initiated* reboots are invisible to a one-shot command, so those stay
-doc-only (skill: *Debugger↔VM coherence*). This is the qmu-side stopgap layer of
-umbrella #48; auto re-sync/re-arm and true pry-bridge reap need pry-side work.
+doc-only (skill: *Debugger↔VM coherence*), as does a reset only `wait`
+observes: qmu drives its bridge only after mutations it issued itself.
 `exec`/`compile --run`/`dmesg` watch QMP while the SSH command runs and abort
 within ~1 s of `running:false` (a breakpoint stop), emitting the same paused
 envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.

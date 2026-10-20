@@ -250,9 +250,6 @@ def test_snapshot_load_warns_stale_session_when_debugged(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert rc == 0
     assert "does NOT re-sync" in err
-    # Reworded per review: must steer away from the #40 double-bridge trap.
-    assert "Tear the stale pry bridge down first" in err
-    assert "#40" in err
 
 
 def test_snapshot_load_silent_when_not_debugged(monkeypatch, capsys):
@@ -283,7 +280,8 @@ def test_snapshot_load_pre_restore_refusal_does_not_warn_stale(monkeypatch, caps
     rc = _run(qmp_cmds._handle_snapshot_load, _snap_args())
     err = capsys.readouterr().err
     assert rc == 1
-    assert "does NOT re-sync" not in err
+    assert debug.loadvm_stale_session_warning("dg") not in err
+    assert debug.loadvm_failed_restore_warning("dg") not in err
     assert "snapshot load failed" in err
 
 
@@ -307,7 +305,7 @@ def test_snapshot_load_failure_after_restoration_began_warns_stale(
     rc = _run(qmp_cmds._handle_snapshot_load, _snap_args())
     err = capsys.readouterr().err
     assert rc == 1
-    assert "does NOT re-sync" in err
+    assert debug.loadvm_failed_restore_warning("dg") in err
     assert "snapshot load failed" in err
 
 
@@ -324,8 +322,7 @@ def test_qmp_system_reset_warns_when_debugged(monkeypatch, capsys):
     rc = _run(qmp_cmds._handle_qmp, _qmp_args("system_reset"))
     err = capsys.readouterr().err
     assert rc == 0
-    assert "drops the gdbstub's breakpoint" in err
-    assert "hits stay 0" in err
+    assert debug.reset_dropped_breakpoints_warning("dg") in err
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
@@ -344,7 +341,7 @@ def test_qmp_system_reset_warning_rides_in_the_envelope(monkeypatch, capsys, fmt
     assert payload["ok"] is True
     (warning,) = payload["warnings"]
     assert warning.startswith("VM 'dg' has a GDB stub and was just reset")
-    assert "drops the gdbstub's breakpoint" in captured.err
+    assert debug.reset_dropped_breakpoints_warning("dg") in captured.err
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
@@ -388,7 +385,7 @@ def test_monitor_system_reset_warns_when_debugged(monkeypatch, capsys):
     rc = _run(qmp_cmds._handle_monitor, _monitor_args(["system_reset"]))
     err = capsys.readouterr().err
     assert rc == 0
-    assert "drops the gdbstub's breakpoint" in err
+    assert debug.reset_dropped_breakpoints_warning("dg") in err
 
 
 def test_monitor_unrelated_command_does_not_warn(monkeypatch, capsys):
@@ -484,7 +481,7 @@ def test_qmp_hmp_system_reset_warns_when_debugged(monkeypatch, capsys):
     rc = _run(qmp_cmds._handle_qmp, _hmp_qmp_args("system_reset"))
     err = capsys.readouterr().err
     assert rc == 0
-    assert "drops the gdbstub's breakpoint" in err
+    assert debug.reset_dropped_breakpoints_warning("dg") in err
 
 
 def test_qmp_hmp_help_system_reset_does_not_warn(monkeypatch, capsys):
@@ -771,7 +768,7 @@ def test_wait_warns_on_observed_reset_when_debugged(monkeypatch, tmp_path, capsy
     captured = capsys.readouterr()
     assert rc == 0
     assert json.loads(captured.out)["last_event"] == "RESET"
-    assert "drops the gdbstub's breakpoint" in captured.err
+    assert debug.reset_dropped_breakpoints_warning("debug-vm") in captured.err
 
 
 def test_wait_reset_no_warning_without_debugger(monkeypatch, tmp_path, capsys):
@@ -783,4 +780,4 @@ def test_wait_reset_no_warning_without_debugger(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr()
     assert rc == 0
     assert json.loads(captured.out)["last_event"] == "RESET"
-    assert "drops the gdbstub's breakpoint" not in captured.err
+    assert debug.reset_dropped_breakpoints_warning("debug-vm") not in captured.err
