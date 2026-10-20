@@ -868,10 +868,11 @@ def _with_guest_output(
     The stopped child's output is still the guest's output: a long-running
     exploit that prints progress and then panics (or outlives `--timeout`)
     has told the caller where it got to, and dropping that with the
-    classification made every such run look silent. Guest stdout leads on
-    stdout (it is stdout) with the classification's text after it; guest
-    stderr goes to the stderr notes, verbatim — unless a stream sink already
-    relayed it live (`note_stderr=False`).
+    classification made every such run look silent. Guest stdout goes to
+    stdout (it is stdout); the classification's text and guest stderr go to
+    stderr — the text as a note after the guest's own stderr, which is in
+    the notes verbatim unless a stream sink already relayed it live
+    (`note_stderr=False`).
     """
     status, data, text = outcome
     data.update(_stream_fields(stdout, stderr))
@@ -901,9 +902,10 @@ class _TextStreamSink:
     the budget (:data:`STREAM_SPILL_BYTES`) stays on stdout, and the first
     chunk crossing it diverts the remainder into a spill file that then holds
     the *whole* output (the prefix already shown included), announced by the
-    usual pointer + preview trailer once the command ends. The trailing
-    `text` lines (a crash report, the timeout notice) follow the stream to
-    the same destination, exactly as they were appended to `raw`.
+    usual pointer + preview trailer once the command ends. The file (like
+    stdout) holds guest stdout only: the outcome text (a crash report, the
+    timeout or debugger-stop notice) is a stderr note, rendered after the
+    stream (#172).
 
     `finish` writes whatever the final output holds beyond what was
     relayed: nothing for the real client, everything for a test double that
@@ -931,6 +933,12 @@ class _TextStreamSink:
     def _open(self, path: Path) -> None:
         self._path = path
         self._file = path.open("wb")
+
+    @property
+    def wrote_to_file(self) -> bool:
+        """True when stdout ended with a pointer line (`--out` or a spill),
+        not with the guest's last byte."""
+        return self._path is not None
 
     def on_chunk(self, stream: str, data: bytes) -> None:
         if stream == "stderr":
@@ -975,28 +983,19 @@ class _TextStreamSink:
         self,
         stdout: str,
         stderr: str,
-        text: list[str],
         *,
         source_ok: bool,
         exit_code: int | None,
     ) -> None:
-        """Flush the un-relayed remainder, the `text` trailer, and the
-        pointer when the stream went to a file."""
+        """Flush the un-relayed remainder, and the pointer when the stream
+        went to a file."""
         out_raw, err_raw = guest_bytes(stdout), guest_bytes(stderr)
         self.on_chunk("stdout", out_raw[self._out_received:])
         self.on_chunk("stderr", err_raw[self._err_received:])
-        tail = b""
-        if text:
-            if out_raw and not out_raw.endswith(b"\n"):
-                tail += b"\n"
-            tail += "\n".join(text).encode("utf-8")
-            if not tail.endswith(b"\n"):
-                tail += b"\n"
-            self._write_out(tail)
         if self._file is None:
             return
         self._file.close()
-        full = out_raw + tail
+        full = out_raw
         if self._spilled:
             mark_spill_artifact(self._path)
         artifact = _artifact_payload(
@@ -1114,10 +1113,10 @@ def _classify_guest_command(
     stderr notes) rather than emitting, so ``qmu exec``, ``qmu run`` and
     ``compile --run`` render the same classification under their own
     ``stem`` instead of maintaining copies of the crash-vs-transport-loss
-    discrimination. In text mode the guest stdout goes to stdout byte for
-    byte, followed by the text lines when the command was lost (the crash
-    report); the notes belong on stderr (guest stderr bytes verbatim, the
-    `[exit code: N]` trailer, a survived kernel report) — see
+    discrimination. In text mode stdout is the guest's stdout, byte for
+    byte; the text lines (the crash report, the timeout or halt notice when
+    the command was lost) and the notes belong on stderr (guest stderr bytes
+    verbatim, the `[exit code: N]` trailer, a survived kernel report) — see
     :func:`_guest_result`.
 
     The ssh child is watched by :func:`_guest_abort_watcher`: a terminal
@@ -1252,6 +1251,13 @@ def _guest_exit_hint(inst: VMInstance, rc: int, kernel_report: bool) -> str:
     )
 
 
+def _stdout_is_terminal() -> bool:
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def _guest_result(
     *,
     data: dict[str, Any],
@@ -1259,6 +1265,7 @@ def _guest_result(
     stderr: str = "",
     text: list[str] = (),
     notes: list[str | bytes] = (),
+    followups: list[str] = (),
     stem: str,
     exit_code: int,
     sink: _TextStreamSink | _NdjsonStreamSink | None = None,
@@ -1267,31 +1274,42 @@ def _guest_result(
 
     Text mode writes the guest's `stdout` bytes to stdout exactly as the
     guest wrote them — no decode, no added newline — as `Result.raw`
-    (spill/--out apply). `text` (the crash report or timeout notice when the
-    command was lost) follows on its own lines. An empty payload prints
-    nothing rather than a blank line, so `qmu exec ... > out.txt` is
-    byte-exact for a silent command too. `notes` go to stderr: `bytes`
-    entries are guest stderr, verbatim; `str` entries (`[exit code: N]`,
-    kernel warnings, follow-up hints) are qmu's lines and start on a fresh
-    line. `exec` used to print all of it on stdout as `[stderr] ...` /
-    `[exit code: N]` lines, so a pipeline or a redirect collected the
-    decorations as if the guest had printed them; then it rendered the
-    stdout as text, so `printf x` arrived as `x\\n` and a 0xff byte as
-    U+FFFD. JSON modes: `data` is the envelope.
+    (spill/--out apply), and nothing else: an empty payload prints nothing
+    rather than a blank line, so `qmu exec ... > out.txt` is byte-exact for
+    a silent command too. `notes` go to stderr: `bytes` entries are guest
+    stderr, verbatim; `str` entries (`[exit code: N]`, kernel warnings,
+    follow-up hints) are qmu's lines and start on a fresh line. `text` (the
+    crash report, timeout or debugger-stop notice when the command was lost)
+    follows them, then `followups` (`run`'s preserved-VM hints: the cause
+    reads before the cleanup advice). When guest stdout on a terminal ended
+    mid-line, the text starts on a fresh terminal line. `exec` used to
+    print all of it on stdout as
+    `[stderr] ...` / `[exit code: N]` lines, so a pipeline or a redirect
+    collected the decorations as if the guest had printed them; then it
+    rendered the stdout as text, so `printf x` arrived as `x\\n` and a 0xff
+    byte as U+FFFD; the `text` trailer stayed on stdout until #172. JSON
+    modes: `data` is the envelope.
 
     With a text `sink` the stdout bytes (and guest stderr) were relayed as
-    they arrived; `sink.finish` writes the trailer and any remainder, and
-    the Result is `streamed` so render adds nothing to stdout. The
-    `[exit code: N]`/warning/hint notes still follow on stderr, on a fresh
-    line after streamed stderr that ended without one. An ndjson sink has
-    nothing left to do: the envelope renders as usual.
+    they arrived; `sink.finish` writes any remainder, and the Result is
+    `streamed` so render adds nothing to stdout. The notes still follow on
+    stderr, on a fresh line after streamed stderr that ended without one.
+    An ndjson sink has nothing left to do: the envelope renders as usual.
     """
+    raw = guest_bytes(stdout)
+    if text:
+        if (raw and not raw.endswith(b"\n") and _stdout_is_terminal()
+                and not (isinstance(sink, _TextStreamSink) and sink.wrote_to_file)):
+            # The old stdout trailer started on a fresh line; on a shared
+            # terminal the stderr text must too, without touching stdout.
+            notes = [*notes, b"\n"]
+        notes = [*notes, "\n".join(text)]
+    notes = [*notes, *followups]
     if isinstance(sink, _TextStreamSink):
         exit_rc = data.get("exit_code")
         sink.finish(
             stdout,
             stderr,
-            list(text),
             source_ok=bool(data.get("ok", False)),
             exit_code=exit_rc if isinstance(exit_rc, int) else None,
         )
@@ -1301,13 +1319,6 @@ def _guest_result(
             data=data, stem=stem, exit_code=exit_code, notes=tuple(notes),
             streamed=True,
         )
-    raw = guest_bytes(stdout)
-    if text:
-        if raw and not raw.endswith(b"\n"):
-            raw += b"\n"
-        raw += "\n".join(text).encode("utf-8")
-        if not raw.endswith(b"\n"):
-            raw += b"\n"
     return Result(
         data=data,
         stem=stem,

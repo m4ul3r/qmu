@@ -2513,7 +2513,9 @@ def test_every_ssh_command_agrees_on_a_panic_mid_command(
             assert "qmu crash" in payload["hint"], command
             assert "guest_state" not in payload, command
         else:
-            assert "Kernel panic - not syncing" in captured.out, command
+            # exec/dmesg/compile keep stdout for guest bytes, so the report is
+            # a stderr note there (#172); push/pull print it as their result.
+            assert "Kernel panic - not syncing" in captured.out + captured.err, command
             assert "vCPU halted" not in captured.out + captured.err, command
 
 

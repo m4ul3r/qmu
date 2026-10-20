@@ -375,21 +375,21 @@ def _handle_run(args: argparse.Namespace) -> Result:
         "state_preserved": bool(args.keep or preserve),
     }
 
+    followups: list[str] = []
     if data["state_preserved"]:
         # Follow-up hints are stderr notes, like the `[exit code: N]` trailer:
-        # text-mode stdout is the guest's stdout (plus the crash report on a
-        # lost transport) exactly as `qmu exec` prints it, so an agent can pipe
-        # `qmu run` the same way on every path.
-        notes = [
-            *notes,
+        # text-mode stdout is the guest's stdout only, exactly as `qmu exec`
+        # prints it, so an agent can pipe `qmu run` the same way on every
+        # path. They follow the outcome text (the cause before the cleanup).
+        followups = [
             f"VM '{inst.vm_id}' {vm_state}. Serial log: {inst.serial_log}",
             f"Inspect: qmu log --vm {inst.vm_id} --tail 200, or "
             f"qmu crash --vm {inst.vm_id}",
         ]
         if not args.keep:
-            notes.append(f"Clean up: qmu prune --vm {inst.vm_id}")
+            followups.append(f"Clean up: qmu prune --vm {inst.vm_id}")
 
     return _guest_result(
         data=data, stdout=stdout, stderr=data.get("stderr", ""), text=text,
-        notes=notes, stem="run", exit_code=status, sink=sink,
+        notes=notes, followups=followups, stem="run", exit_code=status, sink=sink,
     )
