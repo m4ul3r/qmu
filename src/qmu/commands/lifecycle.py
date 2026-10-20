@@ -3600,12 +3600,16 @@ def _doctor_row(
     }
 
 
-def _check_libguestfs() -> dict[str, Any]:
-    """Report whether libguestfs can actually build its appliance.
+def _check_libguestfs() -> tuple[dict[str, Any], bool | None]:
+    """The libguestfs doctor row, plus whether the appliance can run.
 
     Every failure here is a warning, never a blocker: libguestfs serves only
     `qmu rootfs *` and `launch --inject`, so a host where launch/exec/crash all
-    work must not be red-lined by a 0600 /boot kernel. The fix text stays.
+    work must not be red-lined by a 0600 /boot kernel. An unreadable kernel is
+    only an input: a cached appliance runs without one (#146), so that case
+    starts the appliance once and reports what actually happened. The second
+    value is False when the appliance positively cannot run, else True (or
+    None when the probe could not finish).
     """
     check = "libguestfs (rootfs inject / launch --inject)"
     fish = shutil.which("guestfish")
@@ -3616,88 +3620,115 @@ def _check_libguestfs() -> dict[str, Any]:
             "`qmu rootfs *` and `qmu launch --inject`. "
             "Install libguestfs-tools.",
             hint="apt install libguestfs-tools",
-        )
+        ), False
 
-    # An explicit supermin kernel overrides the /boot lookup entirely.
+    # A fixed appliance (LIBGUESTFS_PATH) never runs supermin; an explicit
+    # supermin kernel overrides the /boot lookup entirely.
+    fixed = rootfs_mod.fixed_appliance()
     override = os.environ.get("SUPERMIN_KERNEL")
-    if override:
-        readable = os.access(override, os.R_OK)
-        return _doctor_row(
-            check, "ok" if readable else "warn",
-            f"{fish}; SUPERMIN_KERNEL={override}"
-            + ("" if readable else " is NOT readable"),
-            hint="" if readable else "export SUPERMIN_KERNEL=<readable kernel image>",
-        )
-
-    kernels = sorted(Path("/boot").glob("vmlinuz-*")) if Path("/boot").is_dir() else []
-    if not kernels:
-        return _doctor_row(
-            check, "warn",
-            f"{fish}; no /boot/vmlinuz-* found for the supermin "
-            f"appliance. Set SUPERMIN_KERNEL to a readable kernel.",
-            hint="export SUPERMIN_KERNEL=<readable kernel image>",
-        )
-    if any(os.access(k, os.R_OK) for k in kernels):
-        return _doctor_row(check, "ok", fish)
-
-    return _doctor_row(
-        check, "warn",
-        f"{fish} is installed, but NO /boot/vmlinuz-* is readable "
-        f"(they are mode 0600), so the appliance cannot build and "
-        f"every inject will fail. Fix: sudo chmod 0644 /boot/vmlinuz-* "
-        f"— or leave system perms alone and export SUPERMIN_KERNEL / "
-        f"SUPERMIN_KERNEL_VERSION / SUPERMIN_MODULES pointing at a "
-        f"readable copy.",
-        hint="sudo chmod 0644 /boot/vmlinuz-*  (or: export SUPERMIN_KERNEL="
-             "<readable copy> SUPERMIN_KERNEL_VERSION=<ver> SUPERMIN_MODULES="
-             "/lib/modules/<ver>)",
+    problem = rootfs_mod.appliance_kernel_problem()
+    if problem is None:
+        if fixed:
+            detail = f"{fish}; fixed appliance LIBGUESTFS_PATH={fixed}"
+        else:
+            detail = f"{fish}; SUPERMIN_KERNEL={override}" if override else fish
+        return _doctor_row(check, "ok", detail), True
+    hint = (
+        "export SUPERMIN_KERNEL=<readable kernel image>" if override
+        else rootfs_mod.SUPERMIN_ENV_HINT
     )
 
+    runs, why = rootfs_mod.probe_appliance(fish)
+    cache = rootfs_mod.appliance_cache_dir()
+    if runs:
+        detail = (
+            f"{fish}; the appliance runs from its cache in {cache}, but "
+            f"{problem}, so supermin cannot rebuild it: once the cache goes "
+            f"stale (a host package update) or under another TMPDIR/"
+            f"LIBGUESTFS_CACHEDIR, `qmu rootfs *` and `launch --inject` fail. "
+            f"Point SUPERMIN_KERNEL at a readable kernel to make it durable."
+        )
+    elif runs is False:
+        detail = (
+            f"{fish}; {problem}, and the appliance does not start "
+            f"(`guestfish -a /dev/null run`: {why}) with no usable cached "
+            f"appliance in {cache}, so `qmu rootfs *` and `launch --inject` "
+            f"fail until supermin can read a kernel."
+        )
+    else:
+        detail = f"{fish}; {problem}, and the appliance probe did not finish ({why})."
+    return _doctor_row(check, "warn", detail, hint=hint), runs
 
-def _check_rootfs_sshd_policy(rootfs: str, libguestfs_row: dict[str, Any]) -> dict[str, Any]:
-    """Does the configured rootfs carry mkrootfs's `sshd_policy=key-only`?
+
+def _check_rootfs_sshd_policy(rootfs: str, appliance_runs: bool | None) -> dict[str, Any]:
+    """Can a key other than the image's own log in as root?
 
     Images `tools/mkrootfs.sh` built before #68 accept root with ANY key —
-    the contributing cause of the cross-VM exec P0 — and nothing else tells
-    them apart from a current build. The stamp is read through libguestfs,
-    read-only, so the row exists only when the appliance check passed;
-    `warn`, never `fail`: launch works, the image is merely permissive.
+    the contributing cause of the cross-VM exec P0. That is measured, not
+    inferred from a missing stamp (#145): root's shadow entry and the sshd
+    config are read with both qmu stamps in one read-only guestfish session.
+    `warn`, never `fail`: launch works, the image is merely permissive. An
+    image with no qmu stamp and no open path is `info` — nothing is claimed
+    about the keys its sshd accepts.
     """
     check = "rootfs sshd policy"
-    rebuild = "rebuild the image with tools/mkrootfs.sh"
-    if libguestfs_row["status"] != "ok":
+    if appliance_runs is False:
         return _doctor_row(
             check, "info",
-            "not checked (libguestfs is not usable here — see the libguestfs "
-            "row; a tools/mkrootfs.sh image built before key-only sshd "
-            "accepts root with ANY key)",
+            "not checked (libguestfs cannot run its appliance here — see "
+            "the libguestfs row)",
             sshd_policy=None,
         )
     try:
-        stamp = rootfs_mod.read_stamp(rootfs)
+        evidence = rootfs_mod.read_sshd_evidence(rootfs)
     except QMUError as exc:
         reason = str(exc).splitlines()[0]
         return _doctor_row(
             check, "info", f"not checked ({reason})", sshd_policy=None,
         )
-    policy = None
-    if stamp is not None:
-        try:
-            policy = json.loads(stamp).get("sshd_policy")
-        except (ValueError, AttributeError):
-            policy = None
-    if policy == "key-only":
+    rootfs_policy = _stamp_field(evidence.rootfs_stamp, "sshd_policy")
+    open_path, why = rootfs_mod.root_login_without_key(evidence)
+    if open_path:
+        relaxed = _stamp_field(evidence.target_stamp, "hardening") == "relaxed"
+        rebuild = (
+            "rebuild the target with tools/mktarget.sh"
+            + (" --relax-hardening" if relaxed else "")
+            + " (same --kernel-abi/--arch)"
+            if evidence.target_stamp is not None
+            else "rebuild the image with tools/mkrootfs.sh --no-cache "
+                 "(another image: lock root's password in it)"
+        )
+        return _doctor_row(
+            check, "warn",
+            f"permissive — {why}, so sshd accepts root with ANY key (or none)",
+            hint=rebuild, sshd_policy="permissive",
+        )
+    if rootfs_policy == "key-only":
         return _doctor_row(check, "ok", "key-only", sshd_policy="key-only")
-    if stamp is None:
-        why = f"no {rootfs_mod.STAMP_PATH} stamp"
+    if evidence.target_stamp is not None:
+        return _doctor_row(
+            check, "ok",
+            f"key-only (tools/mktarget.sh target, {rootfs_mod.TARGET_STAMP_PATH})",
+            sshd_policy="key-only",
+        )
+    if evidence.rootfs_stamp is not None:
+        stamp = f"{rootfs_mod.STAMP_PATH} records sshd_policy={rootfs_policy!r}"
     else:
-        why = f"{rootfs_mod.STAMP_PATH} records sshd_policy={policy!r}"
+        stamp = f"no qmu stamp ({rootfs_mod.STAMP_PATH}, {rootfs_mod.TARGET_STAMP_PATH})"
+    checked = why if open_path is False else f"empty-password login not checked: {why}"
     return _doctor_row(
-        check, "warn",
-        f"permissive (image predates key-only sshd; rebuild with "
-        f"tools/mkrootfs.sh) — {why}, so sshd accepts root with ANY key",
-        hint=rebuild, sshd_policy="permissive",
+        check, "info", f"unknown — {stamp}; {checked}", sshd_policy="unknown",
     )
+
+
+def _stamp_field(stamp: str | None, key: str) -> Any:
+    """One field of a JSON stamp, None when absent or unparseable."""
+    if stamp is None:
+        return None
+    try:
+        return json.loads(stamp).get(key)
+    except (ValueError, AttributeError):
+        return None
 
 
 def _check_cross_toolchain(arch: str) -> list[dict[str, Any]]:
@@ -4019,19 +4050,19 @@ def _handle_doctor(args: argparse.Namespace) -> Result:
         ))
 
     # libguestfs (required by `rootfs *` and `launch --inject`). Both the
-    # binary and its appliance kernel are checked: guestfish is routinely on
-    # PATH while the appliance cannot build, because Debian/Ubuntu ship
+    # binary and its appliance are checked: guestfish is routinely on PATH
+    # while the appliance cannot build, because Debian/Ubuntu ship
     # /boot/vmlinuz-* mode 0600 and the build runs unprivileged. Reporting only
-    # "guestfish: found" sends the reader off to debug an opaque
-    # "appliance closed the connection unexpectedly" instead.
-    libguestfs_row = _check_libguestfs()
+    # "guestfish: found" sends the reader off to debug an opaque supermin
+    # failure instead.
+    libguestfs_row, appliance_runs = _check_libguestfs()
     checks.append(libguestfs_row)
 
     # Rootfs sshd policy (#75): only an image that exists can be opened, and
     # a missing one already has its `[!] rootfs image` row above.
     if config.rootfs and Path(config.rootfs).expanduser().exists():
         checks.append(_check_rootfs_sshd_policy(
-            str(Path(config.rootfs).expanduser()), libguestfs_row,
+            str(Path(config.rootfs).expanduser()), appliance_runs,
         ))
 
     # pry (optional — only needed for `qmu gdb`)

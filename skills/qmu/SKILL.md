@@ -84,7 +84,7 @@ Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `
 qmu doctor            # [!] = blocking, [~] = warning, [i] = info; "Run: qmu config init" if no config
 qmu skill install     # fixes a "[~] skills: … stale (linked to another checkout)" doctor row; prints one line per changed link — installed | relinked … (was <old target>) | replaced — and tallies current ones, which it leaves untouched
 qmu config init       # starter qmu.toml; the three `# CHANGE ME` lines are live (no uncommenting)
-qmu doctor            # kernel, initrd, rootfs image, rootfs sshd policy ([~] permissive = any key logs in as root; rebuild with tools/mkrootfs.sh), SSH key, SSH key permissions (no group/other bits — 0644 is [!]: OpenSSH refuses the key) all [+]
+qmu doctor            # kernel, initrd, rootfs image, rootfs sshd policy ([~] permissive = measured empty-root-password sshd, any key logs in as root; [i] unknown = no qmu stamp, no claim), SSH key, SSH key permissions (no group/other bits — 0644 is [!]: OpenSSH refuses the key) all [+]
 qmu config path       # which global/project file qmu reads, and whether each exists
 qmu config show       # resolved values, each tagged [built-in | global | project | --config | flag]
 qmu doctor --config ./other.toml --format json   # --config also on launch/run/status/list/log/crash/config show

@@ -33,11 +33,13 @@ def doctor_env(tmp_path, monkeypatch):
     monkeypatch.setattr(lifecycle, "list_instances", lambda: [])
     monkeypatch.setattr(lifecycle, "find_orphan_qemus", lambda: [])
     # The sshd-policy row reads the image through guestfish; the fixture's
-    # image is an empty file, so stub the read (tests override it).
+    # image is an empty file, so stub the read (tests override it). The
+    # appliance probe would start a real guestfish: stub it as running.
     monkeypatch.setattr(
-        lifecycle.rootfs_mod, "read_stamp",
-        lambda image, partition=0: b'{"sshd_policy": "key-only"}\n',
+        lifecycle.rootfs_mod, "read_sshd_evidence",
+        lambda image, partition=0: _evidence(rootfs_stamp='{"sshd_policy": "key-only"}'),
     )
+    monkeypatch.setattr(lifecycle.rootfs_mod, "probe_appliance", lambda fish: (True, ""))
 
     skill_source = tmp_path / "skill-source" / "qmu"
     skill_source.mkdir(parents=True)
@@ -53,6 +55,25 @@ def doctor_env(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(lifecycle.shutil, "which", executables.get)
     return SimpleNamespace(config=config, executables=executables)
+
+
+_KEY_ONLY_SHADOW = "root:!*:20664:0:99999:7:::"
+_LEGACY_SHADOW = "root::20627:0:99999:7:::"
+_LEGACY_SSHD = (
+    "Include /etc/ssh/sshd_config.d/*.conf\n"
+    "PermitRootLogin yes\nPermitEmptyPasswords yes\nUsePAM yes\n"
+)
+_STOCK_SSHD = "Include /etc/ssh/sshd_config.d/*.conf\nUsePAM yes\n"
+
+
+def _evidence(
+    *, rootfs_stamp=None, target_stamp=None, root_shadow=_KEY_ONLY_SHADOW,
+    sshd_config=_STOCK_SSHD, sshd_config_d=(),
+):
+    return lifecycle.rootfs_mod.SshdEvidence(
+        rootfs_stamp=rootfs_stamp, target_stamp=target_stamp,
+        root_shadow=root_shadow, sshd_config=sshd_config, sshd_config_d=sshd_config_d,
+    )
 
 
 def _check(payload, name):
@@ -497,6 +518,14 @@ def test_doctor_stays_healthy_when_only_libguestfs_cannot_build(
     _passt_ok(monkeypatch)
     doctor_env.executables["guestfish"] = "/usr/bin/guestfish"
     monkeypatch.setenv("SUPERMIN_KERNEL", str(tmp_path / "unreadable-vmlinuz"))
+    monkeypatch.setattr(
+        lifecycle.rootfs_mod, "probe_appliance",
+        lambda fish: (False, "libguestfs: error: /usr/bin/supermin exited with error status 1."),
+    )
+    monkeypatch.setattr(
+        lifecycle.rootfs_mod, "read_sshd_evidence",
+        lambda image, partition=0: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
 
     rc, payload = _run_json_doctor(capsys)
 
@@ -505,14 +534,46 @@ def test_doctor_stays_healthy_when_only_libguestfs_cannot_build(
     assert row["status"] == "warn"
     assert row["blocking"] is False
     assert "NOT readable" in row["detail"]
+    policy = _check(payload, "rootfs sshd policy")
+    assert policy["status"] == "info" and policy["sshd_policy"] is None
+    assert "ANY key" not in policy["detail"]
 
     cli.main(["doctor"])
     assert "[~] libguestfs" in capsys.readouterr().out
 
 
+def test_doctor_unreadable_boot_kernels_with_a_cached_appliance_still_reads_the_rootfs(
+    doctor_env, monkeypatch, capsys
+):
+    """#146: the appliance cache made inject work while the row said every
+    inject would fail, and the sshd-policy row went dark with it."""
+    _passt_ok(monkeypatch)
+    doctor_env.executables["guestfish"] = "/usr/bin/guestfish"
+    monkeypatch.delenv("SUPERMIN_KERNEL", raising=False)
+    monkeypatch.setattr(
+        lifecycle.rootfs_mod, "appliance_kernel_problem",
+        lambda: "no /boot/vmlinuz-* is readable (they are mode 0600)",
+    )
+    probed = []
+    monkeypatch.setattr(
+        lifecycle.rootfs_mod, "probe_appliance", lambda fish: probed.append(fish) or (True, ""),
+    )
+
+    rc, payload = _run_json_doctor(capsys)
+
+    row = _check(payload, "libguestfs (rootfs inject / launch --inject)")
+    assert probed == ["/usr/bin/guestfish"]
+    assert rc == 0 and row["status"] == "warn" and row["blocking"] is False
+    assert "will fail" not in row["detail"]
+    # The unprivileged remedy leads; the system-wide chmod is the alternative.
+    assert row["hint"].startswith("export SUPERMIN_KERNEL=")
+    assert _check(payload, "rootfs sshd policy")["sshd_policy"] == "key-only"
+
+
 # ---------------------------------------------------------------------------
-# #75: a cached mkrootfs image built before key-only sshd accepts root with
-# ANY key. doctor reads the stamp read-only when libguestfs works.
+# #75/#145: a cached mkrootfs image built before key-only sshd accepts root
+# with ANY key. doctor measures that (root's shadow entry + sshd config) and
+# reads both qmu stamps; a missing stamp alone is no evidence either way.
 # ---------------------------------------------------------------------------
 
 
@@ -523,16 +584,22 @@ def _libguestfs_ok(doctor_env, monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERMIN_KERNEL", str(kernel))
 
 
+def _use_evidence(monkeypatch, evidence, seen=None):
+    def read(image, partition=0):
+        if seen is not None:
+            seen["image"] = image
+        return evidence
+
+    monkeypatch.setattr(lifecycle.rootfs_mod, "read_sshd_evidence", read)
+
+
 def test_doctor_sshd_policy_key_only_is_ok(doctor_env, monkeypatch, capsys, tmp_path):
     _passt_ok(monkeypatch)
     _libguestfs_ok(doctor_env, monkeypatch, tmp_path)
     seen = {}
-
-    def read_stamp(image, partition=0):
-        seen["image"] = image
-        return b'{"schema": 1, "sshd_policy": "key-only"}\n'
-
-    monkeypatch.setattr(lifecycle.rootfs_mod, "read_stamp", read_stamp)
+    _use_evidence(
+        monkeypatch, _evidence(rootfs_stamp='{"schema": 1, "sshd_policy": "key-only"}'), seen,
+    )
     rc, payload = _run_json_doctor(capsys)
     assert rc == 0
     assert _check(payload, "rootfs sshd policy") == {
@@ -544,41 +611,84 @@ def test_doctor_sshd_policy_key_only_is_ok(doctor_env, monkeypatch, capsys, tmp_
     assert "[+] rootfs sshd policy: key-only" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("stamp", [None, b"{}\n", b'{"sshd_policy": "any-key"}\n', b"not json"])
-def test_doctor_sshd_policy_without_key_only_stamp_warns_not_blocks(
-    doctor_env, monkeypatch, capsys, tmp_path, stamp
+def test_doctor_sshd_policy_mktarget_target_is_key_only(
+    doctor_env, monkeypatch, capsys, tmp_path
 ):
+    """#145: every mktarget.sh target was reported permissive with a hint to
+    rebuild it with mkrootfs.sh, which cannot build an Ubuntu target."""
     _passt_ok(monkeypatch)
     _libguestfs_ok(doctor_env, monkeypatch, tmp_path)
-    monkeypatch.setattr(lifecycle.rootfs_mod, "read_stamp", lambda image, partition=0: stamp)
+    _use_evidence(monkeypatch, _evidence(
+        target_stamp='{"mktarget_version": "2", "distro": "ubuntu"}',
+        sshd_config_d=("PermitRootLogin prohibit-password\nPasswordAuthentication no\n"
+                       "PermitEmptyPasswords no\n",),
+    ))
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "rootfs sshd policy")
+    assert rc == 0
+    assert row["status"] == "ok" and row["sshd_policy"] == "key-only"
+    assert "mkrootfs" not in row["detail"] + row["hint"]
+
+
+@pytest.mark.parametrize("stamps", [
+    {},
+    {"rootfs_stamp": '{"sshd_policy": "key-only"}'},
+    {"target_stamp": '{"mktarget_version": "2"}'},
+    {"target_stamp": '{"mktarget_version": "2", "hardening": "relaxed"}'},
+])
+def test_doctor_sshd_policy_measured_empty_root_password_warns_not_blocks(
+    doctor_env, monkeypatch, capsys, tmp_path, stamps
+):
+    """The legacy mkrootfs setup is permissive whatever a stamp says."""
+    _passt_ok(monkeypatch)
+    _libguestfs_ok(doctor_env, monkeypatch, tmp_path)
+    _use_evidence(monkeypatch, _evidence(
+        root_shadow=_LEGACY_SHADOW, sshd_config=_LEGACY_SSHD, **stamps,
+    ))
     rc, payload = _run_json_doctor(capsys)
     row = _check(payload, "rootfs sshd policy")
     assert rc == 0 and payload["ok"] is True
     assert row["status"] == "warn" and row["blocking"] is False
-    assert row["detail"].startswith(
-        "permissive (image predates key-only sshd; rebuild with tools/mkrootfs.sh)"
-    )
-    assert "ANY key" in row["detail"]
-    assert row["hint"] == "rebuild the image with tools/mkrootfs.sh"
     assert row["sshd_policy"] == "permissive"
+    assert ("mktarget" in row["hint"]) == ("target_stamp" in stamps)
+    # a relaxed target lives in its own -relaxed directory: only the same
+    # flag rebuilds the image doctor is looking at
+    assert ("--relax-hardening" in row["hint"]) == ("relaxed" in stamps.get("target_stamp", ""))
     cli.main(["doctor"])
-    assert "[~] rootfs sshd policy: permissive (image predates key-only sshd" in capsys.readouterr().out
+    assert "[~] rootfs sshd policy: permissive" in capsys.readouterr().out
 
 
-def test_doctor_sshd_policy_is_not_checked_without_a_working_libguestfs(
+@pytest.mark.parametrize("rootfs_stamp", [None, "{}", '{"sshd_policy": "any-key"}', "not json"])
+def test_doctor_sshd_policy_without_stamp_or_open_path_claims_nothing(
+    doctor_env, monkeypatch, capsys, tmp_path, rootfs_stamp
+):
+    """#145: a missing stamp is evidence the image was not built by a qmu
+    tool, not that its sshd is permissive."""
+    _passt_ok(monkeypatch)
+    _libguestfs_ok(doctor_env, monkeypatch, tmp_path)
+    _use_evidence(monkeypatch, _evidence(rootfs_stamp=rootfs_stamp))
+    rc, payload = _run_json_doctor(capsys)
+    row = _check(payload, "rootfs sshd policy")
+    assert rc == 0
+    assert row["status"] == "info" and row["sshd_policy"] == "unknown"
+    assert row["hint"] == ""
+    assert "ANY key" not in row["detail"]
+
+
+def test_doctor_sshd_policy_is_not_checked_without_guestfish(
     doctor_env, monkeypatch, capsys
 ):
     """guestfish absent: the row says so instead of guessing either way."""
     _passt_ok(monkeypatch)
     monkeypatch.setattr(
-        lifecycle.rootfs_mod, "read_stamp",
+        lifecycle.rootfs_mod, "read_sshd_evidence",
         lambda image, partition=0: (_ for _ in ()).throw(AssertionError("must not run")),
     )
     rc, payload = _run_json_doctor(capsys)
     row = _check(payload, "rootfs sshd policy")
     assert rc == 0
     assert row["status"] == "info" and row["sshd_policy"] is None
-    assert row["detail"].startswith("not checked (libguestfs is not usable here")
+    assert "ANY key" not in row["detail"]
     cli.main(["doctor"])
     assert "[i] rootfs sshd policy: not checked (" in capsys.readouterr().out
 
@@ -593,14 +703,14 @@ def test_doctor_sshd_policy_guestfish_failure_is_not_checked(
     _libguestfs_ok(doctor_env, monkeypatch, tmp_path)
 
     def boom(image, partition=0):
-        raise QMUError("guestfish stamp failed (exit 1).\nTry `qmu rootfs shell`")
+        raise QMUError("guestfish sshd failed (exit 1).\nTry `qmu rootfs shell`")
 
-    monkeypatch.setattr(lifecycle.rootfs_mod, "read_stamp", boom)
+    monkeypatch.setattr(lifecycle.rootfs_mod, "read_sshd_evidence", boom)
     rc, payload = _run_json_doctor(capsys)
     row = _check(payload, "rootfs sshd policy")
     assert rc == 0
     assert row["status"] == "info"
-    assert row["detail"] == "not checked (guestfish stamp failed (exit 1).)"
+    assert row["detail"] == "not checked (guestfish sshd failed (exit 1).)"
 
 
 def test_doctor_sshd_policy_row_absent_without_a_usable_rootfs(

@@ -35,10 +35,12 @@ export PATH=/tmp/gdb-multiarch-bin:$PATH
 ## aarch64 (arm64)
 
 ```bash
-# Outputs of the qmu-linux-kbuild / qmu-linux-rootfs skills, under ~/.cache/qmu:
-KERNEL=~/.cache/qmu/kernels/7.0/arm64/Image      VMLINUX=~/.cache/qmu/kernels/7.0/arm64/vmlinux
-ROOTFS=~/.cache/qmu/rootfs/bookworm/arm64/rootfs.img  SSH_KEY=~/.cache/qmu/rootfs/bookworm/arm64/id_ed25519
-KERNEL_SRC=~/.cache/qmu/kernels/src/linux-7.0       # unpacked source tree, for `pry load --src`
+# Outputs of the qmu-linux-kbuild / qmu-linux-rootfs skills (cache hits once built):
+eval "$(tools/kbuild.sh --version 7.0 --arch arm64)"   # KERNEL VMLINUX CONFIG KERNEL_SRC VMLINUX_GDB KDIR
+eval "$(tools/mkrootfs.sh --arch arm64)"               # ROOTFS SSH_KEY
+# KERNEL_SRC (~/.cache/qmu/kernels/src/linux-7.0) is the version's shared source
+# tree for `pry load --src`; it holds whichever arch was built last — build
+# modules against KDIR (see "Out-of-tree modules" below), never against it.
 
 qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY" \
   --arch aarch64 --name arm70 --no-replace \
@@ -90,9 +92,8 @@ needs `--no-net` plus a manual `-netdev`/`virtio-net-device` pair. Pick the SSH 
 yourself with `--ssh-port N` and use the same `N` in the `hostfwd`:
 
 ```bash
-KERNEL=~/.cache/qmu/kernels/7.0/arm32/zImage     VMLINUX=~/.cache/qmu/kernels/7.0/arm32/vmlinux   # multi_v7
-ROOTFS=~/.cache/qmu/rootfs/bookworm/arm32/rootfs.img  SSH_KEY=~/.cache/qmu/rootfs/bookworm/arm32/id_ed25519
-KERNEL_SRC=~/.cache/qmu/kernels/src/linux-7.0
+eval "$(tools/kbuild.sh --version 7.0 --arch arm32)"   # multi_v7; KERNEL=…/zImage
+eval "$(tools/mkrootfs.sh --arch arm32)"
 
 qmu launch --kernel "$KERNEL" --rootfs "$ROOTFS" --ssh-key "$SSH_KEY" \
   --arch arm --gdb --name arm32-70 --no-replace --no-net --ssh-port 10131 \
@@ -139,6 +140,34 @@ qmu exec --vm arm32-70 "uname -r"          # hits the breakpoint
 KASAN is **unsupported on arm32** upstream (no `HAVE_ARCH_KASAN`); use x86_64 or arm64 if you
 need it. `nokaslr` is reported as unknown on arm32 because `arch/arm/` has no
 KASLR at all — it really does nothing there.
+
+## Out-of-tree modules (a survivable Oops on arm)
+
+The kbuild configs carry no LKDTM, so the deterministic, root-reachable,
+*survivable* Oops is a tiny `.ko`. Build it against the arch's `KDIR`, not
+`KERNEL_SRC` — that tree is shared by every arch of the version and holds
+whichever arch was built last. `"$KDIR/qmu-kmake"` runs make in the toolchain
+image that built the kernel (same cross GCC, same `Module.symvers`):
+
+```bash
+mkdir oops && cd oops
+cat > oops.c <<'EOF'
+#include <linux/module.h>
+static int __init oops_init(void) { *(volatile int *)0 = 0; return 0; }
+module_init(oops_init);
+MODULE_DESCRIPTION("null write in init: a survivable Oops");
+MODULE_LICENSE("GPL");
+EOF
+echo 'obj-m += oops.o' > Kbuild
+"$KDIR/qmu-kmake" modules                    # oops.ko for this arch, this kernel's vermagic
+qmu push oops.ko /root/oops.ko --vm arm70
+qmu exec --vm arm70 'insmod /root/oops.ko'  # exit 1 + kernel_warning: insmod died in the Oops
+qmu crash --vm arm70                        # Internal error: Oops …; `status` says guest: crashed, still serving
+```
+
+A kernel cached before kbuild shipped `KDIR` is rebuilt once by the `eval`
+above (`cached build is incomplete; rebuilding …`). Details:
+`skill://qmu-linux-kbuild` → *Out-of-tree modules*.
 
 ## Arch-aware qmu.toml (skip the per-launch flags)
 

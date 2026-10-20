@@ -307,12 +307,17 @@ pry load "$VMLINUX" --base "$KBASE"
 Docker and `curl` (both are checked; missing ⇒ exit 2). binfmt for arm64 on
 an x86 host. libguestfs with a readable appliance kernel **only** for offline
 edits (`qmu rootfs inject|ls|cat|rm`, `qmu launch --inject`): Ubuntu hosts
-ship `/boot/vmlinuz-*` as `0600`, so the appliance fails with "appliance closed
-the connection unexpectedly"; `qmu doctor` reports it; fix with `sudo chmod
-0644 /boot/vmlinuz-*` or `SUPERMIN_KERNEL=/var/tmp/vmlinuz` pointing at a
-readable copy. The image is a whole-disk ext4 (label `qmu-ubuntu`), so every
+ship `/boot/vmlinuz-*` as `0600`, so a fresh appliance build fails with
+`supermin exited with error status 1` (a cached one keeps working until it
+goes stale); `qmu doctor` starts the appliance once and reports which. Fix
+without root by exporting `SUPERMIN_KERNEL`/`SUPERMIN_KERNEL_VERSION`/
+`SUPERMIN_MODULES` for a readable kernel (recipe:
+`skill://qmu/reference/troubleshooting.md`), or `sudo chmod 0644
+/boot/vmlinuz-*`. The image is a whole-disk ext4 (label `qmu-ubuntu`), so every
 offline command needs `--partition 0`. `qmu push`/`compile` over SSH need
-none of this.
+none of this. `qmu doctor --config "$QMU_TOML"` reports the target's
+`rootfs sshd policy` as `[+] key-only (tools/mktarget.sh target, …)` — root's
+password is locked and `sshd_config.d/60-qmu.conf` is key-only.
 
 ## Verifying a fresh target
 
@@ -345,4 +350,4 @@ mask (the write path bypasses it).
 | `qmu kbase` fails | non-root SSH user, `kptr_restrict=2`, or no `VMLINUX` | keep `[ssh] user = "root"`; `--symbols` on an ABI with dbgsym |
 | rebuild happens though nothing changed | resolved deb version moved (`latest`), or options differ from the stamp | pin with `--kernel-abi <abi>` / `--kernel-version` |
 | Docker build fails naming `--unpriv-user` | name exists at another uid | choose an unused name |
-| `qmu rootfs inject` appliance error | libguestfs cannot read `/boot/vmlinuz-*` | see Prerequisites; `qmu doctor` |
+| `qmu rootfs inject` → `supermin exited with error status 1` | libguestfs cannot read a kernel and has no cached appliance | the error's `hint`; see Prerequisites; `qmu doctor` |
