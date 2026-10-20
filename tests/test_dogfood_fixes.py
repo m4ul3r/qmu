@@ -605,6 +605,18 @@ def test_missing_dirs_is_inconclusive_on_a_short_read(tmp_path, monkeypatch):
 # Round 3: rootfs rm was backwards
 # ---------------------------------------------------------------------------
 
+def _exists_probe(*existing):
+    """A `_run_script` fake answering each `exists`/`is-dir` line like guestfish."""
+    def run(img, part, script, action):
+        lines = [
+            l for l in script.splitlines() if l.startswith(("exists ", "is-dir "))
+        ]
+        return b"".join(
+            b"true\n" if l.split(" ")[1].strip('"') in existing else b"false\n"
+            for l in lines
+        )
+    return run
+
 
 def test_rm_errors_on_a_missing_path(tmp_path, monkeypatch):
     """`rm-f` semantics report success for a typo — wrong for a verification tool."""
@@ -612,7 +624,7 @@ def test_rm_errors_on_a_missing_path(tmp_path, monkeypatch):
     image.write_text("disk")
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
     monkeypatch.setattr(
-        rootfs_mod, "_run_script", lambda *a, **k: b"false\n"
+        rootfs_mod, "_run_script", _exists_probe()
     )
 
     with pytest.raises(QMUError) as exc:
@@ -632,7 +644,7 @@ def test_rm_force_reports_a_missing_path_instead_of_claiming_removal(
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
     monkeypatch.setattr(
         rootfs_mod, "_run_script",
-        lambda img, part, script, action: scripts.append(script) or b"false\n",
+        lambda img, part, script, action: scripts.append(script) or _exists_probe()(img, part, script, action),
     )
 
     result = rootfs_mod.remove(
@@ -652,7 +664,7 @@ def test_rm_force_removes_only_the_present_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
     monkeypatch.setattr(
         rootfs_mod, "_run_script",
-        lambda img, part, script, action: scripts.append(script) or b"true\nfalse\n",
+        lambda img, part, script, action: scripts.append(script) or _exists_probe("/root", "/root/here.txt")(img, part, script, action),
     )
 
     result = rootfs_mod.remove(
@@ -673,7 +685,7 @@ def test_rm_recursive_uses_rm_rf(tmp_path, monkeypatch):
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
     monkeypatch.setattr(
         rootfs_mod, "_run_script",
-        lambda img, part, script, action: scripts.append(script) or b"true\n",
+        lambda img, part, script, action: scripts.append(script) or _exists_probe("/rooot")(img, part, script, action),
     )
 
     rootfs_mod.remove(str(image), ["/rooot"], partition=0, recursive=True)
