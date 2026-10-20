@@ -37,7 +37,12 @@ from .ssh import SSHClient
 
 
 def _make_ssh(inst: VMInstance) -> SSHClient:
-    return SSHClient(port=inst.ssh_port, key_path=inst.ssh_key, user=inst.ssh_user)
+    # `kvm` is the accel recorded at launch; None (a pre-#39 record) is
+    # unknown and keeps the KVM-sized probe.
+    return SSHClient(
+        port=inst.ssh_port, key_path=inst.ssh_key, user=inst.ssh_user,
+        emulated=getattr(inst, "kvm", None) is False,
+    )
 
 
 def _require_ssh(inst: VMInstance) -> None:

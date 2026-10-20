@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -362,3 +363,49 @@ def test_is_ready_subprocess_cap_is_connect_timeout_plus_a_small_grace(monkeypat
     assert client.is_ready(timeout=3) is False
     assert seen["timeout"] == 3.25
     assert "ConnectTimeout=3" in _options(seen["cmd"])
+
+
+def test_an_emulated_guest_probe_gets_the_tcg_budget(monkeypatch):
+    """#161: a TCG sshd under host load needs >2 s just to send its banner,
+    so the KVM-sized probe called a serving guest `ssh: down`. The budget
+    is floored for `kvm: false`; KVM and unknown-accel guests keep 2 s.
+
+    The budget is checked as OpenSSH resolves it (`ssh -G`), not as argv
+    text: ssh keeps the FIRST value of a repeated `-o`, so an appended
+    `ConnectTimeout=8` behind the base `ConnectTimeout=5` was in argv yet
+    held the banner wait at 5 s."""
+    from qmu._cliutil import _make_ssh
+    from qmu.instance import VMInstance
+
+    real_run = subprocess.run
+    seen: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["timeout"] = kwargs["timeout"]
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(ssh.subprocess, "run", fake_run)
+
+    def inst(kvm):
+        return VMInstance(
+            vm_id="v", pid=1, qmp_socket="/q", ssh_port=2222, ssh_key="k",
+            gdb_port=None, serial_log="/s", kernel="/k", rootfs=None,
+            memory="1G", cpus=1, cmdline="", profile="exploit-dev",
+            started_at="", harness=False, kvm=kvm,
+        )
+
+    expected = {False: ssh.EMULATED_PROBE_SECONDS, True: 2, None: 2}
+    for kvm, budget in expected.items():
+        assert _make_ssh(inst(kvm)).is_ready() is False
+        assert seen["timeout"] == budget + ssh.PROBE_GRACE_SECONDS, kvm
+        cmd = list(seen["cmd"])
+        timeouts = [o for o in cmd if o.startswith("ConnectTimeout=")]
+        assert timeouts == [f"ConnectTimeout={budget}"], kvm
+        if shutil.which("ssh"):
+            # `ssh -G` prints the resolved config without connecting.
+            resolved = real_run(
+                [cmd[0], "-G", *cmd[1:-1]], capture_output=True, text=True,
+                timeout=10,
+            ).stdout
+            assert f"connecttimeout {budget}\n" in resolved, kvm

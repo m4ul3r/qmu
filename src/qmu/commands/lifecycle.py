@@ -628,26 +628,35 @@ def _handle_launch(args: argparse.Namespace) -> Result:
     config, name = _prepare_boot(args, prep)
 
     launch_notes: list[str] = []
-    inst = launch_vm(
-        config=config,
-        kernel=config.kernel,
-        profile=config.profile,
-        cmdline=config.cmdline,
-        append=args.append,
-        gdb=args.gdb,
-        name=name,
-        ssh_port=args.ssh_port,
-        gdb_port=args.gdb_port,
-        extra_args=args.extra or None,
-        ssh_timeout=args.ssh_timeout,
-        initrd=config.initrd,
-        drives=args.drives,
-        no_net=args.no_net,
-        nic_model=args.nic_model,
-        net_backend=args.net_backend,
-        harness=args.harness,
-        notes=launch_notes,
-    )
+    try:
+        inst = launch_vm(
+            config=config,
+            kernel=config.kernel,
+            profile=config.profile,
+            cmdline=config.cmdline,
+            append=args.append,
+            gdb=args.gdb,
+            name=name,
+            ssh_port=args.ssh_port,
+            gdb_port=args.gdb_port,
+            extra_args=args.extra or None,
+            ssh_timeout=args.ssh_timeout,
+            initrd=config.initrd,
+            drives=args.drives,
+            no_net=args.no_net,
+            nic_model=args.nic_model,
+            net_backend=args.net_backend,
+            harness=args.harness,
+            notes=launch_notes,
+        )
+    except QMUError as exc:
+        # The lint already printed on stderr (`console=ttyS0` on aarch64) is
+        # usually the explanation of a failed boot; a JSON reader must get it
+        # in the failure envelope too, not only on success (#157).
+        for note in launch_notes:
+            sys.stderr.write(f"[qmu] {note}\n")
+        exc.warnings = [*prep.warnings, *launch_notes, *exc.warnings]
+        raise
     # The first-QMP-connect retry (#76): observable, not silently absorbed.
     for note in launch_notes:
         sys.stderr.write(f"[qmu] {note}\n")
@@ -3171,7 +3180,13 @@ def _add_status(sub: argparse._SubParsersAction) -> None:
 
 
 def _require_running(vm_id: str | None, command: str) -> None:
-    """Reject a non-running VM with a description, never with "not found"."""
+    """Reject a non-running VM with a description, never with "not found".
+
+    The one refusal for every command that needs a live VM — exec/wait call
+    it up front, the rest (`_choose_running` in guest/qmp_cmds) when their
+    running-only lookup misses — so all of them say the same thing about the
+    same remnant, and name it in `vm_id`.
+    """
     if not vm_id:
         return
     explanation = describe_non_running(vm_id, command=command)
@@ -3179,6 +3194,7 @@ def _require_running(vm_id: str | None, command: str) -> None:
         raise QMUError(
             explanation,
             hint=f"qmu status --vm {vm_id} describes it; qmu launch --name {vm_id} --no-replace starts a fresh one",
+            vm_id=vm_id,
         )
 
 
@@ -3233,7 +3249,7 @@ def describe_non_running(
             f"VM '{vm_id}' is an orphaned remnant: its metadata is gone but its "
             f"QEMU process (pid {info['pid']}) is still running."
         )
-        if command in ("exec", "wait"):
+        if command is not None:
             lead += f" `qmu {command}` needs a tracked VM, so it cannot act on it."
         lead += _crash_warning(info.get("guest"), vm_id)
         return (
@@ -3243,7 +3259,7 @@ def describe_non_running(
     if state in (VM_STOPPED, VM_HELD_BACK):
         verb = (
             f"`qmu {command}` needs a running VM"
-            if command in ("exec", "wait")
+            if command is not None
             else "there is no live state to report"
         )
         retained = _retained_logs(info["instance"])

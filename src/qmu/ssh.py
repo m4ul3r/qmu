@@ -334,6 +334,14 @@ def _watch_child(
 # a 2.6 s end-to-end budget, so the probe itself is capped at 2.25 s.
 PROBE_GRACE_SECONDS = 0.25
 
+# The readiness probe's floor for an emulated (TCG, `kvm: false`) guest. The
+# 2 s budget above is sized for KVM, where sshd answers in milliseconds; an
+# emulated sshd needed 1.4–1.8 s at host load 1 and 4.2–5.1 s for a full
+# `ssh … true` at load 15, so `status`/`list` called a guest `exec` reached
+# in 4.7 s `ssh: down` / `guest: unknown` (#161). The cap still bounds a hung
+# listener (#77) — it is only sized to emulation cost, with ~1.6× headroom.
+EMULATED_PROBE_SECONDS = 8
+
 
 class SSHClient:
     """Wraps system ssh/scp for guest communication."""
@@ -347,20 +355,30 @@ class SSHClient:
         key_path: str,
         host: str = "localhost",
         user: str = "root",
+        *,
+        emulated: bool = False,
     ):
         self.port = port
         self.key_path = key_path
         self.host = host
         self.user = user
+        # TCG guest: readiness probes get at least EMULATED_PROBE_SECONDS.
+        self.emulated = emulated
 
-    def _ssh_base(self, *, multiplex: bool = True) -> list[str]:
+    def _ssh_base(
+        self, *, multiplex: bool = True, connect_timeout: int = 5
+    ) -> list[str]:
+        # ConnectTimeout is a parameter, never re-appended by a caller:
+        # OpenSSH keeps the FIRST value of a repeated `-o`, so a later
+        # `-o ConnectTimeout=8` is silently ignored (`ssh -G` shows 5) — which
+        # held the TCG probe's banner budget at 5 s (#161 review).
         base = [
             "ssh",
             "-i", self.key_path,
             "-p", str(self.port),
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=5",
+            "-o", f"ConnectTimeout={connect_timeout}",
             "-o", "ServerAliveInterval=5",
             "-o", "ServerAliveCountMax=3",
             "-o", "LogLevel=ERROR",
@@ -395,10 +413,12 @@ class SSHClient:
 
         `timeout` is the whole budget: ssh's own ConnectTimeout bounds both the
         TCP connect and the banner exchange, and the subprocess cap is only
-        PROBE_GRACE_SECONDS beyond it.
+        PROBE_GRACE_SECONDS beyond it. An emulated guest's budget is raised to
+        EMULATED_PROBE_SECONDS: below that a serving TCG sshd reads as down.
         """
-        cmd = self._ssh_base(multiplex=False) + [
-            "-o", f"ConnectTimeout={timeout}",
+        if self.emulated:
+            timeout = max(timeout, EMULATED_PROBE_SECONDS)
+        cmd = self._ssh_base(multiplex=False, connect_timeout=timeout) + [
             "-o", "BatchMode=yes",
             self._target(),
             "true",

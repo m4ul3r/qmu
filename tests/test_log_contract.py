@@ -57,7 +57,7 @@ def test_empty_log_query_is_successful_and_explicit(
         "ok": True,
         # Added so a caller can always tell which VM it read -- load-bearing
         # now that log/crash auto-select the single running VM.
-        "vm": "log-vm",
+        "vm_id": "log-vm",
         "log": "",
         "available": False,
         "empty": True,
@@ -79,7 +79,7 @@ def test_nonempty_log_query_is_available(monkeypatch, tmp_path, capsys, fmt):
         "ok": True,
         # Added so a caller can always tell which VM it read -- load-bearing
         # now that log/crash auto-select the single running VM.
-        "vm": "log-vm",
+        "vm_id": "log-vm",
         "log": "second\n",
         "available": True,
         "empty": False,

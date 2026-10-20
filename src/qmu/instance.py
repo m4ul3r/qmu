@@ -26,11 +26,29 @@ class QMUError(RuntimeError):
     in text mode, as a `[qmu] Hint:` line after the error. Subclasses inherit
     the keyword; a subclass that renders its own structured hint
     (`ConfigError`) keeps its own `hint` attribute, which this base reads.
+
+    `vm_id` names the VM the failed operation was about, and `warnings` the
+    launch-time warnings already printed before it failed; both ride in the
+    envelope (`envelope_fields`) exactly as a successful Result carries them,
+    so a JSON reader running several VMs never has to parse the VM out of
+    the English `hint` (#159) or regex stderr for a lint (#157).
     """
 
-    def __init__(self, *args: object, hint: str | None = None) -> None:
+    def __init__(
+        self, *args: object, hint: str | None = None, vm_id: str | None = None
+    ) -> None:
         super().__init__(*args)
         self.hint = hint if hint is not None else getattr(self, "hint", None)
+        self.vm_id = vm_id if vm_id is not None else getattr(self, "vm_id", None)
+        self.warnings: list[str] = list(getattr(self, "warnings", None) or ())
+
+    def envelope_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        if self.vm_id is not None:
+            fields["vm_id"] = self.vm_id
+        if self.warnings:
+            fields["warnings"] = list(self.warnings)
+        return fields
 
 
 @dataclass(kw_only=True)
@@ -568,12 +586,6 @@ def choose_instance(vm_id: str | None = None) -> VMInstance:
     if vm_id is None:
         _refuse_autoselect_if_required()
     instances = list_instances()
-    if not instances:
-        raise QMUError(
-            "No running VMs. Start one with: qmu launch --kernel <bzImage>",
-            hint="qmu list; qmu launch --name <name> --no-replace",
-        )
-
     if vm_id is not None:
         for inst in instances:
             if inst.vm_id == vm_id:
@@ -582,13 +594,27 @@ def choose_instance(vm_id: str | None = None) -> VMInstance:
         # typo on a STOPPED vm_id used to answer "not found. Running: <live>",
         # hiding the very VM the caller was aiming at and making the next move a
         # second guess instead of a corrected name. Same wording as
-        # find_instance below, so the two lookups cannot drift.
+        # find_instance below, so the two lookups cannot drift. Checked before
+        # the empty-running-set refusal: "No running VMs" answers a question
+        # nobody asked, never names the VM, and its "launch something" hint is
+        # the wrong next step for "what happened to my VM?" (#144) — exactly
+        # the post-run state of every auto-cleaned harness `wait`. A name that
+        # `qmu list` shows is not answered here: every command-layer caller
+        # describes it through `lifecycle.describe_non_running` (before this
+        # lookup or, on its failure, `_choose_running`), so one describer owns
+        # that wording.
         stopped = list_stopped_instances()
         raise QMUError(
             f"VM '{vm_id}' not found. "
             f"Running: {', '.join(i.vm_id for i in instances) or 'none'}; "
             f"Stopped: {', '.join(i.vm_id for i in stopped) or 'none'}.",
             hint="qmu list",
+        )
+
+    if not instances:
+        raise QMUError(
+            "No running VMs. Start one with: qmu launch --kernel <bzImage>",
+            hint="qmu list; qmu launch --name <name> --no-replace",
         )
 
     if len(instances) == 1:
