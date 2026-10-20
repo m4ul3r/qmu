@@ -194,12 +194,15 @@ recipes, the arch-aware `qmu.toml` and pry rebasing:
 `KDIR` (`<outdir>/build`) is exported from the build container right after the
 kernel build: the linux-headers file set (top and arch `Makefile*`,
 `include/`, `scripts/` with the host tools the container compiled,
-`arch/<arch>/include`, `module.lds`, `objtool` where built), the build's
+`arch/<arch>/include` — plus `arch/arm/include/asm/opcodes.h` on arm64, which
+4.x arm64 headers include — `module.lds`, `objtool` where built), the build's
 `.config`, and `Module.symvers` — `vmlinux.symvers` on 5.10+, the one 4.x–5.9
 write while linking vmlinux, else written by `make modules`. It covers the
 core kernel's exports (modules that need another module's exports set
 `KBUILD_EXTRA_SYMBOLS`). It is per arch and survives later builds of other
-arches, which is exactly what `KERNEL_SRC` does not.
+arches, which is exactly what `KERNEL_SRC` does not. Before kbuild accepts the
+export it builds a trivial module against it in the container; an export that
+cannot is a failed build (exit 1), never a cache hit.
 
 `KDIR/qmu-kmake` runs `make -C "$KDIR" M="$PWD" ARCH=… CROSS_COMPILE=…` in
 the `qmu-kbuild` image that built the kernel (`KDIR` mounted read-only, the

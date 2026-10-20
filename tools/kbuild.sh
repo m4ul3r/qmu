@@ -664,9 +664,25 @@ docker run --rm \
       find arch/\$SRC_ARCH -name module.lds -o -name Kbuild.platforms -o -name Platform
       find \$(find arch/\$SRC_ARCH -name include -o -name scripts -type d) -type f
       find arch/\$SRC_ARCH/include Module.symvers -type f
+      # arm64's asm/opcodes.h includes ../../arm/include/asm/opcodes.h on
+      # 4.x, outside arch/arm64: without it no module compiles.
+      if [[ \$SRC_ARCH == arm64 && -f arch/arm/include/asm/opcodes.h ]]; then
+        echo arch/arm/include/asm/opcodes.h
+      fi
       if [[ -f tools/objtool/objtool ]]; then echo tools/objtool/objtool; fi
     } | sort -u | tr '\n' '\0' | xargs -0 -r cp -a --parents -t /output/build
     cp .config /output/build/.config
+    # Prove the export: an exported tree that cannot build a trivial module
+    # must fail the build, never be served as a complete cache.
+    kdir_check=\$(mktemp -d)
+    printf '%s\n' '#include <linux/module.h>' 'static int __init c_init(void) { return 0; }' \
+      'module_init(c_init);' 'MODULE_DESCRIPTION(\"kdir check\");' 'MODULE_LICENSE(\"GPL\");' \
+      > \$kdir_check/kdircheck.c
+    echo 'obj-m += kdircheck.o' > \$kdir_check/Kbuild
+    make -C /output/build M=\$kdir_check ARCH=\$MAKE_ARCH CROSS_COMPILE=\$CROSS_COMPILE \
+      \$MAKE_VERBOSE modules 2>&1 | tee -a /output/build.log >&2
+    test -f \$kdir_check/kdircheck.ko
+    rm -rf \$kdir_check
 
     # copy artifacts and preserve the upstream relative GDB-loader layout
     cp \$IMAGE_SUBPATH /output/

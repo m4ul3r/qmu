@@ -3509,11 +3509,16 @@ def _check_libguestfs() -> tuple[dict[str, Any], bool | None]:
             hint="apt install libguestfs-tools",
         ), False
 
-    # An explicit supermin kernel overrides the /boot lookup entirely.
+    # A fixed appliance (LIBGUESTFS_PATH) never runs supermin; an explicit
+    # supermin kernel overrides the /boot lookup entirely.
+    fixed = rootfs_mod.fixed_appliance()
     override = os.environ.get("SUPERMIN_KERNEL")
     problem = rootfs_mod.appliance_kernel_problem()
     if problem is None:
-        detail = f"{fish}; SUPERMIN_KERNEL={override}" if override else fish
+        if fixed:
+            detail = f"{fish}; fixed appliance LIBGUESTFS_PATH={fixed}"
+        else:
+            detail = f"{fish}; SUPERMIN_KERNEL={override}" if override else fish
         return _doctor_row(check, "ok", detail), True
     hint = (
         "export SUPERMIN_KERNEL=<readable kernel image>" if override
@@ -3571,8 +3576,11 @@ def _check_rootfs_sshd_policy(rootfs: str, appliance_runs: bool | None) -> dict[
     rootfs_policy = _stamp_field(evidence.rootfs_stamp, "sshd_policy")
     open_path, why = rootfs_mod.root_login_without_key(evidence)
     if open_path:
+        relaxed = _stamp_field(evidence.target_stamp, "hardening") == "relaxed"
         rebuild = (
             "rebuild the target with tools/mktarget.sh"
+            + (" --relax-hardening" if relaxed else "")
+            + " (same --kernel-abi/--arch)"
             if evidence.target_stamp is not None
             else "rebuild the image with tools/mkrootfs.sh --no-cache "
                  "(another image: lock root's password in it)"

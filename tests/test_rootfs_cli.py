@@ -461,12 +461,24 @@ def test_read_sshd_evidence_is_read_only_whole_disk_and_tells_absent_from_presen
         '{"mktarget_version": "2"}\n\n'
         f"{mark} shadow\nroot:!*:20664:0:99999:7:::\n"
         f"{mark} sshd\nInclude /etc/ssh/sshd_config.d/*.conf\nUsePAM yes\n\n"
-        f"{mark} sshd.d\nPermitRootLogin prohibit-password\n\n"
     ).encode()
     seen = {}
 
     def fake_run(cmd, input=None, capture_output=None):
+        import io
+        import re
+        import tarfile
+
         seen["cmd"] = cmd
+        # `tar-out` writes sshd_config.d to the host path the script names
+        target = re.search(rb'tar-out /etc/ssh/sshd_config.d "([^"]+)"', input).group(1)
+        with tarfile.open(target.decode(), "w") as tar:
+            for name, text in (("./60-qmu.conf", b"PermitRootLogin prohibit-password\n"),
+                               ("./README", b"not a .conf\n"),
+                               ("./05-a.conf", b"Match User nobody\n")):
+                info = tarfile.TarInfo(name)
+                info.size = len(text)
+                tar.addfile(info, io.BytesIO(text))
         return mock.Mock(returncode=0, stderr=b"", stdout=stdout)
 
     monkeypatch.setattr(rootfs_mod.subprocess, "run", fake_run)
@@ -477,36 +489,37 @@ def test_read_sshd_evidence_is_read_only_whole_disk_and_tells_absent_from_presen
         target_stamp='{"mktarget_version": "2"}',
         root_shadow="root:!*:20664:0:99999:7:::",
         sshd_config="Include /etc/ssh/sshd_config.d/*.conf\nUsePAM yes",
-        sshd_config_d="PermitRootLogin prohibit-password",
+        sshd_config_d=("Match User nobody\n", "PermitRootLogin prohibit-password\n"),
     )
 
 
 _EMPTY_ROOT = "root::20627:0:99999:7:::"
 _LEGACY = "PermitRootLogin yes\nPermitEmptyPasswords yes\n"
+_INCLUDE = "Include /etc/ssh/sshd_config.d/*.conf\n"
 
 
 @pytest.mark.parametrize(("shadow", "main", "included", "expected"), [
     # the legacy tools/mkrootfs.sh setup
-    (_EMPTY_ROOT, "Include /etc/ssh/sshd_config.d/*.conf\n" + _LEGACY, "", True),
+    (_EMPTY_ROOT, _INCLUDE + _LEGACY, (), True),
     # `Keyword=value` and mixed case parse like sshd does
-    (_EMPTY_ROOT, "permitrootlogin=yes\nPERMITEMPTYPASSWORDS  yes\n", "", True),
+    (_EMPTY_ROOT, "permitrootlogin=yes\nPERMITEMPTYPASSWORDS  yes\n", (), True),
     # a locked root closes it whatever sshd says
-    ("root:!*:1:0:99999:7:::", _LEGACY, "", False),
+    ("root:!*:1:0:99999:7:::", _LEGACY, (), False),
     # sshd keeps the FIRST value: an included override wins over the main file
-    (_EMPTY_ROOT, "Include /etc/ssh/sshd_config.d/*.conf\n" + _LEGACY,
-     "PermitEmptyPasswords no\n", False),
+    (_EMPTY_ROOT, _INCLUDE + _LEGACY, ("PermitEmptyPasswords no\n",), False),
     # ...but sshd_config.d is read only where the main file includes it
-    (_EMPTY_ROOT, _LEGACY + "Include /etc/ssh/sshd_config.d/*.conf\n",
-     "PermitEmptyPasswords no\n", True),
-    (_EMPTY_ROOT, _LEGACY, "PermitEmptyPasswords no\n", True),
+    (_EMPTY_ROOT, _LEGACY + _INCLUDE, ("PermitEmptyPasswords no\n",), True),
+    (_EMPTY_ROOT, _LEGACY, ("PermitEmptyPasswords no\n",), True),
     # a Match block is conditional, not global
-    (_EMPTY_ROOT, "PermitRootLogin yes\nMatch User root\n  PermitEmptyPasswords yes\n", "", False),
+    (_EMPTY_ROOT, "PermitRootLogin yes\nMatch User root\n  PermitEmptyPasswords yes\n", (), False),
+    # ...and ends with the drop-in that opened it: the next file is global
+    (_EMPTY_ROOT, _INCLUDE, ("Match User nobody\n", _LEGACY), True),
     # OpenSSH defaults: PermitRootLogin prohibit-password, no empty passwords
-    (_EMPTY_ROOT, "PermitEmptyPasswords yes\n", "", False),
-    (_EMPTY_ROOT, _LEGACY + "PasswordAuthentication no\n", "", False),
+    (_EMPTY_ROOT, "PermitEmptyPasswords yes\n", (), False),
+    (_EMPTY_ROOT, _LEGACY + "PasswordAuthentication no\n", (), False),
     # nothing to decide from
-    (None, _LEGACY, "", None),
-    (_EMPTY_ROOT, "", "", None),
+    (None, _LEGACY, (), None),
+    (_EMPTY_ROOT, "", (), None),
 ])
 def test_root_login_without_key_follows_sshd_resolution(shadow, main, included, expected):
     evidence = rootfs_mod.SshdEvidence(

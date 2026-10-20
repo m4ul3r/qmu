@@ -68,7 +68,7 @@ _STOCK_SSHD = "Include /etc/ssh/sshd_config.d/*.conf\nUsePAM yes\n"
 
 def _evidence(
     *, rootfs_stamp=None, target_stamp=None, root_shadow=_KEY_ONLY_SHADOW,
-    sshd_config=_STOCK_SSHD, sshd_config_d="",
+    sshd_config=_STOCK_SSHD, sshd_config_d=(),
 ):
     return lifecycle.rootfs_mod.SshdEvidence(
         rootfs_stamp=rootfs_stamp, target_stamp=target_stamp,
@@ -620,8 +620,8 @@ def test_doctor_sshd_policy_mktarget_target_is_key_only(
     _libguestfs_ok(doctor_env, monkeypatch, tmp_path)
     _use_evidence(monkeypatch, _evidence(
         target_stamp='{"mktarget_version": "2", "distro": "ubuntu"}',
-        sshd_config_d="PermitRootLogin prohibit-password\nPasswordAuthentication no\n"
-                      "PermitEmptyPasswords no\n",
+        sshd_config_d=("PermitRootLogin prohibit-password\nPasswordAuthentication no\n"
+                       "PermitEmptyPasswords no\n",),
     ))
     rc, payload = _run_json_doctor(capsys)
     row = _check(payload, "rootfs sshd policy")
@@ -634,6 +634,7 @@ def test_doctor_sshd_policy_mktarget_target_is_key_only(
     {},
     {"rootfs_stamp": '{"sshd_policy": "key-only"}'},
     {"target_stamp": '{"mktarget_version": "2"}'},
+    {"target_stamp": '{"mktarget_version": "2", "hardening": "relaxed"}'},
 ])
 def test_doctor_sshd_policy_measured_empty_root_password_warns_not_blocks(
     doctor_env, monkeypatch, capsys, tmp_path, stamps
@@ -650,6 +651,9 @@ def test_doctor_sshd_policy_measured_empty_root_password_warns_not_blocks(
     assert row["status"] == "warn" and row["blocking"] is False
     assert row["sshd_policy"] == "permissive"
     assert ("mktarget" in row["hint"]) == ("target_stamp" in stamps)
+    # a relaxed target lives in its own -relaxed directory: only the same
+    # flag rebuilds the image doctor is looking at
+    assert ("--relax-hardening" in row["hint"]) == ("relaxed" in stamps.get("target_stamp", ""))
     cli.main(["doctor"])
     assert "[~] rootfs sshd policy: permissive" in capsys.readouterr().out
 

@@ -376,6 +376,27 @@ def test_appliance_kernel_problem_reads_boot_kernel_permissions(monkeypatch, tmp
     assert "readable" in rootfs_mod.appliance_kernel_problem(boot)
 
 
+def test_a_fixed_appliance_needs_no_readable_kernel_and_no_probe(monkeypatch, tmp_path):
+    """A LIBGUESTFS_PATH fixed appliance never runs supermin, so there is no
+    cache to go stale and nothing for the kernel check to warn about."""
+    fixed = tmp_path / "fixed"
+    fixed.mkdir()
+    for name in ("README.fixed", "kernel", "initrd", "root"):
+        (fixed / name).write_text("x")
+    monkeypatch.setenv("LIBGUESTFS_PATH", str(fixed))
+    monkeypatch.delenv("SUPERMIN_KERNEL", raising=False)
+    monkeypatch.setattr(rootfs_mod.os, "access", lambda path, mode: False)
+    monkeypatch.setattr(lifecycle.shutil, "which", lambda name: "/usr/bin/guestfish")
+    monkeypatch.setattr(
+        rootfs_mod, "probe_appliance", lambda fish: pytest.fail("a fixed appliance needs no probe"),
+    )
+
+    assert rootfs_mod.appliance_kernel_problem(tmp_path / "boot") is None
+    row, runs = lifecycle._check_libguestfs()
+    assert row["status"] == "ok" and runs is True
+    assert str(fixed) in row["detail"]
+
+
 def test_doctor_flags_an_unreadable_appliance_kernel(monkeypatch):
     monkeypatch.setattr(lifecycle.shutil, "which", lambda name: "/usr/bin/guestfish")
     monkeypatch.delenv("SUPERMIN_KERNEL", raising=False)

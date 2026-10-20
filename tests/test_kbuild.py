@@ -219,6 +219,9 @@ modules_prepare:
 \tmkdir -p include/generated arch/x86/include/generated
 \tprintf '#define CONFIG_X86_64 1\\n' > include/generated/autoconf.h
 \tprintf '/* asm-offsets */\\n' > arch/x86/include/generated/asm-offsets.h
+modules:
+\ttest -n "$(M)" && test -f include/generated/autoconf.h
+\tif test "$$KBUILD_TEST_KDIR_BROKEN" != 1; then touch $(M)/kdircheck.ko; fi
 bzImage:
 \tmkdir -p arch/x86/boot
 \tprintf 'kernel image\\n' > arch/x86/boot/bzImage
@@ -302,6 +305,18 @@ def test_helper_target_failure_is_fatal_without_fallback(kbuild_env, mode):
     assert (source / "helper-called").is_file()
     assert not (source / "unexpected-fallback").exists()
     assert (source / "arch/x86/boot/bzImage").is_file()
+
+
+def test_module_dir_that_cannot_build_a_module_fails_the_build(kbuild_env):
+    """A KDIR missing a header a module needs (4.x arm64 lacked arm's
+    asm/opcodes.h) was served as a complete cache; the build now proves it."""
+    _use_real_helper_targets(kbuild_env, "modern")
+    kbuild_env.env["KBUILD_TEST_KDIR_BROKEN"] = "1"
+    result = kbuild_env.run()
+    assert result.returncode != 0
+    assert result.stdout == ""
+    kbuild_env.env.pop("KBUILD_TEST_KDIR_BROKEN")
+    assert kbuild_env.run(fail_if_docker_runs=True).returncode != 0, "broken KDIR was cached"
 
 
 @pytest.mark.parametrize("mode", ["modern", "legacy"])

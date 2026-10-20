@@ -7,11 +7,12 @@ import re
 import shutil
 import stat as stat_mod
 import subprocess
+import tarfile
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, Sequence
 
 from .instance import QMUError
 
@@ -197,12 +198,30 @@ def appliance_cache_dir() -> Path:
     return Path(base) / f".guestfs-{os.getuid()}" / "appliance.d"
 
 
+def fixed_appliance() -> str | None:
+    """The `LIBGUESTFS_PATH` directory holding a fixed appliance, or None.
+
+    libguestfs-make-fixed-appliance writes `README.fixed` beside `kernel`,
+    `initrd` and `root`; libguestfs then boots that and never runs supermin,
+    so no host kernel needs to be readable and there is no cache to go stale.
+    """
+    for entry in (os.environ.get("LIBGUESTFS_PATH") or "").split(":"):
+        if entry and all(
+            (Path(entry) / name).is_file() for name in ("README.fixed", "kernel", "initrd", "root")
+        ):
+            return entry
+    return None
+
+
 def appliance_kernel_problem(boot: Path = Path("/boot")) -> str | None:
     """Why supermin cannot read a kernel to (re)build the appliance, or None.
 
     Only an input check: a cached appliance runs without any kernel being
-    readable now, so this alone never says whether `rootfs *` works.
+    readable now, so this alone never says whether `rootfs *` works. A fixed
+    appliance needs no kernel at all.
     """
+    if fixed_appliance() is not None:
+        return None
     override = os.environ.get("SUPERMIN_KERNEL")
     if override:
         if os.access(override, os.R_OK):
@@ -912,7 +931,7 @@ class SshdEvidence:
     target_stamp: str | None    # /etc/qmu-target.json, None when absent
     root_shadow: str | None     # root's /etc/shadow line, None when unreadable
     sshd_config: str            # /etc/ssh/sshd_config ("" when absent)
-    sshd_config_d: str          # /etc/ssh/sshd_config.d/*.conf, concatenated
+    sshd_config_d: tuple[str, ...]  # /etc/ssh/sshd_config.d/*.conf, one per file, glob order
 
 
 def read_sshd_evidence(image: str, partition: int = 0) -> SshdEvidence:
@@ -923,16 +942,21 @@ def read_sshd_evidence(image: str, partition: int = 0) -> SshdEvidence:
     file from ending the script; the `exists` answers tell absent from empty.
     Raises QMUError when guestfish is missing or cannot open the image.
     """
-    sections = ("rootfs", "target", "shadow", "sshd", "sshd.d")
-    script = (
-        f"exists {STAMP_PATH}\nexists {TARGET_STAMP_PATH}\n"
-        f"echo {_EVIDENCE_MARK} rootfs\n-cat {STAMP_PATH}\n"
-        f"echo {_EVIDENCE_MARK} target\n-cat {TARGET_STAMP_PATH}\n"
-        f"echo {_EVIDENCE_MARK} shadow\n-egrep ^root: /etc/shadow\n"
-        f"echo {_EVIDENCE_MARK} sshd\n-cat /etc/ssh/sshd_config\n"
-        f"echo {_EVIDENCE_MARK} sshd.d\n-glob cat /etc/ssh/sshd_config.d/*.conf\n"
-    )
-    out = _run_script(image, partition, script, "sshd", read_only=True)
+    sections = ("rootfs", "target", "shadow", "sshd")
+    with tempfile.TemporaryDirectory(prefix="qmu-sshd-") as scratch:
+        dropins = Path(scratch) / "sshd_config.d.tar"
+        script = (
+            f"exists {STAMP_PATH}\nexists {TARGET_STAMP_PATH}\n"
+            f"echo {_EVIDENCE_MARK} rootfs\n-cat {STAMP_PATH}\n"
+            f"echo {_EVIDENCE_MARK} target\n-cat {TARGET_STAMP_PATH}\n"
+            f"echo {_EVIDENCE_MARK} shadow\n-egrep ^root: /etc/shadow\n"
+            f"echo {_EVIDENCE_MARK} sshd\n-cat /etc/ssh/sshd_config\n"
+            # Per file, not concatenated: sshd ends a drop-in's `Match`
+            # block at the end of that file.
+            f"-tar-out /etc/ssh/sshd_config.d {guestfish_quote(str(dropins))}\n"
+        )
+        out = _run_script(image, partition, script, "sshd", read_only=True)
+        included = _read_dropins(dropins)
     lines = out.decode("utf-8", "replace").splitlines()
     has_rootfs, has_target = (
         [answer.strip().lower() == "true" for answer in lines[:2]] + [False, False]
@@ -952,19 +976,39 @@ def read_sshd_evidence(image: str, partition: int = 0) -> SshdEvidence:
         target_stamp=text["target"] if has_target else None,
         root_shadow=shadow[0] if shadow else None,
         sshd_config=text["sshd"],
-        sshd_config_d=text["sshd.d"],
+        sshd_config_d=included,
     )
+
+
+def _read_dropins(archive: Path) -> tuple[str, ...]:
+    """The `*.conf` files of a `tar-out` of sshd_config.d, in glob order.
+    No archive (the directory is absent) is no drop-ins."""
+    if not archive.is_file() or archive.stat().st_size == 0:
+        return ()
+    texts: list[tuple[str, str]] = []
+    try:
+        with tarfile.open(archive) as tar:
+            for member in tar.getmembers():
+                name = posixpath.normpath(member.name)
+                if member.isfile() and "/" not in name and name.endswith(".conf"):
+                    data = tar.extractfile(member)
+                    if data is not None:
+                        texts.append((name, data.read().decode("utf-8", "replace")))
+    except tarfile.TarError:
+        return ()
+    return tuple(text for _, text in sorted(texts))
 
 
 _SSHD_LINE = re.compile(r"^\s*([A-Za-z]\w*)\s*(?:=\s*|\s+)(.*)$")
 
 
-def _sshd_settings(main: str, included: str) -> dict[str, str]:
+def _sshd_settings(main: str, included: Sequence[str]) -> dict[str, str]:
     """First value of each keyword, as sshd resolves them outside `Match`.
 
     sshd keeps the FIRST value it reads, and a `Match` line makes everything
-    after it in that file conditional. An `Include` of sshd_config.d expands
-    to `included` in place (Debian/Ubuntu put it on the first line).
+    after it in that file conditional — the state resets at the end of each
+    included file. An `Include` of sshd_config.d expands to `included` in
+    place (Debian/Ubuntu put it on the first line).
     """
     settings: dict[str, str] = {}
 
@@ -978,7 +1022,8 @@ def _sshd_settings(main: str, included: str) -> dict[str, str]:
                 return
             if key == "include":
                 if expand and any("sshd_config.d" in v for v in value):
-                    walk(included, False)
+                    for dropin in included:
+                        walk(dropin, False)
                 continue
             settings.setdefault(key, value[0].lower() if value else "")
 
