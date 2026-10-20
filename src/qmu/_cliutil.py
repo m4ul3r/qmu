@@ -21,7 +21,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .config import QMUConfig, global_config_warnings, resolve_config
+from .config import (
+    FORWARD_SPEC_HINT,
+    QMUConfig,
+    global_config_warnings,
+    parse_forward_spec,
+    resolve_config,
+)
 from .instance import (
     QMUError,
     VMInstance,
@@ -33,7 +39,7 @@ from .output import write_bytes_result, write_output_result
 from .qmp import QMPBusyError, QMPClient, QMPError
 from . import daemon_client
 from .serial import current_boot_offset, has_terminal_panic
-from .ssh import SSHClient
+from .ssh import SSHAuthError, SSHClient
 
 
 def _make_ssh(inst: VMInstance) -> SSHClient:
@@ -43,6 +49,51 @@ def _make_ssh(inst: VMInstance) -> SSHClient:
         port=inst.ssh_port, key_path=inst.ssh_key, user=inst.ssh_user,
         emulated=getattr(inst, "kvm", None) is False,
     )
+
+
+def _ssh_user(inst: Any) -> str | None:
+    """The account SSH commands log in as (`[ssh] user`, recorded at launch),
+    or None for a VM with no SSH endpoint (harness, --no-net)."""
+    if getattr(inst, "harness", False) or getattr(inst, "ssh_port", None) is None:
+        return None
+    return getattr(inst, "ssh_user", "root")
+
+
+def forward_label(forward: dict[str, Any]) -> str:
+    """`127.0.0.1:12345 -> guest:2345`, one recorded `--forward`."""
+    return f"{forward['host']}:{forward['host_port']} -> guest:{forward['guest_port']}"
+
+
+def _auth_refused_hint(inst: VMInstance) -> str:
+    """Recovery for sshd refusing the VM's recorded user/key (#158).
+
+    The account is fixed at launch from `[ssh] user`, so the fix is a
+    relaunch; a longer wait or `qmu log` cannot help. A non-root user is
+    usually an attempt to run a PoC unprivileged, which `--user` does over
+    the root login.
+    """
+    user = inst.ssh_user
+    hint = (
+        f"The guest booted and sshd answers, but refuses user '{user}' with "
+        f"key {inst.ssh_key}. The user is recorded at launch from [ssh] user: "
+        f"qmu kill --vm {inst.vm_id}, fix [ssh] user/key in qmu.toml to an "
+        "account the image accepts (root for qmu-built rootfs), then relaunch."
+    )
+    if user != "root":
+        hint += (
+            f" To run a command as '{user}', keep root and pass "
+            f"--user {user} to qmu exec / compile --run / run."
+        )
+    return hint
+
+
+def _auth_refused_error(
+    inst: VMInstance, ssh: Any, stderr: str | None = None
+) -> SSHAuthError:
+    """The SSHAuthError (exit 4) for `inst`, with the relaunch hint."""
+    exc = ssh.auth_error(stderr)
+    exc.hint = _auth_refused_hint(inst)
+    return exc
 
 
 def _require_ssh(inst: VMInstance) -> None:
@@ -109,6 +160,8 @@ def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
         "cpu_model": "cpu_model",
         "arch": "arch",
         "nic_model": "nic_model",
+        # Repeatable: the flag's list replaces [machine] forwards entirely.
+        "forwards": "forwards",
     }
     for flag, cfg_field in flag_map.items():
         val = getattr(args, flag, None)
@@ -759,6 +812,17 @@ def _add_format_opts(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _forward_spec_arg(value: str) -> str:
+    """argparse `type` for `--forward`: a malformed spec is a usage error
+    (exit 2) at parse time; the string is kept so it layers over
+    `[machine] forwards` exactly as written."""
+    try:
+        parse_forward_spec(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{exc}; {FORWARD_SPEC_HINT}") from None
+    return value
+
+
 def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False) -> None:
     """Register the boot-describing flags shared by ``launch`` and ``run``.
 
@@ -823,11 +887,21 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
                         help="Don't kill existing VM with same name (default: replace)")
     parser.add_argument("--ssh-port", type=int, default=None, help="SSH port (auto-allocated)")
     parser.add_argument("--gdb-port", type=int, default=None, help="GDB port (auto-allocated)")
+    parser.add_argument(
+        "--forward", action="append", dest="forwards", default=None,
+        type=_forward_spec_arg,
+        metavar="[HOST:]HPORT:GPORT",
+        help="Forward a host TCP port to a guest port on qmu's own NIC, repeatable "
+             "(gdbserver, a service under test). HOST defaults to 127.0.0.1; a bare "
+             "GPORT auto-allocates the host port. Recorded on the VM and reported "
+             "as `forwards` by launch/status/list. Replaces [machine] forwards.",
+    )
     if run_mode:
         ssh_timeout_help = (
             "Seconds to wait for the guest to answer SSH (default: 60). On "
             "expiry `run` reaps the VM and exits 124 (the timeout class); a "
-            "guest that panicked first exits 3."
+            "guest that panicked first exits 3; an sshd that refuses the "
+            "[ssh] user/key exits 4 (SSHAuthError) without waiting it out."
         )
     else:
         ssh_timeout_help = (
@@ -837,7 +911,8 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
             "status`/`qmu log --vm <id>` — the same code `run` returns, "
             "which does not retain it. A serial log still empty after ~10 s fails "
             "earlier with ssh_status 'no-console-output' (wrong console= or "
-            "machine type for this arch)."
+            "machine type for this arch); an sshd that refuses the "
+            "[ssh] user/key fails with ssh_status 'auth-failed' (exit 4)."
         )
     parser.add_argument("--ssh-timeout", type=int, default=60, help=ssh_timeout_help)
     reboot = parser.add_mutually_exclusive_group()

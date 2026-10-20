@@ -26,6 +26,35 @@ def _options(command: list[str]) -> set[str]:
     }
 
 
+class _FakeProbe:
+    """Stand-in for the probe's ssh child. Each `communicate` call consumes
+    one of `answers`: bytes = the child exited with `rc` and that stderr; an
+    exception instance is raised (a TimeoutExpired carrying partial stderr)."""
+
+    def __init__(self, seen: dict, answers: list, rc: int = 0):
+        self.seen, self.answers, self.returncode = seen, list(answers), None
+        self._rc = rc
+        self.killed = False
+
+    def __call__(self, cmd, **kwargs):
+        self.seen["cmd"] = cmd
+        self.seen["timeouts"] = []
+        return self
+
+    def communicate(self, timeout=None):
+        self.seen["timeouts"].append(timeout)
+        if self.killed:
+            return b"", b""
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        self.returncode = self._rc
+        return b"", answer
+
+    def kill(self):
+        self.killed = True
+
+
 def test_control_opts_uses_current_runtime_override(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     first = Path("a")
@@ -89,11 +118,7 @@ def test_is_ready_probe_never_spawns_a_control_master(tmp_path, monkeypatch):
     client = ssh.SSHClient(port=2222, key_path="test-key")
     seen: dict[str, list[str]] = {}
 
-    def fake_run(cmd, **kwargs):
-        seen["cmd"] = cmd
-        return subprocess.CompletedProcess(cmd, 0, b"", b"")
-
-    monkeypatch.setattr(ssh.subprocess, "run", fake_run)
+    monkeypatch.setattr(ssh.subprocess, "Popen", _FakeProbe(seen, [b""]))
     assert client.is_ready() is True
     options = _options(seen["cmd"])
     assert "ControlMaster=no" in options
@@ -349,20 +374,57 @@ def test_is_ready_subprocess_cap_is_connect_timeout_plus_a_small_grace(monkeypat
     client = ssh.SSHClient(port=2222, key_path="test-key")
     seen: dict[str, object] = {}
 
-    def fake_run(cmd, **kwargs):
-        seen["cmd"] = cmd
-        seen["timeout"] = kwargs["timeout"]
-        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+    def hang(cmd):
+        # Accepts TCP, never finishes the handshake: no service-accept line.
+        return subprocess.TimeoutExpired(cmd, 0, stderr=b"debug1: Connecting to localhost\n")
 
-    monkeypatch.setattr(ssh.subprocess, "run", fake_run)
+    monkeypatch.setattr(ssh.subprocess, "Popen", _FakeProbe(seen, [hang(["ssh"])]))
     assert client.is_ready() is False
     assert ssh.PROBE_GRACE_SECONDS == 0.25
-    assert seen["timeout"] == 2.25
+    assert seen["timeouts"][0] == 2.25
     assert "ConnectTimeout=2" in _options(seen["cmd"])
 
+    monkeypatch.setattr(ssh.subprocess, "Popen", _FakeProbe(seen, [hang(["ssh"])]))
     assert client.is_ready(timeout=3) is False
-    assert seen["timeout"] == 3.25
+    assert seen["timeouts"][0] == 3.25
     assert "ConnectTimeout=3" in _options(seen["cmd"])
+
+
+def test_probe_waits_for_the_verdict_once_sshd_is_authenticating(monkeypatch):
+    """#158: sshd that has accepted the userauth service is up; a slow refusal
+    (PAM fail delay on the `none` method, 4.2 s measured) used to be killed at
+    the connect cap and reported `down`. It now gets the auth grace."""
+    client = ssh.SSHClient(port=2222, key_path="test-key", user="lowpriv")
+    seen: dict[str, object] = {}
+    in_auth = subprocess.TimeoutExpired(
+        ["ssh"], 2.25, stderr=b"debug1: SSH2_MSG_SERVICE_ACCEPT received\n"
+    )
+    refused = (
+        b"debug1: SSH2_MSG_SERVICE_ACCEPT received\n"
+        b"lowpriv@localhost: Permission denied (publickey,password).\n"
+    )
+    monkeypatch.setattr(ssh.subprocess, "Popen", _FakeProbe(seen, [in_auth, refused], rc=255))
+
+    assert client.probe() == ssh.PROBE_AUTH_FAILED
+    assert seen["timeouts"] == [2.25, ssh.PROBE_AUTH_GRACE_SECONDS]
+    assert client.last_probe_stderr == "lowpriv@localhost: Permission denied (publickey,password)."
+
+
+@pytest.mark.parametrize(
+    "rc,stderr,expected",
+    [
+        (255, b"lowpriv@localhost: Permission denied (publickey,password).\r\n", ssh.PROBE_AUTH_FAILED),
+        (255, b"ssh: connect to host localhost port 2222: Connection refused\r\n", ssh.PROBE_DOWN),
+        (255, b"Connection timed out during banner exchange\r\n", ssh.PROBE_DOWN),
+        (0, b"", ssh.PROBE_READY),
+    ],
+)
+def test_probe_tells_a_refused_login_from_a_dead_port(monkeypatch, rc, stderr, expected):
+    client = ssh.SSHClient(port=2222, key_path="k", user="lowpriv")
+    monkeypatch.setattr(ssh.subprocess, "Popen", _FakeProbe({}, [stderr], rc=rc))
+
+    assert client.probe() == expected
+    assert client.last_probe == expected
 
 
 def test_an_emulated_guest_probe_gets_the_tcg_budget(monkeypatch):
@@ -380,13 +442,6 @@ def test_an_emulated_guest_probe_gets_the_tcg_budget(monkeypatch):
     real_run = subprocess.run
     seen: dict[str, object] = {}
 
-    def fake_run(cmd, **kwargs):
-        seen["cmd"] = cmd
-        seen["timeout"] = kwargs["timeout"]
-        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-
-    monkeypatch.setattr(ssh.subprocess, "run", fake_run)
-
     def inst(kvm):
         return VMInstance(
             vm_id="v", pid=1, qmp_socket="/q", ssh_port=2222, ssh_key="k",
@@ -397,11 +452,14 @@ def test_an_emulated_guest_probe_gets_the_tcg_budget(monkeypatch):
 
     expected = {False: ssh.EMULATED_PROBE_SECONDS, True: 2, None: 2}
     for kvm, budget in expected.items():
+        hang = subprocess.TimeoutExpired(["ssh"], budget, stderr=b"")
+        monkeypatch.setattr(ssh.subprocess, "Popen", _FakeProbe(seen, [hang]))
         assert _make_ssh(inst(kvm)).is_ready() is False
-        assert seen["timeout"] == budget + ssh.PROBE_GRACE_SECONDS, kvm
+        assert seen["timeouts"][0] == budget + ssh.PROBE_GRACE_SECONDS, kvm
         cmd = list(seen["cmd"])
         timeouts = [o for o in cmd if o.startswith("ConnectTimeout=")]
         assert timeouts == [f"ConnectTimeout={budget}"], kvm
+        monkeypatch.undo()  # the real Popen for `ssh -G`
         if shutil.which("ssh"):
             # `ssh -G` prints the resolved config without connecting.
             resolved = real_run(

@@ -22,7 +22,7 @@ board model or silently replace a convergence request with shell access.
 | Inject helpers/keys/init offline | `sudo debugfs -w -f inject.cmds fw-root.img`, then verify every injected file (phase 4) |
 | Dependency probe, serial only | `qmu launch --harness --cmdline '… init=/qmu-probe-init.sh' --name fw-probe --no-replace`, then `qmu wait --vm fw-probe --pattern QMU-BOOT-DONE --timeout 30` |
 | Interactive access over SSH | `qmu launch --cmdline '… init=/qmu-net-init.sh net.ifnames=0' --ssh-timeout 240 --name fw-access --no-replace`, then `qmu --vm fw-access exec -- '…'` |
-| Run / debug original binaries | phase 6: `exec`/`push`/`pull`, gdbserver over the SSH pipe |
+| Run / debug original binaries | phase 6: `exec`/`push`/`pull`, gdbserver over the SSH pipe, or a TCP gdbserver via `launch --forward` |
 | Decide what counts as evidence, handoff | `skill://qmu/reference/evidence-contract.md` — read before promoting any marker, SSH connection or green run into a claim |
 
 Exit codes you will branch on (full contract: `qmu --help`, `skill://qmu/reference/wait.md`):
@@ -154,7 +154,7 @@ on the host:
 | Both templates | Executable `/bin/bash` (their shebang requires Bash, not just a BusyBox `sh`), its loader/shared libraries, `mount`, and `sleep` |
 | Probe template | `uname`, `sed`, `ldd`, `sync`, `poweroff`, `halt`; representative target and its dependency closure |
 | Network template | `mkdir`, `chmod`, `ip` supporting the shown link/address/route/query options, and `dropbear` |
-| SSH commands/transfers | `/bin/sh`, the account's configured login shell, `dropbearkey`, `sftp-server` at Dropbear's compiled path, their ELF loaders/libraries, and utilities used by the intended benign command |
+| SSH commands/transfers | `/bin/sh`, the account's configured login shell, `dropbearkey`, for transfers either `sftp-server` at Dropbear's compiled path or Dropbear's `scp` on `PATH` (qmu retries with `scp -O` when there is no SFTP server), their ELF loaders/libraries, and utilities used by the intended benign command |
 | Dependency inspection/debugging | `ldd` itself may be a script: inspect its shebang, interpreter, helper commands and loader paths; inspect `gdbserver` dependencies separately |
 
 Check executable modes, symlink destinations, mountpoints and command lookup
@@ -321,11 +321,12 @@ address or route reported as an error is failure, not silently repaired.
 Network configuration can succeed before the daemon stage fails; the earlier
 configuration observation remains true but does not prove SSH access.
 SSH readiness is qmu's actual **host-side connection check**, not a serial
-marker. When it times out, `launch` exits `4` with `ok: false` and
-`ssh_status: "timeout (VM may still be booting)"`, retaining the VM, logs and SSH status for diagnosis
-(`ssh_status: "no-console-output"` after ~10 s of empty serial means the
-`console=`/machine type is wrong for this arch); `124` remains a `wait`/`run`
-timeout outcome. `--no-wait-ssh` and `--harness` skip that check; a successful
+marker. When it times out, `launch` exits `124` with `ok: false` and
+`ssh_status: "timeout"`, retaining the VM, logs and SSH status for diagnosis
+(`ssh_status: "no-console-output"`, exit `4`, after ~10 s of empty serial means the
+`console=`/machine type is wrong for this arch; `ssh_status: "auth-failed"`,
+exit `4`, means dropbear answered and refused the `[ssh] user`/key — `ssh_user`
+names the account qmu tried). `--no-wait-ssh` and `--harness` skip that check; a successful
 launch then makes no SSH-readiness claim. After readiness, perform a benign
 `qmu --vm fw-access exec -- 'printf "%s\n" QMU-ACCESS-CHECK'` and, if transfers
 are required, push/pull a known harmless file and compare its bytes. Record
@@ -354,7 +355,7 @@ agreed benign operation, then apply the independent clean-VM handoff gate.
 ### 6. Audit
 ```bash
 qmu --vm fw-access exec -- 'LD_LIBRARY_PATH=/usr/lib64 <cmd>'  # original userland, not service convergence
-qmu --vm fw-access push <local> <guest>       # needs sftp-server injected (phase 4)
+qmu --vm fw-access push <local> <guest>       # SFTP, or `scp -O` automatically when the guest has no sftp-server
 qmu --vm fw-access pull <guest> <local>
 ```
 **Benign harnesses — build outside the guest when it has no toolchain.**
@@ -402,6 +403,15 @@ gdb-multiarch -q -ex 'set architecture <arch>' \
         LD_LIBRARY_PATH=/opt/qmu-tools/lib:/usr/lib64 /opt/qmu-tools/bin/gdbserver - /usr/bin/<target>'
 # then: break/continue/stepi/x/info sharedlibrary. `gdbserver --attach <pid>` for a live process.
 ```
+For a long-lived session across `exec` calls (a vendor daemon you attach to and
+keep), launch with `--forward 2345` (or `[machine] forwards = ["2345"]`) and
+run gdbserver on a guest address slirp reaches — `0.0.0.0:2345`, not
+`127.0.0.1` — then connect to the host port `forwards[]` reports; the forward
+dies with the VM:
+```bash
+qmu --vm fw-access exec -- 'nohup /opt/qmu-tools/bin/gdbserver --attach 0.0.0.0:2345 <pid> >/tmp/gdbs.log 2>&1 &'
+gdb-multiarch -q -ex "target remote 127.0.0.1:$(qmu --vm fw-access --format json status | jq '.forwards[0].host_port')"
+```
 The process stops at the ld.so entry (libs not yet mapped); `continue` to a breakpoint past
 rtld to see `info sharedlibrary`. (qmu's `--gdb`/`gdb` is the QEMU stub for the *kernel*, not
 userspace.) Stripped binaries: load symbols from your BNDB/IDA analysis or a `.symtab` sidecar.
@@ -412,14 +422,15 @@ userspace.) Stripped binaries: load symbols from your BNDB/IDA analysis or a `.s
 |---|---|---|
 | `qmu exec`/`log` says no such VM, but `launch --name fw` worked | `--name` names the instance at `launch`; every other verb selects with the global `--vm` | `qmu --vm fw exec -- '…'` (or `qmu exec --vm fw …`) |
 | `launch` exit 4, `ssh_status: "no-console-output"` | wrong `console=` or machine type for the arch; the guest never wrote to serial | arm64: `console=ttyAMA0` + `extra_args = ["-M", "virt"]`; x86: `console=ttyS0`, no `-M virt` |
-| `launch` exit 4, `ssh_status: "timeout (VM may still be booting)"`, serial shows `QMU-NET-CONFIGURED` and no `QMU-HELPER-EXITED` | dropbear is running but rejected the key, or listens elsewhere: bad `authorized_keys` perms, key algorithm, port | `qmu log --vm fw-access --grep 'QMU-NET|QMU-HELPER|dropbear'`; see the key and permission rows below |
+| `launch` exit 4, `ssh_status: "auth-failed"` (`SSHAuthError`) | dropbear answered and refused `ssh_user` with the key: account absent or without a login shell, `authorized_keys` missing/bad perms, key algorithm | `qmu log --vm fw-access --grep 'QMU-NET|QMU-HELPER|dropbear'`; see the key and permission rows below; `[ssh] user` is fixed at launch |
+| `launch` exit 124, `ssh_status: "timeout"`, serial shows `QMU-NET-CONFIGURED` and no `QMU-HELPER-EXITED` | dropbear is running but listens elsewhere (port/address), or the NIC never came up | `qmu log --vm fw-access --grep 'QMU-NET|QMU-HELPER|dropbear'` |
 | same, serial shows `=== QMU-HELPER-EXITED code=N ===` | dropbear exited: `127`/`126` = not found/not executable (loader path, ELF interpreter), other = missing library, ABI mismatch, or a startup error printed just above the marker | `qmu log --vm fw-access --tail 40`; phase 4 checks on the helper, `libs/` completeness, `LD_LIBRARY_PATH=/opt/qmu-tools/lib` |
 | same, serial shows `Attempted to kill init!` (wait exit 3) | the image's init is not this template: a hand-written `exec daemon` init lost PID 1 when the daemon returned | use the template's child+`wait` shape; the panic hides the daemon's exit status |
 | same, serial shows `QMU-NET-FAILED: <stage>` | `ip` link/address/route step failed, or the address already existed (strict one-shot `add`) | fix the template for this firmware's `ip`/interface; check `VIRTIO_NET`/`VIRTIO_PCI`/`PCI_HOST_GENERIC` are `=y` in `$CONFIG` |
 | same, serial empty after the kernel banner | kernel reached init but init could not exec (`/bin/bash` missing, wrong ELF interpreter) | phase 4 inventory; the templates require Bash |
 | `No matching algo hostkey` / client key rejected | sourced dropbear predates ed25519 (bionic 2017.75) | ecdsa-nistp256 for both host keys (`dropbear -R` makes rsa+ecdsa) and the client key (`ssh-keygen -t ecdsa`); ≥2018.76 can use ed25519 |
 | SSH connects then closes; `Authentication refused: bad ownership or modes` in daemon output | home/`.ssh`/`authorized_keys` writable by group/other, or wrong owner | home `0700`/`0755`, `.ssh` `0700`, key file `0600`, owned by the account or root — in the private image only |
-| `qmu push`/`pull` → `No such file` | `sftp-server` absent at dropbear's compiled path (often `/usr/lib/sftp-server`), or its loader/library missing, or a dangling symlink | inject it at the compiled path and verify its dependency closure |
+| `qmu push`/`pull` → `the guest has no SFTP server … legacy-protocol retry (scp -O) failed` | neither `sftp-server` at dropbear's compiled path nor `scp` on the guest `PATH` (or their loader/library is missing, or a dangling symlink) | inject either one and verify its dependency closure |
 | `push` to `/tmp` → `No such file or directory` | firmware `/tmp` is a symlink to a tmpfs systemd would mount | the net template recreates `/var/volatile/tmp`; adjust to this firmware's layout (`readlink /tmp`) |
 | guest boots but no network device | `VIRTIO_NET`/`VIRTIO_PCI`/`PCI_HOST_GENERIC` are `=m` (modules not in the image) | rebuild with them `=y` |
 | slow boot, SSH wait expires | cross-emulation is TCG (no KVM unless guest arch == host arch) | raise `--ssh-timeout`; elapsed time is not readiness evidence |

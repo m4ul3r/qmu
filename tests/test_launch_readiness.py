@@ -9,6 +9,7 @@ import pytest
 from qmu import cli
 from qmu.commands import lifecycle
 from qmu.instance import VMInstance, load_instance, save_instance
+from qmu.ssh import PROBE_AUTH_FAILED, SSHClient
 
 
 @pytest.fixture
@@ -421,6 +422,85 @@ def test_arm_console_on_x86_warns(launch_env, capsys):
 
     assert rc == 0
     assert any("console=ttyAMA0" in w and "ttyS0" in w for w in payload["warnings"])
+
+
+def test_virtio_root_on_x86_warns_in_the_same_launch_as_the_console(launch_env, capsys):
+    """#152: the root= lint runs for x86_64 too. qmu's implicit x86 disk is a
+    plain IDE/SATA drive (/dev/sda), so `root=/dev/vda` is as fatal there as
+    `root=/dev/sda` is on arm — and one launch must name both mistakes."""
+    _, _, state = launch_env
+    state["ready"] = True
+
+    rc = cli.main([
+        "launch", "--arch", "x86_64", "--format", "json",
+        "--cmdline", "console=ttyAMA0 root=/dev/vda ro init=/run.sh",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert any("console=ttyAMA0" in w for w in payload["warnings"])
+    assert any("root=/dev/vda" in w and "/dev/sda" in w for w in payload["warnings"])
+
+
+def test_explicit_drive_suppresses_the_x86_root_device_lint(launch_env, capsys):
+    _, _, state = launch_env
+    state["ready"] = True
+
+    rc = cli.main([
+        "launch", "--arch", "x86_64", "--format", "json",
+        "--cmdline", "console=ttyS0 root=/dev/vda rw",
+        "--drive", "file=/tmp/x.img,if=virtio",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["warnings"] == []
+
+
+class _RefusingSSH(SSHClient):
+    """The real client's classification, with sshd answering every probe by
+    refusing the login (an `[ssh] user` the image has no account for)."""
+
+    def probe(self, timeout=2):
+        self.last_probe = PROBE_AUTH_FAILED
+        self.last_probe_stderr = (
+            f"{self.user}@localhost: Permission denied (publickey,password)."
+        )
+        return PROBE_AUTH_FAILED
+
+
+@pytest.mark.parametrize("output_format", ["json", "text"])
+def test_refused_ssh_user_is_auth_failed_not_a_boot_timeout(
+    launch_env, capsys, monkeypatch, output_format
+):
+    """#158: sshd refusing `[ssh] user` is positive evidence the guest booted.
+    It ends the wait (no 60 s burn), exits 4 as an SSH failure — not 124
+    "may still be booting" — and names the user qmu tried. The VM is kept."""
+    inst, _, _ = launch_env
+    inst.ssh_user = "lowpriv"
+    monkeypatch.setattr(
+        lifecycle, "_make_ssh",
+        lambda i: _RefusingSSH(port=i.ssh_port, key_path=i.ssh_key, user=i.ssh_user),
+    )
+    monkeypatch.setattr(lifecycle, "AUTH_REFUSED_SETTLE_SECONDS", 0.0)
+
+    rc = cli.main(["launch", "--ssh-timeout", "60", "--format", output_format])
+    output = capsys.readouterr()
+
+    assert rc == 4
+    if output_format == "json":
+        payload = json.loads(output.out)
+        assert payload["ssh_status"] == "auth-failed"
+        assert payload["error_type"] == "SSHAuthError"
+        assert payload["ssh_user"] == "lowpriv"
+        assert payload["ssh_error"] is True
+        assert "timed_out" not in payload
+        assert "lowpriv" in payload["error"]
+        assert "may still be booting" not in payload["error"]
+    else:
+        assert "auth-failed" in output.out
+        assert "lowpriv" in output.err
+    assert load_instance(inst.vm_id) is not None
 
 
 def test_no_reboot_flag_reaches_launch_vm(launch_env, capsys, monkeypatch):

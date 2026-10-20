@@ -231,12 +231,14 @@ AppArmor userns restriction is also defeated" — a separate proof obligation.
 
 An LPE result measured as root is meaningless. The uid-1000 account is
 `ubuntu` (or `--unpriv-user NAME`, which renames it; a name that already
-exists at another uid — including `nobody`, 65534 — fails the build). `/root`
-is `0700`, so copy the binary out:
+exists at another uid — including `nobody`, 65534 — fails the build). Keep
+`[ssh] user = "root"` (`kbase` needs it) and drop privileges per command with
+`--user`: qmu runs `runuser -u ubuntu -- …` in `ubuntu`'s home, forwards the
+program's exit status, and records `run_as: "ubuntu"` with `command` as given:
 
 ```bash
-qmu compile ./poc.c --vm ubu
-qmu exec --vm ubu 'install -m755 /root/poc /home/ubuntu/ && su ubuntu -c /home/ubuntu/poc'
+qmu compile ./poc.c --vm ubu --run --user ubuntu   # builds into /tmp (/root is 0700), runs as ubuntu
+qmu exec --vm ubu --user ubuntu -- /tmp/poc arg1   # rerun without rebuilding
 ```
 
 ## Debug symbols and GDB
@@ -344,7 +346,7 @@ mask (the write path bypasses it).
 | `mktarget: error: debug-symbol extraction failed …` (exit 2) | ddebs infra fault; target unchanged | retry with `--verbose`, or drop `--symbols` |
 | SSH timeout on a guest that booted | NIC naming or `[ssh] key` mismatch | `qmu log --vm ubu --grep 'QMU-NET'`; use `--config "$QMU_TOML"` so the key matches |
 | unprivileged PoC "does nothing" | module only in `-extra`, or userns denial on `uid_map` | per-module `modprobe` check above; `unshare -U -r` |
-| `unshare -U -r` succeeds for your probe | you ran it as root | `su ubuntu -c …` |
+| `unshare -U -r` succeeds for your probe | you ran it as root | `qmu exec --vm ubu --user ubuntu -- unshare -U -r id` |
 | `qmu kbase` fails | non-root SSH user, `kptr_restrict=2`, or no `VMLINUX` | keep `[ssh] user = "root"`; `--symbols` on an ABI with dbgsym |
 | rebuild happens though nothing changed | resolved deb version moved (`latest`), or options differ from the stamp | pin with `--kernel-abi <abi>` / `--kernel-version` |
 | Docker build fails naming `--unpriv-user` | name exists at another uid | choose an unused name |
