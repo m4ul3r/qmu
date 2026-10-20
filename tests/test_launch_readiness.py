@@ -594,3 +594,36 @@ def test_launch_mirrors_the_qmp_retry_note_into_warnings(
     assert "[qmu] QMP connect retried 2× (ECONNRESET)" in output.err
     if output_format == "json":
         assert json.loads(output.out)["warnings"] == ["QMP connect retried 2× (ECONNRESET)"]
+
+
+def test_a_failed_launch_envelope_keeps_the_vm_and_the_lint(
+    launch_env, capsys, monkeypatch
+):
+    """#157: the arch/cmdline lint is usually WHY a launch failed, yet the
+    failure envelope carried neither it nor the VM (`vm_id: null`,
+    `warnings: null`) and fell back to the `<vm_id>` placeholder hint."""
+    from qmu.instance import QMUError
+
+    def launch(**kwargs):
+        kwargs["notes"].append("Waited 2.0s for the port-allocation lock")
+        raise QMUError(
+            "QMP connection failed after launch: boom", vm_id="xarch-2",
+            hint="VM 'xarch-2' was rolled back",
+        )
+
+    monkeypatch.setattr(lifecycle, "launch_vm", launch)
+    rc = cli.main([
+        "launch", "--arch", "aarch64", "--format", "json",
+        "--cmdline", "console=ttyS0 root=/dev/sda rw",
+    ])
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+
+    assert rc == 1
+    assert payload["ok"] is False
+    assert payload["vm_id"] == "xarch-2"
+    assert payload["hint"] == "VM 'xarch-2' was rolled back"
+    assert any("console=ttyS0" in w for w in payload["warnings"])
+    assert any("root=/dev/sda" in w for w in payload["warnings"])
+    assert payload["warnings"][-1] == "Waited 2.0s for the port-allocation lock"
+    assert "[qmu] Waited 2.0s for the port-allocation lock" in output.err

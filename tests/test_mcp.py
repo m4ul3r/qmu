@@ -102,6 +102,22 @@ def test_schema_maps_flags_choices_and_repeatables():
     assert save["required"] == ["name"] and save["properties"]["name"]["type"] == "string"
 
 
+def test_descriptions_are_whole_sentences_and_name_their_flag():
+    """#131: a description is never cut at `e.g.` or inside parentheses, and a
+    property whose name is an argparse dest (`cpu_model`) names its flag."""
+    assert mcp_server.first_sentence("Arch (e.g. x86_64; aarch64). More.") == "Arch (e.g. x86_64; aarch64)."
+    assert mcp_server.first_sentence("QEMU -cpu model, e.g. 'host'. More.") == "QEMU -cpu model, e.g. 'host'."
+    for tool in mcp_server.build_tools(build_parser()):
+        props = tool.schema["properties"]
+        for text in [tool.description] + [p.get("description", "") for p in props.values()]:
+            assert text.count("(") == text.count(")"), (tool.name, text)
+            assert not text.endswith(("e.g.", "i.e.")), (tool.name, text)
+        for action in tool.options:
+            flag = mcp_server._long_flag(action.option_strings)
+            if flag.lstrip("-").replace("-", "_") != action.dest:
+                assert props[action.dest]["description"].startswith(flag), (tool.name, action.dest)
+
+
 def test_argv_for_keeps_the_guest_command_as_one_token():
     tools = {t.name: t for t in mcp_server.build_tools(build_parser())}
     assert mcp_server.argv_for(tools["qmu_exec"], {"command": "uname -a", "timeout": 5, "vm": "x"}) == [

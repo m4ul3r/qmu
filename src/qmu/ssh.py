@@ -400,6 +400,14 @@ def _watch_child(
 # a 2.6 s end-to-end budget, so the probe itself is capped at 2.25 s.
 PROBE_GRACE_SECONDS = 0.25
 
+# The readiness probe's floor for an emulated (TCG, `kvm: false`) guest. The
+# 2 s budget above is sized for KVM, where sshd answers in milliseconds; an
+# emulated sshd needed 1.4–1.8 s at host load 1 and 4.2–5.1 s for a full
+# `ssh … true` at load 15, so `status`/`list` called a guest `exec` reached
+# in 4.7 s `ssh: down` / `guest: unknown` (#161). The cap still bounds a hung
+# listener (#77) — it is only sized to emulation cost, with ~1.6× headroom.
+EMULATED_PROBE_SECONDS = 8
+
 # How much longer a probe waits once sshd has accepted the userauth service
 # (`SSH2_MSG_SERVICE_ACCEPT`): the server is up, and only its verdict on the
 # login is outstanding. A refusal is not always fast — an image with
@@ -434,26 +442,39 @@ class SSHClient:
         key_path: str,
         host: str = "localhost",
         user: str = "root",
+        *,
+        emulated: bool = False,
     ):
         self.port = port
         self.key_path = key_path
         self.host = host
         self.user = user
+        # TCG guest: readiness probes get at least EMULATED_PROBE_SECONDS.
+        self.emulated = emulated
         # Set once a transfer found no SFTP server in the guest and the
         # legacy protocol worked, so a second transfer in the same command
         # goes straight to `scp -O` (#148).
         self.scp_legacy = False
 
-    def _ssh_base(self, *, multiplex: bool = True, log_level: str = "ERROR") -> list[str]:
-        # ssh keeps the FIRST value of a repeated -o, so a caller that needs
-        # another LogLevel (the probe reads the handshake phase) sets it here.
+    def _ssh_base(
+        self,
+        *,
+        multiplex: bool = True,
+        connect_timeout: int = 5,
+        log_level: str = "ERROR",
+    ) -> list[str]:
+        # ConnectTimeout and LogLevel are parameters, never re-appended by a
+        # caller: OpenSSH keeps the FIRST value of a repeated `-o`, so a later
+        # `-o ConnectTimeout=8` is silently ignored (`ssh -G` shows 5) — which
+        # held the TCG probe's banner budget at 5 s (#161 review). The probe
+        # sets LogLevel to read the handshake phase (#158).
         base = [
             "ssh",
             "-i", self.key_path,
             "-p", str(self.port),
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=5",
+            "-o", f"ConnectTimeout={connect_timeout}",
             "-o", "ServerAliveInterval=5",
             "-o", "ServerAliveCountMax=3",
             "-o", f"LogLevel={log_level}",
@@ -498,13 +519,17 @@ class SSHClient:
 
         `timeout` is the budget up to authentication: ssh's own
         ConnectTimeout bounds both the TCP connect and the banner exchange,
-        and the subprocess cap is only PROBE_GRACE_SECONDS beyond it. A probe
-        still running at the cap whose (debug) stderr shows the server
-        accepted the userauth service gets PROBE_AUTH_GRACE_SECONDS more for
-        the verdict.
+        and the subprocess cap is only PROBE_GRACE_SECONDS beyond it. An
+        emulated guest's budget is raised to EMULATED_PROBE_SECONDS: below
+        that a serving TCG sshd reads as down. A probe still running at the
+        cap whose (debug) stderr shows the server accepted the userauth
+        service gets PROBE_AUTH_GRACE_SECONDS more for the verdict.
         """
-        cmd = self._ssh_base(multiplex=False, log_level="DEBUG1") + [
-            "-o", f"ConnectTimeout={timeout}",
+        if self.emulated:
+            timeout = max(timeout, EMULATED_PROBE_SECONDS)
+        cmd = self._ssh_base(
+            multiplex=False, connect_timeout=timeout, log_level="DEBUG1"
+        ) + [
             "-o", "BatchMode=yes",
             self._target(),
             "true",

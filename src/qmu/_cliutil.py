@@ -43,7 +43,12 @@ from .ssh import SSHAuthError, SSHClient
 
 
 def _make_ssh(inst: VMInstance) -> SSHClient:
-    return SSHClient(port=inst.ssh_port, key_path=inst.ssh_key, user=inst.ssh_user)
+    # `kvm` is the accel recorded at launch; None (a pre-#39 record) is
+    # unknown and keeps the KVM-sized probe.
+    return SSHClient(
+        port=inst.ssh_port, key_path=inst.ssh_key, user=inst.ssh_user,
+        emulated=getattr(inst, "kvm", None) is False,
+    )
 
 
 def _ssh_user(inst: Any) -> str | None:
@@ -898,10 +903,12 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
     else:
         ssh_timeout_help = (
             "Seconds to wait for the guest to answer SSH (default: 60). On "
-            "expiry `launch` exits 124 and RETAINS the VM for inspection — "
-            "`qmu status`/`qmu log --vm <id>`. A serial log still empty after "
-            "~10 s fails earlier with ssh_status 'no-console-output' (wrong "
-            "console= or machine type for this arch); an sshd that refuses the "
+            "expiry `launch` exits 124 (TimeoutError, timed_out: true, "
+            "ssh_status 'timeout') and RETAINS the VM for inspection — `qmu "
+            "status`/`qmu log --vm <id>` — the same code `run` returns, "
+            "which does not retain it. A serial log still empty after ~10 s fails "
+            "earlier with ssh_status 'no-console-output' (wrong console= or "
+            "machine type for this arch); an sshd that refuses the "
             "[ssh] user/key fails with ssh_status 'auth-failed' (exit 4)."
         )
     parser.add_argument("--ssh-timeout", type=int, default=60, help=ssh_timeout_help)
