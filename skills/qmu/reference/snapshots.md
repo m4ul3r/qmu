@@ -160,7 +160,10 @@ with it in the table.
 
 ## Debugger interaction
 
-`snapshot save` with software breakpoints armed bakes their `int3` bytes into
-the image, and `snapshot load` leaves an attached debugger with a stale view.
-See the coherence table in `skill://qmu/reference/debugging.md` before mixing
-snapshots and pry.
+`snapshot save` taken while a debugger has the guest running bakes its
+breakpoints' `int3` bytes into the image (under KVM); a save at a debugger
+stop is clean. On a `--gdb` VM the save's envelope says which as
+`breakpoints_in_image` (`possible` with a warning / `lifted` with a note /
+`never` under TCG). `snapshot load` leaves an attached debugger with a stale
+view. See the coherence table in `skill://qmu/reference/debugging.md` before
+mixing snapshots and pry.

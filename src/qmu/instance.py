@@ -107,6 +107,15 @@ class VMInstance:
     # bridge was spawned or the record predates the field.
     gdb_bridge_pid: int | None = None
     gdb_bridge_pid_start: str | None = None
+    # The guest generation a debugger on this VM's stub was last brought up to
+    # date with (#184): the serial offset of `qmu gdb`'s attach, or of the last
+    # reset / snapshot load / guest reboot qmu warned about, and how many boot
+    # banners at or past that offset belong to it (1 after a reset whose boot
+    # had not printed yet, else 0). One more banner past it is a guest reboot
+    # nobody warned about: the next command on the VM says so. None when no
+    # such point was recorded (counted from the first boot then).
+    debugger_epoch_offset: int | None = None
+    debugger_epoch_banners: int = 0
     # Extra host->guest TCP forwards on qmu's own NIC (`--forward`, #149):
     # `{"host", "host_port", "guest_port"}` with the host port as allocated,
     # so `status`/`list` can answer where a guest service is reachable the

@@ -144,7 +144,9 @@ from a `--pattern` wait, is the receipt for a successful harness run.
   guest reboot) adds the debugger-coherence warning to the **wait's own
   result** — `warnings[]` in json/ndjson, stderr once in every mode, never
   twice and never dropped — on both the daemon-backed and the standalone
-  path (#121). Re-arm per `reference/debugging.md` before trusting a
+  path (#121). That counts as the announcement: the next command on the VM
+  does not repeat it (a reboot no wait saw is announced by the next command
+  instead, #184). Re-arm per `reference/debugging.md` before trusting a
   breakpoint again.
 - Every failed verdict carries `hint`: `timeout` → raise `--timeout` or check
   `qmu status --vm X; qmu log --vm X --tail 50`; `terminal_panic` → `qmu

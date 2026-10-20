@@ -48,6 +48,7 @@ import pytest
 
 from qmu import daemon_client, rootfs
 from qmu.config import reset_global_config_warnings
+from qmu.debug import reset_coherence_warnings
 
 
 @pytest.fixture
@@ -99,6 +100,7 @@ def isolate_qmu_env(tmp_path_factory, monkeypatch):
     # resolve_config() directly, bypassing cli.main's own reset) must not
     # mask the same message in this test.
     reset_global_config_warnings()
+    reset_coherence_warnings()
 
     yield
 

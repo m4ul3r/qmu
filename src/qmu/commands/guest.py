@@ -28,6 +28,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ..debug import check_unwarned_reboot
 from ..hostcc import host_compile, resolve_host_cc
 from ..instance import (
     QMUError,
@@ -96,13 +97,15 @@ def _choose_running(vm_id: str | None, command: str) -> VMInstance:
     VM that `qmu list` displays; on that miss the shared describer answers
     instead (the same words and `vm_id` `exec` gives), and only a name no
     command knows keeps the "not found" listing. Paid on the failure path
-    only, so a running VM costs no extra classification.
+    only, so a running VM costs no extra classification. A guest reboot the
+    VM's debugger was not told about is announced here (#184).
     """
     try:
-        return choose_instance(vm_id)
+        inst = choose_instance(vm_id)
     except QMUError:
         _require_running_vm(vm_id, command)
         raise
+    return check_unwarned_reboot(inst)
 
 
 # ---------------------------------------------------------------------------
@@ -1382,7 +1385,7 @@ def _guest_result(
 
 def _handle_exec(args: argparse.Namespace) -> Result:
     _require_running_vm(args.vm, "exec")
-    inst = choose_instance(args.vm)
+    inst = check_unwarned_reboot(choose_instance(args.vm))
     _require_ssh(inst)
     if (refused := _preflight_ssh_guest(inst, stem="exec")) is not None:
         return refused

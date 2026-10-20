@@ -9,6 +9,8 @@ pry path is exercised through a fake `pry` on PATH so no real GDB is started.
 from __future__ import annotations
 
 import json
+import os
+import socket
 import subprocess
 
 import pytest
@@ -215,14 +217,84 @@ def test_kill_on_a_stopped_vm_never_signals_a_recycled_bridge_pid(
     assert load_instance("bridge-vm").gdb_bridge_pid == sleeper.pid
 
 
-# --- the reset warning names the KASLR re-slide (debug audit F9) -----------
+# --- the reset warning names the KASLR re-slide (debug audit F9, #183) ------
 
 
-def test_reset_warning_tells_the_agent_to_rebase_before_rearming():
-    w = debug.reset_dropped_breakpoints_warning("vm")
-    assert "hits stay 0" in w
-    assert "KASLR" in w
-    assert "qmu kbase --vm vm" in w
-    assert "pry load <vmlinux> --base $KBASE" in w
-    # Order matters: rebase, reload, THEN re-arm.
-    assert w.index("qmu kbase") < w.index("pry load") < w.index("re-set (re-arm)")
+def test_reset_recovery_rebases_while_running_then_reloads_at_a_stop(tmp_path):
+    """Run as written against live pry (#183): `kbase` needs the guest
+    running, `pry load` on a running target leaves the breakpoints
+    <PENDING>, so the order is kbase → interrupt → load → continue."""
+    w = debug.reset_dropped_breakpoints_warning(_inst(tmp_path, vm_id="vm"))
+    steps = ("qmu kbase --vm vm", "interrupt`", "load <vmlinux> --base $KBASE", "continue --background")
+    positions = [w.index(step) for step in steps]
+    assert positions == sorted(positions)
+
+
+def test_reset_recovery_skips_the_rebase_on_a_nokaslr_guest(tmp_path):
+    """Addresses did not move: interrupt + continue re-inserts in place."""
+    inst = _inst(tmp_path, vm_id="vm", cmdline="console=ttyS0 nokaslr")
+    w = debug.reset_dropped_breakpoints_warning(inst, guest_initiated=True)
+    assert "qmu kbase" not in w and "--base" not in w
+    assert w.index("interrupt`") < w.index("continue --background")
+
+
+@pytest.fixture
+def stub_client():
+    """A listening "stub" on loopback with one client end held by THIS
+    process — what a bridge's GDB holds while attached."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    client = socket.create_connection(server.getsockname())
+    accepted, _ = server.accept()
+    yield server.getsockname()[1]
+    for s in (client, accepted, server):
+        s.close()
+
+
+def test_recoveries_name_qmu_bridge_only_while_it_holds_the_stub(
+    tmp_path, sleeper, stub_client
+):
+    """#186: `qmu-<vm>` reaches the attached client only when it is the
+    bridge `qmu gdb` recorded. Neither a hand-started client with no qmu
+    bridge alive, nor one that took the stub after qmu's bridge disconnected
+    (alive, holding nothing), may be offered that name."""
+    me = os.getpid()
+    ours = _inst(
+        tmp_path, gdb_port=stub_client, gdb_bridge_pid=me,
+        gdb_bridge_pid_start=proc_pid_start(me),
+    )
+    no_bridge = _inst(tmp_path, gdb_port=stub_client)
+    disconnected = _inst(
+        tmp_path, gdb_port=stub_client, gdb_bridge_pid=sleeper.pid,
+        gdb_bridge_pid_start=proc_pid_start(sleeper.pid),
+    )
+    assert debug.bridge_holds_stub(ours) is True
+    assert debug.bridge_holds_stub(disconnected) is False
+    for build in (
+        debug.reset_dropped_breakpoints_warning,
+        debug.loadvm_stale_session_warning,
+        lambda inst: debug.savevm_breakpoint_warning(inst, "running"),
+    ):
+        assert "pry --instance qmu-bridge-vm interrupt" in build(ours)
+        for foreign in (no_bridge, disconnected):
+            assert "qmu-bridge-vm" not in build(foreign)
+            assert "pry doctor" in build(foreign)
+
+
+def test_tcg_warnings_do_not_claim_breakpoints_died(tmp_path):
+    """Measured under --no-kvm: breakpoints live in QEMU, not guest RAM, so
+    they keep firing after a snapshot load and after a nokaslr reset; only
+    a KASLR re-slide strands them (and the rebase recovery applies)."""
+    tcg = _inst(tmp_path, kvm=False)
+    tcg_nokaslr = _inst(tmp_path, kvm=False, cmdline="console=ttyS0 nokaslr")
+    load = debug.loadvm_stale_session_warning(tcg)
+    assert "never fire" not in load and "interrupt" not in load
+    reset = debug.reset_dropped_breakpoints_warning(tcg_nokaslr)
+    assert "do not fire" not in reset and "Nothing to re-arm" in reset
+    # At a debugger stop GDB had lifted them: booting needs `qmu cont`, and
+    # its resume puts them back.
+    halted = debug.reset_dropped_breakpoints_warning(tcg_nokaslr, qemu_status="prelaunch")
+    assert "qmu cont --vm bridge-vm" in halted and "continue --background" in halted
+    moved = debug.reset_dropped_breakpoints_warning(tcg)
+    assert moved.index("qmu kbase") < moved.index("--base $KBASE")

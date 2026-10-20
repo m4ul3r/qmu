@@ -21,7 +21,8 @@ import argparse
 import sys
 from typing import NoReturn
 
-from .config import global_config_warnings, reset_global_config_warnings
+from .config import reset_global_config_warnings
+from .debug import reset_coherence_warnings
 from .instance import QMUError, reset_autoselection
 from .output import render_value
 from .qmp import QMPError
@@ -30,6 +31,7 @@ from .version import VERSION
 
 from ._cliutil import (
     Result,
+    dispatch_warnings,
     _add_top_level_common_opts,
     _emit_error,
     _resolve_config_from_args,
@@ -292,6 +294,7 @@ def _parse(argv: list[str]) -> argparse.Namespace | None:
     # warn on a broken global config; only resolve_config() calls WITHIN this
     # one dispatch (the gate below plus a handler that resolves again) dedupe.
     reset_global_config_warnings()
+    reset_coherence_warnings()
     reset_autoselection()
     parser = build_parser()
     try:
@@ -344,15 +347,16 @@ def _absorb_trailing_positionals(
 def _dispatch(args: argparse.Namespace) -> Result:
     """Apply the project-config gate, then run the handler; nothing rendered.
 
-    Warnings the gate (or the handler's own config resolution) recorded — a
-    broken global config is skipped with a warning, never fatal — are
-    attached to the Result so they reach stderr and the envelope's
-    `warnings[]` through the same rendering as every other warning (#74).
+    Warnings recorded outside the handler's Result — a broken global config
+    the gate skipped (never fatal), a guest reboot the VM's debugger was not
+    told about, found while the VM was resolved (#184) — are attached to the
+    Result so they reach stderr and the envelope's `warnings[]` through the
+    same rendering as every other warning (#74).
     """
     if args.subcommand not in _CONFIG_EXEMPT_SUBCOMMANDS:
         _resolve_config_from_args(args)
     result = args.handler(args)
-    return result.warn(*global_config_warnings())
+    return result.warn(*dispatch_warnings())
 
 
 def invoke(argv: list[str]) -> Result:
