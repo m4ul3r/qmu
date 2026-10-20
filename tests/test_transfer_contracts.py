@@ -402,7 +402,7 @@ def test_transfer_transport_loss_without_fresh_crash_is_exit4(
     assert payload["ssh_error"] is True
     assert payload["crash_detected"] is False
     assert payload["crash"] is None
-    assert "qmu log --tail 100" in payload["hint"]
+    assert "qmu log --vm xfer-vm --tail 100" in payload["hint"]
 
 
 @pytest.mark.parametrize("operation", ["push", "pull"])

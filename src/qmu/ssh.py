@@ -158,9 +158,27 @@ def _control_opts() -> list[str]:
     ]
 
 
+# The keepalive every guest connection (and so every ControlMaster) runs
+# with (#182). The master still sends a keepalive every 5 s, so a peer that
+# resets the connection — a guest that rebooted under an idle master — is
+# noticed and the master exits; but it never gives up on *silence*. A vCPU
+# halted by a debugger answers nothing for as long as the operator inspects
+# it, and `ServerAliveCountMax=3` dropped the master 15 s into the stop —
+# taking a detached trigger's session, its further output and its exit
+# status with it, although the command itself kept running. Silence is
+# qmu's to judge, not ssh's: the guest watcher reports a panic or a halted
+# vCPU within a second, and every guest command has its own `--timeout`.
+# scp carries the same options: whichever command opens the master sets its
+# keepalive for every session multiplexed over it.
+_KEEPALIVE_OPTS = (
+    "-o", "ServerAliveInterval=5",
+    "-o", "ServerAliveCountMax=2147483647",
+)
+
+
 # Markers written by the *local* ssh/scp client (not the guest) when the
-# transport is lost — e.g. the guest kernel panicked and the connection was
-# dropped by the keepalive. ssh exits 255 in these cases.
+# transport is lost or was never established — the guest's sshd is down, or
+# the connection was reset. ssh exits 255 in these cases.
 SSH_TRANSPORT_ERROR_MARKERS = (
     "Connection timed out during banner exchange",
     "Connection reset by peer",
@@ -182,6 +200,33 @@ def is_transport_failure(rc: int, stderr: str) -> bool:
     if rc != 255:
         return False
     return any(m in stderr for m in SSH_TRANSPORT_ERROR_MARKERS)
+
+
+# What ssh prints when it never got as far as a session: the TCP connect
+# failed, or sshd did not complete the banner/key exchange. A 255 with only
+# these on stderr proves the command was never started (#177).
+_NOT_CONNECTED_PATTERNS = (
+    re.compile(r"Connection timed out during banner exchange"),
+    re.compile(r"^kex_exchange_identification: "),
+    re.compile(r"^ssh: connect to host \S+ port \d+: "),
+)
+
+
+def never_connected(rc: int, stdout: str, stderr: str) -> bool:
+    """True if (rc, stdout, stderr) prove ssh never reached the guest, so the
+    remote command did not run.
+
+    Stricter than :func:`is_transport_failure`: guest output and ssh's own
+    lines share stderr, so every non-empty stderr line must be one of ssh's
+    pre-session failures and nothing may have arrived on stdout — a guest
+    command that itself runs `ssh` and exits 255 is not mistaken for one.
+    """
+    if rc != 255 or stdout:
+        return False
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    return bool(lines) and all(
+        any(p.search(line) for p in _NOT_CONNECTED_PATTERNS) for line in lines
+    )
 
 
 # What `ssh` itself prints when sshd answered and every authentication method
@@ -475,8 +520,7 @@ class SSHClient:
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", f"ConnectTimeout={connect_timeout}",
-            "-o", "ServerAliveInterval=5",
-            "-o", "ServerAliveCountMax=3",
+            *_KEEPALIVE_OPTS,
             "-o", f"LogLevel={log_level}",
         ]
         if multiplex:
@@ -492,6 +536,7 @@ class SSHClient:
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "ConnectTimeout=5",
+            *_KEEPALIVE_OPTS,
             "-o", "LogLevel=ERROR",
         ] + _control_opts()
 
@@ -584,8 +629,9 @@ class SSHClient:
         The master connection outlives the command that opened it
         (`ControlPersist=60`). After the guest's TCP state is rewound or reset
         underneath it (`snapshot load`, `system_reset`), the next command
-        reuses the stale master and stalls for the keepalive window before
-        reporting a `Broken pipe`. Closing it first makes the next command
+        reuses the stale master and stalls — until its own `--timeout`, since
+        the keepalive never gives up on a silent peer (#182) — or fails with
+        `Broken pipe`. Closing it first makes the next command
         open a fresh connection. Returns True when a master was closed; False
         when multiplexing is off or no master was alive — never raises.
         """
@@ -617,10 +663,10 @@ class SSHClient:
         `abort_when` is polled every `poll_interval` seconds while the child
         runs; when it returns True the child is killed and :class:`SSHAborted`
         is raised with the output collected so far. The caller watches the
-        serial log and QMP with it: a guest that panics mid-command drops the
-        transport, but ssh only notices after the keepalive window
-        (`ServerAliveInterval × ServerAliveCountMax` = 15 s) while the panic
-        is on disk within ~100 ms; a halted vCPU never drops it at all. When
+        serial log and QMP with it: a guest that panics mid-command stops
+        answering, and ssh's keepalive never gives up on a silent peer
+        (:data:`_KEEPALIVE_OPTS`), while the panic is on disk within ~100 ms;
+        a halted vCPU must not drop the session at all. When
         `detach_to` returns a path at that moment the child is left running
         instead (see :func:`_watch_child`) and the exception carries the path
         as `detached_output`. A

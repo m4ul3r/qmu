@@ -108,7 +108,7 @@ external passt process.
 `snapshot load` tears down the VM's SSH ControlMaster (the multiplexed
 connection that was alive when the snapshot was taken), so the first `qmu exec`
 after a load connects fresh and is fast. Without that teardown the first SSH
-command after a load stalls 15–20 s on the stale master's keepalive expiry
+command after a load can stall on the stale master until its `--timeout`
 (exiting 124 or 4, sometimes with a one-off `Broken pipe`) — if you ever see
 that symptom, `ssh -O exit` on the control socket under `$QMU_TEMP_DIR/ssh`
 (or a second `qmu exec`) clears it.

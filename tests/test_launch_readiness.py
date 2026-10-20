@@ -627,3 +627,91 @@ def test_a_failed_launch_envelope_keeps_the_vm_and_the_lint(
     assert any("root=/dev/sda" in w for w in payload["warnings"])
     assert payload["warnings"][-1] == "Waited 2.0s for the port-allocation lock"
     assert "[qmu] Waited 2.0s for the port-allocation lock" in output.err
+
+
+# ---------------------------------------------------------------------------
+# #176: a QEMU retained before its main loop (#157) has written nothing
+# because nothing has run yet. The no-console window opens when QMP first
+# says the vCPUs run; until then an empty console is not a console= verdict.
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """`lifecycle.time` with a clock that only `sleep` advances."""
+
+    def __init__(self):
+        import time as real
+
+        self._real = real
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _qmp_answers(monkeypatch, states):
+    """`_query_qmp` answering from `states` (the last one repeats)."""
+    seen = []
+
+    def query(inst):
+        state = states[min(len(seen), len(states) - 1)]
+        seen.append(state)
+        if state == "busy":
+            return lifecycle._QMPProbe(lifecycle.QMP_BUSY, error="no greeting")
+        return lifecycle._QMPProbe(
+            lifecycle.QMP_CONNECTED, status=state, running=state == "running"
+        )
+
+    monkeypatch.setattr(lifecycle, "_query_qmp", query)
+    return seen
+
+
+def test_console_window_opens_when_qemu_starts_the_vcpus(
+    launch_env, capsys, monkeypatch
+):
+    """QEMU busy for the first 3 s of the wait: the 10 s window counts from
+    the first `running` answer, so the verdict comes at 13 s, not 10."""
+    _, serial, _ = launch_env
+    serial.write_text("")
+    clock = _Clock()
+    monkeypatch.setattr(lifecycle, "time", clock)
+    _qmp_answers(monkeypatch, ["busy", "busy", "busy", "running"])
+
+    rc = cli.main(["launch", "--ssh-timeout", "600", "--format", "json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 4
+    assert payload["ssh_status"] == "no-console-output"
+    assert clock.now - 1000.0 == 3 + lifecycle.NO_CONSOLE_OUTPUT_SECONDS
+
+
+@pytest.mark.parametrize("never", ["busy", "prelaunch"])
+def test_qemu_that_never_ran_is_a_timeout_not_a_console_verdict(
+    launch_env, capsys, monkeypatch, never
+):
+    """Still initialising (no QMP greeting) or never started (vCPUs stopped)
+    at the deadline: 124, the VM retained, and no `console=` fix suggested."""
+    inst, serial, _ = launch_env
+    serial.write_text("")
+    monkeypatch.setattr(lifecycle, "time", _Clock())
+    monkeypatch.setattr(lifecycle, "NO_CONSOLE_OUTPUT_SECONDS", 0.0)
+    _qmp_answers(monkeypatch, [never])
+
+    rc = cli.main([
+        "launch", "--arch", "aarch64", "--ssh-timeout", "30", "--format", "json",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 124
+    assert payload["ok"] is False
+    assert payload["ssh_status"] == "timeout"
+    assert payload["timed_out"] is True
+    assert "ttyAMA0" not in payload["hint"]
+    assert f"qmu status --vm {inst.vm_id}" in payload["hint"]
+    assert load_instance(inst.vm_id) is not None

@@ -25,8 +25,9 @@ pry --instance qmu-debug-vm backtrace
 ```
 
 **The trigger survives the stop.** When the breakpoint fires, `exec` returns
-but leaves the command running: its SSH session stays open (a 120 s halt was
-measured), and what it prints afterwards goes to the file in
+but leaves the command running: its SSH session stays open for as long as the
+vCPU is halted (the connection's keepalive never gives up on a silent guest;
+a 130 s halt was measured), and what it prints afterwards goes to the file in
 `detached_output` (`cat` it after `pry continue`). Only the SSH connection
 going away ends it — `snapshot load`, a reset and `kill` drop it. For a
 trigger that must survive a rewind as well, start it fully detached and read

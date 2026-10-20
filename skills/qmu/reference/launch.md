@@ -63,7 +63,8 @@ qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only 
   (`ssh_status: "timeout"`, `qmu status --vm X` still answers), `run` stops it
   with state preserved. Not exit 4: nothing broke, the guest may still be
   booting — `qmu log --vm X --tail 50`, `qmu status --vm X`, or relaunch with
-  a longer `--ssh-timeout`. A serial log still empty after ~10 s fails
+  a longer `--ssh-timeout`. A serial log still empty ~10 s after QEMU started
+  the vCPUs (QMP `running: true`) fails
   earlier with `ssh_status: "no-console-output"` (exit 4, VM retained), naming
   the expected `console=` for the arch. An sshd that answers and refuses the
   recorded `[ssh] user`/key (`Permission denied`) ends the wait after ~5 s
@@ -117,7 +118,11 @@ client, so this is never contention. A handshake that completed late adds
 initialising)`; one that never completed **retains** the live VM with `QMP
 did not complete its handshake within 30s of launch, but QEMU (pid N) is
 alive …` in `warnings[]`, and the SSH wait decides the exit as usual
-(`ready`, `no-console-output` 4, timeout 124 — VM kept in each). A launch that
+(`ready`, `no-console-output` 4, timeout 124 — VM kept in each). Its
+no-console window only opens once QMP answers with the vCPUs running: until
+then nothing has executed, so a wait that ends first is the timeout (124)
+with an `error` saying QEMU is still initialising — never a `console=`
+verdict. A launch that
 fails after QEMU started (exited immediately, QMP refused) is rolled back;
 its `ok: false` envelope still carries `vm_id`, every lint already printed in
 `warnings[]`, and a hint that says the VM is gone (never `qmu status --vm

@@ -1179,3 +1179,41 @@ def test_a_panic_mid_stream_keeps_the_delivered_lines_and_exits_3(
     assert fake.predicate_answers == [True]
     assert captured.out == b"line 1\n"
     assert b"Kernel panic - not syncing" in captured.err
+
+
+# --- ssh that never reached the guest (#177) -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "stdout, stderr, expected_rc",
+    [
+        ("", "Connection timed out during banner exchange\r\n", 4),
+        ("", "kex_exchange_identification: read: Connection reset by peer\r\n", 4),
+        ("", "ssh: connect to host localhost port 10021: Connection refused\r\n", 4),
+        # Guest output alongside ssh-like words: the session ran the command,
+        # which exited 255 itself.
+        ("", "Connection timed out during banner exchange\nretry failed\n", 1),
+        ("partial\n", "Connection timed out during banner exchange\r\n", 1),
+    ],
+)
+def test_a_session_that_never_connected_is_transport_class_whatever_the_probe_says(
+    wired, capsys, stdout, stderr, expected_rc
+):
+    """ssh's own pre-session failure means the command never ran: exit 4,
+    `exit_code: null`, even when sshd is up by the time qmu would re-probe.
+    It used to be "the guest command exited 255" (exit 1) whenever sshd won
+    that race — right after `launch --no-wait-ssh` or a reboot."""
+    wired(rc=255, stdout=stdout, stderr=stderr, ready=True)
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "true"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == expected_rc
+    assert payload["ok"] is False
+    if expected_rc == 4:
+        assert payload["exit_code"] is None
+        assert payload["ssh_error"] is True
+        assert "qmu log --vm exec-vm --tail 100" in payload["hint"]
+    else:
+        assert payload["exit_code"] == 255
+        assert payload["ssh_error"] is False

@@ -544,24 +544,32 @@ def dmesg_ssh(monkeypatch, tmp_path):
     return install
 
 
-def test_dmesg_transport_loss_without_fresh_crash_is_exit4(dmesg_ssh, capsys):
+@pytest.mark.parametrize("sshd_up_by_probe", [False, True])
+def test_dmesg_transport_loss_without_fresh_crash_is_exit4(
+    dmesg_ssh, capsys, sshd_up_by_probe
+):
     """The exact dogfooded shape: rc=255 + banner-exchange timeout, no panic.
 
     Exit 4 (guest merely unreachable), never 1 and never 3 — the contract
-    `exec`/`push`/`pull` already met.
+    `exec`/`push`/`pull` already met. ssh never connected, so dmesg never
+    ran: an sshd that answers by the time qmu would re-probe does not turn
+    it into "dmesg exited 255" (#177).
     """
-    fake = dmesg_ssh(stderr="Connection timed out during banner exchange")
+    dmesg_ssh(
+        stderr="Connection timed out during banner exchange\r\n",
+        ready=sshd_up_by_probe,
+    )
 
     rc = cli.main(["--format", "json", "dmesg", "--vm", "state-vm", "--tail", "5"])
 
     payload = json.loads(capsys.readouterr().out)
     assert rc == 4
-    assert fake.is_ready_calls >= 1
     assert payload["ok"] is False
+    assert payload["exit_code"] is None
     assert payload["ssh_error"] is True
     assert payload["crash_detected"] is False
     assert payload["crash"] is None
-    assert "qmu log --tail 100" in payload["hint"]
+    assert "qmu log --vm state-vm --tail 100" in payload["hint"]
 
 
 def test_dmesg_transport_loss_with_fresh_crash_is_exit3(dmesg_ssh, capsys):
@@ -705,5 +713,5 @@ def test_compile_run_transport_loss_names_the_same_follow_up_as_exec(
     assert rc == (3 if panicked else 4)
     assert payload["ssh_error"] is True
     assert payload["crash_detected"] is panicked
-    assert ("qmu crash" in payload["hint"]) is panicked
-    assert ("qmu log --tail 100" in payload["hint"]) is not panicked
+    assert ("qmu crash --vm state-vm" in payload["hint"]) is panicked
+    assert ("qmu log --vm state-vm --tail 100" in payload["hint"]) is not panicked

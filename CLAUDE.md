@@ -346,7 +346,13 @@ required: QMU_REQUIRE_VM is set`). No message anywhere recommends `prune
 transport (kernel panic). Handlers disambiguate with `_transport_lost()` (a
 liveness re-probe, retried once) plus `extract_crash()` on the serial log. Only
 emit the strong "kernel may have crashed" wording (exit 3) when a crash report
-was actually extracted; otherwise report "unreachable" and exit 4.
+was actually extracted; otherwise report "unreachable" and exit 4. A 255
+whose only output is ssh's own pre-session failure (`ssh.never_connected`:
+`Connection timed out during banner exchange`, `kex_exchange_identification:`,
+`ssh: connect to host …`) never ran the command and skips the probe —
+`guest._ssh_255_payload` makes it exit 4 "the command was not started" on
+exec/dmesg/compile's chmod; an sshd that came up during the probe window
+used to turn it into "the guest command exited 255" (#177).
 
 A third answer exists and is neither (#158): sshd answered and **refused the
 login** (`Permission denied (publickey,…)`). `SSHClient.probe()` returns
@@ -414,16 +420,22 @@ transport.
 Every guest command passes `abort_when=panicked` to `SSHClient.run`, a serial
 watcher polled while the child runs: a terminal panic raises `SSHAborted` with
 the output collected so far, so exec/compile/dmesg/run report exit 3 within a
-second instead of after the 15 s ssh keepalive plus re-probes. A halted vCPU
+second instead of waiting on ssh. A halted vCPU
 (debugger stop) aborts too, but `_run_guest_command` passes `detach_to` (#143):
 the ssh child is NOT killed, `ssh._spawn_drainer` hands its pipe read ends to
 a detached helper that appends the rest of the output to a spill file
 (`detached_output`, capped at 16 MiB, then discarded), so the remote command
 keeps its session and survives `pry continue`. Killing the mux client closed
-the channel and the command died of SIGPIPE on its next write. OpenSSH's
-keepalive does not drop the master while the vCPU is stopped (a 120 s halt
-was measured); `snapshot load`/reset/`kill` tearing the ControlMaster down
-still end it. The timeout path still kills. Text mode
+the channel and the command died of SIGPIPE on its next write. The session
+lives in the ControlMaster, so the master's keepalive decides how long a
+halt it survives: `ssh._KEEPALIVE_OPTS` (every ssh/scp, so whichever command
+opens the master) sends one every 5 s but sets `ServerAliveCountMax` to
+INT_MAX — a reset (a guest that rebooted under an idle master) still ends it,
+silence never does. `CountMax=3` dropped the master, the trigger's output and
+its exit status 15 s into a breakpoint stop (#182; a 130 s halt measured
+since). Silence is qmu's to judge — the watcher sees panic/halt, `--timeout`
+bounds a wedged guest (124). `snapshot load`/reset/`kill` tearing the
+ControlMaster down still end the session. The timeout path still kills. Text mode
 (`_run_guest_command`) prints guest stdout only on stdout; guest stderr,
 `[exit code: N]` (non-zero only) and the lost/timeout/halt narrative go to
 stderr so pipelines see guest bytes.
@@ -498,8 +510,12 @@ because an agent in `--format json` otherwise had to regex the other stream to
 learn that `--profile` dropped `nokaslr`. New launch-time lints go through
 `_note`, never a bare `sys.stderr.write`. `_warn_arch_cmdline_mismatch` is the
 arch/`console=`/`root=` lint; the SSH wait fails early with
-`ssh_status: "no-console-output"` when the serial log is still empty after
-~10 s, since a wrong-arch guest otherwise runs forever and answers nobody.
+`ssh_status: "no-console-output"` when the serial log is still empty
+~10 s after QMP first said the vCPUs run (`_vcpus_started`), since a
+wrong-arch guest otherwise runs forever and answers nobody. A QEMU retained
+before its main loop (#157) has written nothing because nothing ran: its
+window does not open until QMP answers, and a wait that ends first is 124
+naming QEMU's slow start, never a `console=` verdict (#176).
 
 `doctor` rows are `_doctor_row(check, status, detail)` with `status` in
 `ok|fail|warn|info` → glyph `[+] [!] [~] [i]`; `blocking` is `status == "fail"`

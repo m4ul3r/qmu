@@ -2294,8 +2294,8 @@ def _agreement_view(rc, payload):
         "ssh_error": payload.get("ssh_error"),
         "crash_detected": payload.get("crash_detected"),
         "crash_present": payload.get("crash") is not None,
-        "names_qmu_crash": "qmu crash" in hint,
-        "names_qmu_log": "qmu log --tail 100" in hint,
+        "names_qmu_crash": f"qmu crash --vm {VM}" in hint,
+        "names_qmu_log": f"qmu log --vm {VM} --tail 100" in hint,
     }
 
 

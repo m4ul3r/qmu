@@ -685,3 +685,49 @@ def test_format_entry_keeps_one_line_per_entry(tmp_path, monkeypatch):
     lines = [rootfs_mod.format_entry(e) for e in entries]
     assert all("\n" not in line and "\r" not in line for line in lines)
     assert len(set(lines)) == 3
+
+
+# #178: an image command has no VM, so its caller errors carry their own
+# recovery, never the VM default `qmu status --vm <vm_id>`.
+
+
+def test_rm_of_a_missing_path_hints_the_listing_of_its_directory(
+    tmp_path, monkeypatch, capsys
+):
+    from qmu import cli
+
+    image = tmp_path / "rootfs.img"
+    image.write_text("disk")
+    monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
+    monkeypatch.setattr(rootfs_mod, "_run_script", lambda *a, **k: b"false\n")
+
+    rc = cli.main([
+        "--format", "json", "rootfs", "rm", str(image), "/no/such", "--partition", "0",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1 and payload["ok"] is False
+    assert payload["hint"].startswith(f"qmu rootfs ls {image} /no --partition 0")
+    assert "--force" in payload["hint"]
+
+
+@pytest.mark.parametrize("spec, corrected", [
+    ("probe.txt", "probe.txt:/root/"),
+    ("probe.txt:", "LOCAL:GUEST"),
+])
+def test_inject_with_a_malformed_mapping_hints_the_corrected_form(
+    tmp_path, capsys, spec, corrected
+):
+    from qmu import cli
+
+    image = tmp_path / "rootfs.img"
+    image.write_text("disk")
+
+    rc = cli.main([
+        "--format", "json", "rootfs", "inject", str(image), spec, "--partition", "0",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1 and payload["ok"] is False
+    assert corrected in payload["hint"]
+    assert "--vm" not in payload["hint"]

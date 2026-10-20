@@ -1076,8 +1076,9 @@ def launch_vm(
                 # Retained, never rolled back: the process is alive and its
                 # serial and QEMU logs are the only evidence of why it is slow.
                 # The SSH readiness wait that follows decides the launch's
-                # outcome — ready, `no-console-output` (4) or a timeout (124),
-                # the VM kept in each.
+                # outcome — ready, `no-console-output` (4, only once QMP shows
+                # the vCPUs running, #176) or a timeout (124), the VM kept in
+                # each.
                 notes.append(
                     f"QMP did not complete its handshake within "
                     f"{QMP_STARTUP_SECONDS:g}s of launch, but QEMU (pid {proc.pid}) "

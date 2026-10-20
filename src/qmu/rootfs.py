@@ -154,14 +154,25 @@ def _mount_args(partition: int) -> list[str]:
 
 
 def parse_mapping(spec: str) -> tuple[str, str]:
-    """Parse a LOCAL:GUEST string into (local, guest). Splits on first ':'."""
+    """Parse a LOCAL:GUEST string into (local, guest). Splits on first ':'.
+
+    The hint is the corrected form: an image command has no VM, so the
+    default `qmu status --vm <vm_id>` recovery is meaningless here (#178).
+    """
     if ":" not in spec:
         raise QMUError(
-            f"Invalid mapping '{spec}'. Expected LOCAL:GUEST (e.g. ./run.sh:/root/)"
+            f"Invalid mapping '{spec}'. Expected LOCAL:GUEST (e.g. ./run.sh:/root/)",
+            hint=(
+                f"one LOCAL:GUEST argument per file, joined by ':' — e.g. "
+                f"{spec}:/root/ (a GUEST ending in / is a directory)"
+            ),
         )
     local, guest = spec.split(":", 1)
     if not local or not guest:
-        raise QMUError(f"Invalid mapping '{spec}'. Both LOCAL and GUEST must be non-empty.")
+        raise QMUError(
+            f"Invalid mapping '{spec}'. Both LOCAL and GUEST must be non-empty.",
+            hint="name both sides: LOCAL:GUEST, e.g. ./run.sh:/root/",
+        )
     return local, guest
 
 
@@ -1097,10 +1108,15 @@ def remove(
         for guest_path, answer in zip(guest_paths, answers):
             (present if answer.strip().lower() == b"true" else missing).append(guest_path)
     if missing and not force:
+        parent = posixpath.dirname(missing[0].rstrip("/")) or "/"
         raise QMUError(
             f"Not found in {image}: {', '.join(missing)}. "
             f"Nothing was removed. Pass --force to ignore missing paths, "
-            f"or check with `qmu rootfs ls`."
+            f"or check with `qmu rootfs ls`.",
+            hint=(
+                f"qmu rootfs ls {image} {parent} --partition {partition}; "
+                "or re-run with --force to skip missing paths"
+            ),
         )
     if not present:
         return {"removed": [], "missing": missing}
