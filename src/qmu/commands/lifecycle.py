@@ -1690,7 +1690,13 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
             f"build, so reclaiming residue from a build that may still be "
             f"running corrupts it. Use `--older-than "
             f"{MIN_BUILD_RESIDUE_AGE:g}` or higher, or inspect first with "
-            f"`qmu cache du --older-than {older_than:g}`."
+            f"`qmu cache du --older-than {older_than:g}`.",
+            hint=(
+                f"Use `qmu prune --build-residue --older-than "
+                f"{MIN_BUILD_RESIDUE_AGE:g}` to include recently modified "
+                f"trees, or inspect first with `qmu cache du --older-than "
+                f"{older_than:g}`."
+            ),
         )
 
     # QMU_CACHE_DIR is honoured with no validation, so a typo pointing at
@@ -1819,8 +1825,10 @@ def _residue_lines(
         lines.append(
             f"Held back by the --older-than cutoff ({older_than:g}s): "
             f"{', '.join(report.held_back.groups)}. These trees were modified "
-            f"recently and may be mid-build. Re-run later, or with a larger "
-            f"--older-than once the build has finished."
+            f"recently and may be mid-build. Re-run later, or with a smaller "
+            f"--older-than, down to the {MIN_BUILD_RESIDUE_AGE:g}s floor "
+            f"(`qmu prune --build-residue --older-than {MIN_BUILD_RESIDUE_AGE:g}`), "
+            f"to reclaim trees from builds that have finished."
         )
     if report.refused.files:
         lines.append(
