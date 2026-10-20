@@ -109,6 +109,7 @@ _FIXED_SCHEMA: dict[str, dict[str, str]] = {
         "net_backend": "net_backend",
         "accel": "accel",
         "no_reboot": "boolean",
+        "forwards": "forward_array",
         "extra_args": "string_array",
     },
     "drive": {
@@ -152,6 +153,7 @@ _FIELD_TOML_KEYS: dict[str, str] = {
     "net_backend": "machine.net_backend",
     "accel": "machine.accel",
     "no_reboot": "machine.no_reboot",
+    "forwards": "machine.forwards",
     "extra_args": "machine.extra_args",
     "rootfs": "drive.rootfs",
     "drive_format": "drive.format",
@@ -197,6 +199,9 @@ _MIGRATION_DESTINATIONS: dict[str, tuple[str, ...]] = {
     "no_reboot": ("[machine] no_reboot",),
     "no-reboot": ("[machine] no_reboot",),
     "noreboot": ("[machine] no_reboot",),
+    "forward": ("[machine] forwards",),
+    "forwards": ("[machine] forwards",),
+    "hostfwd": ("[machine] forwards",),
     "extra_args": ("[machine] extra_args",),
     "rootfs": ("[drive] rootfs",),
     "format": ("[drive] format",),
@@ -247,6 +252,46 @@ def _migration_hint(key: str, *, is_table: bool = False) -> str | None:
         # named tables — so "move 'vm' to '[boot]'" would misdescribe the fix.
         return f"the keys of '[{key}]' belong in {target}"
     return f"move '{key}' to {target}"
+
+
+FORWARD_SPEC_HINT = (
+    "use [HOST:]HPORT:GPORT (e.g. '2345:2345', '0.0.0.0:8080:80'), or a bare "
+    "GPORT to auto-allocate the host port"
+)
+
+
+def parse_forward_spec(spec: str) -> dict[str, Any]:
+    """`[HOST:]HPORT:GPORT` or `GPORT` -> {host, host_port, guest_port}.
+
+    `host_port` is None for a bare GPORT: `launch` allocates one. HOST
+    defaults to 127.0.0.1, the address qmu binds its SSH forward on, so a
+    forward is not exposed beyond the host unless the caller names an
+    address. Raises ValueError naming what is wrong with `spec`.
+    """
+    parts = spec.strip().split(":")
+    if len(parts) == 1:
+        host, hport, gport = "127.0.0.1", None, parts[0]
+    elif len(parts) == 2:
+        host, (hport, gport) = "127.0.0.1", parts
+    elif len(parts) == 3:
+        host, hport, gport = parts
+        if not host:
+            raise ValueError(f"forward {spec!r}: empty HOST")
+    else:
+        raise ValueError(f"forward {spec!r}: expected [HOST:]HPORT:GPORT or GPORT")
+
+    def port(text: str, what: str) -> int:
+        if not text.isdigit() or not 1 <= int(text) <= 65535:
+            raise ValueError(f"forward {spec!r}: {what} {text!r} is not a port (1-65535)")
+        return int(text)
+
+    return {
+        "host": host,
+        "host_port": None if hport is None else port(hport, "HPORT"),
+        "guest_port": port(gport, "GPORT"),
+    }
+
+
 def _validate_value(
     value: Any, kind: str, source: Path, key_path: str, problems: list[ConfigError]
 ) -> None:
@@ -274,6 +319,32 @@ def _validate_value(
                     source,
                     f"expected string, got {_value_type_name(item)}",
                     key_path=f"{key_path}[{index}]",
+                ))
+        return
+    elif kind == "forward_array":
+        if not isinstance(value, list):
+            problems.append(ConfigError(
+                source,
+                f"expected array of strings, got {_value_type_name(value)}",
+                key_path=key_path,
+            ))
+            return
+        for index, item in enumerate(value):
+            if not isinstance(item, str):
+                problems.append(ConfigError(
+                    source,
+                    f"expected string, got {_value_type_name(item)}",
+                    key_path=f"{key_path}[{index}]",
+                ))
+                continue
+            try:
+                parse_forward_spec(item)
+            except ValueError as exc:
+                problems.append(ConfigError(
+                    source,
+                    str(exc),
+                    key_path=f"{key_path}[{index}]",
+                    hint=FORWARD_SPEC_HINT,
                 ))
         return
     elif kind == "net_backend":
@@ -490,6 +561,10 @@ class QMUConfig:
     # a fresh boot that buries the report. The one launch flag that had no
     # config key (#76); boot-and-die projects set it once here.
     no_reboot: bool = False
+    # Extra host->guest TCP forwards on qmu's own NIC (#149), as written:
+    # `[HOST:]HPORT:GPORT`, or a bare `GPORT` for an auto-allocated host port.
+    # `--forward` (repeatable) replaces the list, like every launch flag.
+    forwards: list[str] = field(default_factory=list)
     extra_args: list[str] = field(default_factory=list)
 
     # drive
@@ -666,7 +741,7 @@ def _apply_toml(
         if field_name in _PATH_FIELDS:
             cfg._written_paths[field_name] = str(value)
             value = _anchor_path(value, base_dir)
-        elif field_name == "extra_args":
+        elif field_name in ("extra_args", "forwards"):
             value = list(value)
         _set_field(cfg, field_name, value, source)
 
@@ -908,6 +983,9 @@ cpus = 2
 #                                #   instead of rebooting over its own report (boot-and-die
 #                                #   harnesses). Same as the --no-reboot flag on every launch.
 # nic_model = "virtio-net-pci"   # or "e1000", "rtl8139", ...
+# forwards = ["2345:2345"]       # extra host->guest TCP forwards on qmu's NIC (gdbserver, a
+#                                #   service under test): [HOST:]HPORT:GPORT, or a bare GPORT
+#                                #   for an auto-allocated host port. Same as --forward.
 # net_backend = "passt"          # Optional migration-compatible backend. The selected
 #                                #   QEMU must advertise native passt; qmu probes whether it
 #                                #   advertises native passt (documented since QEMU 10.1 but

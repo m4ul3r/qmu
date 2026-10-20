@@ -54,15 +54,19 @@ from ..output import (
 from ..runtime import invalidate_owned_spill_marker, mark_spill_artifact
 from ..ssh import (
     SCPFileError,
+    SSHAuthError,
     SSHClient,
     SSHError,
     guest_bytes,
     guest_lossy,
     is_transport_failure,
+    probe_refused_auth,
 )
 from .._cliutil import (
     Result,
     _add_common_opts,
+    _auth_refused_error,
+    _auth_refused_hint,
     _make_ssh,
     _preflight_ssh_guest,
     _qmp_stopped_status,
@@ -292,6 +296,12 @@ def _classify_transfer_failure(
       crash-vs-unreachable split; an ordinary scp timeout or protocol failure
       with no panic stays infra.
     """
+    if isinstance(exc, SSHAuthError):
+        # sshd answered and refused the login: not a transfer outcome, and
+        # not a lost transport — the recorded user/key is wrong (#158).
+        if exc.hint is None:
+            exc.hint = _auth_refused_hint(inst)
+        raise exc
     halted = _transfer_halted(
         inst, start_offset, operation=operation, stem=stem
     )
@@ -410,6 +420,37 @@ GUEST_COMMAND_HELP = (
 )
 
 
+def _add_user_opt(parser: argparse.ArgumentParser, *, what: str = "the guest command") -> None:
+    """Register `--user NAME` (#150), shared by exec, compile --run and run."""
+    parser.add_argument(
+        "--user", default=None, metavar="NAME",
+        help=f"Run {what} as guest account NAME instead of the VM's SSH user "
+             "(an unprivileged PoC run): qmu logs in as usual and drops to NAME "
+             "with `runuser -u NAME --` (BusyBox: `su`), in NAME's home "
+             "directory; the exit status is the command's. Needs the SSH user to "
+             "be root. JSON `run_as` names the account.",
+    )
+
+
+def _as_user(command: str, user: str) -> str:
+    """The guest shell line that runs `command` as `user` (#150).
+
+    `runuser -u` (util-linux) is the non-PAM privilege drop for root and
+    forwards the child's exit status; a BusyBox guest has `su` instead, which
+    does the same for root without a password. Both set HOME to the target's,
+    so the command starts in NAME's home — the SSH user's home (/root) is
+    normally unreadable to NAME — or in / when it has none. The command is
+    one `sh -c` argument, so the caller's quoting reaches the guest unchanged.
+    """
+    inner = shlex.quote(f'cd "$HOME" 2>/dev/null || cd /; {command}')
+    name = shlex.quote(user)
+    return (
+        f"if command -v runuser >/dev/null 2>&1; then exec runuser -u {name} -- "
+        f"sh -c {inner}; else exec su -s /bin/sh {name} -c {inner}; fi"
+    )
+
+
+
 def _add_exec(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "exec",
@@ -431,11 +472,12 @@ def _add_exec(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--timeout", type=float, default=30.0,
                    help="Guest command timeout in seconds (default: 30); on expiry the "
                         "output produced so far is still reported (exit 124)")
+    _add_user_opt(p)
     _add_common_opts(p)
     p.set_defaults(handler=_handle_exec)
 
 
-def _transport_lost(ssh: SSHClient) -> bool:
+def _transport_lost(ssh: SSHClient, inst: VMInstance) -> bool:
     """True only if SSH is unreachable after probing twice (CORR-5).
 
     rc==255 from `ssh.run` is ambiguous: it is both a legal guest exit code and
@@ -444,14 +486,22 @@ def _transport_lost(ssh: SSHClient) -> bool:
     single slow probe against a busy live guest can spuriously fail and produce a
     false-positive "kernel crashed". Only when BOTH probes fail do we treat the
     transport as lost.
+
+    A probe that sshd answers by refusing the login is neither: the 255 was
+    ssh's own "Permission denied" for the VM's recorded user/key, so this
+    raises :class:`SSHAuthError` (exit 4, naming the user) instead of calling
+    a serving guest unreachable (#158).
     """
-    if ssh.is_ready(timeout=3):
-        return False
-    # Retry once after a short backoff: a busy guest may have missed the first
-    # short probe, and an immediate re-probe would just fail the same way.
-    time.sleep(0.5)
-    if ssh.is_ready(timeout=3):
-        return False
+    for attempt in range(2):
+        if attempt:
+            # Retry once after a short backoff: a busy guest may have missed
+            # the first short probe, and an immediate re-probe would just fail
+            # the same way.
+            time.sleep(0.5)
+        if ssh.is_ready(timeout=3):
+            return False
+        if probe_refused_auth(ssh):
+            raise _auth_refused_error(inst, ssh)
     return True
 
 
@@ -1030,8 +1080,35 @@ def _run_guest_command(
     *,
     timeout: float,
     sink: _TextStreamSink | _NdjsonStreamSink | None = None,
+    user: str | None = None,
 ) -> tuple[int, dict[str, Any], str, list[str], list[str | bytes]]:
-    """Run `command` in the guest and classify the outcome.
+    """Run `command` in the guest — as `user` when given (#150) — and
+    classify the outcome (see :func:`_classify_guest_command`).
+
+    The privilege drop is :func:`_as_user` around the command on the wire
+    only: every envelope's `command` is the command as the caller gave it,
+    and `run_as` names the account it ran as, on every path.
+    """
+    run_as = user or inst.ssh_user
+    wire = _as_user(command, user) if user and user != inst.ssh_user else command
+    status, data, stdout, text, notes = _classify_guest_command(
+        ssh, command, inst, timeout=timeout, sink=sink, wire=wire
+    )
+    data["run_as"] = run_as
+    return status, data, stdout, text, notes
+
+
+def _classify_guest_command(
+    ssh: SSHClient,
+    command: str,
+    inst: VMInstance,
+    *,
+    timeout: float,
+    sink: _TextStreamSink | _NdjsonStreamSink | None,
+    wire: str,
+) -> tuple[int, dict[str, Any], str, list[str], list[str | bytes]]:
+    """Run `wire` (`command`, or its privilege-dropped form) in the guest and
+    classify the outcome; envelopes and messages name `command`.
 
     Returns (exit status, JSON data, guest stdout, trailing stdout text,
     stderr notes) rather than emitting, so ``qmu exec``, ``qmu run`` and
@@ -1064,7 +1141,7 @@ def _run_guest_command(
     note_stderr = sink is None or not sink.streams_stderr
     try:
         rc, stdout, stderr = ssh.run(
-            command,
+            wire,
             timeout=timeout,
             abort_when=watcher,
             on_chunk=sink.on_chunk if sink is not None else None,
@@ -1110,7 +1187,7 @@ def _run_guest_command(
         explained = _explain_lost_transport(
             command, inst, start_offset=command_start_offset, session_note=True
         )
-        if explained is None and _transport_lost(ssh):
+        if explained is None and _transport_lost(ssh, inst):
             explained = _ssh_lost_payload(
                 command, inst, start_offset=command_start_offset
             )
@@ -1251,7 +1328,7 @@ def _handle_exec(args: argparse.Namespace) -> Result:
     command = _join_exec_command(args.command)
     sink = _stream_sink(args, stem="exec")
     status, data, stdout, text, notes = _run_guest_command(
-        ssh, command, inst, timeout=args.timeout, sink=sink
+        ssh, command, inst, timeout=args.timeout, sink=sink, user=args.user
     )
     return _guest_result(
         data=data, stdout=stdout, stderr=data.get("stderr", ""), text=text,
@@ -1284,6 +1361,7 @@ def _add_compile(sub: argparse._SubParsersAction) -> None:
              "overrides the arch-based host toolchain selection, e.g. "
              "'clang --target=aarch64-linux-gnu')",
     )
+    _add_user_opt(p, what="the compiled binary (with --run)")
     _add_common_opts(p)
     p.set_defaults(handler=_handle_compile)
 
@@ -1341,7 +1419,7 @@ def _compile_on_host(
     # what ssh returns when a panic drops the transport, so confirm with the same
     # liveness probe exec uses and hand the caller the transport-loss path:
     # reporting a kernel panic as "compilation failed" would bury it.
-    if chmod_rc == 255 and _transport_lost(ssh):
+    if chmod_rc == 255 and _transport_lost(ssh, inst):
         raise _DeliveryTransportLost(
             "SSH transport lost (rc=255) while delivering the host-built "
             "binary — guest likely crashed"
@@ -1356,6 +1434,13 @@ def _compile_on_host(
 
 
 def _handle_compile(args: argparse.Namespace) -> Result:
+    if args.user and not args.run:
+        # A mode-scoped flag must not parse and do nothing.
+        raise QMUError(
+            "--user applies to --run (it names who runs the binary); "
+            "nothing runs without --run.",
+            hint="add --run, or drop --user",
+        )
     inst = _choose_running(args.vm, "compile")
     _require_ssh(inst)
     if (refused := _preflight_ssh_guest(inst, stem="compile")) is not None:
@@ -1367,8 +1452,11 @@ def _handle_compile(args: argparse.Namespace) -> Result:
         raise QMUError(f"Source file not found: {source}")
 
     name = source.stem
-    remote_src = f"/root/{source.name}"
-    remote_bin = f"/root/{name}"
+    # The SSH user's home (/root) is unreadable to another account, so a
+    # binary that runs as --user is built into /tmp (#150).
+    remote_dir = "/tmp" if args.user and args.user != inst.ssh_user else "/root"
+    remote_src = f"{remote_dir}/{source.name}"
+    remote_bin = f"{remote_dir}/{name}"
 
     if args.host_build:
         delivery_offset = serial_log_offset(inst.serial_log)
@@ -1505,7 +1593,8 @@ def _handle_compile(args: argparse.Namespace) -> Result:
     # serving guest, while the same program under `exec` was 124.
     sink = _stream_sink(args, stem="compile")
     status, data, stdout, text, notes = _run_guest_command(
-        ssh, shlex.quote(remote_bin), inst, timeout=args.timeout, sink=sink
+        ssh, shlex.quote(remote_bin), inst, timeout=args.timeout, sink=sink,
+        user=args.user,
     )
     run_stderr = data.get("stderr", "")
     data = {**result, **_as_run_fields(data)}
@@ -1519,7 +1608,8 @@ def _as_run_fields(data: dict[str, Any]) -> dict[str, Any]:
     """Rename exec's stream/exit keys to the compile envelope's `run_*` ones.
 
     `command` is dropped: the envelope already names what ran
-    (`compile_cmd`, and the binary is `/root/<stem>`).
+    (`compile_cmd`, and the binary is `/root/<stem>`, or `/tmp/<stem>` under
+    `--user`); `run_as` stays as is.
     """
     renamed = dict(data)
     renamed.pop("command", None)
@@ -1571,7 +1661,7 @@ def _handle_dmesg(args: argparse.Namespace) -> Result:
             halted_status=watcher.halted_status,
         )
         if explained is None:
-            if not _transport_lost(ssh):
+            if not _transport_lost(ssh, inst):
                 raise
             explained = _ssh_lost_payload(
                 cmd, inst, start_offset=command_start_offset
@@ -1594,7 +1684,7 @@ def _handle_dmesg(args: argparse.Namespace) -> Result:
         explained = _explain_lost_transport(
             cmd, inst, start_offset=command_start_offset
         )
-        if explained is None and _transport_lost(ssh):
+        if explained is None and _transport_lost(ssh, inst):
             explained = _ssh_lost_payload(
                 cmd, inst, start_offset=command_start_offset
             )

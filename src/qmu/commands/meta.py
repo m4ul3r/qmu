@@ -377,6 +377,7 @@ def _handle_config_show(args: argparse.Namespace) -> Result:
             "net_backend": config.net_backend,
             "accel": config.accel,
             "no_reboot": config.no_reboot,
+            "forwards": config.forwards,
             "qemu_binary": config.qemu_binary(),
             "kvm": config.use_kvm(),
             "extra_args": config.extra_args,
@@ -432,6 +433,9 @@ def _handle_config_show(args: argparse.Namespace) -> Result:
     lines.append(row("CPU model:", config.cpu_model or "(qemu default)", "machine.cpu"))
     lines.append(row("NIC model:", config.nic_model, "machine.nic_model"))
     lines.append(row("Net backend:", config.net_backend, "machine.net_backend"))
+    lines.append(row(
+        "Forwards:", " ".join(config.forwards) or "(none)", "machine.forwards",
+    ))
     lines.append(row(
         "Extra args:", " ".join(config.extra_args) or "(none)", "machine.extra_args",
     ))

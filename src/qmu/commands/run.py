@@ -43,23 +43,25 @@ from typing import Any
 
 from ..instance import VMInstance, instance_alive
 from ..serial import extract_crash, has_terminal_panic
-from ..ssh import SSHClient
+from ..ssh import SSHClient, probe_refused_auth
 from ..vm import launch_vm
 from .._cliutil import (
     Result,
     _add_common_opts,
     _add_launch_opts,
+    _auth_refused_error,
     _kill_vm,
     _make_ssh,
 )
 from .guest import (
     GUEST_COMMAND_HELP,
+    _add_user_opt,
     _guest_result,
     _join_exec_command,
     _run_guest_command,
     _stream_sink,
 )
-from .lifecycle import _prepare_boot
+from .lifecycle import AUTH_REFUSED_SETTLE_SECONDS, _prepare_boot
 
 
 class _NoHarnessAction(argparse.Action):
@@ -117,19 +119,25 @@ def _add_run(sub: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Leave the VM running afterwards instead of stopping it",
     )
+    _add_user_opt(p)
     _add_common_opts(p)
     p.set_defaults(handler=_handle_run)
 
 
 def _wait_for_guest(ssh: SSHClient, inst: VMInstance, timeout: float) -> str:
-    """Block until the guest answers SSH. Returns 'ready' / 'died' / 'timeout'.
+    """Block until the guest answers SSH. Returns 'ready' / 'died' / 'timeout'
+    / 'auth-failed'.
 
-    An SSH readiness loop plus a liveness check, because the two failures
-    need different exit codes and a VM that died on boot must not burn the
+    An SSH readiness loop plus a liveness check, because the failures need
+    different exit codes and a VM that died on boot must not burn the
     whole ``--ssh-timeout`` before saying so: a kernel that panics three
     seconds in would otherwise cost a full minute of wall clock per attempt.
+    An sshd that keeps refusing the recorded user/key has booted and will
+    not change its answer, so that ends the wait as well (#158), on the
+    same settle window `launch` uses.
     """
     deadline = time.monotonic() + timeout
+    refused_since: float | None = None
     while True:
         if ssh.is_ready(timeout=2):
             return "ready"
@@ -138,9 +146,17 @@ def _wait_for_guest(ssh: SSHClient, inst: VMInstance, timeout: float) -> str:
             # two checks, and reporting 'died' for a VM that did come up would
             # send the agent chasing a boot failure that did not happen.
             return "ready" if ssh.is_ready(timeout=2) else "died"
+        now = time.monotonic()
+        if probe_refused_auth(ssh):
+            if refused_since is None:
+                refused_since = now
+            if now - refused_since >= AUTH_REFUSED_SETTLE_SECONDS or now >= deadline:
+                return "auth-failed"
+        else:
+            refused_since = None
         # Deadline is checked AFTER a probe, so the guest is always given at
         # least one chance to answer (`--ssh-timeout 0` means "probe once").
-        if time.monotonic() >= deadline:
+        if now >= deadline:
             return "timeout"
         time.sleep(1.0)
 
@@ -149,6 +165,7 @@ def _boot_failure_payload(
     inst: VMInstance,
     outcome: str,
     timeout: float,
+    ssh: SSHClient | None = None,
 ) -> tuple[int, dict[str, Any], list[str]]:
     """Classify a VM that never reached a usable guest.
 
@@ -191,6 +208,28 @@ def _boot_failure_payload(
     # but it does not change the exit code, because the guest that printed it
     # did not die of it.
     warned = report is not None
+    if outcome == "auth-failed":
+        # The guest booted and sshd refused the recorded user/key (#158):
+        # the same SSHAuthError class `exec` reports, exit 4, not "booting".
+        auth = _auth_refused_error(inst, ssh)
+        return (
+            4,
+            {
+                "ok": False,
+                "error": str(auth),
+                "error_type": "SSHAuthError",
+                **auth.envelope_fields(),
+                "crash_detected": warned,
+                "crash": report,
+                "kernel_warning_detected": warned,
+                "kernel_warning": report,
+                "hint": auth.hint,
+            },
+            [
+                f"VM '{inst.vm_id}' booted, but sshd refused user '{inst.ssh_user}'.",
+                str(auth),
+            ],
+        )
     warning_line = (
         f"\nNon-fatal kernel report from serial log:\n{report}"
         if warned
@@ -283,13 +322,14 @@ def _handle_run(args: argparse.Namespace) -> Result:
         sink = _stream_sink(args, stem="run")
         if outcome != "ready":
             status, data, text = _boot_failure_payload(
-                inst, outcome, float(args.ssh_timeout)
+                inst, outcome, float(args.ssh_timeout), ssh
             )
             stdout = ""
             notes: list[str | bytes] = []
         else:
             status, data, stdout, text, notes = _run_guest_command(
-                ssh, command, inst, timeout=args.timeout, sink=sink
+                ssh, command, inst, timeout=args.timeout, sink=sink,
+                user=args.user,
             )
             # The ssh ControlMaster (`ControlPersist=60`) outlives the command;
             # the VM is about to be stopped under it, so close it now rather
