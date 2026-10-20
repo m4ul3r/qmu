@@ -99,8 +99,9 @@ byte `78`; a `0xff` byte passes through; `qmu exec … > out.txt` is
 checksum-comparable with what the guest wrote). Guest stderr goes to host
 stderr verbatim, followed by `[exit code: N]` **only when N ≠ 0**; `exec true`
 prints nothing at all. `compile --run`'s `Compiled and ran X:` banner,
-`dmesg`'s `(empty dmesg)` / `[dmesg failed, exit N]`, a survived `Kernel
-warning from command serial output:` block, and `run`'s `VM 'x' stopped (state
+`dmesg`'s `(empty dmesg)` / `[dmesg failed, exit N]`, the report of a crash
+the guest survived during the command (`Kernel crash report from command
+serial output (the guest kept running):`), and `run`'s `VM 'x' stopped (state
 preserved)… / Inspect: … / Clean up: …` lines are all on stderr. The
 ssh-lost / timeout / paused narrative stays on stdout, preceded by whatever
 guest stdout was captured (a newline is inserted between the two only then).

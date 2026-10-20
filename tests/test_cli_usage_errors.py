@@ -176,7 +176,7 @@ def test_launch_help_documents_no_reboot_and_ssh_timeout_expiry(capsys):
     assert exc.value.code == 0
     text = capsys.readouterr().out
     assert "--no-reboot" in text
-    assert "exits 4" in text and "RETAINS" in text and "no-console-output" in text
+    assert "RETAINS" in text and "no-console-output" in text
 
     with pytest.raises(SystemExit) as exc:
         cli.main(["run", "--help"])

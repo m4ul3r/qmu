@@ -290,7 +290,10 @@ def test_boot_warning_without_a_panic_is_not_promoted_to_a_crash(harness, capsys
     assert state["kills"] == [False]
 
 
-def test_boot_warning_is_reported_in_json_without_crash_detected(harness, capsys):
+def test_boot_report_is_reported_as_a_survived_crash_without_exit_3(harness, capsys):
+    """A survived boot-time report is `crash_detected` (what `status` and
+    `crash` call it, #136) but, with no terminal panic, never the exit-3
+    class: the guest that printed it is still alive."""
     install, state = harness
     install(serial_text=WARNING, ready=False, alive=True)
 
@@ -298,10 +301,8 @@ def test_boot_warning_is_reported_in_json_without_crash_detected(harness, capsys
 
     assert rc == 124
     payload = json.loads(capsys.readouterr().out)
-    assert payload["crash_detected"] is False
-    assert payload["crash"] is None
-    assert payload["kernel_warning_detected"] is True
-    assert "WARNING: CPU: 0" in payload["kernel_warning"]
+    assert payload["crash_detected"] is True
+    assert "WARNING: CPU: 0" in payload["crash"]
 
 
 def test_survived_kernel_warning_during_a_clean_run_is_not_reaped(harness, capsys):
@@ -315,7 +316,7 @@ def test_survived_kernel_warning_during_a_clean_run_is_not_reaped(harness, capsy
 
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["kernel_warning_detected"] is True
+    assert payload["crash_detected"] is True
     assert payload["state_preserved"] is True
     assert state["kills"] == [False]          # clean=False -> serial log kept
 
@@ -645,9 +646,8 @@ def test_kasan_boot_banner_is_not_a_kernel_warning(harness, capsys):
 
     assert rc == 124
     payload = json.loads(capsys.readouterr().out)
-    assert payload["kernel_warning_detected"] is False
-    assert payload["kernel_warning"] is None
     assert payload["crash_detected"] is False
+    assert payload["crash"] is None
 
 
 def test_genuine_report_after_a_kasan_banner_is_still_reported(harness, capsys):
@@ -666,8 +666,8 @@ def test_genuine_report_after_a_kasan_banner_is_still_reported(harness, capsys):
 
     assert rc == 124
     payload = json.loads(capsys.readouterr().out)
-    assert payload["kernel_warning_detected"] is True
-    assert "slab-use-after-free" in payload["kernel_warning"]
+    assert payload["crash_detected"] is True
+    assert "slab-use-after-free" in payload["crash"]
 
 
 def test_healthy_command_timeout_is_124_not_a_crash(harness, capsys):

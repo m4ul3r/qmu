@@ -268,6 +268,15 @@ RETIRED_CLAIMS = [
     # The attach gate refuses a second `qmu gdb` while a client is connected.
     (r"would spawn a second bridge",
      "qmu gdb exits 1 naming the attached bridge pid and spawns nothing"),
+    # Wave-8 doc/tool mismatches (#128, #130, #132, #141), each measured live.
+    (r"`crash_detected: true`, `guest: \"panicked\"` \|",
+     "exit 3 also covers a survived report + dropped SSH, where guest is \"crashed\" (do not reap)"),
+    (r"spilled: true",
+     "the pointer envelope has no spilled key and no preview; branch on artifact_path"),
+    (r"`ssh: \"none\"` / SSH command refuses",
+     "a --harness VM reports ssh: \"n/a (harness)\"; \"none\" is --no-net without --ssh-port"),
+    (r"--pattern '\^",
+     "^ cannot match a marker after a printk timestamp (/dev/kmsg) or the login: prompt; anchor the tail"),
 ]
 
 

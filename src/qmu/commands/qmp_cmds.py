@@ -15,6 +15,7 @@ import subprocess
 from dataclasses import replace
 from pathlib import Path
 
+from .. import daemon_client
 from ..instance import (
     QMUError,
     VMInstance,
@@ -349,6 +350,19 @@ def _snapshot_load_mentions_slirp(msg: str) -> bool:
     return "slirp" in msg.lower()
 
 
+def _persist_epoch(inst: VMInstance, offset: int) -> VMInstance:
+    """Record the guest generation a qmu command just started, everywhere.
+
+    The record serves the standalone readers; the daemon's watch serves the
+    daemon-backed ones and does not re-read the record. `loadvm` emits no
+    QMP RESET, so without the hand-off `status`/`list` kept scoping the guest
+    axis to the pre-load generation while `qmu crash` used the record (#135).
+    """
+    inst = save_guest_epoch_serial_offset(inst, offset)
+    daemon_client.adopt_epoch(inst.vm_id, offset)
+    return inst
+
+
 def _handle_snapshot_load(args: argparse.Namespace) -> Result:
     inst = choose_instance(args.vm)
     epoch_offset = serial_log_offset(inst.serial_log)
@@ -356,7 +370,7 @@ def _handle_snapshot_load(args: argparse.Namespace) -> Result:
     with _qmp_ctx(inst) as qmp:
         result = load_snapshot(qmp, args.name)
     if result.ok:
-        inst = save_guest_epoch_serial_offset(inst, epoch_offset)
+        inst = _persist_epoch(inst, epoch_offset)
         _drop_ssh_master(inst)
     res = _snapshot_result(args, "load", inst, result)
     if res.exit_code != 0:
@@ -751,10 +765,11 @@ def _handle_gdb(args: argparse.Namespace) -> Result:
     # moment qmu is on the debug path — but only when the VM was actually
     # launched under KVM (recorded on the instance). Kept in the stdout
     # payload alongside the other gdb warnings so the JSON envelope carries
-    # it and stderr stays clean.
-    if getattr(inst, "kvm", None) is True:
+    # it and stderr stays clean. `kvm` itself is always present with the
+    # recorded value, exactly as `launch`/`status`/`list` report it (#134).
+    data["kvm"] = getattr(inst, "kvm", None)
+    if data["kvm"] is True:
         kvm_warning = kvm_watchpoint_warning(inst.vm_id)
-        data["kvm"] = True
         data["kvm_watchpoint_warning"] = kvm_warning
         text = f"{text}\n{kvm_warning}"
     return Result(data=data, text=text, stem="gdb")
@@ -1077,7 +1092,7 @@ def _after_mutation(
     if verb in _TCP_RESETTING_VERBS and not failed:
         if epoch is not None:
             try:
-                inst = save_guest_epoch_serial_offset(inst, epoch)
+                inst = _persist_epoch(inst, epoch)
             except OSError as exc:
                 persist_error = exc
         _drop_ssh_master(inst)
