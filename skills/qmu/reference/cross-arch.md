@@ -55,9 +55,10 @@ qmu compile hello.c --run --vm arm70    # machine=aarch64, sizeof(void*)=8 (bann
 stub, no pry bridge — so the rebase check below works on this plain VM; add
 `--gdb` to the launch only when you intend to attach pry.
 
-**KASLR rebase on arm64 — use `qmu kbase`'s `KBASE` (`_text`), nothing else.**
-pry (0.1.0 and later) keys the slide to the `_text` symbol, which is exactly
-what `qmu kbase` and `/proc/kallsyms` report. Measured against a live 7.0 arm64
+**KASLR rebase on arm64 — use `_text` (`qmu kbase`'s or `pry kbase`'s
+`KBASE`), nothing else.** pry (0.1.0 and later) keys the slide to the `_text`
+symbol, which is exactly what `qmu kbase`, `pry kbase` and `/proc/kallsyms`
+report. Measured against a live 7.0 arm64
 guest: `--base "$KBASE"` placed `__arm64_sys_newuname` at the kallsyms address;
 `--base 0x$STEXT` (the runtime `_stext`, `0x10000` above `_text` because of the
 `.head.text` gap) placed every symbol **`0x10000` too high** and breakpoints
@@ -82,7 +83,16 @@ For `lx-*` scripts and `$lx_current()`, the arm64 kernel must be built with **fu
 refuse to load). Current `qmu-linux-kbuild` disables the reduced variant, but a kernel
 cached before that change still carries it — check
 `grep DEBUG_INFO_REDUCED "$CONFIG"` and rebuild with `--no-cache` if it says `=y`.
-`pry kbase`'s VBAR fallback is unreliable here — prefer `qmu kbase` or kallsyms.
+
+`pry kbase` (pry #66) works here and needs no SSH: on the halted guest it maps
+the VBAR handler back through `vectors`, accepts the base only once the guest's
+`linux_banner` there matches the vmlinux, and rebases the loaded vmlinux
+(measured on 7.0 arm64 right after `qmu gdb`: `found by: VBAR handler … =
+vectors`, the same `_text` as `qmu kbase` and kallsyms, `&commit_creds` equal
+to its kallsyms address, and an `__arm64_sys_newuname` breakpoint fired). It
+needs the vmlinux loaded (`qmu gdb --symbols`) and the kernel booted, and exits
+1 (`could not determine the kernel base`) rather than guess; `qmu kbase` is the
+SSH route.
 
 ## arm32 (armv7l)
 

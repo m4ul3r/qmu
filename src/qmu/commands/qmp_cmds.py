@@ -55,12 +55,17 @@ from ..debug import (
     loadvm_stale_session_warning,
     mark_debugger_attached,
     mark_debugger_epoch,
+    note_coherence_warnings,
     qmu_bridge_attached,
     reap_bridge,
     reset_dropped_breakpoints_warning,
+    resume_bridge_after_save,
+    save_left_stopped_warning,
+    save_stop_failed_warning,
     savevm_breakpoint_state,
     savevm_breakpoint_warning,
     savevm_lifted_note,
+    stop_bridge_for_save,
 )
 from .._cliutil import (
     Result,
@@ -148,6 +153,75 @@ def _savevm_coherence(
     if state == INT3_POSSIBLE:
         return state, savevm_breakpoint_warning(inst, before) + "\n"
     return state, None
+
+
+class _SaveStop:
+    """A savevm with the bridge `qmu gdb` spawned stopped across it (#201).
+
+    Under KVM, with that bridge attached and QEMU running, qmu interrupts it
+    so GDB lifts its breakpoints from guest RAM, takes the save at that stop
+    and resumes it after; otherwise (TCG, another client, already stopped)
+    the save runs as it is. `begin` takes `before`, QEMU's run state the save
+    starts in, and re-reads it after the interrupt. `finish` classifies the
+    image (`breakpoints_in_image`, which may ask the bridge whether it is
+    stopped) BEFORE it resumes the bridge. A save that outran its budget
+    leaves the bridge stopped: QEMU may still be writing the image. Any other
+    failure resumes it, and `record_on_failure` hands what qmu did to the
+    error envelope.
+    """
+
+    def __init__(self, inst: VMInstance, event: str):
+        self.inst = inst
+        self.event = event
+        self.before: str | None = None
+        self.stop: SaveStop | None = None
+        self.warnings: tuple[str, ...] = ()
+        self.drive: BridgeDrive | None = None
+        self.coherence: tuple[str | None, str | None] = (None, None)
+
+    def begin(self, qmp: object, before: str | None) -> None:
+        self.before = before
+        self.stop, error = stop_bridge_for_save(self.inst, before)
+        if error:
+            self.warnings = (save_stop_failed_warning(self.inst, error),)
+        if self.stop is not None:
+            self.before = self.save(lambda: _status_before_save(qmp, self.inst))
+
+    def save(self, run):
+        """`run()`, resuming the bridge first when it fails other than by
+        running out of time."""
+        try:
+            return run()
+        except QMPTimeoutError:
+            raise
+        except BaseException:
+            self.resume()
+            raise
+
+    def finish(self, after: str | None, landed: bool) -> BridgeDrive | None:
+        """The save returned: what the image holds (`coherence`, for a save
+        that `landed`), then resume the bridge."""
+        if landed:
+            self.coherence = _savevm_coherence(self.inst, self.before, after)
+        return self.resume()
+
+    def resume(self) -> BridgeDrive | None:
+        if self.stop is not None and self.drive is None:
+            self.drive = resume_bridge_after_save(self.stop, self.event)
+        return self.drive
+
+    def left_stopped(self) -> tuple[str, ...]:
+        """Warnings for a save that outran its budget."""
+        if self.stop is None or not self.stop.interrupted or self.drive is not None:
+            return self.warnings
+        return self.warnings + (save_left_stopped_warning(self.stop, self.event),)
+
+    def record_on_failure(self) -> None:
+        """An exception other than the save's own timeout is leaving the
+        handler: what qmu did to its bridge reaches the error envelope
+        through the dispatch warnings."""
+        drive = self.drive.warnings if self.drive is not None else ()
+        note_coherence_warnings(*self.left_stopped(), *drive)
 
 
 # ---------------------------------------------------------------------------
@@ -419,22 +493,31 @@ def _handle_snapshot_save(args: argparse.Namespace) -> Result:
     # guest sshd session that every later load resurrects as an orphan; close
     # it first so the checkpoint carries no half-open connection.
     _drop_ssh_master(inst)
+    stop = _SaveStop(inst, "snapshot save")
     try:
         with _qmp_ctx(inst) as qmp:
             # QEMU's run state across the save decides what the image holds
             # of the debugger's breakpoints (#188): read on both sides, since
-            # savevm resumes a running guest before it returns.
-            before = _status_before_save(qmp, inst)
-            result = save_snapshot(qmp, args.name, timeout=timeout)
+            # savevm resumes a running guest before it returns. The bridge
+            # `qmu gdb` spawned is stopped for the save (#201).
+            stop.begin(qmp, _status_before_save(qmp, inst))
+            result = stop.save(lambda: save_snapshot(qmp, args.name, timeout=timeout))
             after = (
                 _qemu_status(qmp) if result.ok and debug_stub_present(inst) else None
             )
+            drive = stop.finish(after, result.ok)
     except QMPTimeoutError:
         # The client has already closed its socket (`QMPClient.execute`), so
         # the next command connects fresh instead of reading savevm's late
         # reply as its own answer.
-        return _snapshot_save_timeout(args, inst, timeout)
+        return _snapshot_save_timeout(args, inst, timeout).warn(*stop.left_stopped())
+    except BaseException:
+        stop.record_on_failure()
+        raise
     res = _snapshot_result(args, "save", inst, result)
+    res = res.warn(*stop.warnings)
+    if drive is not None:
+        res = _with_drive(res, drive)
     if res.exit_code != 0:
         if result.reason not in ("bad_name", "drive"):
             res = res.warn(
@@ -455,9 +538,12 @@ def _handle_snapshot_save(args: argparse.Namespace) -> Result:
     # Gated on the STUB, not a live client: bytes an uncleanly-detached bridge
     # left behind (the #40 case) are captured too. Only a successful save
     # wrote an image.
-    state, line = _savevm_coherence(inst, before, after)
+    state, line = stop.coherence
     if state is not None:
-        res = replace(res, data={**res.data, "breakpoints_in_image": state})
+        extra: dict[str, object] = {"breakpoints_in_image": state}
+        if stop.stop is not None:
+            extra["breakpoints_lifted"] = state == INT3_LIFTED
+        res = replace(res, data={**res.data, **extra})
     if line is not None:
         res = res.warn(line)
     return res
@@ -896,9 +982,12 @@ def _handle_gdb(args: argparse.Namespace) -> Result:
     if symbols_path is not None:
         symbol_warning = (
             f"WARNING: symbols from '{symbols_path}' were loaded at ELF link-time "
-            "addresses; qmu gdb did not apply runtime rebasing. Obtain the runtime "
-            f"base with `qmu kbase --vm {inst.vm_id} --symbols {symbols_path}`, then "
-            f"reload with `pry load {symbols_path} --base <KBASE>`."
+            "addresses; qmu gdb did not apply runtime rebasing. Rebase with no SSH "
+            f"once the kernel has booted: `pry --instance {instance_id} kbase` "
+            "validates the running kernel's base against this vmlinux and rebases "
+            "it (it exits 1 rather than guess). Or obtain the runtime base with "
+            f"`qmu kbase --vm {inst.vm_id} --symbols {symbols_path}` (SSH: `qmu "
+            f"cont` first), then reload with `pry load {symbols_path} --base <KBASE>`."
         )
         data.update({
             "symbols": str(symbols_path),
@@ -1220,11 +1309,6 @@ def _before_mutation(inst: VMInstance, verb: str) -> int | None:
     return None
 
 
-def _status_before_mutation(qmp: object, inst: VMInstance, verb: str) -> str | None:
-    """QEMU's run state right before a raw `savevm` on a `--gdb` VM (#188)."""
-    return _status_before_save(qmp, inst) if verb == "savevm" else None
-
-
 def _status_after_mutation(qmp: object, inst: VMInstance, verb: str) -> str | None:
     """QEMU's run state right after a raw `savevm`/`system_reset` on a `--gdb` VM.
 
@@ -1240,7 +1324,7 @@ def _status_after_mutation(qmp: object, inst: VMInstance, verb: str) -> str | No
 def _after_mutation(
     inst: VMInstance, verb: str, output: str, epoch: int | None,
     warnings: list[str],
-    run_states: tuple[str | None, str | None] = (None, None),
+    status_after: str | None = None,
     drives: list[BridgeDrive] | None = None,
 ) -> VMInstance:
     """Post-mutation bookkeeping plus the debugger coherence step.
@@ -1255,8 +1339,8 @@ def _after_mutation(
     `drives`; any other client gets the coherence warning in `warnings`. Both
     are filled even when the persist raises, so the caller can put them on
     its Result: stderr in every mode and the envelope's `warnings[]` (#74).
-    `run_states` is QEMU's run state right before and right after the
-    mutation.
+    `status_after` is QEMU's run state right after a reset. A savevm's
+    coherence is decided by `_SaveStop` while the save is bracketed.
     """
     if drives is None:
         drives = []
@@ -1279,21 +1363,15 @@ def _after_mutation(
     owned = (
         verb in _TCP_RESETTING_VERBS and not failed and qmu_bridge_attached(inst)
     )
-    before, after = run_states
     if verb == "system_reset":
         if owned:
             drives.append(
-                drive_bridge_after_reset(inst, epoch=epoch, qemu_status=after)
+                drive_bridge_after_reset(inst, epoch=epoch, qemu_status=status_after)
             )
         elif debug_session_present(inst):
             warnings.append(
-                reset_dropped_breakpoints_warning(inst, qemu_status=after) + "\n"
+                reset_dropped_breakpoints_warning(inst, qemu_status=status_after) + "\n"
             )
-    elif verb == "savevm":
-        if not failed:
-            _, line = _savevm_coherence(inst, before, after)
-            if line is not None:
-                warnings.append(line)
     elif verb == "loadvm":
         if owned:
             drives.append(drive_bridge_after_loadvm(inst, "loadvm"))
@@ -1313,7 +1391,8 @@ def _finish_mutation(
     data: dict[str, object],
     text: object,
     stem: str,
-    run_states: tuple[str | None, str | None] = (None, None),
+    status_after: str | None = None,
+    save_stop: _SaveStop | None = None,
 ) -> Result:
     """Post-mutation bookkeeping, THEN exactly one envelope.
 
@@ -1329,7 +1408,7 @@ def _finish_mutation(
     warnings: list[str] = []
     drives: list[BridgeDrive] = []
     try:
-        _after_mutation(inst, verb, output, epoch, warnings, run_states, drives)
+        _after_mutation(inst, verb, output, epoch, warnings, status_after, drives)
     except OSError as exc:
         error = (
             f"{verb or 'command'} reached the guest, but qmu could not record "
@@ -1358,9 +1437,37 @@ def _finish_mutation(
         ).warn(*warnings)
     else:
         res = Result(data=data, text=text, stem=stem).warn(*warnings)
+    if save_stop is not None:
+        _, line = save_stop.coherence
+        res = res.warn(*save_stop.warnings, *([line] if line is not None else []))
+        drives.extend([save_stop.drive] if save_stop.drive is not None else [])
     for drive in drives:
         res = _with_drive(res, drive)
     return res
+
+
+def _raw_mutation(
+    qmp: object, inst: VMInstance, verb: str, run
+) -> tuple[object, str | None, _SaveStop | None]:
+    """A raw route's QMP/HMP call `run()`; `(result, status_after, stop)`.
+
+    QEMU's run state after a reset tells a booting guest from one left
+    halted at the reset vector. A savevm is bracketed by the run state on
+    both sides (#188), with the bridge `qmu gdb` spawned stopped across it
+    (#201), exactly as `snapshot save` does."""
+    if verb != "savevm":
+        result = run()
+        return result, _status_after_mutation(qmp, inst, verb), None
+    stop = _SaveStop(inst, "savevm")
+    try:
+        stop.begin(qmp, _status_before_save(qmp, inst))
+        result = stop.save(run)
+    except BaseException:
+        stop.record_on_failure()
+        raise
+    landed = not (isinstance(result, str) and hmp_failed(result))
+    stop.finish(_status_after_mutation(qmp, inst, verb), landed)
+    return result, None, stop
 
 
 def _handle_qmp(args: argparse.Namespace) -> Result:
@@ -1391,14 +1498,16 @@ def _handle_qmp(args: argparse.Namespace) -> Result:
     epoch = _before_mutation(inst, verb)
     try:
         with _qmp_ctx(inst) as qmp:
-            before = _status_before_mutation(qmp, inst, verb)
-            result = qmp.execute(method, qmp_args)
-            after = _status_after_mutation(qmp, inst, verb)
+            result, status_after, stop = _raw_mutation(
+                qmp, inst, verb, lambda: qmp.execute(method, qmp_args)
+            )
     except QMPCommandError as exc:
         # A QEMU error REPLY, not a transport fault: the wire worked, so this
         # is the exit-1 class whichever error class QEMU chose.
         raise _qmp_caller_error(method, exc) from exc
     if hmp_line is not None and isinstance(result, str) and hmp_failed(result):
+        if stop is not None:
+            stop.record_on_failure()
         raise _hmp_error(hmp_line, result)
     # Bookkeeping BEFORE the envelope: the epoch persist can fail (unwritable
     # instance dir), and a success envelope already on stdout cannot be
@@ -1409,7 +1518,7 @@ def _handle_qmp(args: argparse.Namespace) -> Result:
     return _finish_mutation(
         inst, verb, result if isinstance(result, str) else "", epoch,
         data={"ok": True, "result": result}, text=result, stem="qmp",
-        run_states=(before, after),
+        status_after=status_after, save_stop=stop,
     )
 
 
@@ -1447,15 +1556,17 @@ def _handle_monitor(args: argparse.Namespace) -> Result:
     verb = _hmp_verb(command)
     epoch = _before_mutation(inst, verb)
     with _qmp_ctx(inst) as qmp:
-        before = _status_before_mutation(qmp, inst, verb)
-        result = qmp.execute_hmp(command)
-        after = _status_after_mutation(qmp, inst, verb)
+        result, status_after, stop = _raw_mutation(
+            qmp, inst, verb, lambda: qmp.execute_hmp(command)
+        )
     if hmp_failed(result):
+        if stop is not None:
+            stop.record_on_failure()
         raise _hmp_error(command, result)
     return _finish_mutation(
         inst, verb, result, epoch,
         data={"ok": True, "output": result},
         text=result if result.strip() else "(no output)",
         stem="monitor",
-        run_states=(before, after),
+        status_after=status_after, save_stop=stop,
     )
