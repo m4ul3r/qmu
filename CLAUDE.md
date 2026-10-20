@@ -205,10 +205,13 @@ the whole output, pointer + `Preview … streamed above` trailer last);
 (surrogateescape) before the ordinary envelope; json gets `None` (buffered).
 `_run_guest_command(..., sink=)` threads it to `run` and keeps guest stderr
 out of `notes` when the sink already relayed it; `_guest_result(...,
-sink=)` calls `sink.finish` (un-relayed remainder — nothing for the real
-client, everything for a fake that never called `on_chunk` — then the crash/
-timeout `text`, then the pointer) and returns `Result(streamed=True)`, which
-`render` honours by skipping stdout and still writing `notes`/`warnings`.
+sink=)` appends the crash/timeout/halt `text` to the stderr `notes` (on
+every path, streamed or not — #172: it used to follow the guest's bytes on
+stdout), calls `sink.finish` (un-relayed remainder — nothing for the real
+client, everything for a fake that never called `on_chunk` — then the
+pointer; the `--out`/spill file holds guest stdout only) and returns
+`Result(streamed=True)`, which `render` honours by skipping stdout and
+still writing `notes`/`warnings`.
 Only the exec phase streams: `compile`'s gcc/chmod steps and `dmesg` pass no
 sink. Fakes keep working because `run(**kwargs)` may ignore `on_chunk`; a
 test that asserts *liveness* must relay chunks itself (`StreamingSSH` in
@@ -421,8 +424,9 @@ the channel and the command died of SIGPIPE on its next write. OpenSSH's
 keepalive does not drop the master while the vCPU is stopped (a 120 s halt
 was measured); `snapshot load`/reset/`kill` tearing the ControlMaster down
 still end it. The timeout path still kills. Text mode
-(`_run_guest_command`) prints guest stdout only on stdout; guest stderr and
-`[exit code: N]` (non-zero only) go to stderr so pipelines see guest bytes.
+(`_run_guest_command`) prints guest stdout only on stdout; guest stderr,
+`[exit code: N]` (non-zero only) and the lost/timeout/halt narrative go to
+stderr so pipelines see guest bytes.
 
 ### Serial-pattern waiting (`serial.SerialTail`, `lifecycle._wait_for_pattern`)
 

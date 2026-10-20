@@ -103,10 +103,12 @@ stderr verbatim, followed by `[exit code: N]` **only when N ≠ 0**; `exec true`
 prints nothing at all. `compile --run`'s `Compiled and ran X:` banner,
 `dmesg`'s `(empty dmesg)` / `[dmesg failed, exit N]`, the report of a crash
 the guest survived during the command (`Kernel crash report from command
-serial output (the guest kept running):`), and `run`'s `VM 'x' stopped (state
-preserved)… / Inspect: … / Clean up: …` lines are all on stderr. The
-ssh-lost / timeout / paused narrative stays on stdout, preceded by whatever
-guest stdout was captured (a newline is inserted between the two only then).
+serial output (the guest kept running):`), the ssh-lost / timeout / paused
+narrative of a command qmu stopped (with its crash report or `detached_output`
+note), and `run`'s boot-failure report and `VM 'x' stopped (state
+preserved)… / Inspect: … / Clean up: …` lines are all on stderr, after the
+guest's own stderr — `qmu exec … | parse` never receives qmu's prose (#172).
+An `--out` file or spill file likewise holds guest stdout only.
 Guest `\r\n` is not translated. JSON cannot hold raw bytes, so its `stdout`/
 `stderr` are a UTF-8 decode with U+FFFD replacement and carry
 `stdout_lossy: true` / `stderr_lossy: true` (`run_stdout_lossy` under
@@ -119,8 +121,8 @@ spilled guest-output artifact is `.txt`, bytes verbatim).
 Guest output is relayed **as it arrives**, not when the command ends: a
 long-running exploit's progress lines show up at ~the moment the guest
 prints them, and are still there after a `--timeout` (exit 124) or a
-mid-command panic (exit 3, the crash narrative follows what was already
-printed). What is relayed is the raw read (no line assembly), flushed per
+mid-command panic (exit 3, the crash narrative follows on stderr). What is
+relayed is the raw read (no line assembly), flushed per
 chunk. `compile --run` streams only the program's run; compile/chmod
 diagnostics stay in the envelope.
 
