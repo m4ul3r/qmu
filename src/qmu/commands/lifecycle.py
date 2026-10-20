@@ -1683,14 +1683,20 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
 
     older_than = float(args.older_than)
     if older_than < MIN_BUILD_RESIDUE_AGE:
+        floor = f"{MIN_BUILD_RESIDUE_AGE:g}"
         raise QMUError(
             f"--older-than {older_than:g} is below the "
-            f"{MIN_BUILD_RESIDUE_AGE:g}s floor for --build-residue. kbuild "
+            f"{floor}s floor for --build-residue. kbuild "
             f"bind-mounts the kernel source tree read-write for the whole "
             f"build, so reclaiming residue from a build that may still be "
             f"running corrupts it. Use `--older-than "
-            f"{MIN_BUILD_RESIDUE_AGE:g}` or higher, or inspect first with "
-            f"`qmu cache du --older-than {older_than:g}`."
+            f"{floor}` or higher, or inspect first with "
+            f"`qmu cache du --older-than {older_than:g}`.",
+            hint=(
+                f"qmu prune --build-residue --dry-run --older-than {floor} "
+                f"(the lowest threshold prune accepts; residue modified in the "
+                f"last {floor}s stays held back)"
+            ),
         )
 
     # QMU_CACHE_DIR is honoured with no validation, so a typo pointing at
@@ -1816,11 +1822,25 @@ def _residue_lines(
 
     # Held-back and refused are disclosed on BOTH branches, in both formats.
     if report.held_back.files:
+        # Residue qualifies by being OLDER than the threshold, so a larger one
+        # holds back more; the recovery is a smaller one, down to the floor
+        # (#164: this line used to advise a larger --older-than).
+        floor = f"{MIN_BUILD_RESIDUE_AGE:g}"
+        if older_than > MIN_BUILD_RESIDUE_AGE:
+            recovery = (
+                f"Once the build has finished, re-run with a smaller "
+                f"--older-than, down to the {floor}s floor: "
+                f"qmu prune --build-residue --older-than {floor}"
+            )
+        else:
+            recovery = (
+                f"Re-run once the build has finished and the trees are older "
+                f"than {floor}s."
+            )
         lines.append(
             f"Held back by the --older-than cutoff ({older_than:g}s): "
             f"{', '.join(report.held_back.groups)}. These trees were modified "
-            f"recently and may be mid-build. Re-run later, or with a larger "
-            f"--older-than once the build has finished."
+            f"recently and may be mid-build. {recovery}"
         )
     if report.refused.files:
         lines.append(

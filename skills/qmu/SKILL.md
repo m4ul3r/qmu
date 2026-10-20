@@ -194,8 +194,8 @@ Text mode: stdout is the guest's stdout **only**, byte-exact (no decode, no
 added newline — `printf x` is one byte, `0xff` passes through), **streamed
 as the guest writes it** (progress shows before exit or `--timeout`; ndjson
 gets `chunk` events, json stays buffered); guest stderr goes to stderr live,
-then `[exit code: N]` only when N ≠ 0 (`exec true` prints nothing); `compile
---run`'s `Compiled and ran X:` banner is on stderr too. JSON: `vm_id`,
+then `[exit code: N]` only when N ≠ 0 (`exec true` prints nothing); the
+timeout/crash/halt narrative and `compile --run`'s banner are on stderr too. JSON: `vm_id`,
 `exit_code` (null if unfinished), `stdout`, `stderr` (UTF-8 with U+FFFD;
 `stdout_lossy: true` / `stderr_lossy: true` present exactly when a byte was
 replaced), `timed_out`, `crash_detected`, `crash`, `run_as`. One argument is passed to

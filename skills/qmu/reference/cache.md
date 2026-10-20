@@ -117,7 +117,7 @@ Results are bucketed, and the buckets partition the total:
 | Bucket | Meaning |
 |---|---|
 | `eligible` | will be removed |
-| `held_back` | tree modified inside `--older-than`; may be mid-build |
+| `held_back` | tree modified inside `--older-than`; may be mid-build. Once the build is done, a **smaller** `--older-than` (down to 600) releases it — a larger one only holds back more |
 | `refused` | parent dir not writable, or referenced by an instance record |
 
 `--older-than` defaults to 86400 and is **floored at 600s** for this mode:
