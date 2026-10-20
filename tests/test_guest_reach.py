@@ -20,17 +20,14 @@ from qmu import cli
 from qmu._cliutil import _resolve_config_from_args
 from qmu.commands import guest, lifecycle
 from qmu.commands.lifecycle import QMP_CONNECTED, _QMPProbe
-from qmu.config import parse_forward_spec, resolve_config
-from qmu.config import ConfigError, QMUConfig
+from qmu.config import ConfigError, QMUConfig, parse_forward_spec, resolve_config
 from qmu.instance import QMUError, VMInstance
 from qmu.ssh import (
     PROBE_AUTH_FAILED,
-    PROBE_DOWN,
-    PROBE_READY,
+    GuestText,
     SCPFileError,
     SSHClient,
     SSHError,
-    GuestText,
 )
 from qmu.vm import _bind_forward_ports, build_qemu_command, launch_vm
 
@@ -54,27 +51,6 @@ def _executable(path: Path, body: str) -> Path:
 # ---------------------------------------------------------------------------
 # #158 — sshd answering "Permission denied" is not "down" and not "booting"
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "rc,stderr,expected",
-    [
-        (255, b"lowpriv@localhost: Permission denied (publickey,password).\r\n", PROBE_AUTH_FAILED),
-        (255, b"ssh: connect to host localhost port 2222: Connection refused\r\n", PROBE_DOWN),
-        (255, b"Connection timed out during banner exchange\r\n", PROBE_DOWN),
-        (0, b"", PROBE_READY),
-    ],
-)
-def test_probe_tells_a_refused_login_from_a_dead_port(monkeypatch, rc, stderr, expected):
-    client = SSHClient(port=2222, key_path="k", user="lowpriv")
-    monkeypatch.setattr(
-        "qmu.ssh.subprocess.run",
-        lambda cmd, **kw: subprocess.CompletedProcess(cmd, rc, b"", stderr),
-    )
-
-    assert client.probe() == expected
-    assert client.is_ready() is (expected == PROBE_READY)
-    assert client.last_probe == expected
 
 
 class _RefusingSSH(SSHClient):
@@ -143,17 +119,29 @@ def test_status_reports_a_refused_login_as_serving_with_the_user(
 # ---------------------------------------------------------------------------
 
 
-def _fake_scp(tmp_path: Path, monkeypatch, *, legacy: str) -> Path:
-    """An `scp` on PATH that speaks like a Dropbear guest's other end: SFTP
-    mode dies on the missing sftp-server; `-O` does whatever `legacy` says."""
+# What host scp 9.6 prints when the guest cannot start an SFTP server, as
+# measured: Dropbear (forwards the shell's complaint), OpenSSH sshd with its
+# sftp-server binary gone (says nothing but the close), and OpenSSH sshd with
+# no `Subsystem sftp` line.
+_SFTP_REFUSALS = {
+    "dropbear": "sh: /usr/libexec/sftp-server: No such file or directory\nscp: Connection closed",
+    "openssh-no-binary": "scp: Connection closed",
+    "openssh-no-subsystem": "subsystem request failed on channel 0\nscp: Connection closed",
+}
+
+
+def _fake_scp(
+    tmp_path: Path, monkeypatch, *, legacy: str, refusal: str = _SFTP_REFUSALS["dropbear"]
+) -> Path:
+    """An `scp` on PATH whose SFTP mode fails with `refusal` (exit 255) and
+    whose `-O` mode does whatever `legacy` says."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     calls = tmp_path / "scp-calls"
     _executable(bindir / "scp", f"""#!/bin/sh
 echo "$*" >> {calls}
 for a in "$@"; do [ "$a" = -O ] && {{ {legacy}; }}; done
-echo "sh: /usr/libexec/sftp-server: No such file or directory" >&2
-echo "scp: Connection closed" >&2
+printf '%b\\n' {json.dumps(refusal)} >&2
 exit 255
 """)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
@@ -164,8 +152,9 @@ def _called_with_legacy(calls: Path) -> list[bool]:
     return ["-O" in line.split() for line in calls.read_text().splitlines()]
 
 
-def test_transfers_fall_back_to_legacy_scp_on_a_guest_without_sftp(tmp_path, monkeypatch):
-    calls = _fake_scp(tmp_path, monkeypatch, legacy="exit 0")
+@pytest.mark.parametrize("refusal", sorted(_SFTP_REFUSALS))
+def test_transfers_fall_back_to_legacy_scp_on_a_guest_without_sftp(tmp_path, monkeypatch, refusal):
+    calls = _fake_scp(tmp_path, monkeypatch, legacy="exit 0", refusal=_SFTP_REFUSALS[refusal])
     client = SSHClient(port=2222, key_path="k")
     source = tmp_path / "blob.bin"
     source.write_bytes(b"x")
@@ -195,23 +184,41 @@ def test_a_guest_with_neither_sftp_nor_scp_is_a_guest_condition(tmp_path, monkey
     assert _called_with_legacy(calls) == [False, True]
 
 
-def test_a_dead_transport_is_not_retried_as_legacy(tmp_path, monkeypatch):
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    calls = tmp_path / "scp-calls"
-    _executable(bindir / "scp", f"""#!/bin/sh
-echo "$*" >> {calls}
-echo "ssh: connect to host localhost port 2222: Connection refused" >&2
-exit 255
-""")
-    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "ssh: connect to host localhost port 2222: Connection refused",
+        "Timeout, server localhost not responding.\nscp: Connection closed",
+    ],
+)
+def test_a_dead_transport_is_not_retried_as_legacy(tmp_path, monkeypatch, stderr):
+    calls = _fake_scp(tmp_path, monkeypatch, legacy="exit 0", refusal=stderr)
     source = tmp_path / "blob.bin"
     source.write_bytes(b"x")
 
-    with pytest.raises(SSHError):
+    with pytest.raises(SSHError) as exc:
         SSHClient(port=2222, key_path="k").push(str(source), "/tmp/blob.bin")
 
+    assert exc.value.returncode == 255
     assert _called_with_legacy(calls) == [False]
+
+
+def test_a_failed_legacy_retry_keeps_the_transport_class(tmp_path, monkeypatch):
+    """A bare close retried with -O that then loses the transport is still
+    SSHError rc 255 — the evidence the crash/transport split reads."""
+    calls = _fake_scp(
+        tmp_path, monkeypatch, refusal=_SFTP_REFUSALS["openssh-no-binary"],
+        legacy='echo "Connection reset by peer" >&2; exit 255',
+    )
+    source = tmp_path / "blob.bin"
+    source.write_bytes(b"x")
+
+    with pytest.raises(SSHError) as exc:
+        SSHClient(port=2222, key_path="k").push(str(source), "/tmp/blob.bin")
+
+    assert exc.value.returncode == 255
+    assert "Connection reset by peer" in exc.value.stderr
+    assert _called_with_legacy(calls) == [False, True]
 
 
 # ---------------------------------------------------------------------------

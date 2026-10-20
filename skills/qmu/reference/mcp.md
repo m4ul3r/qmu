@@ -132,5 +132,5 @@ Tool calls run concurrently (a `qmu_exec` can write the marker a
   same lines ride in the envelope's `warnings[]` where the CLI puts them.
 - Interactive leaves (`rootfs shell`) and the foreground daemon are not tools.
 
-Schema cost: the serialised `tools/list` (38 tools) is ~21.6k characters,
-roughly 5.4k tokens — a third of this skill — and is paid once per session.
+Schema cost: the serialised `tools/list` (38 tools) is ~22.8k characters,
+roughly 5.7k tokens — a third of this skill — and is paid once per session.

@@ -400,6 +400,22 @@ def _watch_child(
 # a 2.6 s end-to-end budget, so the probe itself is capped at 2.25 s.
 PROBE_GRACE_SECONDS = 0.25
 
+# How much longer a probe waits once sshd has accepted the userauth service
+# (`SSH2_MSG_SERVICE_ACCEPT`): the server is up, and only its verdict on the
+# login is outstanding. A refusal is not always fast — an image with
+# `PermitEmptyPasswords yes` + PAM runs the `none` method through pam_unix's
+# fail delay first, and a non-existent `[ssh] user` came back after 4.2 s
+# (measured, bookworm rootfs), past the connect budget. Killing the probe
+# there reported "down" for a guest whose sshd was answering (#158). A port
+# that never completes the handshake never reaches this phase, so the #77
+# bound for it is unchanged.
+PROBE_AUTH_GRACE_SECONDS = 5.0
+_AUTH_PHASE_MARKER = b"SSH2_MSG_SERVICE_ACCEPT received"
+_PROBE_CHATTER = (
+    "debug", "Warning: Permanently added", "Authenticated to", "Transferred:",
+    "Bytes per second",
+)
+
 
 class SSHClient:
     """Wraps system ssh/scp for guest communication."""
@@ -428,7 +444,9 @@ class SSHClient:
         # goes straight to `scp -O` (#148).
         self.scp_legacy = False
 
-    def _ssh_base(self, *, multiplex: bool = True) -> list[str]:
+    def _ssh_base(self, *, multiplex: bool = True, log_level: str = "ERROR") -> list[str]:
+        # ssh keeps the FIRST value of a repeated -o, so a caller that needs
+        # another LogLevel (the probe reads the handshake phase) sets it here.
         base = [
             "ssh",
             "-i", self.key_path,
@@ -438,7 +456,7 @@ class SSHClient:
             "-o", "ConnectTimeout=5",
             "-o", "ServerAliveInterval=5",
             "-o", "ServerAliveCountMax=3",
-            "-o", "LogLevel=ERROR",
+            "-o", f"LogLevel={log_level}",
         ]
         if multiplex:
             return base + _control_opts()
@@ -468,8 +486,8 @@ class SSHClient:
 
         `auth-failed` is sshd answering and refusing this user/key — the
         guest is up, and no amount of waiting changes the answer (#158). The
-        outcome and ssh's stderr are kept on `last_probe`/`last_probe_stderr`
-        for callers that only asked `is_ready`.
+        outcome and ssh's own error lines are kept on `last_probe`/
+        `last_probe_stderr` for callers that only asked `is_ready`.
 
         The probe is deliberately NOT multiplexed (`ControlMaster=no`, no
         `ControlPath`): `list`/`status`/launch run it against every serving VM
@@ -478,30 +496,44 @@ class SSHClient:
         never commands — including other users' — under the caller's
         QMU_TEMP_DIR. `run`/`push`/`pull` keep the shared master.
 
-        `timeout` is the whole budget: ssh's own ConnectTimeout bounds both the
-        TCP connect and the banner exchange, and the subprocess cap is only
-        PROBE_GRACE_SECONDS beyond it.
+        `timeout` is the budget up to authentication: ssh's own
+        ConnectTimeout bounds both the TCP connect and the banner exchange,
+        and the subprocess cap is only PROBE_GRACE_SECONDS beyond it. A probe
+        still running at the cap whose (debug) stderr shows the server
+        accepted the userauth service gets PROBE_AUTH_GRACE_SECONDS more for
+        the verdict.
         """
-        cmd = self._ssh_base(multiplex=False) + [
+        cmd = self._ssh_base(multiplex=False, log_level="DEBUG1") + [
             "-o", f"ConnectTimeout={timeout}",
             "-o", "BatchMode=yes",
             self._target(),
             "true",
         ]
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=timeout + PROBE_GRACE_SECONDS,
-            )
+            try:
+                _, raw = proc.communicate(timeout=timeout + PROBE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired as exc:
+                if _AUTH_PHASE_MARKER not in (exc.stderr or b""):
+                    raise
+                _, raw = proc.communicate(timeout=PROBE_AUTH_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
             self.last_probe, self.last_probe_stderr = PROBE_DOWN, ""
             return PROBE_DOWN
-        raw = result.stderr or b""
-        stderr = (raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw).strip()
-        if result.returncode == 0:
+        # Keep what LogLevel=ERROR would have shown: the debug trace and the
+        # INFO/VERBOSE chatter it brings along are only for the phase check.
+        stderr = "\n".join(
+            line for line in (raw or b"").decode("utf-8", errors="replace").splitlines()
+            if line.strip() and not line.startswith(_PROBE_CHATTER)
+        )
+        if proc.returncode == 0:
             outcome = PROBE_READY
-        elif is_auth_failure(result.returncode, stderr):
+        elif is_auth_failure(proc.returncode, stderr):
             outcome = PROBE_AUTH_FAILED
         else:
             outcome = PROBE_DOWN
@@ -667,7 +699,11 @@ class SSHClient:
             operation=operation, direction=direction, abort_when=abort_when,
         )
         sftp_refusal: str | None = None
-        if result.returncode != 0 and not self.scp_legacy and sftp_unavailable(result.stderr):
+        if (
+            result.returncode != 0
+            and not self.scp_legacy
+            and sftp_unavailable(result.returncode, result.stderr)
+        ):
             sftp_refusal = result.stderr
             self.scp_legacy = True
             result = self._scp(
@@ -730,7 +766,7 @@ class SSHClient:
         hint = None
         if sftp_refusal is not None:
             message = (
-                f"SCP {operation} failed: the guest has no SFTP server "
+                f"SCP {operation} failed: the guest refused the SFTP session "
                 f"({_first_line(sftp_refusal)}) and the legacy-protocol retry "
                 f"(scp -O) failed: {result.stderr.strip()}"
             )
@@ -758,9 +794,20 @@ _SFTP_UNAVAILABLE_MARKERS = ("sftp-server", "subsystem request failed")
 _SCP_MISSING = re.compile(r"\bscp: (?:not found|command not found|No such file)")
 
 
-def sftp_unavailable(stderr: str) -> bool:
-    """True when an scp failure is the guest lacking an SFTP server."""
-    return any(m in stderr for m in _SFTP_UNAVAILABLE_MARKERS)
+def sftp_unavailable(rc: int, stderr: str) -> bool:
+    """True when an scp failure is the guest lacking an SFTP server.
+
+    Dropbear forwards the shell's complaint about the missing binary. OpenSSH
+    sshd does not: with its `sftp-server` gone, the client's whole report is
+    `scp: Connection closed` (measured, bookworm sshd 9.2 under host scp
+    9.6). That exact line alone — no transport marker (a dropped or refused
+    connection names itself), no login refusal — is the server closing the
+    session before SFTP began.
+    """
+    if any(m in stderr for m in _SFTP_UNAVAILABLE_MARKERS):
+        return True
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    return rc == 255 and lines == ["scp: Connection closed"]
 
 
 def _first_line(text: str) -> str:

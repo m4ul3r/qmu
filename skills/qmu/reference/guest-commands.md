@@ -27,9 +27,10 @@ qmu exec --vm X "./exploit" --timeout 120 --format json
 and drops to NAME with `runuser -u NAME -- sh -c '<command>'` (`su -s /bin/sh
 NAME -c …` on a BusyBox guest without `runuser`), starting in NAME's home
 directory (`/` if it has none). The exit status is the command's (`exit 7` →
-`exit_code: 7`), the envelope's `command` is the command as given (not the
-wrapper) and `run_as` names the account on every path (it is the SSH user
-when `--user` is absent). `compile --run --user NAME` builds into `/tmp/`
+`exit_code: 7`); wherever an envelope carries `command` (`run`, a timeout, a
+lost session) it is the command as given, not the wrapper; `run_as` names the
+account on every path (it is the SSH user when `--user` is absent). `compile
+--run --user NAME` builds into `/tmp/`
 instead of `/root/` (unreadable to NAME); `--user` without `--run` is exit 1.
 The account must exist in the image (`runuser: user NAME does not exist` is
 the guest's own stderr, exit 1).
@@ -200,11 +201,13 @@ scp *timeout* with no fresh panic stays 4 `SSHError`; a halted vCPU is the
 paused envelope, exit 1. All carry `vm_id`.
 
 A guest with no SFTP server (Dropbear/BusyBox firmware: `sh:
-/usr/libexec/sftp-server: No such file or directory`, or an sshd without
-`Subsystem sftp`) is retried once in the legacy protocol (`scp -O`), which
-such guests speak; nothing to configure. Only when that retry fails too is
-it an error, naming both attempts (exit 1 `SCPFileError` when the guest has
-no `scp` either, with a hint to inject one).
+/usr/libexec/sftp-server: No such file or directory`; an OpenSSH sshd whose
+`sftp-server` is missing, which the client reports only as a bare `scp:
+Connection closed`; an sshd without `Subsystem sftp`) is retried once in the
+legacy protocol (`scp -O`), which such guests speak; nothing to configure.
+A dropped or refused connection names itself and is not retried. Only when
+the retry fails too is it an error, naming both attempts (exit 1
+`SCPFileError` when the guest has no `scp` either, with a hint to inject one).
 
 ## `dmesg`
 

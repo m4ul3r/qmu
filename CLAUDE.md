@@ -92,7 +92,7 @@ set per call; the daemon-backed `wait` (`lifecycle._daemon_wait_request`)
 calls `daemon_client.report_progress(elapsed, scanned, note)` on each
 daemon `progress` (≤1/s) or QMP event, and the façade relays it as
 `notifications/progress`. Keep tool descriptions to one sentence:
-`mcp_server.schema_cost()` measures the serialised `tools/list` (~5.4k
+`mcp_server.schema_cost()` measures the serialised `tools/list` (~5.7k
 tokens for 38 tools); trim descriptions, never tools, if it grows past ~12k.
 
 ### Exit-code contract (see the epilog in `cli.py:main`)
@@ -329,13 +329,15 @@ evidence). Never let it fall back to "still booting" (124) — a longer wait
 cannot change the account. `launch`/`status`/`list` report `ssh_user`.
 
 Two more reachability rules live in `ssh.py`/`guest.py`. `SSHClient._transfer`
-retries a transfer once with `scp -O` when the first attempt's stderr shows
-the guest has no SFTP server (`sftp-server` / `subsystem request failed`:
-Dropbear/BusyBox firmware) and stays on `-O` for the client's lifetime (#148);
-only a failed retry is an error, naming both attempts. `--user NAME` on
+retries a transfer once with `scp -O` when the first attempt shows the guest
+could not start an SFTP server (`ssh.sftp_unavailable`: `sftp-server` /
+`subsystem request failed`, or rc 255 with nothing but `scp: Connection
+closed` — all OpenSSH sshd says when its sftp-server binary is missing) and
+stays on `-O` for the client's lifetime (#148); a transport marker is never
+retried, and only a failed retry is an error, naming both attempts. `--user NAME` on
 `exec`/`compile --run`/`run` wraps only the wire command (`guest._as_user`:
-`runuser -u NAME -- sh -c …`, `su` fallback, `cd "$HOME"`); every envelope
-keeps `command` as given and carries `run_as` (#150). Extra guest ports are
+`runuser -u NAME -- sh -c …`, `su` fallback, `cd "$HOME"`); an envelope's
+`command` stays the command as given and every one carries `run_as` (#150). Extra guest ports are
 `--forward` / `[machine] forwards` (#149): resolved in `vm._resolve_forwards`
 (refused without qmu's own slirp NIC — `--no-net`/`--harness`/`passt` — never
 dropped), host ports allocated or bind-checked under the port lock, emitted
