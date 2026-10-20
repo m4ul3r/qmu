@@ -106,7 +106,9 @@ expiring before the guest answered SSH — **both** 124 with one envelope shape
 (`timed_out: true`, `ssh_error: true`, `error_type: "TimeoutError"`, `hint`);
 `launch` retains the VM, `ssh_status: "timeout"` (#72: it used to be the
 transport class 4 while `run` said 124) — a guest command outrunning
-`--timeout` on a reachable guest, `snapshot save` outrunning its budget —
+`--timeout`, whether or not the guest still answers (one ≤2.25 s probe sets
+`ssh_error`; #142: it used to probe twice and take the 3/4 lost-transport
+path, 7 s late), `snapshot save` outrunning its budget —
 result unknown, `may_have_landed: true`). `QMUError -> 1`,
 `QMPError`/`SSHError -> 4`, the catch-all `-> 4`. Never let a raw traceback
 escape to the agent.
@@ -334,16 +336,50 @@ emit the strong "kernel may have crashed" wording (exit 3) when a crash report
 was actually extracted; otherwise report "unreachable" and exit 4.
 `serial.extract_crash` walks backward to the *last* crash event and deliberately
 keeps interior end-markers (a `panic_on_warn` epilogue) from truncating the
-report. A soft `---[ end trace ]---` stays interior only while every line
-between it and a following fatal panic is itself die() epilogue (register
-re-dump, `Modules linked in:`, `note: … exited`); ordinary kernel output in
+report. A soft end — `---[ end trace ]---` or a sanitizer report's closing
+`=====` rule — stays interior only while every line between it and a
+following fatal panic is itself die() epilogue (register re-dump, `Modules
+linked in:`, `note: … exited`, the taint notice); ordinary kernel output in
 between proves the first event ended, so a resumed WARNING is never bridged
-into a later unrelated panic.
+into a later unrelated panic. The rule is also what splits a
+`kasan_multi_shot` flood into its reports, so only the newest is returned
+(#142) — the newest *complete* one when the last is still being printed. A
+report starts at the event's headline — `CRASH_START_PATTERNS`
+carries arm's `Unable to handle kernel`, `kernel BUG at`, and the die-header
+shape `<what>: <hex> [#N]` (`int3: 0000 [#1]`) because the abort decode and
+the faulting address precede the generic `Oops:` (#140). What a panic's
+kernel prints right after its own `---[ end Kernel panic` banner (the SMP
+`native_smp_send_reschedule` WARNING) is noise, never "the last crash" —
+only that adjacent splat (`_post_panic_noise`: its headline right after the
+banner, at most `cut here`/`sched: Unexpected reschedule` before it, within
+1 s on the banner's printk clock, AND the reschedule signature in its lead or
+headline, through its end marker), NOT "the rest of the log" and not
+position + clock alone: a `snapshot load` prints no boot banner, and the
+restored guest can crash on the very next line 0.22 s later on the guest
+clock (measured), which an unsigned rule hid from `crash --full-history`.
+
+A report printed while a guest command ran is attributed through the same
+keys on every path: `crash_detected: true` + `crash`, also when the command
+completed and the guest survived (#136; it used to be `kernel_warning` with
+`crash_detected: false` while `status` said `crashed` — `kernel_warning`/
+`kernel_warning_detected` stay on that path and `run`'s boot failure as the
+same report, for consumers of the old keys). The exit code stays
+the guest command's then — 3 still needs a terminal panic or a dropped
+transport.
 
 Every guest command passes `abort_when=panicked` to `SSHClient.run`, a serial
 watcher polled while the child runs: a terminal panic raises `SSHAborted` with
 the output collected so far, so exec/compile/dmesg/run report exit 3 within a
-second instead of after the 15 s ssh keepalive plus re-probes. Text mode
+second instead of after the 15 s ssh keepalive plus re-probes. A halted vCPU
+(debugger stop) aborts too, but `_run_guest_command` passes `detach_to` (#143):
+the ssh child is NOT killed, `ssh._spawn_drainer` hands its pipe read ends to
+a detached helper that appends the rest of the output to a spill file
+(`detached_output`, capped at 16 MiB, then discarded), so the remote command
+keeps its session and survives `pry continue`. Killing the mux client closed
+the channel and the command died of SIGPIPE on its next write. OpenSSH's
+keepalive does not drop the master while the vCPU is stopped (a 120 s halt
+was measured); `snapshot load`/reset/`kill` tearing the ControlMaster down
+still end it. The timeout path still kills. Text mode
 (`_run_guest_command`) prints guest stdout only on stdout; guest stderr and
 `[exit code: N]` (non-zero only) go to stderr so pipelines see guest bytes.
 
@@ -437,7 +473,7 @@ per-cache-dir supervisor: one QMP connection + reader thread per watched VM
 `debug.reap_bridge_on_exit`; `GUEST_PANICKED` → `panicked`), one 100 ms serial
 tick that scans only on
 growth and wakes `wait` subscribers, and a newline-JSON protocol (`ping`,
-`watch`, `unwatch`, `vm_state`, `qmp`, `wait`, `shutdown`; streaming ops send
+`watch`, `unwatch`, `vm_state`, `epoch`, `qmp`, `wait`, `shutdown`; streaming ops send
 `{"id", "event"}` lines first). The client (`daemon_client.connect`) discovers
 it via `<cache>/daemon.json` (pid + /proc start-time, build id, socket path),
 autostarts it detached unless `QMU_DAEMON=off` or `[daemon] autostart=false`,
@@ -452,6 +488,19 @@ that is the contract, and `tests/test_state_agreement_matrix.py` pins that
   `lifecycle._daemon_state` is the one seam `status`/`list`/`wait` read cached
   state through (`qmp: "daemon"`, `_QMPProbe.daemon`); `launch` calls
   `_watch_in_daemon` after `launch_vm`.
+- **The daemon's run state and scope must match the standalone readers.**
+  `loadvm` emits no RESET, so `snapshot load` (and a raw `loadvm`/
+  `system_reset`) persist the new epoch through `qmp_cmds._persist_epoch`,
+  which also sends it to the daemon (`epoch` op → `Daemon.adopt_epoch`,
+  forward-only within the current log); without it daemon-backed `status`/
+  `list` kept the pre-load scope while `crash` used the record (#135). A STOP
+  that arrives while a client's command is proxied through the watch
+  (`qmp_inflight`, e.g. `savevm`) marks the run state `status_stale`:
+  `vm_state` reports `qmp_busy: true`, `running: null`, `qemu_status:
+  "unknown"` and `_probe_from_daemon` turns that into the standalone
+  `qmp: "busy"` probe until a `query-status` answers (re-armed while it
+  fails). Synthesising `paused` there handed concurrent readers the
+  debugger-halt signature and its `qmu cont` recovery for a whole save (#137).
 - **Ownership rule (#118, #119): a subscribed `wait` is never stranded, and
   release is complete when answered.** The daemon keeps a watch until the
   recorded PID identity is gone — `instance_alive` is the only authority for

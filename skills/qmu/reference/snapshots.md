@@ -59,8 +59,13 @@ as the answer to its next command), every command carries a client-unique
 the abandoned `savevm` reply to whichever client holds the socket when it
 finishes, which made `query-status` return `{}` and `snapshot list` say "No
 snapshots." for a tag that was there. While QEMU is still saving, `status`
-and `list` report `qmp: "busy"` (QEMU greets the connection but does not
-answer `qmp_capabilities` within its 10 s floor).
+and `list` report `qmp: "busy"`, `qemu_status: "unknown"` — standalone because
+QEMU greets the connection but does not answer `qmp_capabilities` within its
+10 s floor, daemon-backed because QEMU stopped the vCPUs under the `savevm`
+the daemon is carrying (never the debugger-halt `guest: "paused"` + `qmu cont`
+signature; `savevm` resumes the guest itself). A successful `snapshot load`
+starts a new crash scope for every reader at once — `status`, `list` and
+`crash` all stop attributing a report from before the load.
 
 ## Durable internal snapshots
 

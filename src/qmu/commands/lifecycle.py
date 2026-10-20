@@ -858,6 +858,23 @@ def _daemon_state(inst: Any, *, adopt: bool = True) -> dict[str, Any] | None:
 
 
 def _probe_from_daemon(state: dict[str, Any]) -> _QMPProbe:
+    """The daemon's cached view as one probe result.
+
+    `qmp_busy` is the daemon's word for what the standalone path calls
+    `busy`: QEMU stopped the vCPUs under a command a client proxied through
+    the daemon (`savevm`) and answers nothing until it returns, so the run
+    state is unknown — reported as the documented `qmp: "busy"` /
+    `qemu_status: "unknown"`, never as the debugger halt (#137).
+    """
+    if state.get("qmp_busy") is True:
+        inflight = state.get("qmp_inflight")
+        return _QMPProbe(
+            QMP_BUSY,
+            error="QEMU is busy with "
+            + (f"`{inflight}`" if isinstance(inflight, str) else "a command")
+            + " a client sent through the qmu daemon",
+            daemon=state,
+        )
     running = state.get("running")
     status = state.get("qemu_status")
     return _QMPProbe(
@@ -2447,7 +2464,8 @@ def _wait_via_daemon(
         guest = None
     elif guest is None:
         probe = _probe_from_daemon({**state, **{
-            k: reply[k] for k in ("running", "qemu_status", "boot_offset") if k in reply
+            k: reply[k]
+            for k in ("running", "qemu_status", "qmp_busy", "boot_offset") if k in reply
         }})
         observation = _observe_guest(inst, qmp=probe)
         guest = observation.guest

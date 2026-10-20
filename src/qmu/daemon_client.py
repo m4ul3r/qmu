@@ -516,6 +516,29 @@ def mark_released(vm_id: str) -> None:
     _unwatchable.add(vm_id)
 
 
+def adopt_epoch(vm_id: str, offset: int) -> None:
+    """Hand a guest boundary this process just persisted to the daemon.
+
+    For boundaries QEMU announces with no RESET (`loadvm`): the daemon's
+    watch otherwise keeps scoping the guest axis to the pre-load generation
+    (#135). Never spawns a daemon and never fails the caller — a daemon that
+    adopts the VM later copies the epoch from the record.
+    """
+    if vm_id in _unwatchable:
+        return
+    try:
+        conn = connect(autostart=False)
+    except QMUError:
+        return
+    if conn is None:
+        return
+    with conn:
+        try:
+            conn.request("epoch", vm_id=vm_id, offset=offset)
+        except (DaemonError, DaemonUnavailable):
+            return
+
+
 def vm_state(vm_id: str, *, adopt: bool = True) -> dict[str, Any] | None:
     """The daemon's cached view of `vm_id`, adopting a live record on request.
 

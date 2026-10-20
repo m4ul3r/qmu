@@ -29,6 +29,12 @@ exited 0 and 1 when it exited non-zero, with the guest's code preserved only
 in `exit_code` (`exit 255` → qmu exit 1, `exit_code: 255`, `ok: false`,
 `ssh_error: false`, `crash_detected: false` — not a crash; 3 always needs a
 fresh serial report). The reserved codes 2/3/4/124 are never guest values.
+A kernel report printed while the command ran — on every path, including a
+completed command whose guest survived an Oops — is `crash_detected: true`
+with the report in `crash`: the same event `status` calls `crashed` and `qmu
+crash` returns (the command's exit stays 0/1 when it completed). A completed
+command (and `run`'s boot failure) also keeps the older `kernel_warning` /
+`kernel_warning_detected` keys, carrying the same report.
 
 - Output is **streamed**: in text mode guest stdout/stderr reach the host's
   stdout/stderr as the guest writes them (`for i in 1 2 3; do echo $i; sleep
@@ -40,13 +46,23 @@ fresh serial report). The reserved codes 2/3/4/124 are never guest values.
   Detail, `--out` and the spill cut-over: `output-contract.md` → *Streaming*.
 - `--timeout` (default 30 s; `run` 60 s): on expiry the envelope keeps the
   `stdout`/`stderr` captured so far, `exit_code: null`, `timed_out: true`,
-  exit 124. The remote command is **not** killed in the guest. A held QMP
+  exit 124 — whether or not the guest still answers. One readiness probe
+  (≤2.25 s, the one `status` runs) sets `ssh_error: true` and the hint when
+  it does not (a `kasan_multi_shot` report flood wedges the console, a hang),
+  and `crash` carries the newest report the command provoked; only a terminal
+  panic (3) or a halted vCPU (1) outranks the timeout. A held QMP
   slot (debugger bridge, another command) does not defeat the deadline: the
   watcher's QMP probe runs off the deadline thread, so the result is 124
   within ~N+0.3 s of the command starting (the pre-command QMP preflight may
-  itself spend its 2 s busy budget first). The budget wins outright: a guest
+  itself spend its 2 s busy budget first), plus that probe. The budget wins outright: a guest
   command that finishes *after* the deadline — even while that bounded probe
   was blocked — is still 124, `timed_out: true`, never a late `ok: true`.
+- The deadline kills the guest command's session: the command dies of
+  SIGPIPE on its next stdout/stderr write (a command that stays silent, or a
+  child it backgrounded, survives). A debugger stop does **not** (below).
+  Detach anything that must outlive the step regardless: `qmu exec --vm X
+  'setsid nohup ./poc > /root/poc.log 2>&1 < /dev/null &'`, then read
+  `/root/poc.log`.
 - A kernel panic while the command runs is reported as exit 3 as soon as the
   serial log shows `Kernel panic - not syncing` (sub-second), with the partial
   `stdout`/`stderr` on the crash envelope — not after the SSH keepalive
@@ -57,9 +73,20 @@ fresh serial report). The reserved codes 2/3/4/124 are never guest values.
   command refuses in under a second: exit 1, `guest_state: "panicked" |
   `"paused"`, `hint` naming `qmu crash --vm X` / `qmu kill --vm X` or `qmu cont
   --vm X` (for `qemu_status: "restore-vm"` the hint is a known-good `snapshot
-  load` or `kill` + relaunch instead — never `cont`). A debugger stop that fires mid-command (`exec`, `compile --run`,
-  `dmesg`) aborts the SSH session within ~1 s and gives the same `paused`
-  envelope — never the 15–20 s keepalive wait.
+  load` or `kill` + relaunch instead — never `cont`). A debugger stop that
+  fires mid-command returns within ~1 s with the same `paused` envelope —
+  never the 15–20 s keepalive wait — and the output that reached the host
+  before the stop (bytes the guest wrote just before it may still be in the
+  guest). For `exec`, `run` and `compile --run` the command is **left
+  running**: qmu keeps its SSH session open (`text`: `vCPU halted while
+  running (command left running)`) and a detached helper appends its further
+  output to the file named by `detached_output`, so the trigger continues
+  after `pry continue` / `qmu cont` (measured with a 120 s halt; the
+  connection stays up while the vCPU is stopped, at most 16 MiB of output is
+  kept). What still ends it is the SSH connection going away: `snapshot
+  load`, a reset and `kill` drop the ControlMaster — use the `setsid nohup`
+  form for a trigger that must survive those. `compile`'s gcc step and
+  `dmesg` are aborted (their session closed).
 - Text mode: `reference/output-contract.md` → *Guest-command text mode*.
 
 ## `run`
@@ -76,15 +103,16 @@ run executes a guest command over SSH; for boot-and-die kernels use launch
 | `0` | guest command exited 0; VM reaped |
 | `1` | guest command non-zero, or the VM died before SSH came up |
 | `3` | terminal kernel panic (same discrimination as `exec`) |
-| `124` | guest never answered SSH within `--ssh-timeout`, or the command outran `--timeout` on a reachable guest |
+| `124` | guest never answered SSH within `--ssh-timeout`, or the command outran `--timeout` |
 
 A clean run prints exactly what `exec` prints. Anything left to inspect — a
-crash, a *survived* report (`kernel_warning`), a guest that never answered, a
-boot failure, a timeout — keeps the metadata and `.serial.log` and prints on
-stderr `VM 'X' stopped (state preserved)…`, `Inspect: qmu log --vm X --tail
-200, or qmu crash --vm X`, `Clean up: qmu prune --vm X`. Exit 3 requires a
-terminal panic; a boot that only logged a WARNING and never started sshd is
-124 with the report under `kernel_warning`. `run -- id` ≈ 7 s end to end.
+crash, a *survived* report (`crash_detected: true`, `crash`, exit unchanged),
+a guest that never answered, a boot failure, a timeout — keeps the metadata
+and `.serial.log` and prints on stderr `VM 'X' stopped (state preserved)…`,
+`Inspect: qmu log --vm X --tail 200, or qmu crash --vm X`, `Clean up: qmu
+prune --vm X`. Exit 3 requires a terminal panic; a boot that only logged a
+WARNING and never started sshd is 124 with `crash_detected: true` and the
+report in `crash`. `run -- id` ≈ 7 s end to end.
 
 ## `compile`
 
@@ -106,10 +134,11 @@ the guest has no gcc, and several times faster than compiling inside a TCG
 guest (`cross-arch.md`). JSON: `compile_cmd`, `compile_exit`, `compiled`,
 `compiled_on`, `run_exit`, `run_stdout`, `run_stderr`, `crash_detected`; the
 host path adds `compiler`, `guest_arch`. `--timeout` bounds the **run**: on
-expiry with the guest still answering SSH the exit is 124 (not 4) with
-`timed_out: true`, `run_exit: null`, `ssh_error: false`, the partial
-`run_stdout`/`run_stderr`, and a `hint` (`Guest command exceeded --timeout
-(Ns) but the guest is still answering SSH …`). A lost transport during
+expiry the exit is 124 (not 4) with `timed_out: true`, `run_exit: null`, the
+partial `run_stdout`/`run_stderr`, `ssh_error` from one readiness probe, and a
+`hint` (`Guest command exceeded --timeout (Ns) but the guest is still
+answering SSH …` when it is). A report the run provoked is `crash_detected`/
+`crash` exactly as for `exec`. A lost transport during
 `--run` likewise keeps `run_exit: null` with the partial streams
 (`run_stdout_lossy` when bytes were replaced). Text mode prints `Compiled and
 ran X:` on stderr and the run's stdout on stdout, byte-exact and streamed as

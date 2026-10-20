@@ -209,6 +209,36 @@ def test_run_abort_when_stops_the_child_with_its_output(tmp_path, monkeypatch):
     assert excinfo.value.stdout == "pre\n"
 
 
+def test_run_abort_with_detach_leaves_the_command_running(tmp_path, monkeypatch):
+    """#143: a debugger stop must not kill the command it interrupted. The
+    child keeps its pipes — a drainer holds them — so a write after the
+    abort neither kills it (SIGPIPE) nor gets lost."""
+    marker = tmp_path / "finished"
+    client = _fake_ssh_on_path(
+        tmp_path, monkeypatch,
+        f"echo before\nsleep 1\necho after\necho late >&2\ntouch {marker}\n",
+    )
+    drained = tmp_path / "detached.txt"
+    drained.touch()
+
+    with pytest.raises(ssh.SSHAborted) as excinfo:
+        client.run(
+            "trigger", timeout=30, abort_when=lambda: True, poll_interval=0.2,
+            detach_to=lambda: drained,
+        )
+
+    assert excinfo.value.detached_output == drained
+    assert excinfo.value.stdout == "before\n"
+    deadline = time.monotonic() + 10
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.exists(), "the detached command died instead of finishing"
+    while b"late" not in drained.read_bytes() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert drained.read_bytes() == b"after\nlate\n"
+
+
+
 def test_run_relays_chunks_as_they_arrive_and_returns_the_same_bytes(
     tmp_path, monkeypatch
 ):
