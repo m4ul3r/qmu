@@ -191,11 +191,14 @@ def test_crash_during_the_command_exits_3_and_preserves_state(harness, capsys):
     assert rc == 3
     assert state["kills"] == [False]         # clean=False -> serial log kept
     captured = capsys.readouterr()
-    assert "Kernel panic - not syncing" in captured.out
-    # Follow-up hints are stderr notes: stdout is what `qmu exec` would print.
+    # stdout is what `qmu exec` would print — the guest's stdout only; the
+    # report and the follow-up hints are stderr notes (#172).
+    assert captured.out == ""
+    assert "Kernel panic - not syncing" in captured.err
     assert "qmu crash --vm run-vm" in captured.err
     assert "state preserved" in captured.err
-    assert "state preserved" not in captured.out
+    # the cause reads before the cleanup advice
+    assert captured.err.index("Kernel panic") < captured.err.index("state preserved")
 
 
 def test_boot_panic_exits_3_with_the_report(harness, capsys):
@@ -208,7 +211,7 @@ def test_boot_panic_exits_3_with_the_report(harness, capsys):
 
     assert rc == 3
     assert state["kills"] == [False]
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "crashed before the guest became reachable" in out
     assert "Kernel panic - not syncing" in out
 
@@ -221,7 +224,7 @@ def test_vm_dies_on_boot_without_a_crash_exits_1(harness, capsys):
 
     assert rc == 1
     assert state["kills"] == [False]
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "exited before the guest became reachable" in out
     assert "No crash report" in out
 
@@ -236,7 +239,7 @@ def test_unreachable_guest_exits_124(harness, capsys):
 
     assert rc == 124
     assert state["kills"] == [False]
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "did not become reachable" in out
 
 
@@ -282,7 +285,7 @@ def test_boot_warning_without_a_panic_is_not_promoted_to_a_crash(harness, capsys
     rc = cli.main(_argv("--ssh-timeout", "0", "./exploit"))
 
     assert rc == 124
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     # The warning is still SHOWN and the state preserved — it is usually the
     # reason the boot went wrong — it just does not change the exit code.
     assert "Non-fatal kernel report" in out

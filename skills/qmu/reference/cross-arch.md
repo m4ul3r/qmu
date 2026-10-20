@@ -161,7 +161,7 @@ EOF
 echo 'obj-m += oops.o' > Kbuild
 "$KDIR/qmu-kmake" modules                    # oops.ko for this arch, this kernel's vermagic
 qmu push oops.ko /root/oops.ko --vm arm70
-qmu exec --vm arm70 'insmod /root/oops.ko'  # exit 1 + kernel_warning: insmod died in the Oops
+qmu exec --vm arm70 'insmod /root/oops.ko'  # exit 1 + crash_detected/crash: insmod died in the Oops
 qmu crash --vm arm70                        # Internal error: Oops …; `status` says guest: crashed, still serving
 ```
 

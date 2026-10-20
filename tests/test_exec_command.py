@@ -341,16 +341,17 @@ def test_json_has_no_lossy_flag_for_clean_output(wired, capsys):
     assert "stdout_lossy" not in payload
 
 
-def test_lost_transport_text_leads_with_the_exact_stdout_bytes(wired, capsysbinary):
-    """The partial output before a panic keeps its bytes too; the report
-    follows on a fresh line."""
+def test_lost_transport_text_keeps_stdout_to_the_exact_guest_bytes(wired, capsysbinary):
+    """The partial output before a panic keeps its bytes, and stdout holds
+    nothing else: the report goes to stderr (#172)."""
     wired(stdout=GuestText(b"\xff step"), append_during_run=PANIC)
 
     rc = cli.main(["exec", "--vm", "exec-vm", "trigger"])
 
-    out = capsysbinary.readouterr().out
+    captured = capsysbinary.readouterr()
     assert rc == 3
-    assert out.startswith(b"\xff step\nSSH connection lost while running: trigger\n")
+    assert captured.out == b"\xff step"
+    assert b"Kernel panic - not syncing" in captured.err
 
 
 def test_text_out_file_holds_the_exact_stdout_bytes(wired, tmp_path, capsys):
@@ -516,16 +517,18 @@ def test_the_watcher_ignores_a_panic_from_before_the_command(wired):
     assert fake.predicate_answers == [False]
 
 
-def test_abort_text_mode_leads_with_partial_stdout_then_the_report(wired, capsys):
+def test_abort_text_mode_puts_partial_stdout_on_stdout_and_the_report_on_stderr(
+    wired, capsys
+):
     wired(stdout="step 1\nstep 2\n", stderr="warn\n", append_during_run=PANIC)
 
     rc = cli.main(["exec", "--vm", "exec-vm", "trigger"])
 
     captured = capsys.readouterr()
     assert rc == 3
-    assert captured.out.startswith("step 1\nstep 2\nSSH connection lost while running: trigger\n")
-    assert "Kernel panic - not syncing" in captured.out
-    assert captured.err == "warn\n"
+    assert captured.out == "step 1\nstep 2\n"
+    assert captured.err.startswith("warn\n")
+    assert "Kernel panic - not syncing" in captured.err
 
 
 @pytest.mark.parametrize("command", ["compile", "dmesg"])
@@ -780,14 +783,34 @@ def test_timeout_payload_carries_the_partial_output(wired, capsys):
     assert payload["vm_id"] == "exec-vm"
 
 
-def test_timeout_text_mode_prints_partial_stdout_then_the_notice(wired, capsys):
+def test_timeout_text_mode_prints_partial_stdout_and_the_notice_on_stderr(wired, capsys):
+    """A pipeline reading guest stdout must not receive qmu's timeout
+    narrative as if the guest had printed it (#172)."""
     wired(raises=SSHError("SSH command timed out after 2.0s: cmd", stdout="partial\n"))
 
     rc = cli.main(["exec", "--vm", "exec-vm", "--timeout", "2", "cmd"])
 
     captured = capsys.readouterr()
     assert rc == 124
-    assert captured.out.startswith("partial\nGuest command timed out after 2s")
+    assert captured.out == "partial\n"
+    assert "timed out" in captured.err
+
+
+@pytest.mark.parametrize("terminal", [True, False])
+def test_notice_after_open_stdout_line_starts_a_fresh_terminal_line(
+    wired, capsys, monkeypatch, terminal
+):
+    """Guest stdout that ends mid-line must not glue the stderr notice onto
+    it on a terminal; piped stdout stays byte-exact either way."""
+    monkeypatch.setattr(guest, "_stdout_is_terminal", lambda: terminal)
+    wired(raises=SSHError("SSH command timed out after 2.0s: cmd", stdout="partial"))
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "--timeout", "2", "cmd"])
+
+    captured = capsys.readouterr()
+    assert rc == 124
+    assert captured.out == "partial"
+    assert captured.err.startswith("\nGuest command timed out" if terminal else "Guest command timed out")
 
 
 @pytest.mark.parametrize("fmt", ["json", "text"])
@@ -835,8 +858,9 @@ def test_compile_run_timeout_on_a_serving_guest_is_124_with_partial_output(
         assert payload["timeout"] == 1.0
         assert "command" not in payload
     else:
-        assert captured.out.startswith("before-timeout\nGuest command timed out after 1s")
+        assert captured.out == "before-timeout\n"
         assert captured.err.startswith("Compiled and ran slow.c:\n")
+        assert "timed out" in captured.err
 
 
 def test_a_panic_under_the_guest_compile_step_is_the_crash_class(wired, tmp_path, capsys):
@@ -1144,8 +1168,8 @@ def test_text_out_streams_into_the_file_and_points_at_it_last(
 def test_a_panic_mid_stream_keeps_the_delivered_lines_and_exits_3(
     streaming, capsysbinary
 ):
-    """What was already on stdout stays; the crash report follows it (exit
-    3 + the usual stderr note), and nothing is printed twice."""
+    """What was already on stdout stays and stdout holds nothing else; the
+    crash report goes to stderr (exit 3), and nothing is printed twice."""
     fake = streaming([("stdout", b"line 1\n")], append_during_run=PANIC)
 
     rc = cli.main(["exec", "--vm", "exec-vm", "trigger"])
@@ -1153,9 +1177,8 @@ def test_a_panic_mid_stream_keeps_the_delivered_lines_and_exits_3(
     captured = capsysbinary.readouterr()
     assert rc == 3
     assert fake.predicate_answers == [True]
-    assert captured.out.startswith(b"line 1\nSSH connection lost while running: trigger\n")
-    assert captured.out.count(b"line 1") == 1
-    assert b"Kernel panic - not syncing" in captured.out
+    assert captured.out == b"line 1\n"
+    assert b"Kernel panic - not syncing" in captured.err
 
 
 # --- ssh that never reached the guest (#177) -----------------------------------

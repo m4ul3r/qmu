@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sys
@@ -1739,14 +1740,20 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
 
     older_than = float(args.older_than)
     if older_than < MIN_BUILD_RESIDUE_AGE:
+        floor = f"{MIN_BUILD_RESIDUE_AGE:g}"
         raise QMUError(
             f"--older-than {older_than:g} is below the "
-            f"{MIN_BUILD_RESIDUE_AGE:g}s floor for --build-residue. kbuild "
+            f"{floor}s floor for --build-residue. kbuild "
             f"bind-mounts the kernel source tree read-write for the whole "
             f"build, so reclaiming residue from a build that may still be "
             f"running corrupts it. Use `--older-than "
-            f"{MIN_BUILD_RESIDUE_AGE:g}` or higher, or inspect first with "
-            f"`qmu cache du --older-than {older_than:g}`."
+            f"{floor}` or higher, or inspect first with "
+            f"`qmu cache du --older-than {older_than:g}`.",
+            hint=(
+                f"{_residue_floor_command(getattr(args, 'tree', None), dry_run=True)} "
+                f"(the lowest threshold prune accepts; residue modified in the "
+                f"last {floor}s stays held back)"
+            ),
         )
 
     # QMU_CACHE_DIR is honoured with no validation, so a typo pointing at
@@ -1791,7 +1798,8 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
             "build_residue": payload,
             "unmanaged_cache": unmanaged,
         }
-        return Result(data=data, text=_residue_lines(report, dry_run=True, older_than=older_than),
+        return Result(data=data, text=_residue_lines(report, dry_run=True, older_than=older_than,
+                                                     trees=trees),
                       stem="prune-build-residue")
 
     removed, failed = remove_items(report.bucket_items("eligible"))
@@ -1827,7 +1835,7 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
     return Result(
         data=data,
         text=_residue_lines(
-            report, dry_run=False, older_than=older_than,
+            report, dry_run=False, older_than=older_than, trees=trees,
             removed_bytes=sum(i.bytes for i in removed),
             removed_files=len(removed), failed=len(failed),
         ),
@@ -1835,11 +1843,24 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
     )
 
 
+def _residue_floor_command(trees: Sequence[str] | None, *, dry_run: bool) -> str:
+    """The prune at the 600 s floor, scoped like the invocation that asked:
+    advice given after previewing one tree must not reclaim every tree."""
+    words = ["qmu", "prune", "--build-residue"]
+    for tree in trees or ():
+        words += ["--tree", tree]
+    if dry_run:
+        words.append("--dry-run")
+    words += ["--older-than", f"{MIN_BUILD_RESIDUE_AGE:g}"]
+    return shlex.join(words)
+
+
 def _residue_lines(
     report: Any,
     *,
     dry_run: bool,
     older_than: float,
+    trees: Sequence[str] | None = None,
     removed_bytes: int = 0,
     removed_files: int = 0,
     failed: int = 0,
@@ -1872,11 +1893,25 @@ def _residue_lines(
 
     # Held-back and refused are disclosed on BOTH branches, in both formats.
     if report.held_back.files:
+        # Residue qualifies by being OLDER than the threshold, so a larger one
+        # holds back more; the recovery is a smaller one, down to the floor
+        # (#164: this line used to advise a larger --older-than).
+        floor = f"{MIN_BUILD_RESIDUE_AGE:g}"
+        if older_than > MIN_BUILD_RESIDUE_AGE:
+            recovery = (
+                f"Once the build has finished, re-run with a smaller "
+                f"--older-than, down to the {floor}s floor: "
+                f"{_residue_floor_command(trees, dry_run=dry_run)}"
+            )
+        else:
+            recovery = (
+                f"Re-run once the build has finished and the trees are older "
+                f"than {floor}s."
+            )
         lines.append(
             f"Held back by the --older-than cutoff ({older_than:g}s): "
             f"{', '.join(report.held_back.groups)}. These trees were modified "
-            f"recently and may be mid-build. Re-run later, or with a larger "
-            f"--older-than once the build has finished."
+            f"recently and may be mid-build. {recovery}"
         )
     if report.refused.files:
         lines.append(

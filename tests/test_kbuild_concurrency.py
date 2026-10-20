@@ -138,7 +138,7 @@ def test_config_only_serializes_against_running_build(kbuild_env, tmp_path):
             _release(holder)
         stdout, stderr = proc.communicate(timeout=60)
         assert proc.returncode == 0, stderr
-        assert stdout == f"CONFIG={outdir}/.config\n"
+        assert stdout.splitlines()[0] == f"CONFIG={outdir}/.config"
         assert (outdir / ".config").is_file()
     finally:
         if holder.poll() is None:
