@@ -14,6 +14,7 @@ qmu launch --name X --no-replace --no-net                  # -nic none; no SSH e
 qmu launch --name X --no-replace --nic-model e1000         # default virtio-net-pci
 qmu launch --name X --no-replace --no-kvm                  # force TCG ([machine] accel=tcg); boot 20–60 s
 qmu launch --name X --no-replace --ssh-timeout 120         # default 60 s
+qmu launch --name X --no-replace --forward 2345 --forward 8080:80   # extra guest TCP ports
 qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only after --
 ```
 
@@ -27,6 +28,20 @@ qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only 
 - `--no-net` without `--ssh-port` records **no** SSH endpoint (`ssh:
   "none"`); SSH commands refuse naming the reason. With a manual NIC pass
   `--ssh-port N` and forward `N` yourself.
+- `--forward [HOST:]HPORT:GPORT` (repeatable; config `[machine] forwards =
+  ["2345", "8080:80"]`, the flag replaces the list) adds a `hostfwd` for guest
+  TCP port GPORT to qmu's own NIC — a long-lived `gdbserver
+  127.0.0.1:2345 …`, an HTTP service under test — instead of an `ssh -L` qmu
+  does not manage or a `--no-net` manual NIC. HOST defaults to `127.0.0.1`; a
+  bare `GPORT` auto-allocates the host port under the same port lock as SSH.
+  The mapping is recorded on the VM: `forwards: [{"host", "host_port",
+  "guest_port"}]` in `launch`/`status`/`list` JSON, `Forward: 127.0.0.1:10022
+  -> guest:2345` in text. A pinned port already in use is exit 1 naming it;
+  `--forward` with `--no-net`/`--harness` (no qmu NIC) or `net_backend=passt`
+  is exit 1, never silently dropped; a malformed spec is exit 2. It dies with
+  the VM. The guest service must listen on an address slirp reaches
+  (`0.0.0.0` or the guest's `10.0.2.15`; `127.0.0.1` in the guest is not
+  forwarded to).
 - `--no-kvm` forces TCG; KVM is otherwise auto-enabled when guest arch == host
   and `/dev/kvm` exists, recorded as `kvm` in `launch`/`status`/`list` JSON.
   KVM does **not** disable hardware watchpoints (`debugging.md`).
@@ -47,7 +62,11 @@ qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only 
   booting — `qmu log --vm X --tail 50`, `qmu status --vm X`, or relaunch with
   a longer `--ssh-timeout`. A serial log still empty after ~10 s fails
   earlier with `ssh_status: "no-console-output"` (exit 4, VM retained), naming
-  the expected `console=` for the arch.
+  the expected `console=` for the arch. An sshd that answers and refuses the
+  recorded `[ssh] user`/key (`Permission denied`) ends the wait after ~5 s
+  with `ssh_status: "auth-failed"`, exit 4, `error_type: "SSHAuthError"`,
+  `ssh_user`, VM retained — the guest booted; relaunch with a user/key the
+  image accepts (`root` for qmu rootfs; run unprivileged with `exec --user`).
 - `--harness` implies `--no-wait-ssh --no-net`, skips the rootfs/SSH-key
   requirement, allocates no SSH port (`wait.md`). A config `[drive] rootfs`
   is still attached; the launch note names the source: `Harness mode:
@@ -55,9 +74,11 @@ qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only 
 
 ## Launch result
 
-`launch --format json`: `vm_id`, `pid`, `ssh_port`, `gdb_port`, `ssh_status`
-(`ready` · `skipped` · `no-console-output` · `timeout` · `n/a (harness)` ·
-`none (--no-net, no --ssh-port)`), `kvm`,
+`launch --format json`: `vm_id`, `pid`, `ssh_port`, `ssh_user` (the account
+SSH commands log in as; null without an SSH endpoint), `forwards`,
+`gdb_port`, `ssh_status`
+(`ready` · `skipped` · `no-console-output` · `timeout` · `auth-failed` ·
+`n/a (harness)` · `none (--no-net, no --ssh-port)`), `kvm`,
 `arch`, `cmdline`, `profile`, `profile_applied`, `rootfs`, `serial_log`,
 `qemu_log`, `qmp_socket`, `warnings: [str]`, `config_sources: [paths]`
 (global → project/explicit order), `replaced: {"vm_id", "pid"} | null`,
@@ -72,6 +93,7 @@ profile-sourced unknown-parameter note (`apparmor=0`, `selinux=0`) is JSON-only
 - `'console=ttyS0' names an x86 serial port; on <arch> QEMU's virt console is ttyAMA0 …`
 - `'root=/dev/sda' names a SCSI/SATA disk; qmu attaches the rootfs as virtio on <arch>, where it is /dev/vda …` (aarch64/arm; skipped with `--drive`)
 - `'console=ttyAMA0' names an ARM PL011 UART; on x86_64 the serial console is ttyS0 …`
+- `'root=/dev/vda' names a virtio disk; qmu attaches the rootfs as a plain IDE/SATA drive on x86_64, where it is /dev/sda …` (x86_64; skipped with `--drive`)
 
 `launch`/`run` print `[qmu] config: <path>` on stderr when a project or
 `--config` file applied. The first QMP connect after launch retries transient
@@ -138,11 +160,13 @@ classification for `orphaned` (its QEMU still runs; text keeps the
 crash report waiting: qmu crash --vm X)` / `(logs retained: qmu log --vm X;
 remove with: qmu prune --vm X)` / `(no logs retained)`. Only an absent name
 is exit 1. `list` JSON rows carry the same `ssh` words as `status` (`ready`
-· `down` · `none` · `skipped` · `skipped (debugger attached)` · `n/a
-(harness)`), `ssh_probe_ms` (the probe's wall time in ms; null when no
+· `down` · `auth-failed` · `none` · `skipped` · `skipped (debugger attached)`
+· `n/a (harness)`), `ssh_user`, `forwards`, `ssh_probe_ms` (the probe's wall time in ms; null when no
 probe was sent — also on the `status` envelope and in the status text `SSH:
-port N (ready, probe 87 ms)`), `logs_retained`, `crash_detected`; a stopped row's `guest` is
-null.
+port N (ready, probe 87 ms)`, followed by `SSH user: root`), `logs_retained`,
+`crash_detected`; a stopped row's `guest` is null. `ssh: "auth-failed"`
+means sshd answered and refused `ssh_user` (the guest is `serving`;
+`status` adds a relaunch `hint`, list text `ssh=N(auth-failed as USER)`).
 
 **Guest usability** (`guest`), in precedence order:
 

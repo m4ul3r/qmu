@@ -116,7 +116,11 @@ listener. Always pass `--ssh-port N` with `--no-net` and reuse `N` in the
 VM on the host. `--no-net` without `--ssh-port` records **no** SSH endpoint at
 all (SSH commands then refuse with the `--no-net` reason instead of probing a
 port that may belong to someone else), so the explicit `--ssh-port` is what
-makes the manual NIC usable.
+makes the manual NIC usable. A *second* guest port (gdbserver, a service)
+on a machine where qmu's own NIC works needs none of this: `--forward
+[HOST:]HPORT:GPORT` adds the `hostfwd` to qmu's NIC and records it
+(`launch.md`); with `--no-net` it is refused, so add the extra `hostfwd=`
+to your own `-netdev` instead.
 
 **Debug — `--slide 0`, not `--base`.** The `multi_v7` build typically loads with no KASLR
 slide (`qmu kbase` shows link == runtime). `pry load --base` fails on this ELF

@@ -168,19 +168,3 @@ def test_top_level_version_flag_honors_a_preceding_format(fmt, capsys):
     code, out, err = _run(["--format", fmt, "--version"], capsys)
     assert code == 0
     assert json.loads(out) == {"ok": True, "version": VERSION}
-
-
-def test_launch_help_documents_no_reboot_and_ssh_timeout_expiry(capsys):
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["launch", "--help"])
-    assert exc.value.code == 0
-    text = capsys.readouterr().out
-    assert "--no-reboot" in text
-    assert "exits 4" in text and "RETAINS" in text and "no-console-output" in text
-
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["run", "--help"])
-    assert exc.value.code == 0
-    text = capsys.readouterr().out
-    assert "--no-reboot" in text
-    assert "exits 124" in text

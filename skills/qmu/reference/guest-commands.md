@@ -20,12 +20,35 @@ qmu exec --vm X -- uname -a
 qmu exec --vm X "./exploit" --timeout 120 --format json
 ```
 
+## Running as an unprivileged user (`--user`)
+
+"Can an unprivileged user do X" is answered with `--user NAME` on `exec`,
+`run` and `compile --run`: qmu logs in as the VM's SSH user (keep it `root`)
+and drops to NAME with `runuser -u NAME -- sh -c '<command>'` (`su -s /bin/sh
+NAME -c …` on a BusyBox guest without `runuser`), starting in NAME's home
+directory (`/` if it has none). The exit status is the command's (`exit 7` →
+`exit_code: 7`), the envelope's `command` is the command as given (not the
+wrapper) and `run_as` names the account on every path (it is the SSH user
+when `--user` is absent). `compile --run --user NAME` builds into `/tmp/`
+instead of `/root/` (unreadable to NAME); `--user` without `--run` is exit 1.
+The account must exist in the image (`runuser: user NAME does not exist` is
+the guest's own stderr, exit 1).
+
+```bash
+qmu exec --vm X --user nobody -- id                     # uid=65534(nobody) …
+qmu compile --vm X poc.c --run --user ubuntu --timeout 60
+```
+
+Do not set `[ssh] user` to an unprivileged account for this: it is fixed at
+launch, and an account sshd refuses ends `launch` with `ssh_status:
+"auth-failed"` (below).
+
 ## `exec` result
 
-JSON: `vm_id`, `command`, `exit_code` (null when the command did not finish),
-`stdout`, `stderr`, `timed_out`, `ssh_error`, `crash_detected`, `crash`,
-`hint`. qmu's own exit is **not** the guest's: it is 0 when the guest command
-exited 0 and 1 when it exited non-zero, with the guest's code preserved only
+JSON: `vm_id`, `command`, `run_as`, `exit_code` (null when the command did not
+finish), `stdout`, `stderr`, `timed_out`, `ssh_error`, `crash_detected`,
+`crash`, `hint`. qmu's own exit is **not** the guest's: it is 0 when the guest
+command exited 0 and 1 when it exited non-zero, with the guest's code preserved only
 in `exit_code` (`exit 255` → qmu exit 1, `exit_code: 255`, `ok: false`,
 `ssh_error: false`, `crash_detected: false` — not a crash; 3 always needs a
 fresh serial report). The reserved codes 2/3/4/124 are never guest values.
@@ -69,6 +92,10 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
   (15 s) and re-probes.
 - A dropped transport with no fresh crash report is exit 4 (`ssh_error:
   true`, `crash_detected: false`).
+- sshd refusing the VM's recorded `[ssh] user`/key (`Permission denied
+  (publickey,…)`) is exit 4 `error_type: "SSHAuthError"` with `ssh_status:
+  "auth-failed"`, `ssh_user`, `ssh_key` and a relaunch `hint` — on `exec`,
+  `compile`, `dmesg`, `push`/`pull` alike — never "unreachable".
 - Against a `panicked` or `paused` guest (any QMP `running: false` state) the
   command refuses in under a second: exit 1, `guest_state: "panicked" |
   `"paused"`, `hint` naming `qmu crash --vm X` / `qmu kill --vm X` or `qmu cont
@@ -92,7 +119,7 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
 ## `run`
 
 `qmu run` collapses `launch` → `exec` → `kill`; it takes every `launch` flag
-(`--name`/`--no-replace` included) plus `--timeout`, `--keep`, and
+(`--name`/`--no-replace`/`--forward` included) plus `--timeout`, `--keep`, `--user`, and
 `--qemu-arg` (repeatable; `--qemu-arg=-M --qemu-arg=virt` for dash-leading
 values). `--harness`/`--no-wait-ssh` are exit 2: `--harness is not accepted:
 run executes a guest command over SSH; for boot-and-die kernels use launch
@@ -103,6 +130,7 @@ run executes a guest command over SSH; for boot-and-die kernels use launch
 | `0` | guest command exited 0; VM reaped |
 | `1` | guest command non-zero, or the VM died before SSH came up |
 | `3` | terminal kernel panic (same discrimination as `exec`) |
+| `4` | sshd answered and refused the `[ssh] user`/key (`error_type: "SSHAuthError"`, `ssh_status: "auth-failed"`; within ~5 s, not after `--ssh-timeout`) |
 | `124` | guest never answered SSH within `--ssh-timeout`, or the command outran `--timeout` |
 
 A clean run prints exactly what `exec` prints. Anything left to inspect — a
@@ -170,6 +198,13 @@ bare `SSHAborted`/exit 4. The same rule covers every watched SSH step of
 `compile` (source push, in-guest `gcc`, host-build delivery and `chmod`). An
 scp *timeout* with no fresh panic stays 4 `SSHError`; a halted vCPU is the
 paused envelope, exit 1. All carry `vm_id`.
+
+A guest with no SFTP server (Dropbear/BusyBox firmware: `sh:
+/usr/libexec/sftp-server: No such file or directory`, or an sshd without
+`Subsystem sftp`) is retried once in the legacy protocol (`scp -O`), which
+such guests speak; nothing to configure. Only when that retry fails too is
+it an error, naming both attempts (exit 1 `SCPFileError` when the guest has
+no `scp` either, with a hint to inject one).
 
 ## `dmesg`
 

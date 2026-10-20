@@ -88,15 +88,20 @@ from ..serial import (
     scan_console_growth,
     serial_log_offset,
 )
+from ..ssh import probe_refused_auth
 from ..vm import launch_vm, suspect_dotted_params
 from .._cliutil import (
     Result,
     _add_common_opts,
     _add_launch_opts,
+    _auth_refused_error,
+    _auth_refused_hint,
     _kill_vm,
     _make_ssh,
     _qmp_ctx,
     _resolve_config_from_args,
+    _ssh_user,
+    forward_label,
 )
 
 
@@ -337,6 +342,17 @@ def _warn_arch_cmdline_mismatch(
                     "console is ttyS0, so the kernel will print nothing to the "
                     "serial log."
                 )
+        # The mirror of the arm check (#152): the implicit x86 drive is a
+        # plain -drive (IDE/SATA), so the guest sees /dev/sda, never a vd*.
+        if not args.drives:
+            for token in roots:
+                if token[len("root="):].startswith("/dev/vd"):
+                    messages.append(
+                        f"'{token}' names a virtio disk; qmu attaches the rootfs "
+                        "as a plain IDE/SATA drive on x86_64, where it is "
+                        "/dev/sda. The guest will panic with 'VFS: Unable to "
+                        "mount root fs'."
+                    )
     for message in messages:
         sys.stderr.write(f"[qmu] Warning: {message}\n")
         _note(prep, message)
@@ -569,6 +585,12 @@ def _prepare_boot(
 # --ssh-timeout only adds a minute of nothing to the same answer.
 NO_CONSOLE_OUTPUT_SECONDS = 10.0
 _SSH_POLL_INTERVAL = 1.0
+# How long sshd must keep refusing the login before the wait gives up on it.
+# A refusal is positive evidence the guest is up, and the account comes from
+# the image, so it does not change — but a first-boot script may still be
+# installing authorized_keys when sshd starts. A few seconds covers that and
+# costs nothing next to the full --ssh-timeout the refusal used to burn (#158).
+AUTH_REFUSED_SETTLE_SECONDS = 5.0
 
 
 def _serial_log_empty(path: str | None) -> bool:
@@ -581,18 +603,28 @@ def _serial_log_empty(path: str | None) -> bool:
 
 
 def _wait_for_ssh_or_console(ssh: Any, inst: Any, timeout: float) -> str:
-    """Block for SSH; returns 'ready', 'timeout', or 'no-console-output'.
+    """Block for SSH; returns 'ready', 'timeout', 'no-console-output' or
+    'auth-failed'.
 
     Polls `SSHClient.is_ready` alongside the empty-serial-log check, because
-    the two non-ready outcomes need different explanations: a slow boot may
-    still answer, a silent console never will.
+    the non-ready outcomes need different explanations: a slow boot may
+    still answer, a silent console never will, and an sshd that refuses the
+    recorded user/key has booted and will keep refusing (#158).
     """
     start = time.monotonic()
     deadline = start + timeout
+    refused_since: float | None = None
     while True:
         if ssh.is_ready(timeout=2):
             return "ready"
         now = time.monotonic()
+        if probe_refused_auth(ssh):
+            if refused_since is None:
+                refused_since = now
+            if now - refused_since >= AUTH_REFUSED_SETTLE_SECONDS or now >= deadline:
+                return "auth-failed"
+        else:
+            refused_since = None
         if (
             now - start >= NO_CONSOLE_OUTPUT_SECONDS
             and _serial_log_empty(inst.serial_log)
@@ -685,6 +717,16 @@ def _handle_launch(args: argparse.Namespace) -> Result:
                 + (f"console={expected} " if expected else "the console= ")
                 + "and -M/-cpu matching the kernel's arch"
             )
+        elif outcome == "auth-failed":
+            # sshd answered and refused the recorded user/key: the guest is
+            # up, so neither "still booting" (124) nor a longer timeout
+            # applies (#158). An SSH failure, exit 4, naming who was tried.
+            ssh_status = "auth-failed"
+            exit_code = 4
+            error_type = "SSHAuthError"
+            auth = _auth_refused_error(inst, ssh)
+            error = f"{auth} VM state retained."
+            hint = auth.hint
         else:
             # The window closed with the guest still booting: the timeout
             # code (124), the same `run` exits for the same condition, not
@@ -739,6 +781,10 @@ def _handle_launch(args: argparse.Namespace) -> Result:
         "pid": inst.pid,
         "ssh_port": inst.ssh_port,
         "ssh_status": ssh_status,
+        # Who the SSH commands log in as (#158): fixed here, at launch.
+        "ssh_user": _ssh_user(inst),
+        # Extra host->guest TCP forwards on qmu's own NIC (#149).
+        "forwards": getattr(inst, "forwards", []),
         "gdb_port": inst.gdb_port,
         "kernel": inst.kernel,
         "profile": inst.profile,
@@ -765,8 +811,11 @@ def _handle_launch(args: argparse.Namespace) -> Result:
         lines.append(f"  Mode:    harness (no SSH)")
     elif inst.ssh_port is not None:
         lines.append(f"  SSH:     port {inst.ssh_port} ({ssh_status})")
+        lines.append(f"  User:    {_ssh_user(inst)}")
     else:
         lines.append(f"  SSH:     {ssh_status}")
+    for forward in getattr(inst, "forwards", []):
+        lines.append(f"  Forward: {forward_label(forward)}")
     if inst.gdb_port:
         lines.append(f"  GDB:     port {inst.gdb_port}")
     lines.append(f"  Kernel:  {inst.kernel}")
@@ -779,6 +828,8 @@ def _handle_launch(args: argparse.Namespace) -> Result:
         result["hint"] = hint
         if exit_code == 124:
             result["timed_out"] = True
+            result["ssh_error"] = True
+        elif ssh_status == "auth-failed":
             result["ssh_error"] = True
         # Text-mode stderr trailer, after the launch block it qualifies.
         notes = (f"[qmu] Error: {error}", f"[qmu] Hint: {hint}")
@@ -944,6 +995,9 @@ class _GuestObservation:
     # The SSH probe was withheld because a gdb client is attached: its login
     # runs `uname`, which fires a user breakpoint on `__x64_sys_newuname`.
     debugger_attached: bool = False
+    # sshd answered the probe and refused the recorded user/key (#158): the
+    # guest is up (positive evidence), but no SSH command can log in.
+    ssh_auth_failed: bool = False
     crash_detected: bool = False
     # How the boot boundary `scan_offset` was learned when the daemon serves
     # the VM: "observed" (a RESET it witnessed) or "banner" (inferred from
@@ -960,6 +1014,8 @@ class _GuestObservation:
         if not self.has_endpoint:
             return "none"
         if self.ssh_probed:
+            if self.ssh_auth_failed:
+                return "auth-failed"
             return "ready" if self.ssh_ready else "down"
         if self.debugger_attached:
             return "skipped (debugger attached)"
@@ -1073,16 +1129,21 @@ def _observe_guest(
     ssh_ready: bool | None = None
     ssh_probed = False
     ssh_probe_ms: int | None = None
+    ssh_auth_failed = False
     if probe_ssh and has_endpoint and not attached:
         probe_start = time.monotonic()
-        ssh_ready = bool(_make_ssh(inst).is_ready())
+        ssh = _make_ssh(inst)
+        ssh_ready = bool(ssh.is_ready())
         ssh_probe_ms = int((time.monotonic() - probe_start) * 1000)
         ssh_probed = True
+        ssh_auth_failed = probe_refused_auth(ssh)
 
     if crash_detected:
         guest = GUEST_CRASHED
     elif ssh_probed:
-        guest = GUEST_SERVING if ssh_ready else GUEST_UNKNOWN
+        # An sshd that refuses the login answered: the guest serves, only
+        # not to this user/key — `ssh: "auth-failed"` says which (#158).
+        guest = GUEST_SERVING if ssh_ready or ssh_auth_failed else GUEST_UNKNOWN
     elif qmp.running is True and console_bytes > 0:
         guest = GUEST_SERVING
     else:
@@ -1090,8 +1151,8 @@ def _observe_guest(
     return _GuestObservation(
         guest, start, console_bytes, qmp, has_endpoint,
         ssh_ready=ssh_ready, ssh_probed=ssh_probed, ssh_probe_ms=ssh_probe_ms,
-        debugger_attached=attached, crash_detected=crash_detected,
-        epoch_source=epoch_source,
+        debugger_attached=attached, ssh_auth_failed=ssh_auth_failed,
+        crash_detected=crash_detected, epoch_source=epoch_source,
     )
 
 
@@ -3049,6 +3110,8 @@ def _handle_list(args: argparse.Namespace) -> Result:
                 "harness": inst.harness,
                 "ssh_port": inst.ssh_port,
                 "ssh": "n/a (harness)" if inst.harness else obs.ssh_state(),
+                "ssh_user": _ssh_user(inst),
+                "forwards": inst.forwards,
                 "ssh_ready": obs.ssh_ready,
                 "ssh_probe_ms": obs.ssh_probe_ms,
                 "gdb_port": inst.gdb_port,
@@ -3089,6 +3152,8 @@ def _handle_list(args: argparse.Namespace) -> Result:
                 "harness": inst.harness,
                 "ssh_port": inst.ssh_port,
                 "ssh": "n/a (harness)" if inst.harness else "skipped",
+                "ssh_user": _ssh_user(inst),
+                "forwards": inst.forwards,
                 "ssh_ready": None,
                 "gdb_port": inst.gdb_port,
                 "kernel": inst.kernel or None,
@@ -3113,6 +3178,8 @@ def _handle_list(args: argparse.Namespace) -> Result:
             ssh_str = "ssh=none"
         elif obs.debugger_attached:
             ssh_str = f"ssh={inst.ssh_port}(not probed: debugger attached)"
+        elif obs.ssh_auth_failed:
+            ssh_str = f"ssh={inst.ssh_port}(auth-failed as {inst.ssh_user})"
         else:
             ssh_str = f"ssh={inst.ssh_port}({'ok' if obs.ssh_ready else 'down'})"
         gdb_str = f" gdb={inst.gdb_port}" if inst.gdb_port else ""
@@ -3386,7 +3453,11 @@ def _handle_status(args: argparse.Namespace) -> Result:
         "guest_detail": obs.detail(),
         "ssh_port": inst.ssh_port,
         "ssh": ssh_state,
+        # The account every SSH command logs in as, recorded at launch from
+        # [ssh] user — the one fact an `auth-failed` reader needs (#158).
+        "ssh_user": _ssh_user(inst),
         "ssh_probe_ms": obs.ssh_probe_ms,
+        "forwards": inst.forwards,
         "gdb_port": inst.gdb_port,
         "kernel": inst.kernel,
         "rootfs": inst.rootfs,
@@ -3405,6 +3476,8 @@ def _handle_status(args: argparse.Namespace) -> Result:
         # agree for a paused guest with a retained report (#93).
         "crash_detected": obs.crash_detected,
     }
+    if obs.ssh_auth_failed:
+        result["hint"] = _auth_refused_hint(inst)
     if obs.epoch_source and qmp.daemon is not None:
         # Daemon-served only: "observed" means a RESET was witnessed and the
         # scope is anchored on it; "banner" means the newest kernel boot
@@ -3443,6 +3516,12 @@ def _handle_status(args: argparse.Namespace) -> Result:
         lines.append(
             f"  SSH:       port {inst.ssh_port} (not probed: guest {guest})"
         )
+    if _ssh_user(inst) is not None:
+        lines.append(f"  SSH user:  {inst.ssh_user}")
+    if obs.ssh_auth_failed:
+        lines.append(f"  Hint:      {_auth_refused_hint(inst)}")
+    for forward in inst.forwards:
+        lines.append(f"  Forward:   {forward_label(forward)}")
     if inst.gdb_port:
         lines.append(f"  GDB:       port {inst.gdb_port}")
     lines.extend([

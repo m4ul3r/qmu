@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import selectors
 import subprocess
 import sys
@@ -47,6 +48,40 @@ class SSHAborted(SSHError):
     def __init__(self, message: str, *, detached_output: Path | None = None, **kwargs):
         super().__init__(message, **kwargs)
         self.detached_output = detached_output
+
+
+class SSHAuthError(SSHError):
+    """sshd answered and refused the login qmu tried (#158).
+
+    Positive evidence that the guest booted and its sshd serves: only the
+    account (`[ssh] user`, recorded on the VM at launch) or the key does not
+    match the image. Reporting it as a boot timeout or a lost transport sent
+    the reader to `qmu log` (a healthy boot) or to a longer `--ssh-timeout`,
+    neither of which can help. Exit 4 like every SSHError; the envelope names
+    the user and key and says `ssh_status: "auth-failed"`.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        user: str,
+        key_path: str | None,
+        stderr: str = "",
+        hint: str | None = None,
+    ) -> None:
+        super().__init__(message, returncode=255, stderr=stderr)
+        self.user = user
+        self.key_path = key_path
+        self.hint = hint
+
+    def envelope_fields(self) -> dict[str, object]:
+        return {
+            "ssh_status": PROBE_AUTH_FAILED,
+            "ssh_error": True,
+            "ssh_user": self.user,
+            "ssh_key": self.key_path,
+        }
 
 
 class GuestText(str):
@@ -147,6 +182,37 @@ def is_transport_failure(rc: int, stderr: str) -> bool:
     if rc != 255:
         return False
     return any(m in stderr for m in SSH_TRANSPORT_ERROR_MARKERS)
+
+
+# What `ssh` itself prints when sshd answered and every authentication method
+# failed (`root@localhost: Permission denied (publickey,password).`) or the
+# server gave up on the attempts. The parenthesised method list is the
+# client's, so a guest-side "Permission denied" (a file it could not open)
+# does not match.
+SSH_AUTH_FAILURE_MARKERS = (
+    "Permission denied (",
+    "Too many authentication failures",
+)
+
+# Readiness-probe outcomes (`SSHClient.probe`). `auth-failed` is sshd
+# answering and refusing the login: up, but not usable with this user/key.
+PROBE_READY = "ready"
+PROBE_AUTH_FAILED = "auth-failed"
+PROBE_DOWN = "down"
+
+
+def is_auth_failure(rc: int, stderr: str) -> bool:
+    """True if (rc, stderr) are ssh's own report of a refused login."""
+    return rc == 255 and any(m in stderr for m in SSH_AUTH_FAILURE_MARKERS)
+
+
+def probe_refused_auth(ssh: object) -> bool:
+    """Whether `ssh`'s last readiness probe was refused at authentication.
+
+    Read through getattr because callers hold whatever `_make_ssh` returned,
+    which the test suite replaces with doubles that only answer `is_ready`.
+    """
+    return getattr(ssh, "last_probe", None) == PROBE_AUTH_FAILED
 
 
 # Bytes a detached command's drainer keeps; past this it reads and discards,
@@ -341,6 +407,11 @@ class SSHClient:
     # Budget for one push/pull transfer.
     scp_timeout: float = 30.0
 
+    # What the last readiness probe saw (`PROBE_*`), None before any; and
+    # ssh's stderr from it, which names the refused methods on auth-failed.
+    last_probe: str | None = None
+    last_probe_stderr: str = ""
+
     def __init__(
         self,
         port: int,
@@ -352,6 +423,10 @@ class SSHClient:
         self.key_path = key_path
         self.host = host
         self.user = user
+        # Set once a transfer found no SFTP server in the guest and the
+        # legacy protocol worked, so a second transfer in the same command
+        # goes straight to `scp -O` (#148).
+        self.scp_legacy = False
 
     def _ssh_base(self, *, multiplex: bool = True) -> list[str]:
         base = [
@@ -372,6 +447,7 @@ class SSHClient:
     def _scp_base(self) -> list[str]:
         return [
             "scp",
+            *(["-O"] if self.scp_legacy else []),
             "-i", self.key_path,
             "-P", str(self.port),
             "-o", "StrictHostKeyChecking=no",
@@ -384,7 +460,16 @@ class SSHClient:
         return f"{self.user}@{self.host}"
 
     def is_ready(self, timeout: int = 2) -> bool:
-        """Check if SSH is responding within `timeout` seconds.
+        """Check if SSH is responding within `timeout` seconds; see :meth:`probe`."""
+        return self.probe(timeout) == PROBE_READY
+
+    def probe(self, timeout: int = 2) -> str:
+        """One readiness probe: `ready`, `auth-failed` or `down` (`PROBE_*`).
+
+        `auth-failed` is sshd answering and refusing this user/key — the
+        guest is up, and no amount of waiting changes the answer (#158). The
+        outcome and ssh's stderr are kept on `last_probe`/`last_probe_stderr`
+        for callers that only asked `is_ready`.
 
         The probe is deliberately NOT multiplexed (`ControlMaster=no`, no
         `ControlPath`): `list`/`status`/launch run it against every serving VM
@@ -409,9 +494,32 @@ class SSHClient:
                 capture_output=True,
                 timeout=timeout + PROBE_GRACE_SECONDS,
             )
-            return result.returncode == 0
         except subprocess.TimeoutExpired:
-            return False
+            self.last_probe, self.last_probe_stderr = PROBE_DOWN, ""
+            return PROBE_DOWN
+        raw = result.stderr or b""
+        stderr = (raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw).strip()
+        if result.returncode == 0:
+            outcome = PROBE_READY
+        elif is_auth_failure(result.returncode, stderr):
+            outcome = PROBE_AUTH_FAILED
+        else:
+            outcome = PROBE_DOWN
+        self.last_probe, self.last_probe_stderr = outcome, stderr
+        return outcome
+
+    def auth_error(self, stderr: str | None = None) -> SSHAuthError:
+        """The SSHAuthError for a refused login, naming the user and key."""
+        detail = (self.last_probe_stderr if stderr is None else stderr).strip()
+        reason = "; ".join(line.strip() for line in detail.splitlines() if line.strip())
+        return SSHAuthError(
+            f"sshd on port {self.port} answered but refused user "
+            f"'{self.user}' with key {self.key_path}"
+            + (f": {reason}" if reason else ""),
+            user=self.user,
+            key_path=self.key_path,
+            stderr=detail,
+        )
 
     def close_control_master(self, timeout: float = 5.0) -> bool:
         """Tear down the multiplexed ControlMaster for this guest, if any.
@@ -516,17 +624,12 @@ class SSHClient:
                 "directory (archive it first, e.g. tar)",
                 hint=f"tar czf <archive>.tgz -C {local_path} . ; then push the archive",
             )
-        cmd = self._scp_base() + [
-            str(local),
-            f"{self._target()}:{remote_path}",
-        ]
-        result = self._scp(
-            cmd,
+        self._transfer(
+            [str(local), f"{self._target()}:{remote_path}"],
             operation="push",
             direction=f"{local_path} -> {remote_path}",
             abort_when=abort_when,
         )
-        _raise_scp_failure("push", result)
 
     def pull(
         self,
@@ -536,17 +639,42 @@ class SSHClient:
         abort_when: Callable[[], bool] | None = None,
     ) -> None:
         """Copy a file from the guest. `abort_when` as in :meth:`run`."""
-        cmd = self._scp_base() + [
-            f"{self._target()}:{remote_path}",
-            local_path,
-        ]
-        result = self._scp(
-            cmd,
+        self._transfer(
+            [f"{self._target()}:{remote_path}", local_path],
             operation="pull",
             direction=f"{remote_path} -> {local_path}",
             abort_when=abort_when,
         )
-        _raise_scp_failure("pull", result)
+
+    def _transfer(
+        self,
+        paths: list[str],
+        *,
+        operation: str,
+        direction: str,
+        abort_when: Callable[[], bool] | None,
+    ) -> None:
+        """One scp transfer, retried once in the legacy protocol when the
+        guest has no SFTP server (#148).
+
+        OpenSSH ≥ 9.0 `scp` speaks SFTP by default; a Dropbear/BusyBox guest
+        ships only the legacy `scp` binary, so the remote side dies at once
+        (`sh: /usr/libexec/sftp-server: No such file or directory`) on a
+        perfectly healthy transport. `-O` is what the guest does speak.
+        """
+        result = self._scp(
+            self._scp_base() + paths,
+            operation=operation, direction=direction, abort_when=abort_when,
+        )
+        sftp_refusal: str | None = None
+        if result.returncode != 0 and not self.scp_legacy and sftp_unavailable(result.stderr):
+            sftp_refusal = result.stderr
+            self.scp_legacy = True
+            result = self._scp(
+                self._scp_base() + paths,
+                operation=operation, direction=direction, abort_when=abort_when,
+            )
+        self._raise_scp_failure(operation, result, sftp_refusal=sftp_refusal)
 
     def _scp(
         self,
@@ -576,23 +704,64 @@ class SSHClient:
             raise SSHError(f"SCP {operation} timed out after {timeout:g}s: {direction}")
         return subprocess.CompletedProcess(cmd, proc.returncode, "", stderr)
 
+    def _raise_scp_failure(
+        self,
+        operation: str,
+        result: subprocess.CompletedProcess,
+        *,
+        sftp_refusal: str | None = None,
+    ) -> None:
+        """Map a failed scp to the error class its exit code proves.
 
-def _raise_scp_failure(operation: str, result: subprocess.CompletedProcess) -> None:
-    """Map a failed scp to the error class its exit code proves.
-
-    scp exits 255 only when ssh itself failed (transport dropped, banner
-    timeout, control-master hiccup) — that stays SSHError, carrying the
-    returncode/stderr evidence the callers use to tell a crash from a merely
-    unreachable guest. Any other non-zero code came from scp's file handling
-    on a working connection and is a caller/filesystem error.
-    """
-    if result.returncode == 0:
-        return
-    message = f"SCP {operation} failed: {result.stderr.strip()}"
-    if result.returncode == 255:
-        raise SSHError(
-            message, returncode=result.returncode, stderr=result.stderr
+        scp exits 255 only when ssh itself failed (transport dropped, banner
+        timeout, control-master hiccup) — that stays SSHError, carrying the
+        returncode/stderr evidence the callers use to tell a crash from a
+        merely unreachable guest — unless ssh says the login was refused,
+        which is :class:`SSHAuthError`. Any other non-zero code came from
+        scp's file handling on a working connection and is a caller/
+        filesystem error. `sftp_refusal` is the first attempt's stderr when
+        the legacy-protocol retry is what failed here.
+        """
+        if result.returncode == 0:
+            return
+        if is_auth_failure(result.returncode, result.stderr):
+            raise self.auth_error(result.stderr)
+        message = f"SCP {operation} failed: {result.stderr.strip()}"
+        hint = None
+        if sftp_refusal is not None:
+            message = (
+                f"SCP {operation} failed: the guest has no SFTP server "
+                f"({_first_line(sftp_refusal)}) and the legacy-protocol retry "
+                f"(scp -O) failed: {result.stderr.strip()}"
+            )
+            if _SCP_MISSING.search(result.stderr):
+                hint = (
+                    "The guest has neither an SFTP server nor an scp binary: "
+                    "inject one into the rootfs (qmu launch --inject / qmu rootfs "
+                    "inject; the firmware-over-qmu skill covers static tools)"
+                )
+        if result.returncode == 255:
+            raise SSHError(
+                message, returncode=result.returncode, stderr=result.stderr
+            )
+        raise SCPFileError(
+            message, returncode=result.returncode, stderr=result.stderr, hint=hint
         )
-    raise SCPFileError(
-        message, returncode=result.returncode, stderr=result.stderr
-    )
+
+
+# The remote side of an SFTP-mode scp could not start an SFTP server: no
+# `sftp-server` binary (Dropbear/BusyBox: `sh: /usr/libexec/sftp-server: No
+# such file or directory`) or no `Subsystem sftp` in sshd_config.
+_SFTP_UNAVAILABLE_MARKERS = ("sftp-server", "subsystem request failed")
+
+# The guest shell could not find `scp` for a legacy-protocol transfer.
+_SCP_MISSING = re.compile(r"\bscp: (?:not found|command not found|No such file)")
+
+
+def sftp_unavailable(stderr: str) -> bool:
+    """True when an scp failure is the guest lacking an SFTP server."""
+    return any(m in stderr for m in _SFTP_UNAVAILABLE_MARKERS)
+
+
+def _first_line(text: str) -> str:
+    return next((line.strip() for line in text.splitlines() if line.strip()), "")

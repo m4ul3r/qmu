@@ -63,14 +63,14 @@ registered only on `launch`, `run`, `status`/`show`, `list`, `log`, `crash`,
 TOML settings are table-scoped. The accepted schema is:
 
 - `[boot]`: `kernel`, `initrd`, `cmdline`, `profile`
-- `[machine]`: `arch`, `memory`, `cpus`, `cpu`, `nic_model`, `net_backend`, `accel`, `no_reboot`, `extra_args`
+- `[machine]`: `arch`, `memory`, `cpus`, `cpu`, `nic_model`, `net_backend`, `accel`, `no_reboot`, `extra_args`, `forwards`
 - `[drive]`: `rootfs`, `format`
 - `[ssh]`: `key`, `user`, `port_start`
 - `[gdb]`: `port_start`
 - `[daemon]`: `autostart`, `idle_exit` (the per-user supervisor — `daemon.md`)
 - `[profiles.<name>]`: `cmdline`; `[profiles] name = "..."` is also accepted
 
-`qmu config init` writes `[boot]` (`kernel` live as the first `# CHANGE ME`; `initrd`/`profile`/`cmdline` commented), `[machine]` (arch/memory/cpus, with commented `cpu`/`accel`/`no_reboot`/`nic_model`/`net_backend`/`extra_args`), `[drive]` (rootfs/format — rootfs is the second `# CHANGE ME`), `[ssh]` (key — the third `# CHANGE ME` — and user, with commented `port_start`), `[gdb]` (commented `port_start`), `[daemon]` (commented `autostart`/`idle_exit`), three `[profiles.*]` blocks, and a commented harness-mode block. It refuses to overwrite an existing file (`created: false`, exit 0). `[ssh] user` (default `root`) is recorded on the VM at launch, so set it **before** `qmu launch`; SSH/GDB ports start at `10021`/`1234` (`port_start` overrides); `arch` picks the `qemu-system-*` binary and whether KVM is enabled (guest arch == host only), with `extra_args` for machine flags (e.g. aarch64 `-M virt -cpu cortex-a57`); path values accept `~`. Per-user defaults belong in the global file; the starter's uncommented `[ssh] key` overrides it.
+`qmu config init` writes `[boot]` (`kernel` live as the first `# CHANGE ME`; `initrd`/`profile`/`cmdline` commented), `[machine]` (arch/memory/cpus, with commented `cpu`/`accel`/`no_reboot`/`nic_model`/`forwards`/`net_backend`/`extra_args`), `[drive]` (rootfs/format — rootfs is the second `# CHANGE ME`), `[ssh]` (key — the third `# CHANGE ME` — and user, with commented `port_start`), `[gdb]` (commented `port_start`), `[daemon]` (commented `autostart`/`idle_exit`), three `[profiles.*]` blocks, and a commented harness-mode block. It refuses to overwrite an existing file (`created: false`, exit 0). `[ssh] user` (default `root`) is recorded on the VM at launch, so set it **before** `qmu launch`; `launch`/`status`/`list` report it as `ssh_user`. An account sshd refuses (absent from the image, key not authorized) ends the launch in ~5 s with `ssh_status: "auth-failed"` (exit 4, `SSHAuthError`, VM retained) and `status` says `ssh: "auth-failed"` — never "still booting". To run a PoC unprivileged keep `root` here and pass `--user NAME` to `exec`/`compile --run`/`run`. SSH/GDB ports start at `10021`/`1234` (`port_start` overrides); `arch` picks the `qemu-system-*` binary and whether KVM is enabled (guest arch == host only), with `extra_args` for machine flags (e.g. aarch64 `-M virt -cpu cortex-a57`); path values accept `~`. Per-user defaults belong in the global file; the starter's uncommented `[ssh] key` overrides it.
 
 ## Config validation rules
 
@@ -129,9 +129,9 @@ file is qmu reading?" before anything is launched.
 project <path>`), then one row per setting ending with its layer tag
 `[built-in | global <path> | project <path> | --config <path> | flag]`; path
 rows show `<as written> -> <resolved>` and `(not found)`; `Accel:`, `NIC
-model:`, `Net backend:`, `Extra args:` are always present; profiles one per
+model:`, `Net backend:`, `Forwards:`, `Extra args:` are always present; profiles one per
 line with their layer. JSON: `boot`, `machine` (`arch`, `memory`, `cpus`,
-`cpu`, `nic_model`, `net_backend`, `accel`, `extra_args`), `drive`, `ssh`,
+`cpu`, `nic_model`, `net_backend`, `accel`, `forwards`, `extra_args`), `drive`, `ssh`,
 `gdb`, `profiles`, `sources` (`{dotted key: layer}`), `layers` (ordered list),
 `paths` (`boot.kernel`, `boot.initrd`, `drive.rootfs`, `ssh.key` → `{written,
 resolved, exists}` or null when unset). `config show` reports *resolution*,

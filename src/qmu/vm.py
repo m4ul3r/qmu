@@ -9,12 +9,14 @@ import stat
 import subprocess
 import time
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import get_close_matches
 from pathlib import Path
+from typing import Any
 
-from .config import QMUConfig
+from .config import FORWARD_SPEC_HINT, QMUConfig, parse_forward_spec
 from .instance import QMUError, VMInstance, proc_pid_start, save_instance
 from .paths import instances_dir, qmp_socket_path, qemu_log_path, serial_log_path
 from .qemu import native_passt_problem, probe_qemu_netdevs
@@ -286,17 +288,21 @@ class PortAllocationLock:
             os.close(fd)
 
 
-def find_free_port(start: int, max_tries: int = 100) -> int:
-    """Find a free TCP port starting from `start`.
+def find_free_port(start: int, max_tries: int = 100, exclude: Collection[int] = ()) -> int:
+    """Find a free TCP port starting from `start`, skipping `exclude`.
 
     The probe socket is closed before QEMU binds, so the returned port is not
     a reservation: a foreign listener can still take it in between. Against
     *concurrent qmu launches* that window is closed by `PortAllocationLock`,
     which `launch_vm` holds from this probe until QEMU has bound; callers
     outside the lock must be prepared for a launch-time bind failure.
+    `exclude` carries the ports this launch already picked but QEMU has not
+    bound yet, which a probe alone would report free.
     """
     for offset in range(max_tries):
         port = start + offset
+        if port in exclude:
+            continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind(("127.0.0.1", port))
@@ -304,6 +310,87 @@ def find_free_port(start: int, max_tries: int = 100) -> int:
             except OSError:
                 continue
     raise QMUError(f"No free port found in range {start}-{start + max_tries - 1}")
+
+
+def _resolve_forwards(
+    config: QMUConfig, *, no_net: bool, harness: bool, net_backend: str | None
+) -> list[dict[str, Any]]:
+    """Parse `config.forwards` (`--forward` / `[machine] forwards`, #149).
+
+    The forwards ride qmu's own slirp `-netdev`, so a launch without that NIC
+    is refused rather than silently dropping them — a flag that parses and
+    does nothing is the failure the caller cannot see. `host_port` stays
+    None for a bare GPORT until the attempt loop allocates one.
+    """
+    if not config.forwards:
+        return []
+    forwards: list[dict[str, Any]] = []
+    for spec in config.forwards:
+        try:
+            forwards.append(parse_forward_spec(spec))
+        except ValueError as exc:
+            raise QMUError(str(exc), hint=FORWARD_SPEC_HINT) from exc
+    source = config.source_layer("forwards")
+    origin = "--forward" if source == "flag" else f"[machine] forwards ({source})"
+    if no_net or harness:
+        raise QMUError(
+            f"{origin} needs qmu's own NIC, but this launch has none "
+            f"({'--harness implies --no-net' if harness else '--no-net'}).",
+            hint="drop --no-net/--harness, or add the hostfwd to your own -netdev",
+        )
+    if (net_backend or config.net_backend) == "passt":
+        raise QMUError(
+            f"{origin} is supported on the default user (slirp) backend only, "
+            "not net_backend=passt.",
+            hint="launch with --net-backend user, or drop the forwards",
+        )
+    pinned = [f["host_port"] for f in forwards if f["host_port"] is not None]
+    duplicate = next((p for p in pinned if pinned.count(p) > 1), None)
+    if duplicate is not None:
+        raise QMUError(
+            f"{origin} names host port {duplicate} twice.",
+            hint="give each forward its own host port, or a bare GPORT to auto-allocate",
+        )
+    return forwards
+
+
+def _bind_forward_ports(
+    forwards: list[dict[str, Any]],
+    *,
+    start: int,
+    taken: set[int],
+) -> list[dict[str, Any]]:
+    """Fill in auto host ports and check pinned ones, under the port lock.
+
+    A pinned port that is already in use is the caller's to change, so it is
+    reported by name instead of being retried as a lost allocation race and
+    blamed on a foreign listener of the SSH port.
+    """
+    resolved: list[dict[str, Any]] = []
+    for forward in forwards:
+        port = forward["host_port"]
+        if port is None:
+            port = find_free_port(start, exclude=taken)
+        else:
+            if port in taken:
+                raise QMUError(
+                    f"--forward {forward['host']}:{port}:{forward['guest_port']} "
+                    f"collides with this VM's SSH/GDB port {port}.",
+                    hint="pick another host port, or a bare GPORT to auto-allocate",
+                )
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind((forward["host"], port))
+                except OSError as exc:
+                    raise QMUError(
+                        f"--forward {forward['host']}:{port}:{forward['guest_port']}: "
+                        f"cannot bind {forward['host']}:{port} ({exc.strerror or exc}).",
+                        hint="check `ss -ltnp` for the listener, pick another host "
+                             "port, or pass a bare GPORT to auto-allocate",
+                    ) from exc
+        taken.add(port)
+        resolved.append({**forward, "host_port": port})
+    return resolved
 
 
 def _preflight_native_passt(
@@ -383,10 +470,19 @@ def build_qemu_command(
     net_backend: str | None = None,
     qemu_binary: str | None = None,
     extra_args: list[str] | None = None,
+    forwards: list[dict[str, Any]] | None = None,
 ) -> list[str]:
-    """Build the qemu-system command line from config."""
+    """Build the qemu-system command line from config.
+
+    `forwards` are resolved `--forward` entries (host port allocated); they
+    become extra `hostfwd=` rules on qmu's own user-mode NIC (#149).
+    """
     nic = nic_model or config.nic_model
     backend = net_backend or config.net_backend
+    extra_fwd = "".join(
+        f",hostfwd=tcp:{f['host']}:{f['host_port']}-:{f['guest_port']}"
+        for f in forwards or ()
+    )
 
     cmd = [
         qemu_binary or config.qemu_binary(),
@@ -418,7 +514,7 @@ def build_qemu_command(
         cmd.extend(["-nic", "none"])
     elif ssh_port is None:
         # No SSH hostfwd, but still provide a NIC (rare: --no-wait-ssh without --no-net).
-        cmd.extend(["-nic", f"user,model={nic}"])
+        cmd.extend(["-nic", f"user,model={nic}{extra_fwd}"])
     elif backend == "passt":
         # Native passt is migration-compatible when the selected QEMU advertises it.
         # Some user/slirp QEMU/build/device combinations restore successfully; others
@@ -432,7 +528,8 @@ def build_qemu_command(
         ])
     else:
         cmd.extend([
-            "-netdev", f"user,id=net0,host=10.0.2.10,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
+            "-netdev",
+            f"user,id=net0,host=10.0.2.10,hostfwd=tcp:127.0.0.1:{ssh_port}-:22{extra_fwd}",
             "-device", f"{nic},netdev=net0",
         ])
 
@@ -661,6 +758,11 @@ def launch_vm(
 
     cmdline_override = cmdline is not None
     cmdline = resolve_cmdline(config, profile=profile, cmdline=cmdline, append=append)
+    # Before the passt probe: a forward the backend cannot carry is the
+    # caller's flag problem, and is refused as such.
+    forwards = _resolve_forwards(
+        config, no_net=no_net, harness=harness, net_backend=net_backend
+    )
     resolved_qemu = _preflight_native_passt(
         config=config,
         net_backend=net_backend,
@@ -689,6 +791,7 @@ def launch_vm(
         ssh_port = None
     auto_ssh = (not harness) and (not no_net) and (ssh_port is None)
     auto_gdb = gdb and gdb_port is None
+    auto_fwd = any(f["host_port"] is None for f in forwards)
     bind_markers = ("Address already in use", "Could not set up host forwarding", "Failed to bind")
 
     attempt: _LaunchAttempt | None = None
@@ -697,12 +800,19 @@ def launch_vm(
     port_lock = PortAllocationLock(idir)
     for attempt_idx in range(3):
         try:
-            if auto_ssh or auto_gdb:
+            if auto_ssh or auto_gdb or forwards:
                 port_lock.acquire()
             if auto_ssh:
                 ssh_port = find_free_port(config.ssh_port_start)
             if auto_gdb:
                 gdb_port = find_free_port(config.gdb_port_start)
+            # Forwards after SSH/GDB: an auto host port must skip the ports
+            # this launch just picked, which QEMU has not bound yet.
+            resolved_forwards = _bind_forward_ports(
+                forwards,
+                start=config.ssh_port_start,
+                taken={p for p in (ssh_port, gdb_port) if p is not None},
+            )
 
             if name:
                 vm_id = name
@@ -734,6 +844,7 @@ def launch_vm(
                 net_backend=net_backend,
                 qemu_binary=resolved_qemu,
                 extra_args=extra_args,
+                forwards=resolved_forwards,
             )
 
             try:
@@ -814,20 +925,22 @@ def launch_vm(
             except OSError:
                 log_text = ""
             bind_failed = any(m in log_text for m in bind_markers)
-            retryable = bind_failed and (auto_ssh or auto_gdb) and attempt_idx < 2
+            auto_ports = auto_ssh or auto_gdb or auto_fwd
+            retryable = bind_failed and auto_ports and attempt_idx < 2
             if retryable:
                 attempt.rollback()
                 attempt = None
                 continue  # lost a port race — retry with freshly allocated ports
             lock_note = ""
-            if bind_failed and (auto_ssh or auto_gdb):
+            if bind_failed and auto_ports:
                 # Three allocations under the lock all lost: concurrent qmu
                 # launches are excluded, so something outside qmu owns the port.
                 lock_note = (
                     f"\nPort bind failed on all 3 attempts while holding "
                     f"{port_lock.path}; concurrent qmu launches are serialised by "
                     "that lock, so a foreign listener (not qmu) holds the port. "
-                    "Check `ss -ltnp` or pass --ssh-port/--gdb-port."
+                    "Check `ss -ltnp` or pass --ssh-port/--gdb-port/--forward "
+                    "HPORT:GPORT."
                 )
             primary = QMUError(
                 f"QEMU exited immediately (code {proc.returncode})."
@@ -881,6 +994,7 @@ def launch_vm(
             # re-deriving host state that may have changed since launch. This is
             # the same predicate build_qemu_command used to decide -enable-kvm.
             kvm=config.use_kvm(),
+            forwards=resolved_forwards,
         )
         try:
             save_instance(inst)

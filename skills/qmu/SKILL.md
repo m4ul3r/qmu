@@ -15,11 +15,11 @@ every launch — the host is shared. `qmu <sub> --help` is authoritative.
 | I want to… | Run | Then check |
 |---|---|---|
 | set up a fresh project | `qmu config init` → edit the three `# CHANGE ME` lines → `qmu doctor` | every `[!]` row fixed; exit 0 |
-| boot a VM | `qmu launch --name X --no-replace` (with `[boot] kernel` in `qmu.toml`) | exit 0, `ssh_status: "ready"`, `warnings: []` |
-| run one command in the guest | `qmu exec --vm X "cmd"` | exit 0 if the guest command exited 0, else 1 (its code is JSON `exit_code`); stdout = guest stdout |
+| boot a VM | `qmu launch --name X --no-replace` (with `[boot] kernel` in `qmu.toml`); `--forward 2345` adds a guest TCP port (gdbserver, a service) | exit 0, `ssh_status: "ready"`, `warnings: []`; `forwards[]` names each `host:host_port` |
+| run one command in the guest | `qmu exec --vm X "cmd"`; `--user NAME` runs it unprivileged (also `compile --run`, `run`) — keep `[ssh] user` root | exit 0 if the guest command exited 0, else 1 (its code is JSON `exit_code`); stdout = guest stdout; `run_as` names the account |
 | boot + run + reap in one call | `qmu run --name X --no-replace -- './exploit'` | same 0/1 mapping (`exit_code`); `vm_id` for leftovers |
 | compile and run a C exploit | `qmu compile --vm X exploit.c --run` | `compile_exit`, `run_exit`, `crash_detected` |
-| copy a file in / out | `qmu push --vm X ./f /root/` · `qmu pull --vm X /root/out ./` | exit 0; 1 = caller error (`SCPFileError`), 3 = the guest panicked mid-transfer (fresh `crash`), 4 = transport |
+| copy a file in / out | `qmu push --vm X ./f /root/` · `qmu pull --vm X /root/out ./` | exit 0; 1 = caller error (`SCPFileError`), 3 = the guest panicked mid-transfer (fresh `crash`), 4 = transport. A guest without SFTP (Dropbear) is retried with `scp -O` automatically |
 | see what a VM is doing | `qmu status --vm X` (`qmu list` for all) | `status` (existence) and `guest` (usability); a stopped VM is exit 0, `status: "stopped"`, `guest: null` |
 | get the crash report | `qmu crash --vm X` | `crash_detected: true`; else `qmu log --vm X --tail 200`. Save it: `qmu crash --vm X --format text --out report.txt` |
 | block until a serial marker | `qmu wait --vm X --pattern '^=+ results =+$' --timeout 120` | 0 match · 3 panic · 1 VM died · 124 timeout |
@@ -41,7 +41,7 @@ Branch on the exit code and `ok`, never on the presence of `error`.
 | `1` | operation failed: guest command non-zero, no/bad `--vm` (or `--vm` omitted under `QMU_REQUIRE_VM=1`), `doctor` unhealthy, `SnapshotError`, `SCPFileError`, `ConfigError`, paused/panicked guest refusal, `wait --pattern` outlived the VM, `crash` found nothing | `error_type` (exception paths) or domain keys (`exit_code`, `guest_state`, `crash_detected`, `reason`) | run the `hint` (every `ok: false` envelope has one, result-specific: guest exit N → its `stderr`, `qmu exec --vm X 'dmesg \| tail -n 30'`; `crash` none → `qmu log --vm X --tail 200` / `--full-history`; `doctor` → fix the `[!]` rows, each `checks[]` row carries its own `hint`); for a refusal, `qmu crash --vm X` / `qmu cont --vm X` |
 | `2` | usage error (argparse) ONLY; `error_type: "UsageError"` under JSON | `usage`, `hint` | fix the flags — e.g. quote the guest command |
 | `3` | guest kernel crash, always corroborated by a fresh serial crash report | `crash`, `crash_detected: true`, `guest: "panicked"` | `qmu crash --vm X` → `qmu kill --vm X` |
-| `4` | transport/infra: `SSHError`/`QMPError`, `no-console-output`, dropped SSH with NO fresh crash, `wait --pattern` `inconclusive`, internal error | `error_type` + `hint` (exception paths); a guest-command envelope has **no** `error_type` — read `ssh_error: true`, `crash_detected: false`, `hint`; `inconclusive`, `ssh_status` | `qmu status --vm X`, `qmu log --vm X --tail 200` |
+| `4` | transport/infra: `SSHError`/`QMPError`, `no-console-output`, sshd refused the `[ssh] user`/key (`SSHAuthError`, `ssh_status: "auth-failed"`), dropped SSH with NO fresh crash, `wait --pattern` `inconclusive`, internal error | `error_type` + `hint` (exception paths); a guest-command envelope has **no** `error_type` — read `ssh_error: true`, `crash_detected: false`, `hint`; `inconclusive`, `ssh_status`, `ssh_user` | `qmu status --vm X`, `qmu log --vm X --tail 200` |
 | `124` | timeout: `wait` elapsed, `launch`/`run` `--ssh-timeout` expired before SSH answered (`launch` keeps the VM, `ssh_status: "timeout"`), `exec`/`run`/`compile --run` outran `--timeout` (whether or not the guest still answers — `ssh_error: true` when it does not; a report printed meanwhile is `crash_detected`/`crash`), `snapshot save` outran its budget (result **unknown**, not failed) | `timed_out: true`, `error_type: "TimeoutError"` + `hint` on an SSH timeout, `reason: "timeout"`, partial `stdout`/`stderr`; `may_have_landed: true` + `hint` on a save; `hint` on every one | raise `--timeout`/`--ssh-timeout` (the `hint` names which); `qmu log --vm X --tail 50` after a launch or `wait` timeout; check `crash` on a bare `wait` or a guest command; after a save, `qmu snapshot list --vm X --timeout 300` |
 
 Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `--out`): `reference/output-contract.md`.
@@ -61,8 +61,9 @@ Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `
 | `ssh: "skipped"` / `"skipped (debugger attached)"` | guest paused/panicked, or a gdb client is attached (the probe's `uname` would trip breakpoints), so SSH was not probed | see the `guest` row above; `pry wait` for the stop |
 | `snapshot save` exit 124, `may_have_landed: true` | the save outran its budget (default 60 s + 20 s/GiB RAM); QEMU is probably still writing it and QMP queues behind it | `qmu snapshot list --vm X --timeout 300` (waits, shows whether the tag landed); do not retry the save until it answers; next time `--timeout N` |
 | `ssh_status: "no-console-output"` (launch exit 4) | serial log still empty after 10 s: wrong `console=` or `-M`/`-cpu` for the arch | VM is retained: `qmu log --vm X`; fix the cmdline (`ttyS0` x86, `ttyAMA0` arm) |
+| `ssh_status: "auth-failed"` / `ssh: "auth-failed"` (`SSHAuthError`, exit 4) | the guest booted and sshd answers, but refuses `ssh_user` with that key (`[ssh] user`/`key`, fixed at launch) | `qmu kill --vm X`; set `[ssh] user`/`key` to an account the image accepts (`root` for qmu rootfs), relaunch; run unprivileged with `--user NAME` instead |
 | `ssh_status: "timeout"`, `timed_out: true` (launch exit 124) | `--ssh-timeout` expired with the guest still booting; nothing broke | VM is retained: `qmu log --vm X --tail 50`, `qmu status --vm X` re-probes SSH, or relaunch with a longer `--ssh-timeout` |
-| `[qmu] Warning: 'console=…' names …` / `'root=/dev/sda' names …` | arch-cmdline lint (also in launch `warnings[]`) | fix before trusting a silent console |
+| `[qmu] Warning: 'console=…' names …` / `'root=/dev/sda' names …` / `'root=/dev/vda' names …` | arch-cmdline lint (also in launch `warnings[]`): `/dev/sda` on x86_64, `/dev/vda` on aarch64/arm | fix before trusting a silent console |
 | `[!] kernel: ./bzImage (CHANGE ME placeholder; not found)` | the starter `qmu.toml` was never edited | set `[boot] kernel`; `[!]` rows drive exit 1 |
 | `Hint: quote the guest command … or put -- before it` (exit 2) | unquoted dash-word in `exec`/`run` | `qmu exec --vm X 'uname -a'` or `qmu exec --vm X -- uname -a` |
 | `inconclusive: true` (`wait --pattern`, exit 4) | the serial log could not be read; not a no-match | fix the log path/permissions; never record as negative |
@@ -117,18 +118,19 @@ qmu prune --vm X --dry-run                 # preview; then drop --dry-run (kill-
 qmu prune --orphans --dry-run              # qmu-launched QEMUs no record claims — including other agents' VMs
 ```
 
-Launch success includes SSH readiness: exit 4 (`SSHError`) retains the VM for
-`qmu log --vm X`. JSON carries `vm_id`, `ssh_status`, `warnings[]` (every
-stderr warning), `config_sources[]`, `replaced` (`{vm_id, pid}` or null),
-`kvm`, `profile_applied`, `unknown_kernel_params_by_source.operator` (gate on
-this; the `profile` bucket is JSON-only and never printed on stderr).
-`--append` adds, `--cmdline` replaces (keep `root=`); a CLI `--profile`
-overrides a config `[boot] cmdline` and lists the dropped params. `--inject`
-validates image, file and guest dir before touching a same-named running VM.
-Default `--name` replaces a running VM of that name; `--no-replace` makes it
-exit 1. TCG boots (arm on x86, `--no-kvm`) reach SSH in 20–60 s instead of
-~7 s. Flags, profiles, `--drive`, `--no-net`, `--no-kvm`, the two state
-axes, `kill`/`prune` rules: `reference/launch.md`.
+Launch success includes SSH readiness: exit 124 (still booting) or 4
+(`no-console-output`, `auth-failed`) retains the VM for `qmu log --vm X`. JSON
+carries `vm_id`, `ssh_status`, `ssh_user`, `forwards`, `warnings[]` (every
+stderr warning), `config_sources[]`, `replaced` (`{vm_id, pid}` or null), `kvm`,
+`profile_applied`, `unknown_kernel_params_by_source.operator` (gate on this;
+the `profile` bucket is JSON-only, never on stderr). `--append` adds,
+`--cmdline` replaces (keep `root=`); a CLI `--profile` overrides a config
+`[boot] cmdline` and lists the dropped params. `--inject` validates image,
+file and guest dir before touching a same-named running VM. Default `--name`
+replaces a running VM of that name; `--no-replace` makes it exit 1. TCG boots
+(arm on x86, `--no-kvm`) reach SSH in 20–60 s instead of ~7 s. Flags,
+profiles, `--drive`, `--no-net`, `--no-kvm`, `--forward`, the two state axes,
+`kill`/`prune` rules: `reference/launch.md`.
 
 `status --vm X` on a non-running VM (killed with logs, `wait --no-clean`, a
 log-only remnant) is a **description**, exit 0: `status: "stopped" |
@@ -147,14 +149,13 @@ crash report retained]`; its JSON rows carry `ssh`, `logs_retained`,
 **Two state axes, never collapsed.** `status` (existence): `running` ·
 `orphaned` · `stopped` · `held_back` · `absent`. `guest` (usability, running
 VMs only; `null` once QEMU has exited): `serving` · `paused` · `crashed` ·
-`panicked` · `unknown`. `serving` needs positive evidence (sshd answered, or
-— with no SSH endpoint, e.g. harness — console output in this boot);
-otherwise `unknown` with a `guest_detail`. Under the default `exploit-dev`
-profile a KASAN-detected bug is terminal (`kasan.fault=panic` →
-`panicked`); a plain non-KASAN Oops lands on `crashed` and must not be
-reaped (`sysrq-c` is a direct `panic()`, never `crashed`). `--profile
-exploit-test` makes every Oops terminal; `--append kasan.fault=report`
-survives KASAN reports.
+`panicked` · `unknown`. `serving` needs positive evidence (sshd answered, or —
+with no SSH endpoint, e.g. harness — console output in this boot); otherwise
+`unknown` with a `guest_detail`. Under the default `exploit-dev` profile a
+KASAN-detected bug is terminal (`kasan.fault=panic` → `panicked`); a plain
+non-KASAN Oops lands on `crashed` and must not be reaped (`sysrq-c` is a direct
+`panic()`, never `crashed`). `--profile exploit-test` makes every Oops
+terminal; `--append kasan.fault=report` survives KASAN reports.
 
 ## Iterate loop (no working SSH needed)
 
@@ -165,15 +166,14 @@ qmu log --vm poc --grep "leaked|OOB|UAF" --context 3           # --grep searches
 qmu log --vm poc --full --out ./evidence.log                   # whole log to a file
 ```
 
-Never hand-poll the serial log (`until grep …; do sleep; done` hangs on a
-panic or a dead VM). Anchor the marker (`'^=+ results =+$'`): an unanchored
-word also matches the kernel's echo of the cmdline. The scan starts at the
-latest boot banner (`scan_offset`/`scan_scope`). An unterminated fragment
-(`login:`) matches once the console idles for one poll. A *survived* Oops
-does not abort the wait; `--ignore-crash` suppresses even the terminal
-abort — do not paste it reflexively. Exit 0 proves the regex matched, not the
-claim in its text (`reference/evidence-contract.md`). Full rules:
-`reference/wait.md`.
+Never hand-poll the serial log (`until grep …; do sleep; done` hangs on a panic
+or a dead VM). Anchor the marker (`'^=+ results =+$'`): an unanchored word also
+matches the kernel's echo of the cmdline. The scan starts at the latest boot
+banner (`scan_offset`/`scan_scope`). An unterminated fragment (`login:`)
+matches once the console idles for one poll. A *survived* Oops does not abort
+the wait; `--ignore-crash` suppresses even the terminal abort — do not paste it
+reflexively. Exit 0 proves the regex matched, not the claim in its text
+(`reference/evidence-contract.md`). Full rules: `reference/wait.md`.
 
 ## Guest commands
 
@@ -196,7 +196,7 @@ then `[exit code: N]` only when N ≠ 0 (`exec true` prints nothing); `compile
 --run`'s `Compiled and ran X:` banner is on stderr too. JSON: `vm_id`,
 `exit_code` (null if unfinished), `stdout`, `stderr` (UTF-8 with U+FFFD;
 `stdout_lossy: true` / `stderr_lossy: true` present exactly when a byte was
-replaced), `timed_out`, `crash_detected`, `crash`. One argument is passed to
+replaced), `timed_out`, `crash_detected`, `crash`, `run_as`. One argument is passed to
 the guest shell verbatim; several are shell-quoted and joined; an unquoted
 dash-word (`uname -a`) is exit 2 with a hint. A report the command provoked is
 `crash_detected: true` + `crash` even when the guest survived (exit stays 0/1).

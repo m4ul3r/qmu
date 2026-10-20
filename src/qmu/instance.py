@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +89,11 @@ class VMInstance:
     # bridge was spawned or the record predates the field.
     gdb_bridge_pid: int | None = None
     gdb_bridge_pid_start: str | None = None
+    # Extra host->guest TCP forwards on qmu's own NIC (`--forward`, #149):
+    # `{"host", "host_port", "guest_port"}` with the host port as allocated,
+    # so `status`/`list` can answer where a guest service is reachable the
+    # way they answer `ssh_port`. Empty for records that predate the field.
+    forwards: list[dict] = field(default_factory=list)
 
 
 def _instance_from_dict(data: dict) -> VMInstance:
