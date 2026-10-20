@@ -54,7 +54,13 @@ def _executable(path: Path, body: str) -> Path:
 
 
 class _RefusingSSH(SSHClient):
-    """Real classification and error building; sshd refuses every login."""
+    """Real classification and error building; sshd refuses every login.
+
+    `client_logged` says whether the refusal also reached the client's own
+    log (`-E`) the way the real `run` keeps it; without it only the re-probe
+    can tell."""
+
+    client_logged = False
 
     def probe(self, timeout=2):
         self.last_probe = PROBE_AUTH_FAILED
@@ -62,19 +68,23 @@ class _RefusingSSH(SSHClient):
         return PROBE_AUTH_FAILED
 
     def run(self, command, timeout=30.0, check=False, **kwargs):
-        return 255, GuestText(b""), GuestText(
-            f"{self.user}@localhost: Permission denied (publickey).\n".encode()
-        )
+        refusal = f"{self.user}@localhost: Permission denied (publickey).\n"
+        if self.client_logged:
+            self.last_client_log = refusal
+        return 255, GuestText(b""), GuestText(refusal.encode())
 
 
+@pytest.mark.parametrize("client_logged", [False, True])
 def test_exec_names_the_refused_user_instead_of_calling_the_guest_unreachable(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, tmp_path, capsys, client_logged
 ):
     """ssh's 255 for a refused login used to take the transport-loss path:
-    "VM may be unreachable", with no word of which account was tried."""
+    "VM may be unreachable", with no word of which account was tried. The
+    envelope keys the VM like every other exec envelope (#196)."""
     serial = tmp_path / "reach-vm.serial.log"
     serial.write_text("boot ok\n")
     inst = _instance(str(serial), ssh_user="lowpriv")
+    monkeypatch.setattr(_RefusingSSH, "client_logged", client_logged)
     monkeypatch.setattr(guest, "choose_instance", lambda vm=None: inst)
     monkeypatch.setattr(guest, "_make_ssh", lambda i: _RefusingSSH(i.ssh_port, i.ssh_key, user=i.ssh_user))
     monkeypatch.setattr(guest, "_preflight_ssh_guest", lambda *a, **kw: None)
@@ -88,6 +98,7 @@ def test_exec_names_the_refused_user_instead_of_calling_the_guest_unreachable(
     assert payload["error_type"] == "SSHAuthError"
     assert payload["ssh_status"] == "auth-failed"
     assert payload["ssh_user"] == "lowpriv"
+    assert payload["vm_id"] == "reach-vm"
     assert "unreachable" not in payload["error"]
 
 

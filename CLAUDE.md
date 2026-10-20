@@ -347,23 +347,33 @@ transport (kernel panic). Handlers disambiguate with `_transport_lost()` (a
 liveness re-probe, retried once) plus `extract_crash()` on the serial log. Only
 emit the strong "kernel may have crashed" wording (exit 3) when a crash report
 was actually extracted; otherwise report "unreachable" and exit 4. A 255
-whose only output is ssh's own pre-session failure (`ssh.never_connected`:
-`Connection timed out during banner exchange`, `kex_exchange_identification:`,
-`ssh: connect to host …`) never ran the command and skips the probe —
-`guest._ssh_255_payload` makes it exit 4 "the command was not started" on
-exec/dmesg/compile's chmod; an sshd that came up during the probe window
-used to turn it into "the guest command exited 255" (#177).
+whose **client log** holds only ssh's own pre-session failure
+(`ssh.never_connected`: `Connection timed out during banner exchange`,
+`kex_exchange_identification:`, `ssh: connect to host …`) never ran the
+command and skips the probe — `guest._never_started` makes it exit 4 "the
+command was not started" on exec/dmesg/compile's chmod; an sshd that came up
+during the probe window used to turn it into "the guest command exited 255"
+(#177). The client log is `SSHClient.run`'s `ssh -E` file
+(`last_client_log`, read through `ssh.client_log`; appended to the returned
+stderr for the reader), never the guest's stderr: a guest command whose
+inner `ssh` fails prints the same words there and exits 255 itself, and
+reading stderr called a command that ran "not started, safe to re-run"
+(#199). Never let the 255 heuristic classify on bytes the guest can write.
 
 A third answer exists and is neither (#158): sshd answered and **refused the
-login** (`Permission denied (publickey,…)`). `SSHClient.probe()` returns
+login** (`Permission denied (publickey,…)`). Every ssh/scp runs with
+`BatchMode=yes` (`ssh._BATCH_OPTS`): qmu logs in by key only, so a refused
+account fails in ~2 s instead of prompting for a password under a TTY (#195).
+`SSHClient.probe()` returns
 `ready` / `auth-failed` / `down` and leaves it on `last_probe` (read through
 `ssh.probe_refused_auth`, because `_make_ssh` doubles only answer
-`is_ready`). `_transport_lost` raises `SSHAuthError` (exit 4, envelope
-`ssh_status: "auth-failed"`, `ssh_user`, `ssh_key`, relaunch `hint` from
-`_cliutil._auth_refused_hint`) instead of calling the guest unreachable;
+`is_ready`). The client log naming the refusal, or else `_transport_lost`,
+raises `SSHAuthError` (exit 4, envelope
+`ssh_status: "auth-failed"`, `vm_id`, `ssh_user`, `ssh_key`, relaunch `hint`
+from `_cliutil._auth_refused_error`) instead of calling the guest unreachable;
 scp's 255 with that marker raises it from `_raise_scp_failure`; launch/run
 end the SSH wait with `auth-failed` once the refusal has persisted
-`AUTH_REFUSED_SETTLE_SECONDS` (5 s); `status`/`list` say `ssh:
+`AUTH_REFUSED_SETTLE_SECONDS` (5 s), carrying the same keys; `status`/`list` say `ssh:
 "auth-failed"` with `guest: "serving"` (sshd answering is positive
 evidence). Never let it fall back to "still booting" (124) — a longer wait
 cannot change the account. `launch`/`status`/`list` report `ssh_user`.

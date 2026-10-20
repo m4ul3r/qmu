@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import shutil
+import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -488,3 +490,41 @@ def test_a_debugger_halt_of_any_length_cannot_drop_the_guest_connection(tool):
     interval = int(conf["serveraliveinterval"])
     count = int(conf["serveralivecountmax"])
     assert interval == 0 or interval * count >= 365 * 24 * 3600
+
+
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="needs the OpenSSH client")
+@pytest.mark.parametrize("tool", ["ssh", "scp"])
+def test_guest_connections_never_wait_on_a_password_prompt(tool):
+    """#195: qmu logs in with its key only. Without BatchMode a refused
+    `[ssh] user` fell through to password auth: under a terminal `exec` sat
+    at `user@localhost's password:` until `--timeout`, and without one each
+    command spent ~10 s on password attempts. Read through `ssh -G`."""
+    client = ssh.SSHClient(10021, "/nonexistent-key")
+    argv = client._ssh_base() if tool == "ssh" else client._scp_base()
+    opts = [arg for i, a in enumerate(argv) if a == "-o" for arg in ("-o", argv[i + 1])]
+    resolved = subprocess.run(
+        ["ssh", "-G", "-F", "/dev/null", *opts, "localhost"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "batchmode yes\n" in resolved
+
+
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="needs the OpenSSH client")
+def test_a_failed_connect_is_told_apart_from_the_guest_stderr(tmp_path):
+    """#199: the remote command's stderr can carry ssh's own words (a guest
+    command running an inner `ssh`), so qmu's client keeps its diagnostics in
+    a log of its own. A connect qmu's ssh could not make is in that log —
+    and still on the returned stderr, where the reader looks for it."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    key = tmp_path / "id_ed25519"
+    key.write_text("not a key\n")
+    client = ssh.SSHClient(port, str(key), host="127.0.0.1")
+
+    rc, stdout, stderr = client.run("true", timeout=15)
+
+    assert rc == 255
+    assert ssh.never_connected(rc, client.last_client_log)
+    assert f"port {port}: Connection refused" in stderr
+    assert not list(Path(tempfile.gettempdir()).glob("qmu-ssh-*.log"))

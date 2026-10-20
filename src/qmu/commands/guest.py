@@ -58,8 +58,10 @@ from ..ssh import (
     SSHAuthError,
     SSHClient,
     SSHError,
+    client_log,
     guest_bytes,
     guest_lossy,
+    is_auth_failure,
     is_transport_failure,
     never_connected,
     probe_refused_auth,
@@ -306,6 +308,7 @@ def _classify_transfer_failure(
         # not a lost transport — the recorded user/key is wrong (#158).
         if exc.hint is None:
             exc.hint = _auth_refused_hint(inst)
+        exc.vm_id = inst.vm_id
         raise exc
     halted = _transfer_halted(
         inst, start_offset, operation=operation, stem=stem
@@ -510,6 +513,25 @@ def _transport_lost(ssh: SSHClient, inst: VMInstance) -> bool:
     return True
 
 
+def _never_started(ssh: SSHClient, inst: VMInstance) -> bool:
+    """True when qmu's own ssh client proves an rc-255 session never reached
+    the guest, so the command did not run.
+
+    Only the client's log (:func:`~qmu.ssh.client_log`) is evidence: the
+    guest's stderr carries whatever the command printed, and a command
+    whose last step is a failing inner `ssh` prints ssh's pre-session lines
+    there and exits 255 itself (#199). The same log saying the login was
+    refused raises :class:`SSHAuthError` at once (#158) — no probe needed.
+    No log (a test double) proves nothing: the caller probes.
+    """
+    log = client_log(ssh)
+    if log is None:
+        return False
+    if is_auth_failure(255, log):
+        raise _auth_refused_error(inst, ssh, log)
+    return never_connected(255, log)
+
+
 def _ssh_lost_hint(crash: str | None, vm: str, *, connected: bool = True) -> str:
     """The SSH-lost hint text, in one place.
 
@@ -611,19 +633,18 @@ def _ssh_255_payload(
     inst: VMInstance,
     *,
     start_offset: int,
-    stdout: str,
-    stderr: str,
 ) -> tuple[int, dict[str, Any], list[str]] | None:
     """The SSH-lost triple for an rc-255 session the serial log and QMP did
     not explain, or None when the guest command itself returned 255.
 
     ssh's own pre-session failure (`Connection timed out during banner
-    exchange`, :func:`~qmu.ssh.never_connected`) settles it without a probe:
-    the command never ran, so a sshd that comes up during the probe window
-    must not turn it into "the guest command exited 255" (#177). Anything
-    else is ambiguous and :func:`_transport_lost` probes.
+    exchange`, :func:`_never_started`) settles it without a probe: the
+    command never ran, so a sshd that comes up during the probe window must
+    not turn it into "the guest command exited 255" (#177). Anything else is
+    ambiguous and :func:`_transport_lost` probes. The guest's stdout/stderr
+    decide nothing here: a guest command can print ssh's words itself (#199).
     """
-    if never_connected(255, stdout, stderr):
+    if _never_started(ssh, inst):
         return _ssh_lost_payload(
             command, inst, start_offset=start_offset, connected=False
         )
@@ -1241,8 +1262,7 @@ def _classify_guest_command(
         explained = _explain_lost_transport(
             command, inst, start_offset=command_start_offset, session_note=True
         ) or _ssh_255_payload(
-            ssh, command, inst, start_offset=command_start_offset,
-            stdout=stdout, stderr=stderr,
+            ssh, command, inst, start_offset=command_start_offset
         )
         if explained is not None:
             return _with_guest_output(explained, stdout, stderr, note_stderr=note_stderr)
@@ -1496,9 +1516,10 @@ def _compile_on_host(
     # what ssh returns when a panic drops the transport, so confirm with the same
     # liveness probe exec uses and hand the caller the transport-loss path:
     # reporting a kernel panic as "compilation failed" would bury it. ssh's own
-    # never-connected failure needs no probe: chmod never ran (#177).
+    # never-connected failure, read from its own log, needs no probe: chmod
+    # never ran (#177).
     if chmod_rc == 255 and (
-        never_connected(chmod_rc, chmod_out, chmod_err) or _transport_lost(ssh, inst)
+        _never_started(ssh, inst) or _transport_lost(ssh, inst)
     ):
         raise _DeliveryTransportLost(
             "SSH transport lost (rc=255) while delivering the host-built "
@@ -1791,8 +1812,7 @@ def _handle_dmesg(args: argparse.Namespace) -> Result:
         explained = _explain_lost_transport(
             cmd, inst, start_offset=command_start_offset
         ) or _ssh_255_payload(
-            ssh, cmd, inst, start_offset=command_start_offset,
-            stdout=stdout, stderr=stderr,
+            ssh, cmd, inst, start_offset=command_start_offset
         )
         if explained is not None:
             status, data, out, text, notes = _with_guest_output(

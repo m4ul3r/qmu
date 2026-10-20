@@ -85,12 +85,15 @@ class WatchedSSH:
         ready=True,
         append_during_run="",
         raises=None,
+        client_log=None,
     ):
         self._serial_path = serial_path
         self._rc, self._stdout, self._stderr = rc, stdout, stderr
         self._ready = ready
         self._append = append_during_run
         self._raises = raises
+        # What the real client's `-E` log would hold for this run (#199).
+        self.last_client_log = client_log
         self.runs: list[str] = []
         self.timeouts: list[float] = []
         self.predicate_answers: list[bool] = []
@@ -1185,25 +1188,29 @@ def test_a_panic_mid_stream_keeps_the_delivered_lines_and_exits_3(
 
 
 @pytest.mark.parametrize(
-    "stdout, stderr, expected_rc",
+    "stderr, client_log, expected_rc",
     [
         ("", "Connection timed out during banner exchange\r\n", 4),
         ("", "kex_exchange_identification: read: Connection reset by peer\r\n", 4),
         ("", "ssh: connect to host localhost port 10021: Connection refused\r\n", 4),
-        # Guest output alongside ssh-like words: the session ran the command,
-        # which exited 255 itself.
-        ("", "Connection timed out during banner exchange\nretry failed\n", 1),
-        ("partial\n", "Connection timed out during banner exchange\r\n", 1),
+        # The guest command ran an inner `ssh` that failed and exited 255
+        # itself: the same words on the guest's stderr, nothing in qmu's
+        # client log (#199).
+        ("ssh: connect to host 127.0.0.1 port 1: Connection refused\r\n", "", 1),
+        ("Connection timed out during banner exchange\r\n", "", 1),
     ],
 )
-def test_a_session_that_never_connected_is_transport_class_whatever_the_probe_says(
-    wired, capsys, stdout, stderr, expected_rc
+def test_only_the_client_log_proves_a_session_never_connected(
+    wired, capsys, stderr, client_log, expected_rc
 ):
     """ssh's own pre-session failure means the command never ran: exit 4,
     `exit_code: null`, even when sshd is up by the time qmu would re-probe.
     It used to be "the guest command exited 255" (exit 1) whenever sshd won
-    that race — right after `launch --no-wait-ssh` or a reboot."""
-    wired(rc=255, stdout=stdout, stderr=stderr, ready=True)
+    that race — right after `launch --no-wait-ssh` or a reboot (#177). Read
+    from the guest's stderr instead of qmu's client log, the same rule called
+    a command that ran (and had side effects) "not started, safe to re-run"
+    (#199)."""
+    wired(rc=255, stderr=stderr, client_log=client_log, ready=True)
 
     rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "true"])
 
