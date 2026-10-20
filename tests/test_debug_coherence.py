@@ -868,10 +868,54 @@ def test_raw_savevm_classifies_like_snapshot_save(monkeypatch, capsys):
         assert ("[qmu] WARNING:" in err) is warned
 
 
+class _SequenceQMP(_FakeQMP):
+    """query-status answers in order: the run state before, then after."""
+
+    def __init__(self, *statuses):
+        self.statuses = list(statuses)
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        if command == "query-status":
+            status = self.statuses.pop(0)
+            return {"running": status == "running", "status": status}
+        return {}
+
+    def execute_hmp(self, command_line, timeout=30.0):
+        return ""
+
+
+def test_a_breakpoint_hit_after_savevm_resumes_does_not_clear_the_image(
+    monkeypatch, capsys
+):
+    """Review of #188, reproduced through to an int3 panic: savevm resumes a
+    running guest before it returns, so a breakpoint hit in that gap reads
+    `debug` afterwards for an image taken with the int3s in RAM. Running
+    before the save is what decides: `possible`, on both routes."""
+    inst = _gdb_inst(1234)
+    inst.kvm = True
+    _install_qmp_seams(monkeypatch, inst, present=True)
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'r' saved."))
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx",
+        lambda inst: contextlib.nullcontext(_SequenceQMP("running", "debug")),
+    )
+    args = _snap_args()
+    args.format = "json"
+    assert _run(qmp_cmds._handle_snapshot_save, args) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["breakpoints_in_image"] == "possible"
+    assert "[qmu] WARNING:" in captured.err
+
+    assert _run(qmp_cmds._handle_monitor, _monitor_args(["savevm", "r"])) == 0
+    err = capsys.readouterr().err
+    assert "[qmu] WARNING:" in err and "Note:" not in err
+
+
 def test_reset_at_a_debugger_stop_says_to_boot_it_with_qmu_cont(monkeypatch, capsys):
     """Live (#183): a reset that lands while the debugger is stopped leaves
-    QEMU in `prelaunch` and `pry continue` cannot start it (`Command
-    aborted`); `qmu cont` boots it. A reset of a running guest needs no cont."""
+    QEMU in `prelaunch` and `pry continue` does not start it (the vCPU stays
+    at the reset vector, KVM and TCG alike); `qmu cont` boots it. A reset of
+    a running guest needs no cont."""
     inst = _gdb_inst(1234)
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)

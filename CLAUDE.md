@@ -628,13 +628,21 @@ knows a VM has a stub (`gdb_port is not None`), so `debug.py` enforces the half
 of the contract the protocol doesn't: **invalidate loudly.** It does NOT drive
 pry, so it warns rather than auto re-syncing/re-arming (that is a pry-side
 capability, #187); the one thing it asks the bridge is `pry status`, below.
-Every recovery a warning names was run as written against a live bridge
-(#183): GDB lifts its breakpoints at a stop and re-inserts them on resume, so
-`pry interrupt` → `pry continue --background` re-arms in place, and a KASLR
-re-slide needs `kbase` (guest running) → `interrupt` → `load --base` →
-`continue`. A recovery names `qmu-<vm>` only while the bridge `qmu gdb`
-recorded is alive (`_bridge_ref`; `qmu gdb`'s own refusal too, #186) — a
-hand-started client has no such name.
+Every recovery a warning names was run as written against a live bridge,
+under KVM and TCG, because they differ (#183). Under KVM a breakpoint is an
+`int3` in guest RAM: a load or reset takes it out while GDB still counts it
+inserted, and GDB's lift-at-stop / insert-on-resume cycle (`pry interrupt` →
+`pry continue --background`) puts it back. Under TCG breakpoints live in
+QEMU keyed by virtual address: a load or a `nokaslr` reset leaves them
+firing, so those warnings say "nothing to re-arm" (`debug._tcg`, `kvm:
+false`; a pre-#39 `kvm: null` record is treated as KVM). A KASLR re-slide
+strands them either way: `kbase` (guest running) → `interrupt` → `load
+--base` → `continue`. A recovery names `qmu-<vm>` only while the bridge `qmu
+gdb` recorded is the attached client — `bridge_holds_stub` matches the
+client-end socket inode in `/proc/net/tcp` against the bridge's
+`/proc/<pid>/fd`; a live recorded bridge alone is not enough, it may have
+disconnected while a hand-started client took the stub (`_bridge_ref`, the
+`qmu gdb` refusal, `kill`'s stranded-client note, #186).
 
 - `debug_session_present(inst)` is the gate for divergences a *live* client
   would see: true when `gdb_port` is set AND `gdb_client_attached()` cannot
@@ -650,15 +658,20 @@ hand-started client has no such name.
   (`gdb_port` alone): a debugger that detached uncleanly can have left `int3`
   bytes behind, and the save captures them whether or not anyone is attached
   now — do not "fix" it by switching that call to the session gate. What it
-  reports is decided by QEMU's run state at the save (#188,
-  `debug.savevm_breakpoint_state` → `breakpoints_in_image`): `never` under
-  TCG (breakpoints never touch guest RAM there; silent), `lifted` at a
-  debugger stop — QEMU `debug`, or `paused` AND the recorded bridge's `pry
-  status` says `stopped` (a `[qmu] Note:`), else `possible` (the warning,
-  recovery: save at a `pry interrupt` stop). `paused` alone proves nothing: a
-  QMP `stop` behind a running GDB leaves the int3s in RAM. `pry status` is
-  asked only while QEMU is already paused — a pry command against a target
-  GDB believes stopped halts a running VM.
+  reports is decided by QEMU's run state read **before and after** the save
+  (#188, `debug.savevm_breakpoint_state` → `breakpoints_in_image`): `never`
+  under TCG (silent); `lifted` only when both reads show the same debugger
+  stop — `debug`, or `paused` AND the recorded bridge, as the attached
+  client, says `stopped` in `pry status` (a `[qmu] Note:`); else `possible`
+  (the warning, recovery: save at a `pry interrupt` stop). The before-read is
+  load-bearing: savevm resumes a running guest before it returns, and a
+  breakpoint hit in that gap made an after-only read report an image with
+  `int3`s in it as `lifted` (reproduced through to an int3 panic on load).
+  `paused` alone proves nothing qmu can check: a QMP `stop` is reported to
+  the client as SIGINT and an attached GDB lifts its breakpoints then too,
+  but only the client knows it took that stop. `pry status` is asked only
+  while QEMU is already paused — a pry command against a target GDB believes
+  stopped halts a running VM.
 - Guest reboots nobody issued (#184): `VMInstance.debugger_epoch_offset`/
   `_banners` record the generation the debugger was last told about (`qmu
   gdb` attach, a reset — whose own banner is still to come, so `banners=1` —
@@ -671,11 +684,12 @@ hand-started client has no such name.
 - Warnings fire on exactly the mutation events, via `Result.warn(...)` — stderr
   in every mode plus the envelope's `warnings[]` under json/ndjson (#74), so
   the stdout JSON stays one object: `snapshot save` (#45, baked-in `int3`s),
-  `snapshot load` (#44, stale stop reason, breakpoints gone from RAM),
-  `qmp`/`monitor system_reset` (#46, dropped breakpoint set; with QEMU's
-  post-reset run state — a reset at a debugger stop leaves the vCPU in
-  `prelaunch`, which `pry continue` cannot start, so the warning says `qmu
-  cont` first), a guest reboot (#184), and `kill` (#40, stranded pry bridge). The
+  `snapshot load` (#44, stale stop reason, breakpoints gone from RAM under
+  KVM), `qmp`/`monitor system_reset` (#46, dropped breakpoint set under KVM,
+  stranded by KASLR either way; with QEMU's post-reset run state — a reset at
+  a debugger stop leaves the vCPU in `prelaunch`, which `pry continue` does
+  not start, so the warning says `qmu cont` first), a guest reboot (#184),
+  and `kill` (#40, stranded pry bridge). The
   KVM-watchpoint warning (#39) is the exception: it rides in the `qmu gdb`
   **stdout** payload next to the existing symbol warnings, keyed on the recorded
   `VMInstance.kvm`, so `gdb`'s clean-stderr contract holds.

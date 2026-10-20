@@ -118,6 +118,29 @@ def gdb_client_attached(inst: Any) -> bool | None:
     return False if read_any else None
 
 
+def established_client_inodes(proc_net_tcp_text: str, port: int) -> set[int]:
+    """Socket inodes of the CLIENT ends of ESTABLISHED loopback connections
+    to `port` (remote port == `port`), parsed from /proc/net/tcp{,6} text.
+
+    The server end lives in QEMU; the client end in whichever process
+    attached — what tells qmu's bridge from a hand-started one (#186).
+    """
+    inodes: set[int] = set()
+    for line in proc_net_tcp_text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 10 or fields[3] != _TCP_ESTABLISHED or ":" not in fields[2]:
+            continue
+        ip_hex, _, port_hex = fields[2].rpartition(":")
+        if ip_hex not in _LOOPBACK_LOCAL_HEX:
+            continue
+        try:
+            if int(port_hex, 16) == port:
+                inodes.add(int(fields[9]))
+        except ValueError:
+            continue
+    return inodes
+
+
 def debug_stub_present(inst: Any) -> bool:
     """Whether the VM has a GDB stub at all (`--gdb` was passed at launch).
 
@@ -258,14 +281,68 @@ def bridge_instance_id(vm_id: str) -> str:
     return f"qmu-{vm_id}"
 
 
+def bridge_holds_stub(inst: Any) -> bool | None:
+    """Whether the client attached to the stub is the bridge `qmu gdb` recorded.
+
+    True when that bridge's process owns the client end of the connection;
+    False when it is dead, or alive without it (a hand-started client holds
+    the stub, or nobody does); None when /proc cannot tell. A live recorded
+    bridge alone proves nothing: it may have disconnected while another
+    client took the stub (#186).
+    """
+    if not bridge_alive(inst):
+        return False
+    port = getattr(inst, "gdb_port", None)
+    if port is None:
+        return False
+    inodes: set[int] = set()
+    read_any = False
+    for name in _PROC_NET_TCP:
+        try:
+            text = Path(name).read_text()
+        except OSError:
+            continue
+        read_any = True
+        inodes |= established_client_inodes(text, port)
+    if not read_any:
+        return None
+    if not inodes:
+        return False
+    fd_dir = Path(f"/proc/{inst.gdb_bridge_pid}/fd")
+    try:
+        fds = list(fd_dir.iterdir())
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target.startswith("socket:[") and target.endswith("]"):
+            try:
+                if int(target[8:-1]) in inodes:
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def qmu_bridge_attached(inst: Any) -> bool:
+    """The recorded bridge is the client (or /proc cannot say otherwise)."""
+    holds = bridge_holds_stub(inst)
+    return holds is True or (holds is None and bridge_alive(inst))
+
+
 def _bridge_ref(inst: Any) -> tuple[str, str]:
     """How a recovery addresses this VM's debugger: `(instance, gloss)`.
 
-    Only a live bridge qmu recorded has the `qmu-<vm>` name; naming it for a
-    hand-started client sends the reader to `No running GDB bridge instance
-    named …` (#186), so anything else gets a placeholder and where to find it.
+    Only the bridge qmu recorded, and only while it is the attached client,
+    answers to `qmu-<vm>`; naming it for a hand-started client sends the
+    reader to `No running GDB bridge instance named …` or to a bridge that
+    is not connected (#186), so anything else gets a placeholder and where
+    to find it.
     """
-    if bridge_alive(inst):
+    if qmu_bridge_attached(inst):
         return bridge_instance_id(inst.vm_id), ""
     return "<id>", " (<id>: your bridge's pid or --instance-id, from `pry doctor`)"
 
@@ -274,14 +351,14 @@ _PRY_STATUS_TIMEOUT = 5.0
 
 
 def bridge_stopped(inst: Any) -> bool | None:
-    """Whether the bridge `qmu gdb` recorded says its GDB is at a stop.
+    """Whether the bridge `qmu gdb` recorded, as the attached client, is at a stop.
 
-    Asks `pry status`; None when there is no live recorded bridge or it did
-    not answer. Only ask while QEMU is already paused: a pry command that
+    Asks `pry status`; None when that bridge is not the attached client or
+    did not answer. Only ask while QEMU is already paused: a pry command that
     touches a target GDB believes stopped halts a running VM (the gdbstub
     stops on any packet), so on a running guest this read is not free.
     """
-    if not bridge_alive(inst):
+    if not qmu_bridge_attached(inst):
         return None
     pry = shutil.which("pry")
     if not pry:
@@ -305,30 +382,43 @@ def bridge_stopped(inst: Any) -> bool | None:
 # Under KVM a gdbstub software breakpoint is an int3 QEMU writes into guest
 # RAM; GDB (`breakpoint always-inserted off`) inserts its breakpoints when it
 # resumes the target and lifts them when it stops. So what a `savevm` captures
-# depends on whether GDB was at a stop, which QEMU's run state answers for a
-# breakpoint/step stop (`debug`) and the bridge qmu spawned answers for an
-# interrupt (`paused` — also what a QMP `stop` behind a running GDB leaves, so
-# `paused` alone proves nothing). Under TCG breakpoints live in QEMU's
-# translator and never touch guest RAM (measured: 0x53 at an inserted
-# breakpoint, and the image loaded and ran it clean).
+# depends on whether GDB was at a stop when the save began. QEMU's run state
+# answers that for a breakpoint/step stop (`debug`). `paused` is what an
+# interrupt, a fresh attach and a QMP `stop` all leave (QEMU reports the
+# latter to the client as SIGINT, so an attached GDB lifts its breakpoints
+# then too), but whether a GDB actually took that stop is known only to the
+# client: qmu asks the bridge it spawned, and cannot ask a hand-started one or
+# a client that detached uncleanly and left its bytes behind. The state is
+# read on both sides of the save: savevm resumes a running guest before it
+# returns, so a breakpoint hit right after it shows `debug` for an image
+# taken while the guest ran (measured, through to an int3 panic on load).
+# Under TCG breakpoints live in QEMU's translator and never touch guest RAM
+# (measured: 0x53 at an inserted breakpoint, and the image loaded and ran it
+# clean).
 
 INT3_NEVER = "never"
 INT3_LIFTED = "lifted"
 INT3_POSSIBLE = "possible"
 
 
-def savevm_breakpoint_state(inst: Any, qemu_status: str | None) -> str | None:
-    """What a save taken now holds of debugger breakpoints; None without a stub.
+def savevm_breakpoint_state(
+    inst: Any, before: str | None, after: str | None
+) -> str | None:
+    """What a save holds of debugger breakpoints; None without a stub.
 
-    `never` (TCG), `lifted` (taken at a debugger stop) or `possible`.
+    `before`/`after` are QEMU's run state read right before and right after
+    the save. `never` (TCG), `lifted` (a debugger stop held across the whole
+    save) or `possible`.
     """
     if not debug_stub_present(inst):
         return None
     if getattr(inst, "kvm", None) is False:
         return INT3_NEVER
-    if qemu_status == "debug":
+    if before != after:
+        return INT3_POSSIBLE
+    if before == "debug":
         return INT3_LIFTED
-    if qemu_status == "paused" and bridge_stopped(inst) is True:
+    if before == "paused" and bridge_stopped(inst) is True:
         return INT3_LIFTED
     return INT3_POSSIBLE
 
@@ -426,29 +516,50 @@ def check_unwarned_reboot(inst: Any) -> Any:
 # Each names the divergence event, what silently diverges, and the recovery
 # action, so an agent reading stderr knows the state is suspect without having
 # already learned this contract. Every recovery below was run as written
-# against a live pry bridge (#183, #188): GDB lifts its breakpoints at a stop
-# and re-inserts them on resume, so `pry interrupt` → `pry continue
-# --background` re-inserts breakpoints a rewind or reset took out of RAM.
+# against a live pry bridge (#183, #188), under KVM and under TCG, because the
+# two differ: under KVM a breakpoint is an int3 QEMU writes into guest RAM,
+# so a rewind or reset takes it out of RAM while QEMU and GDB still count it
+# inserted, and GDB's lift-at-stop / insert-on-resume cycle (`pry interrupt` →
+# `pry continue --background`) puts it back. Under TCG breakpoints live in
+# QEMU's translator, keyed by virtual address: a load or reset leaves them in
+# force (measured: the canary fired with no re-arm after both), and only a
+# KASLR re-slide moves the code out from under them.
 
 
 def _kaslr_off(inst: Any) -> bool:
     return "nokaslr" in (getattr(inst, "cmdline", "") or "").split()
 
 
+def _tcg(inst: Any) -> bool:
+    """Positively TCG; None (a pre-#39 record) is treated as KVM."""
+    return getattr(inst, "kvm", None) is False
+
+
 def loadvm_stale_session_warning(inst: Any) -> str:
     """#44 — `snapshot load` rewound the guest but the debugger did not."""
     ref, gloss = _bridge_ref(inst)
-    return (
+    lead = (
         f"[qmu] WARNING: VM '{inst.vm_id}' has a GDB stub and was just rewound "
         "by snapshot load. An attached debugger does NOT re-sync: if it was at "
         "a stop, its stop reason still names that pre-load stop (frame and "
-        "registers are re-read and current), and the breakpoints it had "
-        "inserted while the guest ran are no longer in guest RAM — still "
-        "listed [enabled], they never fire. Addresses did not move, so re-arm "
-        f"in place: `pry --instance {ref} interrupt` (`not interrupted` at a "
-        f"stop is fine), then `pry --instance {ref} continue --background` "
-        f"(GDB re-inserts every breakpoint when it resumes){gloss}; prove one "
-        "fires with a canary before trusting a stop."
+        "registers are re-read and current)"
+    )
+    if _tcg(inst):
+        return lead + (
+            ". Its breakpoints are unaffected: under TCG they live in QEMU, not "
+            "in guest RAM, and a load moves no address, so they still fire with "
+            "no re-arm. Trust the frame, not the reason, until the next stop."
+        )
+    return lead + (
+        ", and the breakpoints it had inserted while the guest ran are no "
+        "longer in guest RAM — still listed [enabled], they never fire. "
+        f"Addresses did not move, so re-arm in place: `pry --instance {ref} "
+        "interrupt` (`not interrupted` at a stop is fine), then `pry --instance "
+        f"{ref} continue --background` (GDB re-inserts every breakpoint when it "
+        f"resumes){gloss}; prove one fires with a canary before trusting a stop. "
+        "An image whose save said `breakpoints_in_image: possible` brings its "
+        "int3 bytes back, and nothing tracks those (they survive `pry "
+        "interrupt`): load a `lifted` image or reboot instead."
     )
 
 
@@ -476,62 +587,93 @@ def savevm_lifted_note(inst: Any, qemu_status: str | None) -> str:
     return (
         f"[qmu] Note: VM '{inst.vm_id}' was saved at a debugger stop "
         f"('{qemu_status}'), where GDB has lifted its breakpoints, so this image "
-        "holds no int3 for a breakpoint the debugger lists. The exception is one "
-        "deleted while the guest ran (m4ul3r/pry#56): its byte stays in RAM and "
-        "in the image."
+        "holds no int3 for a breakpoint the debugger lists. The exceptions are "
+        "int3 bytes nothing tracks — one deleted while the guest ran "
+        "(m4ul3r/pry#56), or one a `possible` image brought back on load: they "
+        "stay in RAM and in the image."
     )
 
 
 def reset_dropped_breakpoints_warning(
     inst: Any, *, guest_initiated: bool = False, qemu_status: str | None = None
 ) -> str:
-    """#46/#184 — a reset drops the gdbstub breakpoint set without telling anyone.
+    """#46/#184 — a reset leaves the debugger's breakpoints dead, silently.
 
-    Re-arming by symbol is not enough on its own: KASLR re-slides the kernel on
-    every boot, so the symbol file pry loaded against the old base now resolves
-    to addresses nothing executes, and the breakpoints sit at stale addresses
-    with hits=0 and no error (debug audit R25–R26). The recovery re-derives the
-    base while the guest runs, THEN stops the debugger to reload: `pry load`
-    on a running target leaves every breakpoint <PENDING> (m4ul3r/pry#57).
+    Under KVM the reset takes them out of guest RAM while GDB still lists them
+    inserted; under TCG QEMU keeps them, at their old virtual addresses. Either
+    way KASLR re-slides the kernel on every boot, so the symbol file pry loaded
+    against the old base resolves to addresses nothing executes (debug audit
+    R25–R26). The recovery re-derives the base while the guest runs, THEN
+    stops the debugger to reload: `pry load` on a running target leaves every
+    breakpoint <PENDING> (m4ul3r/pry#57).
 
     `qemu_status` is QEMU's run state right after the reset, when known. A
     reset that lands while the debugger is at a stop leaves the vCPU halted at
-    the reset vector (`prelaunch`), and `pry continue` cannot start it: GDB
-    fails to re-insert breakpoints at kernel addresses nothing has mapped yet
-    (`Command aborted`). Measured: `qmu cont` boots it, and the debugger,
-    still believing it is stopped, then re-arms through the usual recovery.
+    the reset vector (`prelaunch`), and `pry continue` does not start it
+    (measured under KVM and TCG: still `EIP=0000fff0`, no console output).
+    `qmu cont` boots it; the debugger, still believing it is stopped, then
+    re-arms through the usual recovery.
     """
     vm_id = inst.vm_id
     ref, gloss = _bridge_ref(inst)
+    tcg = _tcg(inst)
+    kaslr_off = _kaslr_off(inst)
+    halted = qemu_status is not None and qemu_status != "running"
     event = (
         "its guest rebooted by itself (a new kernel boot banner is in the "
         "serial log)"
         if guest_initiated
         else "was just reset"
     )
-    lead = (
-        f"[qmu] WARNING: VM '{vm_id}' has a GDB stub and {event}. A machine "
-        "reset drops the gdbstub's breakpoint/watchpoint set without notifying "
-        "the client: an attached debugger still lists them as [enabled] but "
-        "they do not fire (hits stay 0). "
-    )
-    if qemu_status is not None and qemu_status != "running":
+    lead = f"[qmu] WARNING: VM '{vm_id}' has a GDB stub and {event}. "
+    if not tcg:
+        lead += (
+            "A machine reset drops the gdbstub's breakpoint/watchpoint set "
+            "without notifying the client: an attached debugger still lists "
+            "them as [enabled] but they do not fire (hits stay 0). "
+        )
+    elif kaslr_off and halted:
+        lead += (
+            "Under TCG a reset does not drop breakpoints (they live in QEMU, "
+            "not in guest RAM) and nokaslr keeps their addresses, but the "
+            "debugger lifted them at its stop and re-inserts them only when it "
+            "resumes. "
+        )
+    elif kaslr_off:
+        lead += (
+            "Under TCG the gdbstub keeps its breakpoints across a reset (they "
+            "live in QEMU, not in guest RAM), and this kernel booted with "
+            "nokaslr, so they still fire where they were set. "
+        )
+    else:
+        lead += (
+            "Under TCG a reset does not drop the debugger's breakpoints (they "
+            "live in QEMU, not in guest RAM), but they stay at their old "
+            "addresses: KASLR re-slid the kernel, so they sit where nothing "
+            "runs — still listed [enabled], they do not fire. "
+        )
+    if halted:
         lead += (
             f"The guest is still halted (QEMU '{qemu_status}'): the reset "
-            "landed at a debugger stop, and `pry continue` cannot start it "
-            "(GDB cannot re-insert breakpoints the kernel has not mapped yet). "
-            f"Boot it with `qmu cont --vm {vm_id}` first. "
+            "landed at a debugger stop, and `pry continue` does not start it "
+            f"(the vCPU stays at the reset vector). Boot it with `qmu cont --vm "
+            f"{vm_id}` first. "
         )
-    if _kaslr_off(inst):
+    if kaslr_off:
+        if tcg and not halted:
+            return lead + "Nothing to re-arm; prove one fires with a canary."
         return lead + (
-            "This kernel booted with nokaslr, so addresses did not move: "
-            f"`pry --instance {ref} interrupt`, then `pry --instance {ref} "
+            ("Addresses did not move: " if tcg else
+             "This kernel booted with nokaslr, so addresses did not move: ")
+            + f"`pry --instance {ref} interrupt`, then `pry --instance {ref} "
             f"continue --background` re-inserts every breakpoint{gloss}; prove "
             "one fires with a canary."
         )
     return lead + (
-        "KASLR also re-slid the kernel, so symbols loaded against the old base "
-        "resolve to addresses nothing runs. Once the guest serves SSH again: "
+        ("" if tcg else
+         "KASLR also re-slid the kernel, so symbols loaded against the old base "
+         "resolve to addresses nothing runs. ")
+        + "Once the guest serves SSH again: "
         f"`eval \"$(qmu kbase --vm {vm_id} --symbols <vmlinux>)\"` (guest "
         f"running), `pry --instance {ref} interrupt`, `pry --instance {ref} load "
         f"<vmlinux> --base $KBASE`, `pry --instance {ref} continue --background`"

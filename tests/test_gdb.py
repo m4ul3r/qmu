@@ -304,7 +304,7 @@ def test_gdb_refuses_when_a_client_is_already_attached(
     gdb_vm.gdb_bridge_pid = _BRIDGE_PID
     gdb_vm.gdb_bridge_pid_start = "4242"
     calls = _install_gdb_seams(monkeypatch, gdb_vm, attached=True)
-    monkeypatch.setattr(qmp_cmds, "bridge_alive", lambda inst: True)
+    monkeypatch.setattr(qmp_cmds, "qmu_bridge_attached", lambda inst: True)
 
     rc = cli.main(["--format", output_format, "gdb", "--vm", "debug-vm"])
     captured = capsys.readouterr()
@@ -324,12 +324,20 @@ def test_gdb_refuses_when_a_client_is_already_attached(
     assert f"pry kill --instance {_BRIDGE_PID}" in message
 
 
+@pytest.mark.parametrize("ours_alive", [False, True])
 def test_gdb_refusal_without_a_known_bridge_points_at_pry_doctor(
-    monkeypatch, gdb_vm, capsys
+    monkeypatch, gdb_vm, capsys, ours_alive
 ):
     """#186: a hand-started client has no `qmu-<vm>` instance; offering that
-    name for reuse sent the reader to `No running GDB bridge instance`."""
+    name for reuse sent the reader to `No running GDB bridge instance`. The
+    same holds when qmu's bridge is alive but disconnected and another
+    client took the stub: its name does not reach the attached client."""
     calls = _install_gdb_seams(monkeypatch, gdb_vm, attached=True)
+    if ours_alive:
+        gdb_vm.gdb_bridge_pid = _BRIDGE_PID
+        gdb_vm.gdb_bridge_pid_start = "4242"
+        monkeypatch.setattr(qmp_cmds, "bridge_alive", lambda inst: True)
+        monkeypatch.setattr(qmp_cmds, "qmu_bridge_attached", lambda inst: False)
     rc = cli.main(["--format", "json", "gdb", "--vm", "debug-vm"])
     payload = json.loads(capsys.readouterr().out)
     assert rc == 1
@@ -337,6 +345,7 @@ def test_gdb_refusal_without_a_known_bridge_points_at_pry_doctor(
     assert "already attached to port 1234" in payload["error"]
     assert "pry doctor" in payload["hint"]
     assert "qmu-debug-vm" not in payload["error"] + payload["hint"]
+    assert "(reuse)" not in payload["hint"]
 
 
 def test_gdb_timeout_is_an_operational_error_and_reaps_the_attempt(

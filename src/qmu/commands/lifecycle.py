@@ -1427,6 +1427,10 @@ def _handle_kill(args: argparse.Namespace) -> Result:
     # connection, and if one is present, say so on stderr so cleanup is not a
     # later surprise. qmu still does not manage the pry lifecycle.
     had_bridge = debug_session_present(inst) if inst.gdb_port is not None else False
+    # A live recorded bridge is not proof it is the client: it may have
+    # disconnected while a hand-started one took the stub (#186). Reaping
+    # qmu's bridge then leaves that client stranded, so it still gets a note.
+    foreign_client = had_bridge and debug_mod.bridge_holds_stub(inst) is False
     _close_ssh_master(inst)
     # The daemon keeps its watch through the kill (#118). `_kill_vm`'s
     # graceful `quit` rides the daemon's own QMP connection (`_qmp_ctx`
@@ -1461,7 +1465,7 @@ def _handle_kill(args: argparse.Namespace) -> Result:
         text=msg,
         stem="kill",
     )
-    if had_bridge and not bridge_reaped:
+    if had_bridge and (not bridge_reaped or foreign_client):
         res = res.warn(
             f"[qmu] Note: VM '{inst.vm_id}' had an attached debugger on GDB port "
             f"{inst.gdb_port}. That pry bridge now points at a dead stub; qmu does "

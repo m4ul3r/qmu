@@ -37,7 +37,7 @@ from ..snapshot import (
     savevm_timeout,
 )
 from ..serial import serial_log_offset
-from ..qmp import QMPCommandError, QMPTimeoutError, hmp_failed
+from ..qmp import QMPCommandError, QMPError, QMPTimeoutError, hmp_failed
 from ..debug import (
     INT3_LIFTED,
     INT3_POSSIBLE,
@@ -51,6 +51,7 @@ from ..debug import (
     loadvm_stale_session_warning,
     mark_debugger_attached,
     mark_debugger_epoch,
+    qmu_bridge_attached,
     reap_bridge,
     reset_dropped_breakpoints_warning,
     savevm_breakpoint_state,
@@ -103,20 +104,45 @@ def _qemu_status(qmp: object) -> str | None:
     return status if isinstance(status, str) else None
 
 
-def _savevm_coherence(
-    inst: VMInstance, qemu_status: str | None
-) -> tuple[str | None, str | None]:
-    """`(breakpoints_in_image, warning line)` for a save that landed (#188).
+def _status_before_save(qmp: object, inst: VMInstance) -> str | None:
+    """QEMU's run state right before a savevm on a `--gdb` VM (#188).
 
-    A save taken at a debugger stop gets a note; one that may hold int3
-    bytes gets the warning naming the save-at-a-stop recovery; under TCG
-    there is nothing to say — breakpoints never touch guest RAM there.
+    A timeout here means nothing was saved, which is neither the save's
+    budget expiring (124, `may_have_landed`) nor a refused save: it is the
+    transport class, said in those words.
     """
-    state = savevm_breakpoint_state(inst, qemu_status)
+    if not debug_stub_present(inst):
+        return None
+    try:
+        reply = qmp.execute("query-status")  # type: ignore[attr-defined]
+    except QMPCommandError:
+        return None
+    except QMPTimeoutError as exc:
+        raise QMPError(
+            f"QEMU did not answer query-status before the save ({exc}); nothing "
+            "was saved"
+        ) from exc
+    status = reply.get("status") if isinstance(reply, dict) else None
+    return status if isinstance(status, str) else None
+
+
+def _savevm_coherence(
+    inst: VMInstance, before: str | None, after: str | None
+) -> tuple[str | None, str | None]:
+    """`(breakpoints_in_image, stderr line)` for a save that landed (#188).
+
+    `before`/`after` bracket the save: savevm resumes a running guest before
+    it returns, so a breakpoint hit right after it reads `debug` for an image
+    taken while the guest ran. A save taken at a debugger stop gets a note;
+    one that may hold int3 bytes gets the warning naming the save-at-a-stop
+    recovery; under TCG there is nothing to say — breakpoints never touch
+    guest RAM there.
+    """
+    state = savevm_breakpoint_state(inst, before, after)
     if state == INT3_LIFTED:
-        return state, savevm_lifted_note(inst, qemu_status) + "\n"
+        return state, savevm_lifted_note(inst, before) + "\n"
     if state == INT3_POSSIBLE:
-        return state, savevm_breakpoint_warning(inst, qemu_status) + "\n"
+        return state, savevm_breakpoint_warning(inst, before) + "\n"
     return state, None
 
 
@@ -390,12 +416,12 @@ def _handle_snapshot_save(args: argparse.Namespace) -> Result:
     _drop_ssh_master(inst)
     try:
         with _qmp_ctx(inst) as qmp:
+            # QEMU's run state across the save decides what the image holds
+            # of the debugger's breakpoints (#188): read on both sides, since
+            # savevm resumes a running guest before it returns.
+            before = _status_before_save(qmp, inst)
             result = save_snapshot(qmp, args.name, timeout=timeout)
-            # QEMU's run state at the save decides what the image holds of
-            # the debugger's breakpoints (#188). savevm leaves the state it
-            # found, so it is read afterwards: a query queued ahead of the
-            # save behind a wedged main loop must not time out as the save.
-            qemu_status = (
+            after = (
                 _qemu_status(qmp) if result.ok and debug_stub_present(inst) else None
             )
     except QMPTimeoutError:
@@ -424,7 +450,7 @@ def _handle_snapshot_save(args: argparse.Namespace) -> Result:
     # Gated on the STUB, not a live client: bytes an uncleanly-detached bridge
     # left behind (the #40 case) are captured too. Only a successful save
     # wrote an image.
-    state, line = _savevm_coherence(inst, qemu_status)
+    state, line = _savevm_coherence(inst, before, after)
     if state is not None:
         res = replace(res, data={**res.data, "breakpoints_in_image": state})
     if line is not None:
@@ -723,7 +749,7 @@ def _handle_gdb(args: argparse.Namespace) -> Result:
     # through so an unreadable /proc never locks the debugger out.
     attached = gdb_client_attached(inst)
     if attached is True:
-        if bridge_alive(inst):
+        if qmu_bridge_attached(inst):
             detach = f"pry kill --instance {inst.gdb_bridge_pid}"
             raise QMUError(
                 f"A debugger client is already attached to port {inst.gdb_port}"
@@ -731,20 +757,28 @@ def _handle_gdb(args: argparse.Namespace) -> Result:
                 f"with: {detach}",
                 hint=f"pry --instance {bridge_instance_id(inst.vm_id)} (reuse) or {detach}",
             )
-        # #186: the client is not the bridge qmu spawned, so it has no
-        # `qmu-<vm>` name; offering that name sent the reader to `No running
-        # GDB bridge instance named …`. `pry info target` shows which bridge
-        # holds the port (`remote localhost:<port>`).
+        # #186: the client is not the bridge qmu spawned (whose process would
+        # own the client end of the connection), so `qmu-<vm>` does not reach
+        # it; offering that name sent the reader to `No running GDB bridge
+        # instance named …`, or to qmu's own bridge after it disconnected.
+        # `pry info target` shows which bridge holds the port.
         find = (
             "pry doctor lists the bridges; `pry --instance <pid> info target` "
             f"shows the one on remote localhost:{inst.gdb_port}"
         )
+        ours = (
+            f"the bridge `qmu gdb` spawned for this VM (pid {inst.gdb_bridge_pid}) "
+            "is alive but not connected to the stub, so its qmu name does not "
+            "reach the client"
+            if bridge_alive(inst)
+            else "no bridge `qmu gdb` spawned is alive for this VM, so there is "
+            "no qmu-named instance to reuse"
+        )
         raise QMUError(
             f"A debugger client is already attached to port {inst.gdb_port}, "
-            "and it is not a bridge `qmu gdb` spawned (none is alive for this "
-            "VM, so there is no qmu-named instance to reuse). Reuse the client "
-            "under its own pry name, or detach with: pry kill --instance <pid> "
-            "(list pids with: pry doctor)",
+            f"and it is not a bridge `qmu gdb` spawned ({ours}). Reuse the "
+            "client under its own pry name, or detach with: pry kill --instance "
+            "<pid> (list pids with: pry doctor)",
             hint=f"{find}; reuse it with pry --instance <pid>, or detach it with pry kill --instance <pid>",
         )
     # A recorded bridge that is alive while NO client is attached is the #40
@@ -1167,13 +1201,17 @@ def _before_mutation(inst: VMInstance, verb: str) -> int | None:
     return None
 
 
-def _coherence_status(qmp: object, inst: VMInstance, verb: str) -> str | None:
+def _status_before_mutation(qmp: object, inst: VMInstance, verb: str) -> str | None:
+    """QEMU's run state right before a raw `savevm` on a `--gdb` VM (#188)."""
+    return _status_before_save(qmp, inst) if verb == "savevm" else None
+
+
+def _status_after_mutation(qmp: object, inst: VMInstance, verb: str) -> str | None:
     """QEMU's run state right after a raw `savevm`/`system_reset` on a `--gdb` VM.
 
-    Asked on the same connection. savevm leaves the run state it found, so
-    it is the state the image was taken in — what decides whether the image
-    can hold a debugger's int3s (#188); after a reset it tells a guest that
-    is booting from one left halted at the reset vector.
+    Asked on the same connection. After a savevm it is the second half of
+    the bracket `breakpoints_in_image` needs (#188); after a reset it tells a
+    guest that is booting from one left halted at the reset vector.
     """
     if verb not in ("savevm", "system_reset") or not debug_stub_present(inst):
         return None
@@ -1182,7 +1220,8 @@ def _coherence_status(qmp: object, inst: VMInstance, verb: str) -> str | None:
 
 def _after_mutation(
     inst: VMInstance, verb: str, output: str, epoch: int | None,
-    warnings: list[str], qemu_status: str | None = None,
+    warnings: list[str],
+    run_states: tuple[str | None, str | None] = (None, None),
 ) -> VMInstance:
     """Post-mutation bookkeeping plus the debugger coherence warning.
 
@@ -1193,8 +1232,8 @@ def _after_mutation(
     (the same classifier the snapshot handlers use), since a failed op
     landed still needs. The coherence warnings are appended to `warnings`
     (even when the persist raises) so the caller can put them on its Result:
-    stderr in every mode and the envelope's `warnings[]` (#74). `qemu_status`
-    is QEMU's run state right after the mutation (`_coherence_status`).
+    stderr in every mode and the envelope's `warnings[]` (#74). `run_states`
+    is QEMU's run state right before and right after the mutation.
     """
     failed = verb in ("savevm", "loadvm") and _snapshot_failed(output)
     persist_error: OSError | None = None
@@ -1212,14 +1251,15 @@ def _after_mutation(
             inst = mark_debugger_epoch(
                 inst, start, banners=1 if verb == "system_reset" else 0
             )
+    before, after = run_states
     if verb == "system_reset":
         if debug_session_present(inst):
             warnings.append(
-                reset_dropped_breakpoints_warning(inst, qemu_status=qemu_status) + "\n"
+                reset_dropped_breakpoints_warning(inst, qemu_status=after) + "\n"
             )
     elif verb == "savevm":
         if not failed:
-            _, line = _savevm_coherence(inst, qemu_status)
+            _, line = _savevm_coherence(inst, before, after)
             if line is not None:
                 warnings.append(line)
     elif verb == "loadvm":
@@ -1239,7 +1279,7 @@ def _finish_mutation(
     data: dict[str, object],
     text: object,
     stem: str,
-    qemu_status: str | None = None,
+    run_states: tuple[str | None, str | None] = (None, None),
 ) -> Result:
     """Post-mutation bookkeeping, THEN exactly one envelope.
 
@@ -1254,7 +1294,7 @@ def _finish_mutation(
     """
     warnings: list[str] = []
     try:
-        _after_mutation(inst, verb, output, epoch, warnings, qemu_status)
+        _after_mutation(inst, verb, output, epoch, warnings, run_states)
     except OSError as exc:
         error = (
             f"{verb or 'command'} reached the guest, but qmu could not record "
@@ -1312,8 +1352,9 @@ def _handle_qmp(args: argparse.Namespace) -> Result:
     epoch = _before_mutation(inst, verb)
     try:
         with _qmp_ctx(inst) as qmp:
+            before = _status_before_mutation(qmp, inst, verb)
             result = qmp.execute(method, qmp_args)
-            qemu_status = _coherence_status(qmp, inst, verb)
+            after = _status_after_mutation(qmp, inst, verb)
     except QMPCommandError as exc:
         # A QEMU error REPLY, not a transport fault: the wire worked, so this
         # is the exit-1 class whichever error class QEMU chose.
@@ -1329,7 +1370,7 @@ def _handle_qmp(args: argparse.Namespace) -> Result:
     return _finish_mutation(
         inst, verb, result if isinstance(result, str) else "", epoch,
         data={"ok": True, "result": result}, text=result, stem="qmp",
-        qemu_status=qemu_status,
+        run_states=(before, after),
     )
 
 
@@ -1367,8 +1408,9 @@ def _handle_monitor(args: argparse.Namespace) -> Result:
     verb = _hmp_verb(command)
     epoch = _before_mutation(inst, verb)
     with _qmp_ctx(inst) as qmp:
+        before = _status_before_mutation(qmp, inst, verb)
         result = qmp.execute_hmp(command)
-        qemu_status = _coherence_status(qmp, inst, verb)
+        after = _status_after_mutation(qmp, inst, verb)
     if hmp_failed(result):
         raise _hmp_error(command, result)
     return _finish_mutation(
@@ -1376,5 +1418,5 @@ def _handle_monitor(args: argparse.Namespace) -> Result:
         data={"ok": True, "output": result},
         text=result if result.strip() else "(no output)",
         stem="monitor",
-        qemu_status=qemu_status,
+        run_states=(before, after),
     )
