@@ -981,7 +981,8 @@ cpus = 2
 #                                #   KVM (usually a VA-alias issue — see #39).
 # no_reboot = true               # pass -no-reboot: a panic under `panic=N` exits QEMU
 #                                #   instead of rebooting over its own report (boot-and-die
-#                                #   harnesses). Same as the --no-reboot flag on every launch.
+#                                #   harnesses). Same as the --no-reboot flag on every launch;
+#                                #   --reboot clears it for one launch.
 # nic_model = "virtio-net-pci"   # or "e1000", "rtl8139", ...
 # forwards = ["2345:2345"]       # extra host->guest TCP forwards on qmu's NIC (gdbserver, a
 #                                #   service under test): [HOST:]HPORT:GPORT, or a bare GPORT

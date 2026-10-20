@@ -387,6 +387,9 @@ For a config-first recipe, append an app disk to the existing
 "file=/abs/path/app.img,if=virtio,format=raw,readonly=on"`, keeping the existing
 machine arguments and implicit `[drive] rootfs`. Do not switch to a lone
 `--drive` for the app disk: **any `--drive` suppresses the configured rootfs**.
+Keep `readonly=on` (or `snapshot=on` for a disk the guest must write): a
+writable raw extra disk makes `qmu snapshot save` fail with `Device 'virtio1'
+is writable but does not support snapshots`.
 When choosing explicit drives instead, list the root disk first
 and every additional disk, with explicit read-only or snapshot policy. Verify
 the resulting guest device mapping rather than assuming `/dev/vdb`; map mounts

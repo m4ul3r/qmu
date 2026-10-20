@@ -17,6 +17,7 @@ host cross-compiler. So the contract these tests pin is:
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 
@@ -401,6 +402,62 @@ def test_host_build_then_run_executes_the_pushed_binary(wired, source, capsys):
     assert rc == 0
     assert ssh.runs == ["chmod +x /root/exploit", "/root/exploit"]
     assert "pwned" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("form", [
+    ["--host", "--run", "{src}", "--", "/tmp/target", "-1", "two words"],
+    ["--vm", "hostcc-vm", "{src}", "--host", "--run", "--", "/tmp/target", "-1", "two words"],
+    ["--vm", "hostcc-vm", "{src}", "--host", "--run", "/tmp/target", "--", "-1", "two words"],
+    ["{src}", "/tmp/target", "--host", "--run", "--", "-1", "two words"],
+])
+def test_run_passes_program_arguments_one_token_each(wired, source, capsys, form):
+    """#155: a PoC that takes argv (`write_anything TARGET OFFSET DATA`)
+    could not run through `compile --run`; each ARG is one argv entry, in
+    every documented order (before Python 3.12 argparse left ARGs not
+    adjacent to SOURCE unrecognized; `cli` absorbs them)."""
+    install, _state = wired
+    ssh = install(run_results=[(0, "", ""), (0, "done\n", "")])
+    argv = [str(source) if word == "{src}" else word for word in form]
+
+    rc = cli.main(["--format", "json", "compile", *argv])
+
+    assert rc == 0
+    assert ssh.runs[-1] == "/root/exploit /tmp/target -1 'two words'"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["run_args"] == ["/tmp/target", "-1", "two words"]
+
+
+def test_leftover_args_before_python_312_are_absorbed_or_refused():
+    """The 3.10/3.11 parse of `compile poc.c --run -- /tmp/t 1` leaves
+    `-- /tmp/t 1` (or `a b` without `--`) as extras: they join the ARG list;
+    an unknown option among them is still the argparse usage error."""
+    parser = cli.build_parser()
+    args = argparse.Namespace(trailing_positionals="program_args", program_args=["a"])
+    cli._absorb_trailing_positionals(parser, args, ["b", "--", "-x", "--"])
+    assert args.program_args == ["a", "b", "-x", "--"]
+
+    with pytest.raises(cli._UsageError, match="unrecognized arguments: c --bogus"):
+        cli._absorb_trailing_positionals(parser, args, ["c", "--bogus"])
+    with pytest.raises(cli._UsageError, match="unrecognized arguments: x"):
+        cli._absorb_trailing_positionals(parser, argparse.Namespace(), ["x"])
+
+
+def test_program_arguments_without_run_are_refused_before_compiling(wired, source, capsys):
+    install, _state = wired
+    ssh = install()
+
+    rc = cli.main([
+        "--format", "json", "compile", "--vm", "hostcc-vm", "--host",
+        "--cflags", "-static -O2", "--timeout", "120", str(source), "--", "x",
+    ])
+
+    assert rc == 1
+    assert ssh.runs == [] and ssh.pushes == []
+    # The corrected command is the caller's own, with --run added.
+    assert json.loads(capsys.readouterr().out)["hint"] == (
+        f"qmu compile {source} --vm hostcc-vm --host --cflags '-static -O2' "
+        "--timeout 120 --run -- x"
+    )
 
 
 def test_run_text_mode_stdout_is_the_program_output_only(wired, source, capsys):

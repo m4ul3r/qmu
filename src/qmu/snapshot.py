@@ -33,7 +33,8 @@ class SnapshotResult:
     resumed: bool = False
     guest_paused: bool = False
     # Why a FAILED operation failed, for the CLI's `hint`: `missing` (no such
-    # tag), `bad_name` (HMP parse error), `hmp` (any other QEMU refusal).
+    # tag), `bad_name` (HMP parse error), `drive` (a writable drive whose
+    # format cannot hold internal snapshots), `hmp` (any other QEMU refusal).
     reason: str | None = None
     # How far a FAILED load got: `none` (QEMU refused before touching the
     # machine), `partial` (QEMU's error text shows restoration had started),
@@ -75,17 +76,29 @@ def snapshot_tags(qmp: QMPClient) -> set[str]:
     return {snap["tag"] for snap in list_snapshots(qmp)}
 
 
+# QEMU's refusal to snapshot a machine with a writable drive that cannot
+# hold internal snapshots (a raw `-drive` without snapshot=on/readonly=on).
+# The device name is QEMU's (`virtio1`), not a qmu name.
+UNSNAPSHOTTABLE_DRIVE_RE = re.compile(
+    r"Device '(?P<device>[^']*)' (is writable but )?does not support snapshots"
+)
+
+
 def _classify_hmp_failure(message: str) -> str:
     """Bucket an HMP savevm/loadvm/delvm error so the CLI can name the fix.
 
     `missing` — the tag is not in the image (`loadvm` says "does not exist in
     one or more devices"); `bad_name` — HMP could not parse the name as one
-    token (whitespace); `hmp` — anything else QEMU refused.
+    token (whitespace); `drive` — a writable drive cannot hold snapshots
+    (`Device 'virtio1' is writable but does not support snapshots`); `hmp` —
+    anything else QEMU refused.
     """
     if "does not exist" in message:
         return "missing"
     if "extraneous characters" in message:
         return "bad_name"
+    if UNSNAPSHOTTABLE_DRIVE_RE.search(message):
+        return "drive"
     return "hmp"
 
 

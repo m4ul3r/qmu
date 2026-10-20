@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -424,6 +425,35 @@ def test_failed_command_json_out_envelope_reports_the_failure(wired, tmp_path, c
     assert payload["stdout"] == "nope"
 
 
+@pytest.mark.parametrize("timed_out, exit_class", [(False, 1), (True, 124)])
+def test_a_spilled_failure_keeps_its_classification_on_the_pointer(
+    wired, capsys, monkeypatch, tmp_path, timed_out, exit_class
+):
+    """#156: a failing exec whose envelope spilled printed only the artifact
+    keys, so `exit 7` (1), a timeout (124) and a crash (3) were the same
+    pointer and there was no `hint` to run. The pointer repeats the
+    outcome keys the artifact holds; the bulky output stays in the file."""
+    monkeypatch.setenv("QMU_TEMP_DIR", str(tmp_path / "rt"))
+    big = "x" * 200_000
+    if timed_out:
+        wired(raises=SSHError(
+            "SSH command timed out after 3.0s: cmd", stdout=big, stderr=""
+        ))
+    else:
+        wired(rc=7, stdout=big)
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "cmd"])
+
+    assert rc == exit_class
+    pointer = json.loads(capsys.readouterr().out)
+    stored = json.loads(Path(pointer["artifact_path"]).read_text())
+    assert pointer["ok"] is False and "stdout" not in pointer
+    for key in ("vm_id", "exit_code", "crash_detected", "ssh_error", "hint"):
+        assert pointer[key] == stored[key], key
+    assert pointer.get("timed_out") == stored.get("timed_out")
+    assert pointer["hint"]
+
+
 def test_failed_command_text_spill_keeps_the_bytes_and_the_failure(
     wired, capsysbinary, monkeypatch, tmp_path
 ):
@@ -618,8 +648,11 @@ def test_a_blocked_qmp_probe_does_not_defeat_the_command_deadline(
     greeting budget per cadence, so the loop neither drained nor enforced
     the deadline while blocked, and a child that finished meanwhile was
     accepted as completed. The probe is now off-thread with a bounded wait:
-    the deadline holds within +0.3 s, output seen before it is kept, and the
-    busy socket is still treated as "running" (no spurious abort)."""
+    the deadline holds — well before the >= 3 s a synchronous 2 s stall at
+    the 1 s QMP cadence would take, with headroom for a loaded shared host —
+    output seen before it is kept, and the busy socket is still treated as
+    "running" (no spurious abort). The child sleeps past any such slack so
+    its later output can never race the kill."""
     def held_qmp(inst):
         time.sleep(2.0)  # a QMPClient.connect() waiting out its greeting budget
         return None
@@ -628,17 +661,17 @@ def test_a_blocked_qmp_probe_does_not_defeat_the_command_deadline(
     serial = tmp_path / "vm.serial.log"
     serial.write_text("boot ok\n")
     client = _fake_ssh_on_path(
-        tmp_path, monkeypatch, "echo early\nsleep 2.5\nprintf done\n"
+        tmp_path, monkeypatch, "echo early\nsleep 4\nprintf done\n"
     )
     watcher = guest._guest_abort_watcher(_instance(str(serial)), start_offset=0)
 
     started = time.monotonic()
     with pytest.raises(SSHError) as excinfo:
-        client.run("sleep 2.5; printf done", timeout=2.0, abort_when=watcher)
+        client.run("sleep 4; printf done", timeout=2.0, abort_when=watcher)
     elapsed = time.monotonic() - started
 
     assert not isinstance(excinfo.value, SSHAborted)
-    assert elapsed < 2.3, elapsed
+    assert elapsed < 2.75, elapsed
     assert excinfo.value.stdout == "early\n"
 
 
