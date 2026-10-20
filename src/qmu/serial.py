@@ -369,12 +369,16 @@ def extract_crash(
     return "\n".join(tail[crash_start:end]) + "\n"
 
 
-# A dying kernel's post-panic splat (the SMP reschedule WARNING) starts right
-# after its end banner — after at most a `cut here` line and its message — and
-# within milliseconds on its own clock. Anything else after the banner is a
-# live guest again.
+# A dying kernel's post-panic splat starts right after its end banner — after
+# at most a `cut here` line and its message — within milliseconds on its own
+# clock, and says what it is: the scheduler IPIs a CPU `panic()` already
+# stopped ("sched: Unexpected reschedule of offline CPU#N!", a WARNING in
+# `native_smp_send_reschedule`). Position and clock alone are not enough: a
+# guest restored by `snapshot load` can crash on its very first line, within
+# the same second of guest time.
 _POST_PANIC_NOISE_SECONDS = 1.0
 _POST_PANIC_LEAD = re.compile(r"cut here|sched: Unexpected reschedule")
+_POST_PANIC_SIGNATURE = re.compile(r"Unexpected reschedule of offline CPU|smp_send_reschedule")
 # Lines a splat may run before its `end trace`; one that is still being
 # printed at the end of the log counts through EOF.
 _POST_PANIC_EVENT_MAX = 400
@@ -402,11 +406,13 @@ def _post_panic_noise(
     banner (blank, `cut here` and `sched: Unexpected reschedule` lines
     allowed before the headline) on the dying kernel's clock — a timestamp
     not earlier than the banner's and at most `_POST_PANIC_NOISE_SECONDS`
-    later — through their end marker, repeatedly. Bounding it by "the rest of
-    the log" hid every later crash: `snapshot load` prints no boot banner,
-    and the restored guest's clock can pass the panic's within a second, so
-    neither a banner nor the clock alone separates the two. A banner without
-    a timestamp (`printk.time=0`) claims nothing.
+    later — AND carry the post-panic reschedule signature in their lead or
+    headline, through their end marker, repeatedly. Bounding it by "the rest
+    of the log" hid every later crash: `snapshot load` prints no boot banner,
+    and the restored guest's first line can be its own crash headline within
+    a second of the panic on the guest clock, so neither a banner, the clock
+    nor adjacency alone separates the two. A banner without a timestamp
+    (`printk.time=0`) claims nothing.
     """
     noise: set[int] = set()
     for banner in sorted(i for i in end_lines if _PANIC_END_BANNER in tail[i]):
@@ -425,6 +431,7 @@ def _adjacent_splat(
 ) -> int | None:
     """One past the end of the post-panic splat starting at `index`, or None."""
     headline = None
+    signed = False
     for i in range(index, len(tail)):
         line = tail[i]
         if not line.strip():
@@ -432,12 +439,13 @@ def _adjacent_splat(
         when = _printk_time(line)
         if when is None or not stamp <= when <= stamp + _POST_PANIC_NOISE_SECONDS:
             return None
+        signed = signed or _POST_PANIC_SIGNATURE.search(line) is not None
         if i in start_lines and not is_terminal_panic_start(line):
             headline = i
             break
         if not _POST_PANIC_LEAD.search(line):
             return None
-    if headline is None:
+    if headline is None or not signed:
         return None
     last = min(len(tail), headline + _POST_PANIC_EVENT_MAX)
     for j in range(headline + 1, last):

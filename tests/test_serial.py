@@ -683,6 +683,30 @@ def test_extract_crash_after_a_snapshot_load_reports_the_restored_guests_crash(
     assert "int3" not in report
 
 
+def test_extract_crash_restored_guest_crashing_on_its_first_line_is_not_noise(tmp_path):
+    """Review round 2, live: after the load the restored guest's Oops was the
+    very next log line, 0.23 s after the panic's end banner on the guest
+    clock. Adjacent and in the window, it still is not the dying kernel's
+    reschedule splat."""
+    report = extract_crash(
+        _write(
+            tmp_path,
+            "load-first-line.serial.log",
+            "[   84.736941] BUG: kernel NULL pointer dereference, address: 0000000000000000\n"
+            "[   84.737000] Oops: 0002 [#1] PREEMPT SMP KASAN NOPTI\n"
+            "[   84.800000] Kernel panic - not syncing: Fatal exception\n"
+            "[   84.815646] ---[ end Kernel panic - not syncing: Fatal exception ]---\n"
+            "[   85.046159] BUG: kernel NULL pointer dereference, address: 0000000000000000\n"
+            "[   85.046300] Oops: 0002 [#1] PREEMPT SMP KASAN NOPTI\n"
+            "[   85.046400] RIP: 0010:w3r_write+0x10/0x20 [w3r]\n"
+            "[   85.046500] ---[ end trace 0000000000000000 ]---\n",
+        )
+    )
+    assert report is not None
+    assert report.startswith("[   85.046159] BUG: kernel NULL pointer dereference")
+
+
+
 # --- #142: a sanitizer report flood is many events, not one -------------------
 
 _RULE = "=" * 66

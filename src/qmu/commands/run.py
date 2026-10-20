@@ -204,6 +204,8 @@ def _boot_failure_payload(
                 "ssh_error": True,
                 "crash_detected": warned,
                 "crash": report,
+                "kernel_warning_detected": warned,
+                "kernel_warning": report,
                 "hint": "QEMU exited before the guest was reachable. Check: "
                         f"qmu log --vm {inst.vm_id} --tail 200",
             },
@@ -229,6 +231,8 @@ def _boot_failure_payload(
             "ssh_error": True,
             "crash_detected": warned,
             "crash": report,
+            "kernel_warning_detected": warned,
+            "kernel_warning": report,
             "hint": f"Guest did not answer SSH within {timeout:g}s and did not "
                     "panic. Raise --ssh-timeout, or check that the rootfs "
                     f"starts sshd: qmu log --vm {inst.vm_id} --tail 200",

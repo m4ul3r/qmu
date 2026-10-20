@@ -331,15 +331,18 @@ kernel prints right after its own `---[ end Kernel panic` banner (the SMP
 `native_smp_send_reschedule` WARNING) is noise, never "the last crash" —
 only that adjacent splat (`_post_panic_noise`: its headline right after the
 banner, at most `cut here`/`sched: Unexpected reschedule` before it, within
-1 s on the banner's printk clock, through its end marker), NOT "the rest of
-the log": a `snapshot load` prints no boot banner and the restored guest's
-clock can pass the panic's within a second (measured: 27 ms short), so
-cutting after the banner hid every later crash from `crash --full-history`.
+1 s on the banner's printk clock, AND the reschedule signature in its lead or
+headline, through its end marker), NOT "the rest of the log" and not
+position + clock alone: a `snapshot load` prints no boot banner, and the
+restored guest can crash on the very next line 0.22 s later on the guest
+clock (measured), which an unsigned rule hid from `crash --full-history`.
 
 A report printed while a guest command ran is attributed through the same
 keys on every path: `crash_detected: true` + `crash`, also when the command
 completed and the guest survived (#136; it used to be `kernel_warning` with
-`crash_detected: false` while `status` said `crashed`). The exit code stays
+`crash_detected: false` while `status` said `crashed` — `kernel_warning`/
+`kernel_warning_detected` stay on that path and `run`'s boot failure as the
+same report, for consumers of the old keys). The exit code stays
 the guest command's then — 3 still needs a terminal panic or a dropped
 transport.
 

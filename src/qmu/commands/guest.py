@@ -1124,6 +1124,9 @@ def _run_guest_command(
         )
     # L1: always include ssh_error/crash_detected so consumers have a stable,
     # explicit contract (not an implicit "key omitted on success").
+    # `kernel_warning`/`kernel_warning_detected` are the keys this report used
+    # to be filed under; they stay, carrying the same report, so a consumer
+    # written against them keeps working.
     data: dict[str, Any] = {
         "ok": rc == 0,
         "vm_id": inst.vm_id,
@@ -1132,6 +1135,8 @@ def _run_guest_command(
         "ssh_error": False,
         "crash_detected": crash is not None,
         "crash": crash,
+        "kernel_warning_detected": crash is not None,
+        "kernel_warning": crash,
     }
     if rc != 0:
         data["hint"] = _guest_exit_hint(inst, rc, crash is not None)

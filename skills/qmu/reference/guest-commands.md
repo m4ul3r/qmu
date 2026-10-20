@@ -32,7 +32,9 @@ fresh serial report). The reserved codes 2/3/4/124 are never guest values.
 A kernel report printed while the command ran — on every path, including a
 completed command whose guest survived an Oops — is `crash_detected: true`
 with the report in `crash`: the same event `status` calls `crashed` and `qmu
-crash` returns (the command's exit stays 0/1 when it completed).
+crash` returns (the command's exit stays 0/1 when it completed). A completed
+command (and `run`'s boot failure) also keeps the older `kernel_warning` /
+`kernel_warning_detected` keys, carrying the same report.
 
 - Output is **streamed**: in text mode guest stdout/stderr reach the host's
   stdout/stderr as the guest writes them (`for i in 1 2 3; do echo $i; sleep
