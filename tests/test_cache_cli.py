@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import time
 
 import pytest
@@ -254,6 +256,64 @@ def test_held_back_message_never_prescribes_older_than_zero(cache_root, capsys):
     out = capsys.readouterr().out
     assert "Held back" in out
     assert "--older-than 0" not in out
+
+
+def _age_tree(src, seconds):
+    stamp = time.time() - seconds
+    for path in [src, *src.rglob("*")]:
+        os.utime(path, (stamp, stamp), follow_symlinks=False)
+
+
+def _advised_older_than(text):
+    found = re.findall(r"qmu prune --build-residue[^\n]*?--older-than (\d+)", text)
+    assert found, text
+    return found[-1]
+
+
+def test_held_back_advice_releases_a_finished_build(cache_root, capsys):
+    """#164: residue qualifies by being OLDER than the threshold, so the
+    advice for a tree held back by the default must be a threshold that
+    makes it eligible once the build is over — not a larger one, which can
+    only hold back more."""
+    src = _tree(cache_root, "linux-7.0")
+    _age_tree(src, cache_mod.MIN_BUILD_RESIDUE_AGE + 3600)  # finished an hour ago
+    cli.main(["prune", "--build-residue", "--dry-run"])
+    advised = _advised_older_than(capsys.readouterr().out)
+
+    assert cli.main(["prune", "--build-residue", "--dry-run",
+                     "--older-than", advised, "--format", "json"]) == 0
+    residue = _json(capsys)["build_residue"]
+    assert residue["eligible"]["groups"] == ["linux-7.0"]
+    assert residue["held_back"]["files"] == 0
+
+
+def test_floor_refusal_hint_is_a_command_prune_accepts(cache_root, capsys):
+    _tree(cache_root, "linux-7.0")
+    assert cli.main(["prune", "--build-residue", "--older-than", "0",
+                     "--format", "json"]) == 1
+    advised = _advised_older_than(_json(capsys)["hint"])
+    assert cli.main(["prune", "--build-residue", "--dry-run",
+                     "--older-than", advised]) == 0
+
+
+def test_held_back_advice_keeps_the_tree_scope(cache_root, capsys):
+    """Advice given after previewing one tree must not reclaim the others."""
+    mine = _tree(cache_root, "linux-7.0")
+    other = _tree(cache_root, "linux-6.9")
+    _age_tree(mine, cache_mod.MIN_BUILD_RESIDUE_AGE + 3600)
+    _age_tree(other, cache_mod.MIN_BUILD_RESIDUE_AGE + 3600)
+    cli.main(["prune", "--build-residue", "--tree", "linux-7.0", "--dry-run"])
+    out = capsys.readouterr().out
+    advised = re.search(r"qmu (prune --build-residue[^\n]*--older-than \d+)", out)
+    assert advised, out
+    argv = shlex.split(advised.group(1))
+    assert "--dry-run" in argv  # a preview's advice is still a preview
+    argv.remove("--dry-run")
+
+    assert cli.main([*argv, "--format", "json"]) == 0
+    removed = _json(capsys)["build_residue"]["removed"]
+    assert removed and all("linux-7.0" in entry["path"] for entry in removed)
+    assert list((other / "kernel").glob("*.o"))
 
 
 def test_keep_logs_is_rejected(cache_root):

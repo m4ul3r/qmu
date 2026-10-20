@@ -28,6 +28,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ..debug import check_unwarned_reboot
 from ..hostcc import host_compile, resolve_host_cc
 from ..instance import (
     QMUError,
@@ -60,6 +61,7 @@ from ..ssh import (
     guest_bytes,
     guest_lossy,
     is_transport_failure,
+    never_connected,
     probe_refused_auth,
 )
 from .._cliutil import (
@@ -95,13 +97,15 @@ def _choose_running(vm_id: str | None, command: str) -> VMInstance:
     VM that `qmu list` displays; on that miss the shared describer answers
     instead (the same words and `vm_id` `exec` gives), and only a name no
     command knows keeps the "not found" listing. Paid on the failure path
-    only, so a running VM costs no extra classification.
+    only, so a running VM costs no extra classification. A guest reboot the
+    VM's debugger was not told about is announced here (#184).
     """
     try:
-        return choose_instance(vm_id)
+        inst = choose_instance(vm_id)
     except QMUError:
         _require_running_vm(vm_id, command)
         raise
+    return check_unwarned_reboot(inst)
 
 
 # ---------------------------------------------------------------------------
@@ -190,19 +194,20 @@ def _transfer_transport_lost(
     contract's transport-loss (3) and SSH-failure (4) buckets.
     """
     crash = extract_crash(inst.serial_log, start_offset=start_offset)
+    vm = inst.vm_id
     if crash is not None:
         hint = (
             "SCP transport lost. Kernel may have crashed. "
-            "See crash field or run: qmu crash"
+            f"See crash field or run: qmu crash --vm {vm}"
         )
         detail = f"Crash from serial log:\n{crash}"
         status = 3
     else:
         hint = (
             "SCP transport lost; VM may be unreachable. "
-            "No fresh crash report in serial log. Check: qmu log --tail 100"
+            f"No fresh crash report in serial log. Check: qmu log --vm {vm} --tail 100"
         )
-        detail = "No fresh crash detected. Check: qmu log --tail 100"
+        detail = f"No fresh crash detected. Check: qmu log --vm {vm} --tail 100"
         status = 4
     direction = (
         f"{local} -> guest:{remote}"
@@ -505,23 +510,30 @@ def _transport_lost(ssh: SSHClient, inst: VMInstance) -> bool:
     return True
 
 
-def _ssh_lost_hint(crash: str | None) -> str:
+def _ssh_lost_hint(crash: str | None, vm: str, *, connected: bool = True) -> str:
     """The SSH-lost hint text, in one place.
 
     `exec`/`dmesg`/`compile --run` (via :func:`_ssh_lost_payload`) and the
     transfers report the same condition, so the follow-up command a caller is
     told to run must not differ between them: `compile --run` used to name no
     follow-up at all, so an agent whose exploit panicked the guest was never
-    pointed at `qmu crash`.
+    pointed at `qmu crash`. Every follow-up names the VM: a bare `qmu log`
+    fails under `QMU_REQUIRE_VM=1` or with several VMs running (#180).
     """
     if crash is not None:
         return (
             "SSH connection lost. Kernel may have crashed. "
-            "See crash field or run: qmu crash"
+            f"See crash field or run: qmu crash --vm {vm}"
+        )
+    if not connected:
+        return (
+            "SSH could not connect, so the command never started (safe to "
+            "re-run once the guest answers). No fresh crash report in serial "
+            f"log. Check: qmu status --vm {vm}; qmu log --vm {vm} --tail 100"
         )
     return (
         "SSH connection lost; VM may be unreachable. "
-        "No fresh crash report in serial log. Check: qmu log --tail 100"
+        f"No fresh crash report in serial log. Check: qmu log --vm {vm} --tail 100"
     )
 
 
@@ -530,6 +542,7 @@ def _ssh_lost_payload(
     inst: VMInstance,
     *,
     start_offset: int,
+    connected: bool = True,
 ) -> tuple[int, dict[str, Any], list[str]]:
     """Build the SSH-lost (status, data, text) triple; status 3 only on a crash.
 
@@ -550,16 +563,29 @@ def _ssh_lost_payload(
     classification without re-deriving it: a second copy of this decision is
     exactly how ``exec`` and ``push``/``pull`` came to disagree about what a
     dropped connection means.
+
+    `connected=False` is a 255 that :func:`~qmu.ssh.never_connected` proves
+    was ssh's own connect/banner failure (#177): the same class (4, or 3 with
+    a fresh crash), but the command is not described as having run — it
+    never started — whatever a later probe says, because sshd coming up
+    during the probe window made the old path report the guest command as
+    having exited 255.
     """
     crash = extract_crash(inst.serial_log, start_offset=start_offset)
+    vm = inst.vm_id
     # CORR-5: only assert a kernel crash when a crash report was actually
     # extracted; otherwise the connection merely dropped (VM unreachable) and we
     # must not send the agent chasing a phantom panic.
-    hint = _ssh_lost_hint(crash)
+    hint = _ssh_lost_hint(crash, vm, connected=connected)
     if crash is not None:
         text_msg = f"\nCrash from serial log:\n{crash}"
     else:
-        text_msg = "\nNo fresh crash detected in serial log. Check: qmu log --tail 100"
+        text_msg = f"\nNo fresh crash detected in serial log. Check: qmu log --vm {vm} --tail 100"
+    headline = (
+        f"SSH connection lost while running: {command}"
+        if connected
+        else f"SSH could not connect; the command was not started: {command}"
+    )
     # `exit_code`/`vm_id` are present on every exec envelope: the guest's exit
     # code is unknown here (ssh's own 255 is not the guest's), so it is null
     # rather than absent — a caller reads one key set on every path.
@@ -576,7 +602,34 @@ def _ssh_lost_payload(
     # 3 only with a corroborating fresh crash; a bare dropped connection
     # (no sshd, guest wedged) is transport-layer, i.e. 4.
     status = 3 if crash is not None else 4
-    return status, result, [f"SSH connection lost while running: {command}", text_msg]
+    return status, result, [headline, text_msg]
+
+
+def _ssh_255_payload(
+    ssh: SSHClient,
+    command: str,
+    inst: VMInstance,
+    *,
+    start_offset: int,
+    stdout: str,
+    stderr: str,
+) -> tuple[int, dict[str, Any], list[str]] | None:
+    """The SSH-lost triple for an rc-255 session the serial log and QMP did
+    not explain, or None when the guest command itself returned 255.
+
+    ssh's own pre-session failure (`Connection timed out during banner
+    exchange`, :func:`~qmu.ssh.never_connected`) settles it without a probe:
+    the command never ran, so a sshd that comes up during the probe window
+    must not turn it into "the guest command exited 255" (#177). Anything
+    else is ambiguous and :func:`_transport_lost` probes.
+    """
+    if never_connected(255, stdout, stderr):
+        return _ssh_lost_payload(
+            command, inst, start_offset=start_offset, connected=False
+        )
+    if _transport_lost(ssh, inst):
+        return _ssh_lost_payload(command, inst, start_offset=start_offset)
+    return None
 
 
 def _explain_lost_transport(
@@ -805,7 +858,7 @@ def _command_timeout_payload(
             f"No fresh crash report in the serial log. Check: qmu status --vm {vm}; "
             f"qmu log --vm {vm} --tail 100"
         )
-        detail = "No fresh crash detected in serial log. Check: qmu log --tail 100"
+        detail = f"No fresh crash detected in serial log. Check: qmu log --vm {vm} --tail 100"
     return (
         124,
         {
@@ -868,10 +921,11 @@ def _with_guest_output(
     The stopped child's output is still the guest's output: a long-running
     exploit that prints progress and then panics (or outlives `--timeout`)
     has told the caller where it got to, and dropping that with the
-    classification made every such run look silent. Guest stdout leads on
-    stdout (it is stdout) with the classification's text after it; guest
-    stderr goes to the stderr notes, verbatim — unless a stream sink already
-    relayed it live (`note_stderr=False`).
+    classification made every such run look silent. Guest stdout goes to
+    stdout (it is stdout); the classification's text and guest stderr go to
+    stderr — the text as a note after the guest's own stderr, which is in
+    the notes verbatim unless a stream sink already relayed it live
+    (`note_stderr=False`).
     """
     status, data, text = outcome
     data.update(_stream_fields(stdout, stderr))
@@ -901,9 +955,10 @@ class _TextStreamSink:
     the budget (:data:`STREAM_SPILL_BYTES`) stays on stdout, and the first
     chunk crossing it diverts the remainder into a spill file that then holds
     the *whole* output (the prefix already shown included), announced by the
-    usual pointer + preview trailer once the command ends. The trailing
-    `text` lines (a crash report, the timeout notice) follow the stream to
-    the same destination, exactly as they were appended to `raw`.
+    usual pointer + preview trailer once the command ends. The file (like
+    stdout) holds guest stdout only: the outcome text (a crash report, the
+    timeout or debugger-stop notice) is a stderr note, rendered after the
+    stream (#172).
 
     `finish` writes whatever the final output holds beyond what was
     relayed: nothing for the real client, everything for a test double that
@@ -931,6 +986,12 @@ class _TextStreamSink:
     def _open(self, path: Path) -> None:
         self._path = path
         self._file = path.open("wb")
+
+    @property
+    def wrote_to_file(self) -> bool:
+        """True when stdout ended with a pointer line (`--out` or a spill),
+        not with the guest's last byte."""
+        return self._path is not None
 
     def on_chunk(self, stream: str, data: bytes) -> None:
         if stream == "stderr":
@@ -975,28 +1036,19 @@ class _TextStreamSink:
         self,
         stdout: str,
         stderr: str,
-        text: list[str],
         *,
         source_ok: bool,
         exit_code: int | None,
     ) -> None:
-        """Flush the un-relayed remainder, the `text` trailer, and the
-        pointer when the stream went to a file."""
+        """Flush the un-relayed remainder, and the pointer when the stream
+        went to a file."""
         out_raw, err_raw = guest_bytes(stdout), guest_bytes(stderr)
         self.on_chunk("stdout", out_raw[self._out_received:])
         self.on_chunk("stderr", err_raw[self._err_received:])
-        tail = b""
-        if text:
-            if out_raw and not out_raw.endswith(b"\n"):
-                tail += b"\n"
-            tail += "\n".join(text).encode("utf-8")
-            if not tail.endswith(b"\n"):
-                tail += b"\n"
-            self._write_out(tail)
         if self._file is None:
             return
         self._file.close()
-        full = out_raw + tail
+        full = out_raw
         if self._spilled:
             mark_spill_artifact(self._path)
         artifact = _artifact_payload(
@@ -1114,17 +1166,18 @@ def _classify_guest_command(
     stderr notes) rather than emitting, so ``qmu exec``, ``qmu run`` and
     ``compile --run`` render the same classification under their own
     ``stem`` instead of maintaining copies of the crash-vs-transport-loss
-    discrimination. In text mode the guest stdout goes to stdout byte for
-    byte, followed by the text lines when the command was lost (the crash
-    report); the notes belong on stderr (guest stderr bytes verbatim, the
-    `[exit code: N]` trailer, a survived kernel report) — see
+    discrimination. In text mode stdout is the guest's stdout, byte for
+    byte; the text lines (the crash report, the timeout or halt notice when
+    the command was lost) and the notes belong on stderr (guest stderr bytes
+    verbatim, the `[exit code: N]` trailer, a survived kernel report) — see
     :func:`_guest_result`.
 
     The ssh child is watched by :func:`_guest_abort_watcher`: a terminal
     panic appended after the command started, or a vCPU QMP reports halted,
-    kills it immediately instead of waiting the keepalive window (15 s) plus
-    the liveness re-probes for ssh to report the loss itself (measured 20–50 s
-    for a sysrq crash the serial log showed within 100 ms).
+    kills it immediately — ssh's keepalive never gives up on a silent guest
+    (#182), and before that it took the keepalive window plus the liveness
+    re-probes (measured 20–50 s for a sysrq crash the serial log showed
+    within 100 ms).
 
     `sink` (from :func:`_stream_sink`) receives the output live; a text sink
     relays guest stderr itself, so the stderr bytes then stay out of `notes`.
@@ -1179,18 +1232,18 @@ def _classify_guest_command(
     # often with EMPTY stderr (LogLevel=ERROR suppresses the keepalive message),
     # so a stderr-marker test is unreliable. rc=255 is also a legal guest exit
     # code, so disambiguate: the serial log / QMP first (a panic appended after
-    # the command started, or a halted vCPU, settle it), then an authoritative
+    # the command started, or a halted vCPU, settle it), then ssh's own
+    # never-connected lines (#177), then an authoritative
     # liveness probe (retried once to avoid a false positive on a busy live
     # guest): if SSH is still unreachable the guest vanished (crash); if it
     # answers, the guest genuinely returned 255 and we take the normal path.
     if rc == 255:
         explained = _explain_lost_transport(
             command, inst, start_offset=command_start_offset, session_note=True
+        ) or _ssh_255_payload(
+            ssh, command, inst, start_offset=command_start_offset,
+            stdout=stdout, stderr=stderr,
         )
-        if explained is None and _transport_lost(ssh, inst):
-            explained = _ssh_lost_payload(
-                command, inst, start_offset=command_start_offset
-            )
         if explained is not None:
             return _with_guest_output(explained, stdout, stderr, note_stderr=note_stderr)
 
@@ -1252,6 +1305,13 @@ def _guest_exit_hint(inst: VMInstance, rc: int, kernel_report: bool) -> str:
     )
 
 
+def _stdout_is_terminal() -> bool:
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def _guest_result(
     *,
     data: dict[str, Any],
@@ -1259,6 +1319,7 @@ def _guest_result(
     stderr: str = "",
     text: list[str] = (),
     notes: list[str | bytes] = (),
+    followups: list[str] = (),
     stem: str,
     exit_code: int,
     sink: _TextStreamSink | _NdjsonStreamSink | None = None,
@@ -1267,31 +1328,42 @@ def _guest_result(
 
     Text mode writes the guest's `stdout` bytes to stdout exactly as the
     guest wrote them — no decode, no added newline — as `Result.raw`
-    (spill/--out apply). `text` (the crash report or timeout notice when the
-    command was lost) follows on its own lines. An empty payload prints
-    nothing rather than a blank line, so `qmu exec ... > out.txt` is
-    byte-exact for a silent command too. `notes` go to stderr: `bytes`
-    entries are guest stderr, verbatim; `str` entries (`[exit code: N]`,
-    kernel warnings, follow-up hints) are qmu's lines and start on a fresh
-    line. `exec` used to print all of it on stdout as `[stderr] ...` /
-    `[exit code: N]` lines, so a pipeline or a redirect collected the
-    decorations as if the guest had printed them; then it rendered the
-    stdout as text, so `printf x` arrived as `x\\n` and a 0xff byte as
-    U+FFFD. JSON modes: `data` is the envelope.
+    (spill/--out apply), and nothing else: an empty payload prints nothing
+    rather than a blank line, so `qmu exec ... > out.txt` is byte-exact for
+    a silent command too. `notes` go to stderr: `bytes` entries are guest
+    stderr, verbatim; `str` entries (`[exit code: N]`, kernel warnings,
+    follow-up hints) are qmu's lines and start on a fresh line. `text` (the
+    crash report, timeout or debugger-stop notice when the command was lost)
+    follows them, then `followups` (`run`'s preserved-VM hints: the cause
+    reads before the cleanup advice). When guest stdout on a terminal ended
+    mid-line, the text starts on a fresh terminal line. `exec` used to
+    print all of it on stdout as
+    `[stderr] ...` / `[exit code: N]` lines, so a pipeline or a redirect
+    collected the decorations as if the guest had printed them; then it
+    rendered the stdout as text, so `printf x` arrived as `x\\n` and a 0xff
+    byte as U+FFFD; the `text` trailer stayed on stdout until #172. JSON
+    modes: `data` is the envelope.
 
     With a text `sink` the stdout bytes (and guest stderr) were relayed as
-    they arrived; `sink.finish` writes the trailer and any remainder, and
-    the Result is `streamed` so render adds nothing to stdout. The
-    `[exit code: N]`/warning/hint notes still follow on stderr, on a fresh
-    line after streamed stderr that ended without one. An ndjson sink has
-    nothing left to do: the envelope renders as usual.
+    they arrived; `sink.finish` writes any remainder, and the Result is
+    `streamed` so render adds nothing to stdout. The notes still follow on
+    stderr, on a fresh line after streamed stderr that ended without one.
+    An ndjson sink has nothing left to do: the envelope renders as usual.
     """
+    raw = guest_bytes(stdout)
+    if text:
+        if (raw and not raw.endswith(b"\n") and _stdout_is_terminal()
+                and not (isinstance(sink, _TextStreamSink) and sink.wrote_to_file)):
+            # The old stdout trailer started on a fresh line; on a shared
+            # terminal the stderr text must too, without touching stdout.
+            notes = [*notes, b"\n"]
+        notes = [*notes, "\n".join(text)]
+    notes = [*notes, *followups]
     if isinstance(sink, _TextStreamSink):
         exit_rc = data.get("exit_code")
         sink.finish(
             stdout,
             stderr,
-            list(text),
             source_ok=bool(data.get("ok", False)),
             exit_code=exit_rc if isinstance(exit_rc, int) else None,
         )
@@ -1301,13 +1373,6 @@ def _guest_result(
             data=data, stem=stem, exit_code=exit_code, notes=tuple(notes),
             streamed=True,
         )
-    raw = guest_bytes(stdout)
-    if text:
-        if raw and not raw.endswith(b"\n"):
-            raw += b"\n"
-        raw += "\n".join(text).encode("utf-8")
-        if not raw.endswith(b"\n"):
-            raw += b"\n"
     return Result(
         data=data,
         stem=stem,
@@ -1320,7 +1385,7 @@ def _guest_result(
 
 def _handle_exec(args: argparse.Namespace) -> Result:
     _require_running_vm(args.vm, "exec")
-    inst = choose_instance(args.vm)
+    inst = check_unwarned_reboot(choose_instance(args.vm))
     _require_ssh(inst)
     if (refused := _preflight_ssh_guest(inst, stem="exec")) is not None:
         return refused
@@ -1424,14 +1489,17 @@ def _compile_on_host(
     # pushed binary lands non-executable and --run would fail with a bare
     # "Permission denied" that reads like a guest problem. chmod is part of
     # delivering a *runnable* artifact, so its failure is a compile failure.
-    chmod_rc, _, chmod_err = ssh.run(
+    chmod_rc, chmod_out, chmod_err = ssh.run(
         f"chmod +x {shlex.quote(remote_bin)}", timeout=15, abort_when=watcher
     )
     # ...unless the guest vanished under it. rc=255 is both a legal exit code and
     # what ssh returns when a panic drops the transport, so confirm with the same
     # liveness probe exec uses and hand the caller the transport-loss path:
-    # reporting a kernel panic as "compilation failed" would bury it.
-    if chmod_rc == 255 and _transport_lost(ssh, inst):
+    # reporting a kernel panic as "compilation failed" would bury it. ssh's own
+    # never-connected failure needs no probe: chmod never ran (#177).
+    if chmod_rc == 255 and (
+        never_connected(chmod_rc, chmod_out, chmod_err) or _transport_lost(ssh, inst)
+    ):
         raise _DeliveryTransportLost(
             "SSH transport lost (rc=255) while delivering the host-built "
             "binary — guest likely crashed"
@@ -1715,17 +1783,17 @@ def _handle_dmesg(args: argparse.Namespace) -> Result:
     # A panic during the read drops the connection and ssh exits 255, often
     # with only a banner-exchange timeout on stderr. rc=255 is also a legal
     # guest exit code, so disambiguate exactly as exec does: serial log / QMP
-    # first, then the probed liveness check. Without this, `qmu dmesg` on a
+    # first, then ssh's own never-connected lines, then the probed liveness
+    # check. Without this, `qmu dmesg` on a
     # dead guest returned exit 1 — the "guest command non-zero" class —
     # reading as "dmesg failed inside the guest" while the kernel was gone.
     if rc == 255:
         explained = _explain_lost_transport(
             cmd, inst, start_offset=command_start_offset
+        ) or _ssh_255_payload(
+            ssh, cmd, inst, start_offset=command_start_offset,
+            stdout=stdout, stderr=stderr,
         )
-        if explained is None and _transport_lost(ssh, inst):
-            explained = _ssh_lost_payload(
-                cmd, inst, start_offset=command_start_offset
-            )
         if explained is not None:
             status, data, out, text, notes = _with_guest_output(
                 explained, stdout, stderr

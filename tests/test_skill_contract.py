@@ -236,8 +236,6 @@ def test_mcp_reference_claims_match_the_code():
 RETIRED_CLAIMS = [
     (r"--older-than 0\s+# finally drop the retained logs",
      "kill-preserved logs prune at any age; only metadata-free .qemu.log/.qmp.sock remnants are gated"),
-    (r"stale one reports\s+`exited \(code 0\)`",
-     "a stale hand-started bridge fails with RuntimeError: Remote target disappeared"),
     (r"wait` ends in `124` with `crash: null` instead of reporting the panic",
      "bare wait returns 3 at the panic line whether or not --no-reboot is set"),
     (r"15-60 s on a busy host", "list takes a few seconds; the estimate was wrong"),

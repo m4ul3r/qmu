@@ -23,6 +23,9 @@ KEEP_RESIDUE=false
 CONFIG_ONLY=false
 VERBOSE=false
 VERSION=""
+# Caller's kconfig overlay: symbol -> value (y, m, n, a "string" or a
+# number), last setting wins. See add_overlay / --config-enable.
+declare -A OVERLAY=()
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -72,7 +75,20 @@ Optional:
   --outdir DIR           Override output directory
   --jobs N               Parallel build jobs (default: nproc)
   --no-cache             Rebuild even if output exists
-  --config-only          Generate .config and exit (don't build)
+  --config-only          Generate .config and exit (don't build); prints
+                         CONFIG and KERNEL_SRC (the source tree, configured
+                         with that .config); with --keep-residue it skips
+                         mrproper, so the tree keeps its objects
+  --config-enable SYM    Set CONFIG_SYM=y after the built-in overlays, before
+                         the final olddefconfig (repeatable; SYM or CONFIG_SYM,
+                         comma-separated lists allowed)
+  --config-disable SYM   Same, CONFIG_SYM=n (e.g. --config-disable KASAN)
+  --config-fragment FILE Apply a kconfig fragment (CONFIG_X=y|m|n|"str"|N lines,
+                         '# CONFIG_X is not set'); repeatable, later settings
+                         win. A custom config builds into its own output
+                         directory (kernels/VER/ARCH-kconfig-<hash>), never another
+                         config's cache; a requested setting olddefconfig drops
+                         (unmet 'depends on') fails the build.
   --keep-residue         Keep in-tree build intermediates (*.o, .*.cmd, ...)
                          after a successful build. Default is to remove them:
                          the next build mrpropers the tree anyway, so they
@@ -88,7 +104,7 @@ Environment:
 Also written to the output directory: System.map (needed for symbol lookup
 when a vmlinux is unavailable).
 
-Output (eval-able; --config-only outputs only CONFIG and does not generate debugger helpers):
+Output (eval-able; --config-only outputs only CONFIG and KERNEL_SRC and does not generate debugger helpers):
   KERNEL=/path/to/bzImage
   VMLINUX=/path/to/vmlinux
   CONFIG=/path/to/.config
@@ -98,8 +114,53 @@ Output (eval-able; --config-only outputs only CONFIG and does not generate debug
 Example:
   eval $(tools/kbuild.sh --version 6.6.75 --arch arm64)
   qmu launch --kernel "$KERNEL"
+  eval $(tools/kbuild.sh --version 6.1.75 --config-enable NF_TABLES,USER_NS --config-disable KASAN)
 EOF
   exit 2
+}
+
+# Record one overlay setting. SYM may carry the CONFIG_ prefix; VALUE is y,
+# m, n, a double-quoted string (no embedded quote or backslash) or a decimal/
+# hex number -- exactly what scripts/config can set and .config can show.
+add_overlay() {
+  local sym="${1#CONFIG_}" value="$2" origin="$3"
+  [[ "$sym" =~ ^[A-Za-z0-9_]+$ ]] || die "$origin: invalid kconfig symbol '$1'"
+  if ! [[ "$value" =~ ^(y|m|n|-?[0-9]+|0x[0-9a-fA-F]+)$ || "$value" =~ ^\"[^\"\\]*\"$ ]]; then
+    die "$origin: unsupported value for CONFIG_$sym: $value (expected y, m, n, a \"string\" or a number)"
+  fi
+  OVERLAY["$sym"]="$value"
+}
+
+add_overlay_list() {
+  local list="$1" value="$2" flag="$3" sym
+  local -a syms
+  [[ -n "$list" ]] || die "$flag needs a symbol"
+  IFS=',' read -r -a syms <<< "$list"
+  for sym in "${syms[@]}"; do
+    add_overlay "$sym" "$value" "$flag"
+  done
+}
+
+add_overlay_fragment() {
+  local file="$1" line n=0
+  [[ -f "$file" && -r "$file" ]] || die "--config-fragment: cannot read $file"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    if [[ -z "$line" ]]; then
+      continue
+    elif [[ "$line" =~ ^#\ *CONFIG_([A-Za-z0-9_]+)\ is\ not\ set$ ]]; then
+      add_overlay "${BASH_REMATCH[1]}" n "$file:$n"
+    elif [[ "$line" == \#* ]]; then
+      continue
+    elif [[ "$line" =~ ^CONFIG_([A-Za-z0-9_]+)=(.*)$ ]]; then
+      add_overlay "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$file:$n"
+    else
+      die "$file:$n: not a kconfig fragment line: $line"
+    fi
+  done < "$file"
 }
 
 # ---------------------------------------------------------------------------
@@ -115,6 +176,12 @@ while [[ $# -gt 0 ]]; do
     --no-cache)   NO_CACHE=true; shift ;;
     --keep-residue)    KEEP_RESIDUE=true; shift ;;
     --config-only) CONFIG_ONLY=true; shift ;;
+    --config-enable)   [[ $# -ge 2 ]] || die "--config-enable needs a symbol"
+                       add_overlay_list "$2" y --config-enable; shift 2 ;;
+    --config-disable)  [[ $# -ge 2 ]] || die "--config-disable needs a symbol"
+                       add_overlay_list "$2" n --config-disable; shift 2 ;;
+    --config-fragment) [[ $# -ge 2 ]] || die "--config-fragment needs a file"
+                       add_overlay_fragment "$2"; shift 2 ;;
     --verbose)    VERBOSE=true; shift ;;
     -h|--help)    usage ;;
     *)            die "unknown argument: $1" ;;
@@ -231,11 +298,34 @@ esac
 # ---------------------------------------------------------------------------
 # output directory
 # ---------------------------------------------------------------------------
+# A custom kconfig overlay is part of the build's identity: canonical form
+# (one SYM=VALUE per symbol, sorted, so equivalent flag/fragment spellings
+# agree) hashed into its own output directory, and stamped there in
+# kconfig-overlay so no cache check accepts another config's build.
+if [[ "${OVERLAY[MODULES]:-}" == n ]]; then
+  # Every build exports KDIR and proves it with a module build; a kernel
+  # without module support can never pass that, so refuse before compiling.
+  die "CONFIG_MODULES=n is not supported: kbuild's output contract includes KDIR (an out-of-tree module build tree), which needs CONFIG_MODULES=y"
+fi
+OVERLAY_SPEC=""
+if (( ${#OVERLAY[@]} )); then
+  OVERLAY_SPEC="$(for sym in "${!OVERLAY[@]}"; do
+    printf '%s=%s\n' "$sym" "${OVERLAY[$sym]}"
+  done | LC_ALL=C sort)"
+fi
+
 if [[ -n "$OUTDIR_OVERRIDE" ]]; then
   OUTDIR="$OUTDIR_OVERRIDE"
+elif [[ -n "$OVERLAY_SPEC" ]]; then
+  OVERLAY_HASH="$(printf '%s\n' "$OVERLAY_SPEC" | sha256sum | cut -c1-12)"
+  OUTDIR="$CACHE/kernels/$VERSION/$ARCH-kconfig-$OVERLAY_HASH"
 else
   OUTDIR="$CACHE/kernels/$VERSION/$ARCH"
 fi
+OVERLAY_STAMP="$OUTDIR/kconfig-overlay"
+# Read by the container (mounted at /output) between the built-in overlays
+# and the final olddefconfig; removed once the container exits.
+OVERLAY_SCRIPT="$OUTDIR/.kbuild-overlay.sh"
 
 SRCDIR="$CACHE/kernels/src/linux-$VERSION"
 
@@ -283,6 +373,7 @@ fi
 
 emit_config_output() {
   printf 'CONFIG=%q\n' "$OUTDIR/.config"
+  printf 'KERNEL_SRC=%q\n' "$SRCDIR"
 }
 
 emit_build_outputs() {
@@ -332,12 +423,29 @@ clean_build_residue() {
     \) -print0 2>/dev/null | xargs -0 -r rm -f 2>/dev/null || true
 }
 
+# The build in OUTDIR is of THIS overlay: no stamp for the stock config, the
+# same canonical spec for a custom one.
+overlay_matches() {
+  if [[ -z "$OVERLAY_SPEC" ]]; then
+    [[ ! -e "$OVERLAY_STAMP" ]]
+  else
+    [[ -f "$OVERLAY_STAMP" && "$(cat "$OVERLAY_STAMP")" == "$OVERLAY_SPEC" ]]
+  fi
+}
+
+# --config-only promises KERNEL_SRC configured with CONFIG: a hit needs the
+# source tree's own .config to still be that one (any later build of this
+# version, another arch or overlay, reconfigures the shared tree).
 config_cache_complete() {
-  [[ -f "$OUTDIR/.config" ]]
+  [[ -f "$OUTDIR/.config" ]] &&
+  overlay_matches &&
+  [[ -f "$SRCDIR/Makefile" ]] &&
+  cmp -s "$SRCDIR/.config" "$OUTDIR/.config"
 }
 
 build_cache_complete() {
   [[ -f "$OUTDIR/$IMAGE_NAME" ]] &&
+  overlay_matches &&
   [[ -f "$OUTDIR/vmlinux" ]] &&
   [[ -f "$OUTDIR/.config" ]] &&
   [[ -f "$SRCDIR/Makefile" ]] &&
@@ -378,6 +486,60 @@ EOF
   chmod 755 "$KDIR/qmu-kmake"
 }
 
+# The overlay as a script the container sources: kbuild_overlay_apply runs
+# scripts/config for every setting; kbuild_overlay_verify checks each one
+# survived olddefconfig, which silently drops a symbol whose `depends on` is
+# unmet -- a build that quietly lacks what was asked for is the failure this
+# exists to prevent. Generated host-side (see clean_build_residue for why not
+# in the container body); values are %q-quoted.
+write_overlay_script() {
+  local line sym value
+  {
+    echo '# Generated by qmu tools/kbuild.sh: the caller kconfig overlay.'
+    echo 'kbuild_overlay_apply() {'
+    while IFS= read -r line; do
+      sym="${line%%=*}" value="${line#*=}"
+      case "$value" in
+        y) printf '  ./scripts/config --enable %q\n' "$sym" ;;
+        m) printf '  ./scripts/config --module %q\n' "$sym" ;;
+        n) printf '  ./scripts/config --disable %q\n' "$sym" ;;
+        \"*) value="${value#\"}"; value="${value%\"}"
+             printf '  ./scripts/config --set-str %q %q\n' "$sym" "$value" ;;
+        *) printf '  ./scripts/config --set-val %q %q\n' "$sym" "$value" ;;
+      esac
+    done <<< "$OVERLAY_SPEC"
+    echo '}'
+    cat <<'EOF'
+kbuild_overlay_expect() {
+  local sym=$1 want=$2 got
+  if ! grep -qxF "$sym" "$KBUILD_KCONFIG_SYMBOLS"; then
+    echo "kbuild: requested CONFIG_${sym}=${want}, but this kernel's Kconfig declares no symbol ${sym} (misspelled, or not in this version)" >&2
+    return 1
+  fi
+  got=$(grep -E "^(CONFIG_${sym}=|# CONFIG_${sym} is not set$)" .config | head -n 1 || true)
+  if [[ $want == n ]]; then
+    [[ -z $got || $got == "# CONFIG_${sym} is not set" ]] && return 0
+  else
+    [[ $got == "CONFIG_${sym}=${want}" ]] && return 0
+  fi
+  echo "kbuild: requested CONFIG_${sym}=${want}, but olddefconfig resolved it to: ${got:-not set (an unmet depends on: enable its dependencies too)}" >&2
+  return 1
+}
+EOF
+    echo 'kbuild_overlay_verify() {'
+    echo '  local bad=0'
+    # every symbol any Kconfig file of this tree declares, read once
+    echo '  KBUILD_KCONFIG_SYMBOLS=$(mktemp)'
+    echo "  grep -rhoE --include='Kconfig*' '^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+' . | awk '{print \$NF}' | sort -u > \"\$KBUILD_KCONFIG_SYMBOLS\" || true"
+    while IFS= read -r line; do
+      printf '  kbuild_overlay_expect %q %q || bad=1\n' "${line%%=*}" "${line#*=}"
+    done <<< "$OVERLAY_SPEC"
+    echo '  rm -f "$KBUILD_KCONFIG_SYMBOLS"'
+    echo '  return $bad'
+    echo '}'
+  } > "$OVERLAY_SCRIPT"
+}
+
 if [[ "$NO_CACHE" == false ]]; then
   if [[ "$CONFIG_ONLY" == true ]] && config_cache_complete; then
     log "cached config found at $OUTDIR/.config"
@@ -396,6 +558,13 @@ fi
 
 
 mkdir -p "$OUTDIR"
+# A stale stamp must not vouch for whatever this run leaves behind; the stamp
+# is rewritten only once the container has produced this overlay's config.
+rm -f "$OVERLAY_STAMP" "$OVERLAY_SCRIPT"
+if [[ -n "$OVERLAY_SPEC" ]]; then
+  write_overlay_script
+  log "kconfig overlay: $(tr '\n' ' ' <<< "$OVERLAY_SPEC")-> $OUTDIR"
+fi
 
 # ---------------------------------------------------------------------------
 # kernel source
@@ -526,6 +695,7 @@ docker run --rm \
     MINOR='$MINOR'
     ARCH_ARG='$ARCH'
     CONFIG_ONLY='$CONFIG_ONLY'
+    KEEP_RESIDUE='$KEEP_RESIDUE'
     GDB_TARGET='$GDB_TARGET'
     MAKE_VERBOSE='$MAKE_VERBOSE'
     SRC_ARCH='$SRC_ARCH'
@@ -542,8 +712,13 @@ docker run --rm \
       echo \"cross compiler: \$(\${CROSS_COMPILE}gcc --version | head -1)\" >&2
     fi
 
-    # clean previous build state
-    make ARCH=\$MAKE_ARCH \$MAKE_VERBOSE mrproper
+    # clean previous build state -- except for --config-only --keep-residue,
+    # whose point is a hand build that reuses the previous objects
+    if [[ \"\$CONFIG_ONLY\" == true && \"\$KEEP_RESIDUE\" == true ]]; then
+      echo 'config-only --keep-residue: skipping mrproper, the tree keeps its objects' >&2
+    else
+      make ARCH=\$MAKE_ARCH \$MAKE_VERBOSE mrproper
+    fi
 
     # base defconfig
     make ARCH=\$MAKE_ARCH CROSS_COMPILE=\$CROSS_COMPILE \$MAKE_VERBOSE \$DEFCONFIG
@@ -618,8 +793,23 @@ docker run --rm \
     fi
     ./scripts/config --enable GDB_SCRIPTS
 
+    # caller overlay (--config-enable/--config-disable/--config-fragment):
+    # after the built-in overlays so it can override them (KASAN off)
+    if [[ -f /output/.kbuild-overlay.sh ]]; then
+      source /output/.kbuild-overlay.sh
+      kbuild_overlay_apply
+    fi
+
     # re-sync after overlays
     make ARCH=\$MAKE_ARCH CROSS_COMPILE=\$CROSS_COMPILE \$MAKE_VERBOSE olddefconfig
+
+    if [[ -f /output/.kbuild-overlay.sh ]]; then
+      kbuild_overlay_verify || exit 42
+    fi
+    if [[ \"\$CONFIG_ONLY\" != true ]] && ! grep -qx CONFIG_MODULES=y .config; then
+      echo 'kbuild: the resolved .config has CONFIG_MODULES off; KDIR (module build tree) cannot be exported' >&2
+      exit 43
+    fi
 
     if [[ \"\$CONFIG_ONLY\" == true ]]; then
       cp .config /output/.config
@@ -706,10 +896,20 @@ docker run --rm \
 
 # `set -e` would otherwise abort on a failing `docker run` with make's/docker's
 # own status and never reach the diagnostic below.
+rm -f "$OVERLAY_SCRIPT"
+if [[ $RC -eq 42 && -n "$OVERLAY_SPEC" ]]; then
+  log "the requested kconfig overlay did not survive olddefconfig (see above); nothing was built"
+  exit 1
+fi
+if [[ $RC -eq 43 ]]; then
+  log "refusing to build a kernel without module support (see above); nothing was built"
+  exit 1
+fi
 if [[ $RC -ne 0 ]]; then
   log "build failed (exit $RC) — check $OUTDIR/build.log"
   exit 1
 fi
+[[ -z "$OVERLAY_SPEC" ]] || printf '%s\n' "$OVERLAY_SPEC" > "$OVERLAY_STAMP"
 
 # ---------------------------------------------------------------------------
 # output

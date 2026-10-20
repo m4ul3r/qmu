@@ -60,9 +60,9 @@ Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `
 | `ssh: "n/a (harness)"` / `ssh: "none"` (launch `ssh_status`: `"n/a (harness)"` / `"none (--no-net, no --ssh-port)"` — match the prefix) / SSH command refuses naming no endpoint | `n/a (harness)`: `--harness`, no SSH port by design. `none`: `--no-net` without `--ssh-port` | use `log`/`wait`/`crash`/`qmp`; for SSH relaunch **without** `--harness` (it ignores `--ssh-port`), or add `--ssh-port N` to a `--no-net` launch |
 | `ssh: "skipped"` / `"skipped (debugger attached)"` | guest paused/panicked, or a gdb client is attached (the probe's `uname` would trip breakpoints), so SSH was not probed | see the `guest` row above; `pry wait` for the stop |
 | `snapshot save` exit 124, `may_have_landed: true` | the save outran its budget (default 60 s + 20 s/GiB RAM); QEMU is probably still writing it and QMP queues behind it | `qmu snapshot list --vm X --timeout 300` (waits, shows whether the tag landed); do not retry the save until it answers; next time `--timeout N` |
-| `ssh_status: "no-console-output"` (launch exit 4) | serial log still empty after 10 s: wrong `console=` or `-M`/`-cpu` for the arch | VM is retained: `qmu log --vm X`; fix the cmdline (`ttyS0` x86, `ttyAMA0` arm) |
+| `ssh_status: "no-console-output"` (launch exit 4) | serial log still empty 10 s after QEMU started the vCPUs: wrong `console=` or `-M`/`-cpu` for the arch | VM is retained: `qmu log --vm X`; fix the cmdline (`ttyS0` x86, `ttyAMA0` arm) |
 | `ssh_status: "auth-failed"` / `ssh: "auth-failed"` (`SSHAuthError`, exit 4) | the guest booted and sshd answers, but refuses `ssh_user` with that key (`[ssh] user`/`key`, fixed at launch) | `qmu kill --vm X`; set `[ssh] user`/`key` to an account the image accepts (`root` for qmu rootfs), relaunch; run unprivileged with `--user NAME` instead |
-| `ssh_status: "timeout"`, `timed_out: true` (launch exit 124) | `--ssh-timeout` expired with the guest still booting; nothing broke | VM is retained: `qmu log --vm X --tail 50`, `qmu status --vm X` re-probes SSH, or relaunch with a longer `--ssh-timeout` |
+| `ssh_status: "timeout"`, `timed_out: true` (launch exit 124) | `--ssh-timeout` expired with the guest still booting — or QEMU itself still initialising (`error` says so; then the empty console is not a `console=` problem); nothing broke | VM is retained: `qmu log --vm X --tail 50`, `qmu status --vm X` re-probes SSH, or relaunch with a longer `--ssh-timeout` |
 | `[qmu] Warning: 'console=…' names …` / `'root=/dev/sda' names …` / `'root=/dev/vda' names …` | arch-cmdline lint (also in launch `warnings[]`): `/dev/sda` on x86_64, `/dev/vda` on aarch64/arm | fix before trusting a silent console |
 | `[!] kernel: ./bzImage (CHANGE ME placeholder; not found)` | the starter `qmu.toml` was never edited | set `[boot] kernel`; `[!]` rows drive exit 1 |
 | `Hint: quote the guest command … or put -- before it` (exit 2) | unquoted dash-word in `exec`/`run` | `qmu exec --vm X 'uname -a'` or `qmu exec --vm X -- uname -a` |
@@ -75,7 +75,7 @@ Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `
 | `error_type: "SCPFileError"` (exit 1) | missing local file, a directory, bad remote dir | fix the path; archive directories first |
 | `error_type: "SnapshotError"` (exit 1) | HMP refused; on `load` read `restore_state`: `none` → nothing restored (a missing tag is caught before `loadvm`, guest never stopped; `resumed: true` only if QEMU refused a listed tag); `partial`/`unknown` → disks already rewound, guest **left paused** on purpose (`guest_paused: true`) | `none`: run the `hint` (`qmu snapshot list --vm X`); `partial`/`unknown`: load a known-good tag or `kill` + `launch` — never a blind `qmu cont`; `reference/snapshots.md` |
 | `error_type: "ConfigError"`, `errors[]` | every schema problem in the file, with `source`/`key`/`hint` | fix all listed keys; cleanup commands are blocked until it parses (or run them from outside the project dir) |
-| `A debugger client is already attached to port N (pry bridge pid P)` | the stub serves one client; `qmu gdb` spawned nothing | reuse it (`pry --instance qmu-X`, the `bridge_instance_id`) or `pry kill --instance qmu-X` |
+| `A debugger client is already attached to port N (pry bridge pid P)` | the stub serves one client; `qmu gdb` spawned nothing | reuse it (`pry --instance qmu-X`, the `bridge_instance_id`) or `pry kill --instance qmu-X`; without `(pry bridge pid P)` the client is not qmu's and has no `qmu-X` name: `pry doctor` → `pry --instance <pid> info target` finds it |
 | `[qmu] Output spilled to <path> (~N tokens)` | result exceeded ~10k tokens; text shows a preview capped at 40 lines **and** 4096 bytes, then `[qmu] Preview: first A of B bytes (…)` | read `<path>` (`artifact_path` under JSON) |
 
 ## Bootstrap a project
@@ -194,8 +194,8 @@ Text mode: stdout is the guest's stdout **only**, byte-exact (no decode, no
 added newline — `printf x` is one byte, `0xff` passes through), **streamed
 as the guest writes it** (progress shows before exit or `--timeout`; ndjson
 gets `chunk` events, json stays buffered); guest stderr goes to stderr live,
-then `[exit code: N]` only when N ≠ 0 (`exec true` prints nothing); `compile
---run`'s `Compiled and ran X:` banner is on stderr too. JSON: `vm_id`,
+then `[exit code: N]` only when N ≠ 0 (`exec true` prints nothing); the
+timeout/crash/halt narrative and `compile --run`'s banner are on stderr too. JSON: `vm_id`,
 `exit_code` (null if unfinished), `stdout`, `stderr` (UTF-8 with U+FFFD;
 `stdout_lossy: true` / `stderr_lossy: true` present exactly when a byte was
 replaced), `timed_out`, `crash_detected`, `crash`, `run_as`. One argument is passed to
@@ -322,9 +322,9 @@ the same envelope. `qmu kbase` needs only SSH and `/proc/kallsyms` — no
 SSH probe (`ssh: "skipped (debugger attached)"`): that probe runs `uname`,
 which would trip `__x64_sys_newuname`. Address your bridge with `pry --instance
 qmu-<vm>` (`bridge_instance_id`; `bridge_pid` also works) on a shared host.
-`snapshot load`/`system_reset` re-sync the `qmu gdb` bridge (JSON `debugger`) or
-tear it down saying why; other clients, `snapshot save`, `kill` warn — coherence,
-KASLR, KVM watchpoints: `reference/debugging.md`. ARM: `reference/cross-arch.md`.
+`snapshot load`/`system_reset` re-sync the `qmu gdb` bridge (`pry resync`, JSON `debugger`) or tear
+it down saying why; other clients, `snapshot save` (`breakpoints_in_image`), a guest reboot, `kill`
+warn — coherence, KASLR, KVM watchpoints: `reference/debugging.md`. ARM: `reference/cross-arch.md`.
 
 ## Raw QEMU access
 

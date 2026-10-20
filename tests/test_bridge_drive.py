@@ -174,6 +174,9 @@ def _vm(tmp_path, monkeypatch, bridge, *, cmdline="console=ttyS0 nokaslr", runni
         lambda qmp, name: SnapshotResult(True, f"Snapshot '{name}' loaded."),
     )
     monkeypatch.setattr(debug, "_RESYNC_RETRY_SECONDS", 0.0)
+    # The sleeper owns no socket: model "the recorded bridge holds the stub"
+    # as "it is alive" (the hand-started tests record no bridge at all).
+    monkeypatch.setattr(debug, "bridge_holds_stub", debug.bridge_alive)
     return inst
 
 
@@ -286,9 +289,27 @@ def test_a_client_qmu_did_not_spawn_is_warned_about_never_driven(
     assert rc == 0
     assert "debugger" not in payload
     assert payload["warnings"] == [
-        debug.loadvm_stale_session_warning(VM).removeprefix("[qmu] WARNING: ")
+        debug.loadvm_stale_session_warning(load_instance(VM)).removeprefix("[qmu] WARNING: ")
     ]
     assert pry.calls() == []
+
+
+def test_qmus_bridge_that_lost_the_stub_to_another_client_is_not_driven(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """A live recorded bridge proves nothing about who holds the stub (#186):
+    re-syncing it would leave the client that does hold it unwarned."""
+    _vm(tmp_path, monkeypatch, bridge)
+    monkeypatch.setattr(debug, "bridge_holds_stub", lambda inst: False)
+    monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: True)
+
+    rc, payload = _json(capsys, ["snapshot", "load", "clean"])
+
+    assert rc == 0
+    assert "debugger" not in payload
+    assert len(payload["warnings"]) == 1
+    assert pry.calls() == []
+    assert bridge.poll() is None
 
 
 @pytest.mark.parametrize("restore_state", ["partial", "unknown"])
@@ -390,7 +411,9 @@ def test_a_reset_with_no_owned_bridge_keeps_the_warning(tmp_path, monkeypatch, c
     assert rc == 0
     assert "debugger" not in payload
     assert payload["warnings"] == [
-        debug.reset_dropped_breakpoints_warning(VM).removeprefix("[qmu] WARNING: ")
+        debug.reset_dropped_breakpoints_warning(
+            load_instance(VM), qemu_status="running"
+        ).removeprefix("[qmu] WARNING: ")
     ]
     assert pry.calls() == []
 

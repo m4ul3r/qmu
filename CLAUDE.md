@@ -79,7 +79,8 @@ install`, `rootfs shell`. A call becomes argv (options, then `--`, then
 positionals in order — one string is one token, the `exec`/`run` rule) and
 runs `cli.main(["--format", "json", *argv])` with `sys.stdout` captured
 per worker thread (`_ThreadStdout`); the captured JSON, parsed back and
-given `exit_code`, is the result. That is why the envelope, the `UsageError`
+given `qmu_exit` (the qmu process exit code; `exit_code` stays the guest
+command's, #122), is the result. That is why the envelope, the `UsageError`
 shape, spill pointers and `warnings[]` are byte-identical to the CLI's:
 they *are* the CLI's. Errors are results (`isError` mirrors `ok`), never
 protocol errors. `qmu_argv` passes a raw argv through (refusing the managed
@@ -160,11 +161,13 @@ code: N]`); `warnings` are stderr text written after the output in every
 mode (debugger-coherence warnings, follow-up hints — `result.warn(...)`) AND,
 under json/ndjson, the envelope's `warnings: [str]` (#74) — prefix-stripped
 (`envelope_warning`), merged with any `warnings` the handler put in `data`
-(launch's), deduplicated. A warning that fires before the handler — the
-broken-global-config notice in the dispatch gate — is recorded by
-`config.global_config_warnings()` (never written there) and attached by
-`cli._dispatch` (`result.warn(...)`) or `_emit_error` on the failure path, so
-`invoke()` callers get it on the Result and nothing is lost to stderr-only.
+(launch's), deduplicated. A warning that fires outside the handler's Result —
+the broken-global-config notice in the dispatch gate, a guest reboot the VM's
+debugger was not told about (found while the VM is resolved, #184) — is
+recorded (`config.global_config_warnings()`, `debug.coherence_warnings()`,
+never written there) and attached by `cli._dispatch` (`result.warn(...)`) or
+`_emit_error` on the failure path, both through `_cliutil.dispatch_warnings`,
+so `invoke()` callers get it on the Result and nothing is lost to stderr-only.
 Debugger-coherence warnings on the raw `qmp`/`monitor` routes travel the same
 way (`_after_mutation(..., warnings)`); never `sys.stderr.write` a warning
 from a handler. `Result.silent_exit(n)` renders nothing (group help, `rootfs
@@ -202,10 +205,13 @@ the whole output, pointer + `Preview … streamed above` trailer last);
 (surrogateescape) before the ordinary envelope; json gets `None` (buffered).
 `_run_guest_command(..., sink=)` threads it to `run` and keeps guest stderr
 out of `notes` when the sink already relayed it; `_guest_result(...,
-sink=)` calls `sink.finish` (un-relayed remainder — nothing for the real
-client, everything for a fake that never called `on_chunk` — then the crash/
-timeout `text`, then the pointer) and returns `Result(streamed=True)`, which
-`render` honours by skipping stdout and still writing `notes`/`warnings`.
+sink=)` appends the crash/timeout/halt `text` to the stderr `notes` (on
+every path, streamed or not — #172: it used to follow the guest's bytes on
+stdout), calls `sink.finish` (un-relayed remainder — nothing for the real
+client, everything for a fake that never called `on_chunk` — then the
+pointer; the `--out`/spill file holds guest stdout only) and returns
+`Result(streamed=True)`, which `render` honours by skipping stdout and
+still writing `notes`/`warnings`.
 Only the exec phase streams: `compile`'s gcc/chmod steps and `dmesg` pass no
 sink. Fakes keep working because `run(**kwargs)` may ignore `on_chunk`; a
 test that asserts *liveness* must relay chunks itself (`StreamingSSH` in
@@ -340,7 +346,13 @@ required: QMU_REQUIRE_VM is set`). No message anywhere recommends `prune
 transport (kernel panic). Handlers disambiguate with `_transport_lost()` (a
 liveness re-probe, retried once) plus `extract_crash()` on the serial log. Only
 emit the strong "kernel may have crashed" wording (exit 3) when a crash report
-was actually extracted; otherwise report "unreachable" and exit 4.
+was actually extracted; otherwise report "unreachable" and exit 4. A 255
+whose only output is ssh's own pre-session failure (`ssh.never_connected`:
+`Connection timed out during banner exchange`, `kex_exchange_identification:`,
+`ssh: connect to host …`) never ran the command and skips the probe —
+`guest._ssh_255_payload` makes it exit 4 "the command was not started" on
+exec/dmesg/compile's chmod; an sshd that came up during the probe window
+used to turn it into "the guest command exited 255" (#177).
 
 A third answer exists and is neither (#158): sshd answered and **refused the
 login** (`Permission denied (publickey,…)`). `SSHClient.probe()` returns
@@ -408,18 +420,25 @@ transport.
 Every guest command passes `abort_when=panicked` to `SSHClient.run`, a serial
 watcher polled while the child runs: a terminal panic raises `SSHAborted` with
 the output collected so far, so exec/compile/dmesg/run report exit 3 within a
-second instead of after the 15 s ssh keepalive plus re-probes. A halted vCPU
+second instead of waiting on ssh. A halted vCPU
 (debugger stop) aborts too, but `_run_guest_command` passes `detach_to` (#143):
 the ssh child is NOT killed, `ssh._spawn_drainer` hands its pipe read ends to
 a detached helper that appends the rest of the output to a spill file
 (`detached_output`, capped at 16 MiB, then discarded), so the remote command
 keeps its session and survives `pry continue`. Killing the mux client closed
-the channel and the command died of SIGPIPE on its next write. OpenSSH's
-keepalive does not drop the master while the vCPU is stopped (a 120 s halt
-was measured); `snapshot load`/reset/`kill` tearing the ControlMaster down
-still end it. The timeout path still kills. Text mode
-(`_run_guest_command`) prints guest stdout only on stdout; guest stderr and
-`[exit code: N]` (non-zero only) go to stderr so pipelines see guest bytes.
+the channel and the command died of SIGPIPE on its next write. The session
+lives in the ControlMaster, so the master's keepalive decides how long a
+halt it survives: `ssh._KEEPALIVE_OPTS` (every ssh/scp, so whichever command
+opens the master) sends one every 5 s but sets `ServerAliveCountMax` to
+INT_MAX — a reset (a guest that rebooted under an idle master) still ends it,
+silence never does. `CountMax=3` dropped the master, the trigger's output and
+its exit status 15 s into a breakpoint stop (#182; a 130 s halt measured
+since). Silence is qmu's to judge — the watcher sees panic/halt, `--timeout`
+bounds a wedged guest (124). `snapshot load`/reset/`kill` tearing the
+ControlMaster down still end the session. The timeout path still kills. Text mode
+(`_run_guest_command`) prints guest stdout only on stdout; guest stderr,
+`[exit code: N]` (non-zero only) and the lost/timeout/halt narrative go to
+stderr so pipelines see guest bytes.
 
 ### Serial-pattern waiting (`serial.SerialTail`, `lifecycle._wait_for_pattern`)
 
@@ -491,8 +510,12 @@ because an agent in `--format json` otherwise had to regex the other stream to
 learn that `--profile` dropped `nokaslr`. New launch-time lints go through
 `_note`, never a bare `sys.stderr.write`. `_warn_arch_cmdline_mismatch` is the
 arch/`console=`/`root=` lint; the SSH wait fails early with
-`ssh_status: "no-console-output"` when the serial log is still empty after
-~10 s, since a wrong-arch guest otherwise runs forever and answers nobody.
+`ssh_status: "no-console-output"` when the serial log is still empty
+~10 s after QMP first said the vCPUs run (`_vcpus_started`), since a
+wrong-arch guest otherwise runs forever and answers nobody. A QEMU retained
+before its main loop (#157) has written nothing because nothing ran: its
+window does not open until QMP answers, and a wait that ends first is 124
+naming QEMU's slow start, never a `console=` verdict (#176).
 
 `doctor` rows are `_doctor_row(check, status, detail)` with `status` in
 `ok|fail|warn|info` → glyph `[+] [!] [~] [i]`; `blocking` is `status == "fail"`
@@ -622,29 +645,46 @@ changed underneath it, so qmu operations that mutate VM reality make the
 debugger's view silently diverge — the same wrong-answer-with-no-error class as
 the crash/transport and state-axis bugs above. qmu owns the lifecycle events and
 knows a VM has a stub (`gdb_port is not None`), so `debug.py` enforces the half
-of the contract the protocol doesn't. For the bridge **qmu itself spawned**
-(`qmu gdb` records its pid; `bridge_alive` re-checks the identity) it acts:
-re-sync with pry's `pry resync`, or tear down and say why (#187). For any
-other client it **invalidates loudly** and never drives it.
+of the contract the protocol doesn't. For the bridge **qmu itself spawned**,
+while it is the attached client (`qmu_bridge_attached`), it acts after a load
+or a reset qmu issued: re-sync with pry's `pry resync`, or tear down and say
+why (#187). Everything else it **invalidates loudly** and never drives; the
+one other thing it asks the bridge is `pry status`, below.
+Every recovery a warning names was run as written against a live bridge,
+under KVM and TCG, because they differ (#183). Under KVM a breakpoint is an
+`int3` in guest RAM: a load or reset takes it out while GDB still counts it
+inserted, and GDB's lift-at-stop / insert-on-resume cycle (`pry interrupt` →
+`pry continue --background`) puts it back. Under TCG breakpoints live in
+QEMU keyed by virtual address: a load or a `nokaslr` reset leaves them
+firing, so those warnings say "nothing to re-arm" (`debug._tcg`, `kvm:
+false`; a pre-#39 `kvm: null` record is treated as KVM). A KASLR re-slide
+strands them either way: `kbase` (guest running) → `interrupt` → `load
+--base` → `continue`. A recovery names `qmu-<vm>` only while the bridge `qmu
+gdb` recorded is the attached client — `bridge_holds_stub` matches the
+client-end socket inode in `/proc/net/tcp` against the bridge's
+`/proc/<pid>/fd`; a live recorded bridge alone is not enough, it may have
+disconnected while a hand-started client took the stub (`_bridge_ref`, the
+`qmu gdb` refusal, `kill`'s stranded-client note, #186).
 
-- **Owned bridge (#187).** `qmp_cmds` checks `bridge_alive(inst)` after a
-  successful `snapshot load` and after the raw `loadvm`/`system_reset` routes
-  (`_after_mutation`), and calls `debug.drive_bridge_after_loadvm` /
-  `drive_bridge_after_reset`. The returned `BridgeDrive` becomes the envelope's
-  `debugger` object (`action: resynced|torn_down`; `resync` is pry's
-  `--format json` report verbatim — never reshape it), text-mode stderr notes
-  (the receipt; stdout stays the command's own) and warnings only when there
-  is something to act on (not-armed / `elf_match: false` locations, a
+- **Owned bridge (#187).** `qmp_cmds` checks `qmu_bridge_attached(inst)` after
+  a successful `snapshot load` and in `_after_mutation` (raw `loadvm`/
+  `system_reset` routes), and calls `debug.drive_bridge_after_loadvm` /
+  `drive_bridge_after_reset`. The returned `BridgeDrive` becomes the
+  envelope's `debugger` object (`action: resynced|torn_down`; `resync` is
+  pry's `--format json` report verbatim — never reshape it), text-mode stderr
+  notes (the receipt; stdout stays the command's own) and warnings only when
+  there is something to act on (not-armed / `elf_match: false` locations, a
   teardown). The operation's exit code never changes. A load is re-synced at
-  once. A reset is re-synced only on a running `nokaslr` guest, after the new
-  boot's banner, retried while a location is `unreadable`
-  (`RESET_KERNEL_WAIT_SECONDS`); a KASLR reset (new base readable only from the
-  booted guest, and the old base would arm int3s into unrelated code) and a
-  reset of a debugger-halted guest (stuck at the reset vector; GDB cannot even
-  resume it) are torn down, listing `breakpoints_dropped`. A load that failed
-  mid-restore drives nothing: a resync or a detach can resume the
-  half-restored machine (#87). A failed `pry resync` tears down.
-
+  once. A reset is re-synced only on a `nokaslr` guest QEMU reports `running`
+  right after it (the `_status_after_mutation` read), after the new boot's
+  banner, retried while a location is `unreadable` (`RESET_KERNEL_WAIT_
+  SECONDS`); a KASLR reset (new base readable only from the booted guest, and
+  the old base would arm int3s into unrelated code) and a reset at a debugger
+  stop (`prelaunch`; GDB cannot even resume it) are torn down, listing
+  `breakpoints_dropped`. A load that failed mid-restore drives nothing and
+  gets `loadvm_failed_restore_warning` instead of the re-arm recovery: a
+  continue, a resync or a detach can resume the half-restored machine (#87).
+  A failed `pry resync` tears down.
 - `debug_session_present(inst)` is the gate for divergences a *live* client
   would see: true when `gdb_port` is set AND `gdb_client_attached()` cannot
   positively rule out a connected client. The attach probe parses
@@ -656,19 +696,41 @@ other client it **invalidates loudly** and never drives it.
   only; `None` falls through so an unreadable `/proc` never locks the debugger
   out.
 - `snapshot save` deliberately uses the weaker `debug_stub_present(inst)`
-  (`gdb_port` alone): a debugger that already detached can have left `int3`
+  (`gdb_port` alone): a debugger that detached uncleanly can have left `int3`
   bytes behind, and the save captures them whether or not anyone is attached
-  now. A save on a `--gdb` VM therefore always warns; the skill documents this
-  as the one exception to attached-client suppression — do not "fix" it by
-  switching that call to the session gate.
+  now — do not "fix" it by switching that call to the session gate. What it
+  reports is decided by QEMU's run state read **before and after** the save
+  (#188, `debug.savevm_breakpoint_state` → `breakpoints_in_image`): `never`
+  under TCG (silent); `lifted` only when both reads show the same debugger
+  stop — `debug`, or `paused` AND the recorded bridge, as the attached
+  client, says `stopped` in `pry status` (a `[qmu] Note:`); else `possible`
+  (the warning, recovery: save at a `pry interrupt` stop). The before-read is
+  load-bearing: savevm resumes a running guest before it returns, and a
+  breakpoint hit in that gap made an after-only read report an image with
+  `int3`s in it as `lifted` (reproduced through to an int3 panic on load).
+  `paused` alone proves nothing qmu can check: a QMP `stop` is reported to
+  the client as SIGINT and an attached GDB lifts its breakpoints then too,
+  but only the client knows it took that stop. `pry status` is asked only
+  while QEMU is already paused — a pry command against a target GDB believes
+  stopped halts a running VM.
+- Guest reboots nobody issued (#184): `VMInstance.debugger_epoch_offset`/
+  `_banners` record the generation the debugger was last told about (`qmu
+  gdb` attach, a reset — whose own banner is still to come, so `banners=1` —
+  a load, a `wait` that reported a RESET). `check_unwarned_reboot` runs where
+  a running VM is resolved (`_choose_running` in guest/qmp_cmds, `exec`,
+  `status`, `wait`): one more boot banner past that point is a reboot, warned
+  once through `coherence_warnings()` and the epoch moved past it — also
+  silently when no client is attached, so a later attach is not told about a
+  boot it saw. Banner-based, so it works the same with the daemon off.
 - Warnings fire on exactly the mutation events, via `Result.warn(...)` — stderr
   in every mode plus the envelope's `warnings[]` under json/ndjson (#74), so
   the stdout JSON stays one object: `snapshot save` (#45, baked-in `int3`s),
-  `snapshot load` (#44, stale vCPU/bookkeeping; a mid-restore failure gets
-  `loadvm_failed_restore_warning`, which forbids the resync), `qmp`/`monitor
-  system_reset` (#46, breakpoints overwritten + KASLR), and `kill` (#40,
-  stranded pry bridge). The load/reset warnings are for clients qmu does not
-  own and name `pry resync` as the recovery. The
+  `snapshot load` (#44, stale stop reason, breakpoints gone from RAM under
+  KVM), `qmp`/`monitor system_reset` (#46, dropped breakpoint set under KVM,
+  stranded by KASLR either way; with QEMU's post-reset run state — a reset at
+  a debugger stop leaves the vCPU in `prelaunch`, which `pry continue` does
+  not start, so the warning says `qmu cont` first), a guest reboot (#184),
+  and `kill` (#40, stranded pry bridge). The
   KVM-watchpoint warning (#39) is the exception: it rides in the `qmu gdb`
   **stdout** payload next to the existing symbol warnings, keyed on the recorded
   `VMInstance.kvm`, so `gdb`'s clean-stderr contract holds.
@@ -680,9 +742,8 @@ other client it **invalidates loudly** and never drives it.
 A warning keyed on `gdb_port` alone would be noisy on the snapshot-rewind fast
 path when no debugger is attached; the attach probe is what keeps it quiet in
 that common case while still warning whenever a client is (or might be) present.
-Guest-*initiated* reboots are invisible to a one-shot command, so those stay
-doc-only (skill: *Debugger↔VM coherence*), as does a reset only `wait`
-observes: qmu drives its bridge only after mutations it issued itself.
+This is the qmu side of umbrella #48: the owned bridge is driven (#187);
+guest-initiated reboots stay warn-only, as qmu did not issue them.
 `exec`/`compile --run`/`dmesg` watch QMP while the SSH command runs and abort
 within ~1 s of `running:false` (a breakpoint stop), emitting the same paused
 envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.

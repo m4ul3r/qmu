@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sys
@@ -594,7 +595,8 @@ def _prepare_boot(
 # first second on every supported machine, so silence this long means it is
 # writing to a console device that does not exist (`console=ttyS0` on an ARM
 # virt machine) or never started (wrong -M/-cpu). Waiting out the whole
-# --ssh-timeout only adds a minute of nothing to the same answer.
+# --ssh-timeout only adds a minute of nothing to the same answer. The window
+# counts from when QMP first says the vCPUs run, never from before (#176).
 NO_CONSOLE_OUTPUT_SECONDS = 10.0
 _SSH_POLL_INTERVAL = 1.0
 # How long sshd must keep refusing the login before the wait gives up on it.
@@ -614,18 +616,46 @@ def _serial_log_empty(path: str | None) -> bool:
         return True
 
 
+def _vcpus_started(inst: Any) -> bool | None:
+    """Whether QEMU is running its vCPUs, for the no-console verdict.
+
+    True once QMP answers `running: true`. False while QEMU provably has not
+    got there: its QMP accepts but does not greet (`busy` — not yet in its
+    main loop, the slow start `launch_vm` retains, #157) or it answers with
+    the vCPUs stopped. None when QMP cannot say at all (unreachable), which
+    leaves the verdict as it always was.
+    """
+    probe = _query_qmp(inst)
+    if probe.state == QMP_BUSY:
+        return False
+    if probe.state in (QMP_CONNECTED, QMP_DAEMON):
+        return probe.running is not False
+    return None
+
+
 def _wait_for_ssh_or_console(ssh: Any, inst: Any, timeout: float) -> str:
-    """Block for SSH; returns 'ready', 'timeout', 'no-console-output' or
-    'auth-failed'.
+    """Block for SSH; returns 'ready', 'timeout', 'no-console-output',
+    'auth-failed' or 'qemu-not-running'.
 
     Polls `SSHClient.is_ready` alongside the empty-serial-log check, because
     the non-ready outcomes need different explanations: a slow boot may
     still answer, a silent console never will, and an sshd that refuses the
     recorded user/key has booted and will keep refusing (#158).
+
+    An empty console only indicts `console=`/-M once the vCPUs have run: the
+    no-console window opens when :func:`_vcpus_started` first stops saying
+    False. A QEMU that has not reached its main loop has written nothing
+    because nothing has executed yet, and calling that `no-console-output`
+    told the reader to change a correct cmdline (#176). Such a wait ends at
+    the deadline as 'qemu-not-running' instead. QMP is asked only while the
+    log is empty and until it has said the vCPUs run.
     """
     start = time.monotonic()
     deadline = start + timeout
     refused_since: float | None = None
+    # When the no-console window opened; None until QEMU is seen running.
+    console_window_from: float | None = None
+    first_look = True
     while True:
         if ssh.is_ready(timeout=2):
             return "ready"
@@ -637,14 +667,25 @@ def _wait_for_ssh_or_console(ssh: Any, inst: Any, timeout: float) -> str:
                 return "auth-failed"
         else:
             refused_since = None
+        console_empty = _serial_log_empty(inst.serial_log)
+        if console_empty and console_window_from is None:
+            if _vcpus_started(inst) is not False:
+                # The first look follows launch_vm's completed handshake, so
+                # a normal boot's window counts from the start of the wait;
+                # a QEMU first seen running later counts from that moment.
+                console_window_from = start if first_look else now
+            first_look = False
         if (
-            now - start >= NO_CONSOLE_OUTPUT_SECONDS
-            and _serial_log_empty(inst.serial_log)
+            console_empty
+            and console_window_from is not None
+            and now - console_window_from >= NO_CONSOLE_OUTPUT_SECONDS
         ):
             return "no-console-output"
         # Deadline is checked AFTER a probe, so the guest is always given at
         # least one chance to answer (`--ssh-timeout 0` means "probe once").
         if now >= deadline:
+            if console_empty and console_window_from is None:
+                return "qemu-not-running"
             return "timeout"
         time.sleep(_SSH_POLL_INTERVAL)
 
@@ -752,19 +793,35 @@ def _handle_launch(args: argparse.Namespace) -> Result:
             # The window closed with the guest still booting: the timeout
             # code (124), the same `run` exits for the same condition, not
             # the transport class (4) — nothing broke, the VM is retained
-            # and the SSH may still come up (#72).
+            # and the SSH may still come up (#72). When QEMU itself never
+            # got its vCPUs running, that — not the guest — is what is slow,
+            # and the empty console says nothing about console= (#176).
             ssh_status = "timeout"
             exit_code = 124
             error_type = "TimeoutError"
-            error = (
-                f"SSH did not become ready within {args.ssh_timeout}s; the VM "
-                "may still be booting. VM state retained."
-            )
-            hint = (
-                f"qmu log --vm {inst.vm_id} --tail 50 shows how far the boot "
-                f"got; qmu status --vm {inst.vm_id} re-probes SSH; or relaunch "
-                "with a longer --ssh-timeout."
-            )
+            if outcome == "qemu-not-running":
+                error = (
+                    f"SSH did not become ready within {args.ssh_timeout}s: QEMU "
+                    "has not started running the guest yet (its QMP does not "
+                    "answer, or reports the vCPUs stopped), so the empty serial "
+                    "log is not a console= problem — QEMU is still initialising "
+                    "(host load or a slow TCG start). VM state retained."
+                )
+                hint = (
+                    f"qmu status --vm {inst.vm_id} re-checks QMP and SSH; qmu "
+                    f"log --vm {inst.vm_id} --tail 50 once the console has "
+                    "output; or relaunch with a longer --ssh-timeout."
+                )
+            else:
+                error = (
+                    f"SSH did not become ready within {args.ssh_timeout}s; the VM "
+                    "may still be booting. VM state retained."
+                )
+                hint = (
+                    f"qmu log --vm {inst.vm_id} --tail 50 shows how far the boot "
+                    f"got; qmu status --vm {inst.vm_id} re-probes SSH; or relaunch "
+                    "with a longer --ssh-timeout."
+                )
     else:
         ssh_status = "skipped"
 
@@ -1427,6 +1484,10 @@ def _handle_kill(args: argparse.Namespace) -> Result:
     # connection, and if one is present, say so on stderr so cleanup is not a
     # later surprise. qmu still does not manage the pry lifecycle.
     had_bridge = debug_session_present(inst) if inst.gdb_port is not None else False
+    # A live recorded bridge is not proof it is the client: it may have
+    # disconnected while a hand-started one took the stub (#186). Reaping
+    # qmu's bridge then leaves that client stranded, so it still gets a note.
+    foreign_client = had_bridge and debug_mod.bridge_holds_stub(inst) is False
     _close_ssh_master(inst)
     # The daemon keeps its watch through the kill (#118). `_kill_vm`'s
     # graceful `quit` rides the daemon's own QMP connection (`_qmp_ctx`
@@ -1461,13 +1522,15 @@ def _handle_kill(args: argparse.Namespace) -> Result:
         text=msg,
         stem="kill",
     )
-    if had_bridge and not bridge_reaped:
+    if had_bridge and (not bridge_reaped or foreign_client):
         res = res.warn(
             f"[qmu] Note: VM '{inst.vm_id}' had an attached debugger on GDB port "
             f"{inst.gdb_port}. That pry bridge now points at a dead stub; qmu does "
             "not manage it. If a later `pry` command reports \"Multiple bridge "
-            "instances\", this is the stale one — clean it up (`pry doctor`, then "
-            "kill it).\n"
+            "instances\", this is the stale one — clean it up: `pry doctor` lists "
+            "it as `status=ok` like any other, so ask each with `pry --instance "
+            "<id> status` (the stale one says `exited (code 0)`; QEMU sends that "
+            "on an orderly quit), then `pry kill --instance <id>`.\n"
         )
     return res
 
@@ -1683,14 +1746,20 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
 
     older_than = float(args.older_than)
     if older_than < MIN_BUILD_RESIDUE_AGE:
+        floor = f"{MIN_BUILD_RESIDUE_AGE:g}"
         raise QMUError(
             f"--older-than {older_than:g} is below the "
-            f"{MIN_BUILD_RESIDUE_AGE:g}s floor for --build-residue. kbuild "
+            f"{floor}s floor for --build-residue. kbuild "
             f"bind-mounts the kernel source tree read-write for the whole "
             f"build, so reclaiming residue from a build that may still be "
             f"running corrupts it. Use `--older-than "
-            f"{MIN_BUILD_RESIDUE_AGE:g}` or higher, or inspect first with "
-            f"`qmu cache du --older-than {older_than:g}`."
+            f"{floor}` or higher, or inspect first with "
+            f"`qmu cache du --older-than {older_than:g}`.",
+            hint=(
+                f"{_residue_floor_command(getattr(args, 'tree', None), dry_run=True)} "
+                f"(the lowest threshold prune accepts; residue modified in the "
+                f"last {floor}s stays held back)"
+            ),
         )
 
     # QMU_CACHE_DIR is honoured with no validation, so a typo pointing at
@@ -1735,7 +1804,8 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
             "build_residue": payload,
             "unmanaged_cache": unmanaged,
         }
-        return Result(data=data, text=_residue_lines(report, dry_run=True, older_than=older_than),
+        return Result(data=data, text=_residue_lines(report, dry_run=True, older_than=older_than,
+                                                     trees=trees),
                       stem="prune-build-residue")
 
     removed, failed = remove_items(report.bucket_items("eligible"))
@@ -1771,7 +1841,7 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
     return Result(
         data=data,
         text=_residue_lines(
-            report, dry_run=False, older_than=older_than,
+            report, dry_run=False, older_than=older_than, trees=trees,
             removed_bytes=sum(i.bytes for i in removed),
             removed_files=len(removed), failed=len(failed),
         ),
@@ -1779,11 +1849,24 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
     )
 
 
+def _residue_floor_command(trees: Sequence[str] | None, *, dry_run: bool) -> str:
+    """The prune at the 600 s floor, scoped like the invocation that asked:
+    advice given after previewing one tree must not reclaim every tree."""
+    words = ["qmu", "prune", "--build-residue"]
+    for tree in trees or ():
+        words += ["--tree", tree]
+    if dry_run:
+        words.append("--dry-run")
+    words += ["--older-than", f"{MIN_BUILD_RESIDUE_AGE:g}"]
+    return shlex.join(words)
+
+
 def _residue_lines(
     report: Any,
     *,
     dry_run: bool,
     older_than: float,
+    trees: Sequence[str] | None = None,
     removed_bytes: int = 0,
     removed_files: int = 0,
     failed: int = 0,
@@ -1816,11 +1899,25 @@ def _residue_lines(
 
     # Held-back and refused are disclosed on BOTH branches, in both formats.
     if report.held_back.files:
+        # Residue qualifies by being OLDER than the threshold, so a larger one
+        # holds back more; the recovery is a smaller one, down to the floor
+        # (#164: this line used to advise a larger --older-than).
+        floor = f"{MIN_BUILD_RESIDUE_AGE:g}"
+        if older_than > MIN_BUILD_RESIDUE_AGE:
+            recovery = (
+                f"Once the build has finished, re-run with a smaller "
+                f"--older-than, down to the {floor}s floor: "
+                f"{_residue_floor_command(trees, dry_run=dry_run)}"
+            )
+        else:
+            recovery = (
+                f"Re-run once the build has finished and the trees are older "
+                f"than {floor}s."
+            )
         lines.append(
             f"Held back by the --older-than cutoff ({older_than:g}s): "
             f"{', '.join(report.held_back.groups)}. These trees were modified "
-            f"recently and may be mid-build. Re-run later, or with a larger "
-            f"--older-than once the build has finished."
+            f"recently and may be mid-build. {recovery}"
         )
     if report.refused.files:
         lines.append(
@@ -2211,7 +2308,7 @@ def _handle_wait(args: argparse.Namespace) -> Result:
             return _wait_already_stopped(args, info["instance"])
         if info["state"] == VM_ORPHANED:
             _require_running(args.vm, "wait")
-    inst = choose_instance(args.vm)
+    inst = debug_mod.check_unwarned_reboot(choose_instance(args.vm))
     start = time.monotonic()
     deadline: float | None = (
         start + args.timeout if args.timeout is not None else None
@@ -2256,7 +2353,7 @@ def _wait_standalone(
     # guest burn half a core (r2-shared: 10 s user CPU); each tick now reads
     # only what QEMU appended since the last one.
     scanned = boot_offset
-    reset_warning = reset_dropped_breakpoints_warning(inst.vm_id) + "\n"
+    reset_warning = reset_dropped_breakpoints_warning(inst) + "\n"
 
     def scan_console() -> bool:
         """One incremental console scan; adopts a moved boot boundary.
@@ -2279,8 +2376,13 @@ def _wait_standalone(
             last_event = "RESET"
             event_data = {"source": source, "offset": banner}
             inst = save_guest_epoch_serial_offset(inst, banner)
+            if inst.gdb_port is not None:
+                # This wait is what tells the debugger (#184): the next
+                # command must not announce the same reboot again.
+                inst = debug_mod.mark_debugger_epoch(inst, banner, banners=1)
             # #46: a reset drops the gdbstub breakpoint set without telling the
-            # client. `wait` is the one place qmu sees a reset it did not issue.
+            # client. A reset qmu did not issue is seen here mid-wait (between
+            # commands, `debug.check_unwarned_reboot` catches it, #184).
             # Collected once for the Result (#121): `render` writes it to
             # stderr exactly once and the envelope carries it in `warnings[]`.
             if reset_warning not in warnings and debug_session_present(inst):
@@ -2426,7 +2528,7 @@ def _daemon_wait_request(
     the connection is lost: the caller finishes the wait standalone.
     """
     started = time.monotonic()
-    reset_warning = reset_dropped_breakpoints_warning(inst.vm_id) + "\n"
+    reset_warning = reset_dropped_breakpoints_warning(inst) + "\n"
 
     def on_event(event: dict[str, Any]) -> None:
         kind = event.get("kind")
@@ -2446,12 +2548,18 @@ def _daemon_wait_request(
                 time.monotonic() - started, int(event.get("boot_offset", 0)),
                 f"QMP {event.get('name')} on {inst.vm_id}",
             )
-        if (
-            kind == "qmp_event" and event.get("name") == "RESET"
-            and warnings is not None and reset_warning not in warnings
-            and debug_session_present(inst)
-        ):
-            warnings.append(reset_warning)
+        if kind == "qmp_event" and event.get("name") == "RESET":
+            # The reset's boot banner is at or past the scope the daemon
+            # reports for the event; it belongs to the generation warned
+            # about here, not to a later unannounced reboot (#184).
+            offset = event.get("boot_offset")
+            if inst.gdb_port is not None and isinstance(offset, int):
+                debug_mod.mark_debugger_epoch(inst, offset, banners=1)
+            if (
+                warnings is not None and reset_warning not in warnings
+                and debug_session_present(inst)
+            ):
+                warnings.append(reset_warning)
 
     conn = daemon_client.connect()
     if conn is None:
@@ -2744,9 +2852,11 @@ def _wait_for_pattern(args: argparse.Namespace) -> Result:
         info = classify_vm(args.vm, orphan_pids=_orphan_serial_logs())
         if info["state"] in (VM_RUNNING, VM_STOPPED, VM_HELD_BACK):
             inst = info["instance"]
+            if info["state"] == VM_RUNNING:
+                inst = debug_mod.check_unwarned_reboot(inst)
     if inst is None:
         _require_running(args.vm, "wait")
-        inst = choose_instance(args.vm)
+        inst = debug_mod.check_unwarned_reboot(choose_instance(args.vm))
 
     try:
         matcher = re.compile(args.pattern)
@@ -3446,7 +3556,7 @@ def _handle_status(args: argparse.Namespace) -> Result:
         info = _classify(args.vm)
         if info["state"] in (VM_STOPPED, VM_HELD_BACK, VM_ORPHANED):
             return _status_non_running(args, info)
-    inst = choose_instance(args.vm)
+    inst = debug_mod.check_unwarned_reboot(choose_instance(args.vm))
 
     # One QMP round trip, shared with the guest axis: `status` used to connect
     # twice, so a socket held by a `wait` cost it 2 × 10 s and it still said

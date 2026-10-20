@@ -108,7 +108,7 @@ external passt process.
 `snapshot load` tears down the VM's SSH ControlMaster (the multiplexed
 connection that was alive when the snapshot was taken), so the first `qmu exec`
 after a load connects fresh and is fast. Without that teardown the first SSH
-command after a load stalls 15–20 s on the stale master's keepalive expiry
+command after a load can stall on the stale master until its `--timeout`
 (exiting 124 or 4, sometimes with a one-off `Broken pipe`) — if you ever see
 that symptom, `ssh -O exit` on the control socket under `$QMU_TEMP_DIR/ssh`
 (or a second `qmu exec`) clears it.
@@ -160,9 +160,12 @@ with it in the table.
 
 ## Debugger interaction
 
-`snapshot save` with software breakpoints armed bakes their `int3` bytes into
-the image, and `snapshot load` leaves an attached debugger with a stale view:
-qmu re-syncs the bridge `qmu gdb` spawned (`pry resync`, reported as
+`snapshot save` taken while a debugger has the guest running bakes its
+breakpoints' `int3` bytes into the image (under KVM); a save at a debugger
+stop is clean. On a `--gdb` VM the save's envelope says which as
+`breakpoints_in_image` (`possible` with a warning / `lifted` with a note /
+`never` under TCG). `snapshot load` leaves an attached debugger with a stale
+view: qmu re-syncs the bridge `qmu gdb` spawned (`pry resync`, reported as
 `debugger` in the envelope) and warns about any other client. See the
 coherence table in `skill://qmu/reference/debugging.md` before mixing
 snapshots and pry.

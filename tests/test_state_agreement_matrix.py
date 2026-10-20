@@ -2294,8 +2294,8 @@ def _agreement_view(rc, payload):
         "ssh_error": payload.get("ssh_error"),
         "crash_detected": payload.get("crash_detected"),
         "crash_present": payload.get("crash") is not None,
-        "names_qmu_crash": "qmu crash" in hint,
-        "names_qmu_log": "qmu log --tail 100" in hint,
+        "names_qmu_crash": f"qmu crash --vm {VM}" in hint,
+        "names_qmu_log": f"qmu log --vm {VM} --tail 100" in hint,
     }
 
 
@@ -2513,7 +2513,9 @@ def test_every_ssh_command_agrees_on_a_panic_mid_command(
             assert "qmu crash" in payload["hint"], command
             assert "guest_state" not in payload, command
         else:
-            assert "Kernel panic - not syncing" in captured.out, command
+            # exec/dmesg/compile keep stdout for guest bytes, so the report is
+            # a stderr note there (#172); push/pull print it as their result.
+            assert "Kernel panic - not syncing" in captured.out + captured.err, command
             assert "vCPU halted" not in captured.out + captured.err, command
 
 
@@ -3070,7 +3072,7 @@ def test_gdb_refuses_an_attached_stub_identically_in_text_and_json(
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm=None: inst)
     monkeypatch.setattr(qmp_cmds.shutil, "which", lambda name: "/usr/bin/pry")
     monkeypatch.setattr(qmp_cmds, "gdb_client_attached", lambda inst: True)
-    monkeypatch.setattr(qmp_cmds, "bridge_alive", lambda inst: True)
+    monkeypatch.setattr(qmp_cmds, "qmu_bridge_attached", lambda inst: True)
     spawned = []
     monkeypatch.setattr(
         qmp_cmds.subprocess, "run", lambda *a, **kw: spawned.append(a) or None

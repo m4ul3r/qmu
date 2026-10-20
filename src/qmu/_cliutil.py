@@ -38,8 +38,20 @@ from .instance import (
 from .output import write_bytes_result, write_output_result
 from .qmp import QMPBusyError, QMPClient, QMPError
 from . import daemon_client
+from .debug import coherence_warnings
 from .serial import current_boot_offset, has_terminal_panic
 from .ssh import SSHAuthError, SSHClient
+
+
+def dispatch_warnings() -> tuple[str, ...]:
+    """Warnings recorded this dispatch outside any handler's Result.
+
+    The broken-global-config notice (config gate) and a guest reboot the
+    VM's debugger was not told about (found while resolving the VM, #184).
+    `cli._dispatch` attaches them to the Result; `_emit_error` to the
+    failure envelope, so neither is lost to an error path.
+    """
+    return global_config_warnings() + coherence_warnings()
 
 
 def _make_ssh(inst: VMInstance) -> SSHClient:
@@ -658,15 +670,16 @@ def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) 
     the format is not "text", emit the universal error envelope
     {"ok": false, "error": ..., "error_type": ..., "hint": ...} as JSON to
     stdout — `hint` is the exception's own or the `error_type` default, never
-    absent. Warnings collected before the failure (a broken global config in
-    the dispatch gate) trail on stderr in every mode and ride in the envelope
-    as `warnings[]`, exactly as they do on a successful Result. ``args`` may
-    be partially populated (e.g. if argparse failed before defaults were
-    applied), so the format is read defensively with getattr().
+    absent. Warnings collected before the failure (`dispatch_warnings`: a
+    broken global config, an unannounced guest reboot) trail on stderr in
+    every mode and ride in the envelope as `warnings[]`, exactly as they do
+    on a successful Result. ``args`` may be partially populated (e.g. if
+    argparse failed before defaults were applied), so the format is read
+    defensively with getattr().
     """
     fmt = getattr(args, "format", "text") or "text"
     specific = getattr(exc, "hint", None)
-    warnings = global_config_warnings()
+    warnings = dispatch_warnings()
     if fmt == "text":
         sys.stderr.write(f"{text_prefix} {exc}\n")
         if specific and specific not in str(exc):
@@ -909,7 +922,8 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
             "expiry `launch` exits 124 (TimeoutError, timed_out: true, "
             "ssh_status 'timeout') and RETAINS the VM for inspection — `qmu "
             "status`/`qmu log --vm <id>` — the same code `run` returns, "
-            "which does not retain it. A serial log still empty after ~10 s fails "
+            "which does not retain it. A serial log still empty after ~10 s "
+            "of running vCPUs fails "
             "earlier with ssh_status 'no-console-output' (wrong console= or "
             "machine type for this arch); an sshd that refuses the "
             "[ssh] user/key fails with ssh_status 'auth-failed' (exit 4)."

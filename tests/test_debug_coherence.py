@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import subprocess
 
 import pytest
@@ -193,7 +194,6 @@ def test_snapshot_save_warns_int3_when_debugged(monkeypatch, capsys):
     assert rc == 0
     assert "int3" in err
     assert "0xCC" in err
-    assert "debugger artifact" in err
 
 
 def test_snapshot_save_silent_when_not_debugged(monkeypatch, capsys):
@@ -280,8 +280,8 @@ def test_snapshot_load_pre_restore_refusal_does_not_warn_stale(monkeypatch, caps
     rc = _run(qmp_cmds._handle_snapshot_load, _snap_args())
     err = capsys.readouterr().err
     assert rc == 1
-    assert debug.loadvm_stale_session_warning("dg") not in err
-    assert debug.loadvm_failed_restore_warning("dg") not in err
+    assert "does NOT re-sync" not in err
+    assert debug.loadvm_failed_restore_warning(inst) not in err
     assert "snapshot load failed" in err
 
 
@@ -291,7 +291,8 @@ def test_snapshot_load_failure_after_restoration_began_warns_stale(
 ):
     # #87 x #44: a load that got past the tag check reverted the disks and
     # reset the machine before the vmstate load failed, so the attached
-    # debugger's view diverged exactly as it does on a successful load.
+    # debugger's view diverged — and the recovery must not resume the
+    # half-restored machine (no continue/re-sync/detach).
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
     monkeypatch.setattr(
@@ -305,7 +306,8 @@ def test_snapshot_load_failure_after_restoration_began_warns_stale(
     rc = _run(qmp_cmds._handle_snapshot_load, _snap_args())
     err = capsys.readouterr().err
     assert rc == 1
-    assert debug.loadvm_failed_restore_warning("dg") in err
+    assert debug.loadvm_failed_restore_warning(inst) in err
+    assert debug.loadvm_stale_session_warning(inst) not in err
     assert "snapshot load failed" in err
 
 
@@ -322,7 +324,8 @@ def test_qmp_system_reset_warns_when_debugged(monkeypatch, capsys):
     rc = _run(qmp_cmds._handle_qmp, _qmp_args("system_reset"))
     err = capsys.readouterr().err
     assert rc == 0
-    assert debug.reset_dropped_breakpoints_warning("dg") in err
+    assert "drops the gdbstub's breakpoint" in err
+    assert "hits stay 0" in err
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
@@ -341,7 +344,7 @@ def test_qmp_system_reset_warning_rides_in_the_envelope(monkeypatch, capsys, fmt
     assert payload["ok"] is True
     (warning,) = payload["warnings"]
     assert warning.startswith("VM 'dg' has a GDB stub and was just reset")
-    assert debug.reset_dropped_breakpoints_warning("dg") in captured.err
+    assert "drops the gdbstub's breakpoint" in captured.err
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
@@ -385,7 +388,7 @@ def test_monitor_system_reset_warns_when_debugged(monkeypatch, capsys):
     rc = _run(qmp_cmds._handle_monitor, _monitor_args(["system_reset"]))
     err = capsys.readouterr().err
     assert rc == 0
-    assert debug.reset_dropped_breakpoints_warning("dg") in err
+    assert "drops the gdbstub's breakpoint" in err
 
 
 def test_monitor_unrelated_command_does_not_warn(monkeypatch, capsys):
@@ -481,7 +484,7 @@ def test_qmp_hmp_system_reset_warns_when_debugged(monkeypatch, capsys):
     rc = _run(qmp_cmds._handle_qmp, _hmp_qmp_args("system_reset"))
     err = capsys.readouterr().err
     assert rc == 0
-    assert debug.reset_dropped_breakpoints_warning("dg") in err
+    assert "drops the gdbstub's breakpoint" in err
 
 
 def test_qmp_hmp_help_system_reset_does_not_warn(monkeypatch, capsys):
@@ -768,7 +771,7 @@ def test_wait_warns_on_observed_reset_when_debugged(monkeypatch, tmp_path, capsy
     captured = capsys.readouterr()
     assert rc == 0
     assert json.loads(captured.out)["last_event"] == "RESET"
-    assert debug.reset_dropped_breakpoints_warning("debug-vm") in captured.err
+    assert "drops the gdbstub's breakpoint" in captured.err
 
 
 def test_wait_reset_no_warning_without_debugger(monkeypatch, tmp_path, capsys):
@@ -780,4 +783,250 @@ def test_wait_reset_no_warning_without_debugger(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr()
     assert rc == 0
     assert json.loads(captured.out)["last_event"] == "RESET"
-    assert debug.reset_dropped_breakpoints_warning("debug-vm") not in captured.err
+    assert "drops the gdbstub's breakpoint" not in captured.err
+
+
+# --- what a save can hold of the debugger's breakpoints (#188) ---------------
+#
+# Measured on QEMU 8.2.2: under KVM a save taken while GDB had the target
+# running carried 0xCC at the breakpoint; one taken at a breakpoint stop
+# (`debug`) or after `pry interrupt` (`paused`, bridge stopped) held the
+# original byte; under TCG the inserted breakpoint never reached guest RAM.
+
+
+class _StatusQMP(_FakeQMP):
+    def __init__(self, status):
+        self.status = status
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        if command == "query-status":
+            return {"running": self.status == "running", "status": self.status}
+        return {}
+
+
+@pytest.mark.parametrize(
+    "kvm,status,bridge_stopped,expected",
+    [
+        (True, "running", True, "possible"),
+        (True, "debug", None, "lifted"),
+        (True, "paused", True, "lifted"),
+        (True, "paused", False, "possible"),
+        (True, "paused", None, "possible"),
+        (None, "debug", None, "lifted"),
+        (None, "running", None, "possible"),
+        (False, "running", None, "never"),
+    ],
+)
+def test_snapshot_save_reports_what_the_image_can_hold(
+    monkeypatch, capsys, kvm, status, bridge_stopped, expected
+):
+    inst = _gdb_inst(1234)
+    inst.kvm = kvm
+    _install_qmp_seams(monkeypatch, inst, present=True)
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(_StatusQMP(status))
+    )
+    asked: list[str] = []
+
+    def fake_bridge_stopped(inst):
+        asked.append(status)
+        return bridge_stopped
+
+    monkeypatch.setattr(debug, "bridge_stopped", fake_bridge_stopped)
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'clean' saved."))
+    args = _snap_args()
+    args.format = "json"
+    rc = _run(qmp_cmds._handle_snapshot_save, args)
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert json.loads(captured.out)["breakpoints_in_image"] == expected
+    if expected == "possible":
+        assert "[qmu] WARNING:" in captured.err
+    elif expected == "lifted":
+        assert "WARNING" not in captured.err and captured.err
+    else:
+        assert captured.err == ""
+    # A pry command against a target GDB believes stopped halts a running VM,
+    # so the bridge is consulted only while QEMU is already paused.
+    assert set(asked) <= {"paused"}
+
+
+def test_raw_savevm_classifies_like_snapshot_save(monkeypatch, capsys):
+    inst = _gdb_inst(1234)
+    inst.kvm = True
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+
+    class _Monitor(_StatusQMP):
+        def execute_hmp(self, command_line, timeout=30.0):
+            return ""
+
+    for status, warned in (("debug", False), ("running", True)):
+        monkeypatch.setattr(
+            qmp_cmds, "_qmp_ctx", lambda inst, s=status: contextlib.nullcontext(_Monitor(s))
+        )
+        rc = _run(qmp_cmds._handle_monitor, _monitor_args(["savevm", "t"]))
+        err = capsys.readouterr().err
+        assert rc == 0
+        assert ("[qmu] WARNING:" in err) is warned
+
+
+class _SequenceQMP(_FakeQMP):
+    """query-status answers in order: the run state before, then after."""
+
+    def __init__(self, *statuses):
+        self.statuses = list(statuses)
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        if command == "query-status":
+            status = self.statuses.pop(0)
+            return {"running": status == "running", "status": status}
+        return {}
+
+    def execute_hmp(self, command_line, timeout=30.0):
+        return ""
+
+
+def test_a_breakpoint_hit_after_savevm_resumes_does_not_clear_the_image(
+    monkeypatch, capsys
+):
+    """Review of #188, reproduced through to an int3 panic: savevm resumes a
+    running guest before it returns, so a breakpoint hit in that gap reads
+    `debug` afterwards for an image taken with the int3s in RAM. Running
+    before the save is what decides: `possible`, on both routes."""
+    inst = _gdb_inst(1234)
+    inst.kvm = True
+    _install_qmp_seams(monkeypatch, inst, present=True)
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'r' saved."))
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx",
+        lambda inst: contextlib.nullcontext(_SequenceQMP("running", "debug")),
+    )
+    args = _snap_args()
+    args.format = "json"
+    assert _run(qmp_cmds._handle_snapshot_save, args) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["breakpoints_in_image"] == "possible"
+    assert "[qmu] WARNING:" in captured.err
+
+    assert _run(qmp_cmds._handle_monitor, _monitor_args(["savevm", "r"])) == 0
+    err = capsys.readouterr().err
+    assert "[qmu] WARNING:" in err and "Note:" not in err
+
+
+def test_reset_at_a_debugger_stop_says_to_boot_it_with_qmu_cont(monkeypatch, capsys):
+    """Live (#183): a reset that lands while the debugger is stopped leaves
+    QEMU in `prelaunch` and `pry continue` does not start it (the vCPU stays
+    at the reset vector, KVM and TCG alike); `qmu cont` boots it. A reset of
+    a running guest needs no cont."""
+    inst = _gdb_inst(1234)
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+    monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: True)
+    monkeypatch.setattr(qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst)
+
+    class _Monitor(_StatusQMP):
+        def execute_hmp(self, command_line, timeout=30.0):
+            return ""
+
+    for status, told in (("prelaunch", True), ("running", False)):
+        monkeypatch.setattr(
+            qmp_cmds, "_qmp_ctx", lambda inst, s=status: contextlib.nullcontext(_Monitor(s))
+        )
+        assert _run(qmp_cmds._handle_monitor, _monitor_args(["system_reset"])) == 0
+        assert ("qmu cont --vm dg" in capsys.readouterr().err) is told
+
+
+# --- a guest reboot nobody issued is announced by the next command (#184) ----
+
+
+_BANNER = b"[    0.000000] Linux version 6.1.11 (qmu@kbuild) (gcc 11.4.0) #1 SMP\n"
+
+
+def _rebooting_vm(tmp_path, monkeypatch, *, attached=True):
+    from qmu.instance import save_instance
+
+    log = tmp_path / "rb.serial.log"
+    log.write_bytes(b"SeaBIOS\n" + _BANNER + b"localhost login: \n")
+    inst = VMInstance(
+        vm_id="rb", pid=os.getpid(), qmp_socket=str(tmp_path / "rb.sock"), ssh_port=None,
+        ssh_key=None, gdb_port=1234, serial_log=str(log), kernel="/k",
+        rootfs=None, memory="1G", cpus=1, cmdline="", profile="exploit-dev",
+        started_at="2026-01-01T00:00:00+00:00",
+    )
+    save_instance(inst)
+    monkeypatch.setattr(debug, "gdb_client_attached", lambda inst: attached)
+    return inst, log
+
+
+def _reboot(log):
+    with log.open("ab") as f:
+        f.write(b"reboot: Restarting system\nSeaBIOS\n" + _BANNER + b"localhost login: \n")
+
+
+def _announce(vm_id="rb"):
+    from qmu.instance import load_instance
+
+    debug.reset_coherence_warnings()
+    debug.check_unwarned_reboot(load_instance(vm_id))
+    return debug.coherence_warnings()
+
+
+def test_guest_reboot_is_announced_once_by_the_next_command(tmp_path, monkeypatch, capsys):
+    inst, log = _rebooting_vm(tmp_path, monkeypatch)
+    debug.mark_debugger_attached(inst)
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(_StatusQMP("running"))
+    )
+    argv = ["--format", "json", "qmp", "query-status", "--vm", "rb"]
+
+    assert cli.main(argv) == 0
+    assert "warnings" not in json.loads(capsys.readouterr().out)
+
+    _reboot(log)
+    assert cli.main(argv) == 0
+    captured = capsys.readouterr()
+    warnings = json.loads(captured.out)["warnings"]
+    assert len(warnings) == 1 and "rebooted by itself" in warnings[0]
+    assert captured.err.count("rebooted by itself") == 1
+
+    assert cli.main(argv) == 0
+    assert "warnings" not in json.loads(capsys.readouterr().out)
+
+
+def test_a_reset_qmu_warned_about_is_not_announced_again(tmp_path, monkeypatch):
+    """`system_reset` warns itself; the boot it starts is that same generation."""
+    inst, log = _rebooting_vm(tmp_path, monkeypatch)
+    debug.mark_debugger_epoch(inst, log.stat().st_size, banners=1)
+    _reboot(log)
+    assert _announce() == ()
+    _reboot(log)
+    assert len(_announce()) == 1
+
+
+def test_a_reboot_after_snapshot_load_is_announced(tmp_path, monkeypatch):
+    """A restored guest prints no banner, so the first one after it is news."""
+    inst, log = _rebooting_vm(tmp_path, monkeypatch)
+    debug.mark_debugger_epoch(inst, log.stat().st_size, banners=0)
+    _reboot(log)
+    assert len(_announce()) == 1
+
+
+def test_reboot_with_no_client_attached_moves_the_epoch_silently(tmp_path, monkeypatch):
+    """Nobody to warn; a debugger attaching later sees the new boot, so the
+    reboot must not be announced to it afterwards."""
+    inst, log = _rebooting_vm(tmp_path, monkeypatch, attached=False)
+    debug.mark_debugger_attached(inst)
+    _reboot(log)
+    assert _announce() == ()
+    monkeypatch.setattr(debug, "gdb_client_attached", lambda inst: True)
+    assert _announce() == ()
+
+
+def test_first_boot_is_not_a_reboot_without_a_qmu_attach(tmp_path, monkeypatch):
+    """A hand-started bridge leaves no attach point; the first boot is the
+    one it saw, a second banner is a reboot."""
+    inst, log = _rebooting_vm(tmp_path, monkeypatch)
+    assert _announce() == ()
+    _reboot(log)
+    assert len(_announce()) == 1

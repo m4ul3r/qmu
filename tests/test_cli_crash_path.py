@@ -197,9 +197,11 @@ def test_rc255_panic_then_autoreboot_is_a_crash_not_exit_255(
         assert "Kernel panic - not syncing" in payload["crash"]
         assert "qmu crash" in payload["hint"]
     else:
-        assert "Crash from serial log" in captured.out
-        assert "Kernel panic - not syncing" in captured.out
-        assert "[exit code: 255]" not in captured.out
+        # stdout is guest stdout only; the report is a stderr note (#172)
+        assert captured.out == ""
+        assert "Crash from serial log" in captured.err
+        assert "Kernel panic - not syncing" in captured.err
+        assert "[exit code: 255]" not in captured.err
 
 
 def test_rc255_ssh_down_ignores_precommand_crash(patch_exec, capsys):
@@ -286,7 +288,7 @@ def test_rc255_ssh_down_text_mode_reports_crash(patch_exec, capsys):
     rc = cli.main(["exec", "trigger"])
 
     assert rc == 3
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "SSH connection lost" in out
     assert "panic" in out.lower()
 

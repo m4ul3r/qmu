@@ -54,16 +54,19 @@ below):
 
 | path | qmu exit | extra keys |
 |---|---|---|
-| command finished (any guest code) | 0 / 1 | `stdout`, `stderr`, `kernel_warning_detected`, `kernel_warning` (the kernel report the command produced — a *survived* KASAN/WARNING/Oops — or `null`), `hint` only when non-zero |
-| `--timeout` expired, guest still answers | 124 | `timed_out: true`, `timeout`, `command`, partial `stdout`/`stderr`, `hint` |
+| command finished (any guest code) | 0 / 1 | `stdout`, `stderr`, `crash` (the kernel report the command provoked — a *survived* KASAN/WARNING/Oops — or `null`; `crash_detected` says which), the legacy `kernel_warning_detected`/`kernel_warning` carrying the same report, `hint` only when non-zero |
+| `--timeout` expired | 124 | `timed_out: true`, `timeout`, `command`, `crash` (report or `null`), partial `stdout`/`stderr`, `hint`; `ssh_error: false` when the guest still answers SSH, `true` when it no longer does (a report flood or a hang wedged it — still 124, not 3) |
 | transport lost / terminal panic | 3 (fresh report) / 4 | `command`, `crash` (report or `null`), `hint`, partial `stdout`/`stderr` |
-| vCPU halted mid-command | 1 | `command`, `guest_state`, `qemu_status`, `hint`, partial `stdout`/`stderr` |
+| vCPU halted mid-command | 1 | `command`, `guest_state: "paused"`, `qemu_status`, `hint`, partial `stdout`/`stderr`, and `detached_output` (the file the still-running command's further output is appended to) when qmu left its session open |
 
-A report the guest **survived** is attributed to the command only through
-`kernel_warning_detected`/`kernel_warning`: on that path `crash_detected` is
-`false` and there is no `crash` key, so under `kasan.fault=report` branch on
-`kernel_warning_detected`. `timed_out` and `command` are absent from a
-finished command's envelope (read `env.get("timed_out")`). `stdout_lossy`/
+Branch on `crash_detected`: on the finished, timeout and transport-lost
+paths it is `true` with the report in `crash` whenever the kernel printed
+one during the command, whether the guest survived it or not. The
+vCPU-halted envelope is the exception: `crash_detected` is always `false`
+there and it has no `crash` key — check `qmu crash --vm X` after a halt.
+`timed_out` and `command` are absent from a finished
+command's envelope (read `env.get("timed_out")`); `detached_output` is absent
+unless the halted command was left running. `stdout_lossy`/
 `stderr_lossy: true` appear only when invalid UTF-8 was replaced.
 
 qmu's own exit is **not** the guest's: it is 0 when the guest command
@@ -84,7 +87,8 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
   `[exit code: N]` after the command ends; `--format ndjson` emits
   `{"event": "chunk", "stream": …, "data": …}` lines before the final
   envelope; `--format json` buffers. Partial output on `--timeout` / a panic
-  is therefore already on the terminal when the 124 / 3 narrative arrives.
+  is therefore already on the terminal when the 124 / 3 narrative arrives on
+  stderr (stdout stays guest bytes only).
   Detail, `--out` and the spill cut-over: `output-contract.md` → *Streaming*.
 - `--timeout` (default 30 s; `run` 60 s): on expiry the envelope keeps the
   `stdout`/`stderr` captured so far, `exit_code: null`, `timed_out: true`,
@@ -107,10 +111,15 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
   `/root/poc.log`.
 - A kernel panic while the command runs is reported as exit 3 as soon as the
   serial log shows `Kernel panic - not syncing` (sub-second), with the partial
-  `stdout`/`stderr` on the crash envelope — not after the SSH keepalive
-  (15 s) and re-probes.
+  `stdout`/`stderr` on the crash envelope — without waiting on ssh or a
+  re-probe.
 - A dropped transport with no fresh crash report is exit 4 (`ssh_error:
-  true`, `crash_detected: false`).
+  true`, `crash_detected: false`). So is ssh never reaching the guest at all
+  (`Connection timed out during banner exchange` right after a boot or
+  reboot): `exit_code: null`, text `SSH could not connect; the command was
+  not started`, safe to re-run — never "the guest command exited 255".
+- A guest that stops answering without a panic or a halt (wedged) holds the
+  command until `--timeout` (124); ssh itself never gives up on silence.
 - sshd refusing the VM's recorded `[ssh] user`/key (`Permission denied
   (publickey,…)`) is exit 4 `error_type: "SSHAuthError"` with `ssh_status:
   "auth-failed"`, `ssh_user`, `ssh_key` and a relaunch `hint` — on `exec`,
@@ -121,14 +130,14 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
   --vm X` (for `qemu_status: "restore-vm"` the hint is a known-good `snapshot
   load` or `kill` + relaunch instead — never `cont`). A debugger stop that
   fires mid-command returns within ~1 s with the same `paused` envelope —
-  never the 15–20 s keepalive wait — and the output that reached the host
+  never a keepalive wait — and the output that reached the host
   before the stop (bytes the guest wrote just before it may still be in the
   guest). For `exec`, `run` and `compile --run` the command is **left
   running**: qmu keeps its SSH session open (`text`: `vCPU halted while
   running (command left running)`) and a detached helper appends its further
   output to the file named by `detached_output`, so the trigger continues
-  after `pry continue` / `qmu cont` (measured with a 120 s halt; the
-  connection stays up while the vCPU is stopped, at most 16 MiB of output is
+  after `pry continue` / `qmu cont` (measured with a 130 s halt; the
+  connection stays up however long the vCPU is stopped, at most 16 MiB of output is
   kept). What still ends it is the SSH connection going away: `snapshot
   load`, a reset and `kill` drop the ControlMaster — use the `setsid nohup`
   form for a trigger that must survive those. `compile`'s gcc step and
