@@ -38,7 +38,9 @@ def _stub_scp(monkeypatch, client, tmp_path, *, rc=0, stderr="", sleep=0.0):
         ("pull", 1, "Permission denied", SCPFileError, False),
         ("push", 1, "protocol error", SCPFileError, False),
         # ssh itself failed (255): transport class, with evidence retained.
-        ("pull", 255, "scp: Connection closed", SSHError, False),
+        # (A bare `scp: Connection closed` is the SFTP-refusal signature and
+        # is retried with `scp -O` first: test_guest_reach.py.)
+        ("pull", 255, "ssh: Could not resolve hostname guest: Name or service not known", SSHError, False),
         ("push", 255, "mux failed: Broken pipe", SSHError, True),
         ("pull", 255, "Connection timed out during banner exchange", SSHError, True),
     ],
