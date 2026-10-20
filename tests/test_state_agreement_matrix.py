@@ -57,10 +57,10 @@ def cache(tmp_path, monkeypatch):
 def _decoy_running(monkeypatch):
     """A second, healthy VM.
 
-    Without one, `choose_instance` short-circuits to "No running VMs" and the
-    invariant assertion never exercises the "VM 'X' not found. Running: ..."
-    branch — the exact message the real CLI produced on a shared box. A double
-    with an empty instance list hides the bug the matrix exists to catch.
+    Without one the invariant assertion never exercises the "VM 'X' not
+    found. Running: decoy" listing — the exact message the real CLI produced
+    on a shared box. The zero-running branch has its own row
+    (`test_absent_name_with_zero_running_vms_is_named_by_every_command`).
     """
     decoy = VMInstance(
         vm_id="decoy", pid=1, qmp_socket="/tmp/decoy.qmp.sock",
@@ -617,6 +617,128 @@ def test_kill_of_an_absent_vm_still_says_not_found(cache, monkeypatch, capsys):
     assert rc == 1
     assert "not found" in payload["error"]
     assert VM in payload["error"]
+
+
+# Every command that needs a live VM, asked about one `list` shows but no
+# tracked QEMU serves, must give the SAME answer `exec` gives (one describer)
+# and name it in `vm_id` — with or without another VM running. #144 made the
+# zero-running branch reach the running-only lookup, where push/pull/snapshot
+# /gdb/qmp/… said "not found … Stopped: X" while `exec` said "is stopped".
+_RUNNING_ONLY_ARGV = {
+    "exec": ["exec", "--vm", VM, "true"],
+    "push": ["push", "--vm", VM, "/tmp/payload", "/root/"],
+    "pull": ["pull", "--vm", VM, "/root/payload"],
+    "compile": ["compile", "--vm", VM, "/tmp/payload.c"],
+    "dmesg": ["dmesg", "--vm", VM],
+    "snapshot list": ["snapshot", "list", "--vm", VM],
+    "cont": ["cont", "--vm", VM],
+    "gdb": ["gdb", "--vm", VM],
+    "kbase": ["kbase", "--vm", VM, "--symbols", "/tmp/System.map"],
+    "qmp": ["qmp", "--vm", VM, "query-status"],
+    "monitor": ["monitor", "--vm", VM, "info", "status"],
+}
+
+
+@pytest.mark.parametrize("with_decoy", [False, True], ids=["zero-running", "decoy"])
+@pytest.mark.parametrize("state", [VM_ORPHANED, VM_STOPPED])
+@pytest.mark.parametrize("command", sorted(_RUNNING_ONLY_ARGV))
+def test_running_only_commands_never_deny_a_listed_vm(
+    command, state, with_decoy, cache, monkeypatch, capsys
+):
+    _make_state(state, cache, monkeypatch)
+    if with_decoy:
+        decoy = VMInstance(
+            vm_id="decoy", pid=1, qmp_socket="/tmp/decoy.qmp.sock",
+            ssh_port=None, ssh_key=None, gdb_port=None,
+            serial_log="/tmp/decoy.serial.log", kernel="/boot/bzImage",
+            rootfs=None, memory="4G", cpus=2, cmdline="console=ttyS0",
+            profile="exploit-dev", started_at="2026-08-17T00:00:00Z", harness=True,
+        )
+        for mod in (lifecycle, instance_mod):
+            monkeypatch.setattr(mod, "list_instances", lambda: [decoy], raising=False)
+
+    cli.main(["list"])
+    assert VM in capsys.readouterr().out, "fixture did not produce a listed VM"
+
+    answers = {}
+    for name in ("exec", command):
+        rc = cli.main(["--format", "json", *_RUNNING_ONLY_ARGV[name]])
+        answers[name] = json.loads(capsys.readouterr().out)
+        assert rc == 1, name
+    payload = answers[command]
+
+    assert "not found" not in payload["error"], (
+        f"`qmu {command}` denies a VM that `qmu list` displays"
+    )
+    assert payload["vm_id"] == answers["exec"]["vm_id"] == VM
+    assert payload["hint"] == answers["exec"]["hint"]
+    assert payload["error"].replace(f"`qmu {command}`", "`qmu exec`") == (
+        answers["exec"]["error"]
+    ), f"`qmu {command}` and `qmu exec` describe the same VM differently"
+
+
+# The empty-running-set branch (#144): with no VM running — the normal state
+# after an auto-cleaned harness `wait` — status/wait/kill answered "No running
+# VMs. Start one with: qmu launch" without naming the VM, while crash/log
+# answered the question asked. One answer for every command, both formats.
+_ABSENT_NAME_ARGV = {
+    "status": ["status", "--vm", "ghost"],
+    "wait": ["wait", "--vm", "ghost", "--timeout", "0"],
+    "wait --pattern": ["wait", "--vm", "ghost", "--pattern", "x", "--timeout", "0"],
+    "kill": ["kill", "--vm", "ghost"],
+    "crash": ["crash", "--vm", "ghost"],
+    "log": ["log", "--vm", "ghost"],
+    "exec": ["exec", "--vm", "ghost", "true"],
+    "push": ["push", "--vm", "ghost", "/tmp/payload", "/root/"],
+    "pull": ["pull", "--vm", "ghost", "/root/payload"],
+    "dmesg": ["dmesg", "--vm", "ghost"],
+}
+
+
+@pytest.mark.parametrize("output_format", ["text", "json"])
+@pytest.mark.parametrize("command", sorted(_ABSENT_NAME_ARGV))
+def test_absent_name_with_zero_running_vms_is_named_by_every_command(
+    command, output_format, cache, monkeypatch, capsys
+):
+    _stopped_with_report(cache, monkeypatch)
+    expected = f"VM 'ghost' not found. Running: none; Stopped: {VM}."
+
+    rc = cli.main(["--format", output_format, *_ABSENT_NAME_ARGV[command]])
+    captured = capsys.readouterr()
+
+    assert rc == 1, command
+    if output_format == "json":
+        payload = json.loads(captured.out)
+        assert payload["error"] == expected, command
+        assert payload["hint"] == "qmu list", command
+    else:
+        assert captured.out == ""
+        assert f"[qmu] Error: {expected}" in captured.err, command
+        assert "No running VMs" not in captured.err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["status", "--vm", VM],
+        ["wait", "--vm", VM, "--timeout", "0"],
+        ["kill", "--vm", VM],
+        ["crash", "--vm", VM],
+        ["log", "--vm", VM],
+    ],
+    ids=lambda argv: argv[0],
+)
+def test_every_envelope_about_a_vm_keys_it_vm_id(argv, cache, monkeypatch, capsys):
+    """#160: `crash`/`log` keyed the VM `vm` while every other command used
+    `vm_id` — and in harness mode those two plus `wait` are the only result
+    channels, so `d["vm_id"]` on a crash envelope silently read None."""
+    _stopped_with_report(cache, monkeypatch)
+
+    cli.main(["--format", "json", *argv])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["vm_id"] == VM
+    assert "vm" not in payload
 
 
 # ---------------------------------------------------------------------------

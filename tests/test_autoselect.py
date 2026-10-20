@@ -63,7 +63,7 @@ def test_one_running_many_stopped_auto_selects(cmd, cache, capsys):
 
     assert rc in (0, 1), f"{cmd} failed to auto-select"
     assert "Multiple VMs found" not in json.dumps(data)
-    assert data.get("vm", "live") == "live"
+    assert data.get("vm_id", "live") == "live"
 
 
 NOTE = "[qmu] Auto-selected the only running VM 'live' (pass --vm to pin it)."
@@ -84,7 +84,7 @@ def test_auto_selection_is_disclosed_not_silent(cmd, cache, capsys):
     cli.main(["--format", "json", cmd, *extra])
     captured = capsys.readouterr()
     data = json.loads(captured.out)
-    assert data.get("vm", data.get("vm_id", "live")) == "live"
+    assert data.get("vm_id", "live") == "live"
     assert data["autoselected"] is True
     assert NOTE in captured.err
 
@@ -103,7 +103,7 @@ def test_explicit_vm_wins_and_is_not_annotated(cmd, cache, capsys):
     rc = cli.main(["--format", "json", cmd, "--vm", "dead"])
     captured = capsys.readouterr()
     data = json.loads(captured.out)
-    assert data["vm"] == "dead"
+    assert data["vm_id"] == "dead"
     assert "autoselected" not in data
     assert "Auto-selected" not in captured.err
     if cmd == "log":
@@ -117,7 +117,7 @@ def test_single_candidate_is_still_disclosed(cache, capsys):
     cli.main(["--format", "json", "log"])
     captured = capsys.readouterr()
     data = json.loads(captured.out)
-    assert data["vm"] == "solo"
+    assert data["vm_id"] == "solo"
     assert data["autoselected"] is True
     assert "Auto-selected the only VM (stopped) 'solo'" in captured.err
 

@@ -169,6 +169,8 @@ def test_transfer_local_validation_is_exit1_without_crash_claim(
     assert payload["error_type"] == "SCPFileError"
     assert payload["error"] == f"Local file not found: {missing}"
     assert payload["hint"] == f"Check the local path: ls -l {missing}"
+    # #159: a caller error still names the VM, as the success envelope does.
+    assert payload["vm_id"] == "xfer-vm"
     assert "crash" not in payload
     assert "crash_detected" not in payload
     assert "ssh_error" not in payload
@@ -230,6 +232,7 @@ def test_transfer_remote_filesystem_failure_is_operational_exit1(
     assert rc == 1
     assert payload == {
         "ok": False,
+        "vm_id": "xfer-vm",
         "error": message,
         "error_type": "SCPFileError",
         "hint": hint,

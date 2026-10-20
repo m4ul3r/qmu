@@ -164,8 +164,8 @@ $ qmu log
 (`log`/`crash` picking the only VM on disk when it is stopped say `the only
 VM (stopped) 'poc'` instead.)
 
-In JSON the same fact is `"autoselected": true` next to the VM name (`vm` for
-`log`/`crash`, `vm_id` elsewhere). Every command reports which VM it acted
+In JSON the same fact is `"autoselected": true` next to the VM name (`vm_id`
+in every command, `log`/`crash` included). Every command reports which VM it acted
 on, auto-selected or not — never assume it from context. `QMU_REQUIRE_VM=1`
 in the environment turns every
 auto-selection into exit 1 (`--vm is required: QMU_REQUIRE_VM is set`,

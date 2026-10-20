@@ -61,7 +61,7 @@ def test_invoke_raises_the_qmuerror_main_maps_to_exit_1(monkeypatch, capsys):
     # invoke() (above) wrote nothing and left both to the caller.
     assert err == (
         f"[qmu] Error: {raised.value}\n"
-        "[qmu] Hint: qmu list; qmu launch --name <name> --no-replace\n"
+        "[qmu] Hint: qmu list\n"
     )
 
 

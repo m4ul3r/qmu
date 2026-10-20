@@ -866,6 +866,162 @@ def test_non_transient_qmp_fault_is_not_retried(tmp_path, monkeypatch):
     assert _FlakyQMP.seen.count("connect") == 1
 
 
+def _busy(text="accepted the connection but sent no greeting within 2s"):
+    return vm_module.QMPBusyError(f"QMP socket /x {text}")
+
+
+def _launch_flaky(tmp_path, monkeypatch, *, pid, clock_step):
+    kernel = _kernel(tmp_path)
+    proc = FakeProcess(pid=pid)
+
+    def fake_popen(*a, **k):
+        qmp_socket_path("slow-vm").parent.mkdir(parents=True, exist_ok=True)
+        qmp_socket_path("slow-vm").write_text("x")
+        return proc
+
+    # Each attempt costs the greeting budget in real life; the fake clock
+    # makes that cost visible without sleeping it.
+    clock = iter(i * clock_step for i in range(1_000_000))
+    monkeypatch.setattr(vm_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm_module, "proc_pid_start", lambda pid: "1")
+    monkeypatch.setattr(vm_module, "QMPClient", _FlakyQMP)
+    monkeypatch.setattr(vm_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(vm_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(vm_module, "_exits_within", lambda proc, grace: False)
+    notes: list[str] = []
+    inst = launch_vm(
+        config=QMUConfig(), kernel=str(kernel), harness=True, name="slow-vm",
+        notes=notes,
+    )
+    return inst, proc, notes
+
+
+def test_a_slow_qmp_handshake_on_a_fresh_vm_is_waited_for(tmp_path, monkeypatch):
+    """#157: nothing can hold a fresh VM's QMP slot, so an ungreeted connect
+    means QEMU is still initialising — waited for, never blamed on a phantom
+    `wait`/debugger and rolled back. Measured live: the identical relaunch
+    succeeded 8 s later."""
+    _FlakyQMP.plan = [_busy(), _busy("greeted the connection but did not answer qmp_capabilities")]
+    _FlakyQMP.seen = []
+
+    inst, proc, notes = _launch_flaky(tmp_path, monkeypatch, pid=1010, clock_step=1.0)
+
+    assert inst.vm_id == "slow-vm"
+    assert _FlakyQMP.seen.count("connect") == 3
+    assert proc.returncode is None
+    assert load_instance("slow-vm") is not None
+    assert len(notes) == 1 and notes[0].startswith("QMP connect retried 2× over ")
+    assert "QEMU still initialising" in notes[0]
+
+
+def test_a_qmp_handshake_that_never_completes_retains_the_live_vm(tmp_path, monkeypatch):
+    """Past the startup budget the live QEMU is kept with its logs (the SSH
+    wait then decides: ready, `no-console-output` 4 or 124), and the note
+    names the real cause instead of a concurrent client."""
+    _FlakyQMP.plan = [_busy()] * 10_000
+    _FlakyQMP.seen = []
+
+    inst, proc, notes = _launch_flaky(tmp_path, monkeypatch, pid=1011, clock_step=2.0)
+
+    assert inst.vm_id == "slow-vm"
+    assert 1 < _FlakyQMP.seen.count("connect") < 50
+    assert proc.returncode is None
+    assert qmp_socket_path("slow-vm").exists()
+    assert load_instance("slow-vm") is not None
+    assert len(notes) == 1
+    assert "VM 'slow-vm' is retained" in notes[0]
+    assert "another qmu command" not in notes[0]
+
+
+def test_a_retained_pending_vm_keeps_its_ports_from_a_concurrent_launch(
+    tmp_path, monkeypatch
+):
+    """#157 review: QEMU creates its QMP listener before it binds -netdev
+    hostfwd, so a VM retained with its handshake pending may not own its SSH
+    port yet. The next launch's probe then saw the port free, both VMs were
+    recorded on it, the slow one died on `Could not set up host forwarding
+    rule` and still reported `ssh_status: ready` — from the other VM's sshd.
+    The lock is held until the pending VM's record exists, and allocation
+    skips every port a live record claims."""
+    import qmu.instance as instance_mod
+
+    kernel = _kernel(tmp_path)
+    rootfs = tmp_path / "rootfs.img"
+    rootfs.touch()
+    key = tmp_path / "id_rsa"
+    key.touch()
+    config = QMUConfig()
+    config.rootfs = str(rootfs)
+    config.ssh_key = str(key)
+    config.ssh_port_start = vm_module.find_free_port(39100)
+    lock_path = instances_dir() / vm_module.PORT_LOCK_NAME
+
+    procs = {"race-a": FakeProcess(pid=1020), "race-b": FakeProcess(pid=1021)}
+
+    def fake_popen(cmd, **kwargs):
+        name = next(n for n in procs if f"{n}.qmp.sock" in " ".join(cmd))
+        qmp_socket_path(name).parent.mkdir(parents=True, exist_ok=True)
+        qmp_socket_path(name).write_text("x")
+        return procs[name]
+
+    lock_at_save: dict[str, bool] = {}
+    real_save = vm_module.save_instance
+
+    def watching_save(inst):
+        lock_at_save[inst.vm_id] = _lock_held(lock_path)
+        real_save(inst)
+
+    clock = iter(i * 2.0 for i in range(1_000_000))
+    monkeypatch.setattr(vm_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm_module, "proc_pid_start", lambda pid: "1")
+    monkeypatch.setattr(vm_module, "QMPClient", _FlakyQMP)
+    monkeypatch.setattr(vm_module, "save_instance", watching_save)
+    monkeypatch.setattr(vm_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(vm_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(vm_module, "_exits_within", lambda proc, grace: False)
+    # Both fakes are "alive" for the recorded-claim scan.
+    monkeypatch.setattr(instance_mod, "instance_alive", lambda inst: True)
+
+    # A: QEMU never answers QMP (and never binds) — retained, pending.
+    _FlakyQMP.plan = [_busy()] * 10_000
+    _FlakyQMP.seen = []
+    a = launch_vm(config=config, kernel=str(kernel), name="race-a", notes=[])
+    # B: an ordinary launch right after, probing from the same start.
+    _FlakyQMP.plan = []
+    b = launch_vm(config=config, kernel=str(kernel), name="race-b", notes=[])
+
+    assert a.ssh_port == config.ssh_port_start  # nothing listens on it
+    assert b.ssh_port != a.ssh_port
+    assert lock_at_save["race-a"] is True  # claimed before siblings could probe
+    assert not _lock_held(lock_path)
+
+
+def test_a_rolled_back_qmp_failure_names_the_vm_and_its_real_state(tmp_path, monkeypatch):
+    """A non-busy QMP fault still rolls back, but the envelope names the VM
+    and the hint says it is gone — not `qmu status --vm <vm_id>`."""
+    kernel = _kernel(tmp_path)
+    proc = FakeProcess(pid=1012)
+    _FlakyQMP.plan = [vm_module.QMPError("Unexpected QMP greeting: {}")]
+    _FlakyQMP.seen = []
+
+    def fake_popen(*a, **k):
+        qmp_socket_path("flaky-vm").parent.mkdir(parents=True, exist_ok=True)
+        qmp_socket_path("flaky-vm").write_text("x")
+        return proc
+
+    monkeypatch.setattr(vm_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vm_module, "proc_pid_start", lambda pid: "1")
+    monkeypatch.setattr(vm_module, "QMPClient", _FlakyQMP)
+    monkeypatch.setattr(vm_module, "_exits_within", lambda proc, grace: False)
+
+    with pytest.raises(vm_module.QMUError) as raised:
+        launch_vm(config=QMUConfig(), kernel=str(kernel), harness=True, name="flaky-vm")
+
+    assert raised.value.envelope_fields() == {"vm_id": "flaky-vm"}
+    assert "rolled back" in raised.value.hint
+    assert "<vm_id>" not in raised.value.hint
+
+
 def test_qmp_connect_retry_is_reported_in_launch_notes(tmp_path, monkeypatch):
     """#76: a retry that fires is observable — `notes` (mirrored into the
     launch envelope's `warnings[]`) names the count and the errno — instead
