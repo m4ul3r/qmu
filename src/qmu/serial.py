@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import bisect
-import itertools
 import os
 import re
 from pathlib import Path
@@ -335,49 +334,158 @@ def extract_crash(
     start_lines = _lines_matching(CRASH_START_PATTERNS, text) - end_lines
 
     # A panic that printed its own `---[ end Kernel panic` banner is the end
-    # of that kernel: what it prints afterwards is panic-path noise, not a
-    # newer crash. On SMP KVM guests that is routinely a WARNING from
+    # of that kernel: what it prints right afterwards is panic-path noise,
+    # not a newer crash. On SMP KVM guests that is routinely a WARNING from
     # `native_smp_send_reschedule` ("Unexpected reschedule of offline CPU"),
     # which a last-event walk returned in place of the Oops that killed the
-    # guest (seen with an `int3` die, #140). Only until the next boot banner:
-    # a `--full-history` scan past a reboot reports the new boot's events.
-    panic_ends = [i for i in end_lines if _PANIC_END_BANNER in tail[i]]
-    if panic_ends:
-        last_panic_end = max(panic_ends)
-        if not any(
-            _BOOT_BANNER_LINE.match(line)
-            for line in itertools.islice(tail, last_panic_end + 1, None)
-        ):
-            del tail[last_panic_end + 1:]
+    # guest (seen with an `int3` die, #140). Only the splat adjacent to the
+    # banner on the dying kernel's clock is noise, never "the rest of the
+    # log": a `snapshot load` rewinds the guest without printing a boot
+    # banner, and a crash the restored guest takes later must still be the
+    # newest one.
+    noise = _post_panic_noise(tail, start_lines, end_lines)
+    if noise:
+        start_lines -= noise
+        end_lines -= noise
 
-    # Walk backwards to find the first line of the last crash event. A soft
-    # end (a WARNING "end trace", a sanitizer report's closing rule) remains
-    # part of the same event only when it leads directly to a fatal panic
-    # continuation. Every other end marker is a hard boundary between
-    # discrete events — so of a flood of back-to-back sanitizer reports only
-    # the newest is returned, not the flood headed by the oldest.
+    event = _last_event(tail, start_lines, end_lines, len(tail))
+    if event is None:
+        return None
+    crash_start, end = event
+
+    # A sanitizer flood still being printed ends in a half-written report
+    # (headline and access line, no object/alloc/free detail yet). When the
+    # report right before it is complete, that one is the useful newest
+    # crash; a lone report in progress is still returned as it stands.
+    if not any(i in end_lines for i in range(crash_start, len(tail))):
+        opening = _previous_nonblank(tail, crash_start)
+        if opening is not None and _is_report_rule(tail[opening]):
+            closing = _previous_nonblank(tail, opening, skip=_TAINT_NOTICE)
+            if closing is not None and _is_report_rule(tail[closing]):
+                complete = _last_event(tail, start_lines, end_lines, closing + 1)
+                if complete is not None:
+                    crash_start, end = complete
+
+    return "\n".join(tail[crash_start:end]) + "\n"
+
+
+# A dying kernel's post-panic splat (the SMP reschedule WARNING) starts right
+# after its end banner — after at most a `cut here` line and its message — and
+# within milliseconds on its own clock. Anything else after the banner is a
+# live guest again.
+_POST_PANIC_NOISE_SECONDS = 1.0
+_POST_PANIC_LEAD = re.compile(r"cut here|sched: Unexpected reschedule")
+# Lines a splat may run before its `end trace`; one that is still being
+# printed at the end of the log counts through EOF.
+_POST_PANIC_EVENT_MAX = 400
+
+_PRINTK_TIME = re.compile(r"\[\s*(\d+\.\d+)\]")
+_REPORT_RULE_LINE = re.compile(_REPORT_RULE)
+_TAINT_NOTICE = "Disabling lock debugging due to kernel taint"
+
+
+def _printk_time(line: str) -> float | None:
+    match = _PRINTK_TIME.search(line)
+    return float(match.group(1)) if match else None
+
+
+def _is_report_rule(line: str) -> bool:
+    return _REPORT_RULE_LINE.search(line) is not None
+
+
+def _post_panic_noise(
+    tail: list[str], start_lines: set[int], end_lines: set[int]
+) -> set[int]:
+    """Line indices of the splats a finished panic's kernel printed after it.
+
+    Only events that begin immediately after the `---[ end Kernel panic`
+    banner (blank, `cut here` and `sched: Unexpected reschedule` lines
+    allowed before the headline) on the dying kernel's clock — a timestamp
+    not earlier than the banner's and at most `_POST_PANIC_NOISE_SECONDS`
+    later — through their end marker, repeatedly. Bounding it by "the rest of
+    the log" hid every later crash: `snapshot load` prints no boot banner,
+    and the restored guest's clock can pass the panic's within a second, so
+    neither a banner nor the clock alone separates the two. A banner without
+    a timestamp (`printk.time=0`) claims nothing.
+    """
+    noise: set[int] = set()
+    for banner in sorted(i for i in end_lines if _PANIC_END_BANNER in tail[i]):
+        stamp = _printk_time(tail[banner])
+        if stamp is None:
+            continue
+        index = banner + 1
+        while (splat := _adjacent_splat(tail, start_lines, end_lines, index, stamp)) is not None:
+            noise.update(range(index, splat))
+            index = splat
+    return noise
+
+
+def _adjacent_splat(
+    tail: list[str], start_lines: set[int], end_lines: set[int], index: int, stamp: float
+) -> int | None:
+    """One past the end of the post-panic splat starting at `index`, or None."""
+    headline = None
+    for i in range(index, len(tail)):
+        line = tail[i]
+        if not line.strip():
+            continue
+        when = _printk_time(line)
+        if when is None or not stamp <= when <= stamp + _POST_PANIC_NOISE_SECONDS:
+            return None
+        if i in start_lines and not is_terminal_panic_start(line):
+            headline = i
+            break
+        if not _POST_PANIC_LEAD.search(line):
+            return None
+    if headline is None:
+        return None
+    last = min(len(tail), headline + _POST_PANIC_EVENT_MAX)
+    for j in range(headline + 1, last):
+        if j in end_lines:
+            return None if _PANIC_END_BANNER in tail[j] else j + 1
+    return len(tail) if last == len(tail) else None
+
+
+def _previous_nonblank(tail: list[str], index: int, *, skip: str | None = None) -> int | None:
+    """The nearest line above `index` that is not blank (nor contains `skip`)."""
+    for i in range(index - 1, -1, -1):
+        line = tail[i]
+        if not line.strip() or (skip is not None and skip in line):
+            continue
+        return i
+    return None
+
+
+def _last_event(
+    tail: list[str], start_lines: set[int], end_lines: set[int], limit: int
+) -> tuple[int, int] | None:
+    """`(first, past_last)` line indices of the last crash event in `tail[:limit]`.
+
+    Walks backwards to the first line of the last event. A soft end (a
+    WARNING "end trace", a sanitizer report's closing rule) remains part of
+    the same event only when it leads directly to a fatal panic
+    continuation. Every other end marker is a hard boundary between discrete
+    events — so of a flood of back-to-back sanitizer reports only the newest
+    is returned, not the flood headed by the oldest. The event runs through
+    the LAST end marker before `limit` (the epilogue may have several), or
+    to `limit` for a crash still in progress.
+    """
     crash_start = None
-    for i in range(len(tail) - 1, -1, -1):
+    for i in range(limit - 1, -1, -1):
         if i in start_lines:
             crash_start = i
         elif crash_start is not None and i in end_lines:
             if _SOFT_END.search(tail[i]) and _soft_end_links_to_fatal_panic(tail, i):
                 continue
             break
-
     if crash_start is None:
         return None
-
-    # Capture through the LAST end-marker at or after the start (the epilogue may
-    # have several end lines); fall back to end-of-tail for a crash still in
-    # progress (no end banner yet).
-    end = len(tail)
-    for i in range(len(tail) - 1, crash_start, -1):
+    end = limit
+    for i in range(limit - 1, crash_start, -1):
         if i in end_lines:
             end = i + 1
             break
-
-    return "\n".join(tail[crash_start:end]) + "\n"
+    return crash_start, end
 
 
 _REGEX_META = frozenset("\\[](){}.*+?^$|")

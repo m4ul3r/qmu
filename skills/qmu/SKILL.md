@@ -204,9 +204,9 @@ dash-word (`uname -a`) is exit 2 with a hint. A report the command provoked is
 whether or not the guest still answers (`ssh_error: true` if not). A panic
 mid-command is exit 3 within a second; a debugger stop (QMP `running:false`)
 aborts within ~1 s with the exit 1 `guest_state: "paused"` envelope; every SSH
-command refuses a `panicked`/`paused` guest (exit 1). Timeout and stop close the
-session, so the command dies on its next write: detach a trigger that must
-survive (`setsid nohup … &`). Detail: `reference/guest-commands.md`, `cross-arch.md`.
+command refuses a `panicked`/`paused` guest (exit 1). A stop leaves the command
+running (output → `detached_output`) until the vCPU resumes; a timeout kills it
+on its next write. `setsid nohup … &` survives both. Detail: `reference/guest-commands.md`.
 
 ## One-shot runs
 

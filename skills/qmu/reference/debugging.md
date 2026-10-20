@@ -24,13 +24,13 @@ pry --instance qmu-debug-vm wait --timeout 10   # blocks until the stop; the rel
 pry --instance qmu-debug-vm backtrace
 ```
 
-**A trigger that must keep running after `pry continue` has to be detached.**
-The abort that returns `exec` at the stop closes the command's SSH session
-(and any halt longer than OpenSSH's 5 s × 3 keepalive drops the connection
-regardless), so the guest command dies of SIGPIPE on its first write to
-stdout/stderr once the vCPU runs again — a multi-stage exploit is gone after
-the inspection, and its progress lines may never have left the guest. Start
-it detached and read its log instead:
+**The trigger survives the stop.** When the breakpoint fires, `exec` returns
+but leaves the command running: its SSH session stays open (a 120 s halt was
+measured), and what it prints afterwards goes to the file in
+`detached_output` (`cat` it after `pry continue`). Only the SSH connection
+going away ends it — `snapshot load`, a reset and `kill` drop it. For a
+trigger that must survive a rewind as well, start it fully detached and read
+its log:
 
 ```bash
 qmu exec --vm debug-vm 'setsid nohup /root/poc > /root/poc.log 2>&1 < /dev/null &'
@@ -96,13 +96,14 @@ anti-pattern in `skill://qmu/reference/cross-arch.md`).
   cont` itself refuses (`snapshots.md`); text mode prints `[qmu] Error: VM 'X' is debug (vCPU halted).` on
   stderr (the word is QEMU's status name: `debug` for a breakpoint stop,
   `paused` after `qmu gdb`/`stop`). A breakpoint that fires **during**
-  `exec`/`compile --run`/`dmesg` is caught by the same QMP watch within ~1 s:
-  the command aborts and reports the identical paused envelope (exit 1,
-  `exit_code:null`, text `SSH connection lost while running: <cmd>` plus the
-  paused lines and a note that the command dies on its next write after the
-  resume; the output that reached the host before the stop is kept), never
-  exit 4 "VM may be unreachable" and never after the SSH keepalive. `pry
-  wait` then shows the stop.
+  `exec`/`compile --run`/`dmesg` is caught by the same QMP watch within ~1 s
+  and returns the identical paused envelope (exit 1, `exit_code:null`, the
+  output that reached the host before the stop), never exit 4 "VM may be
+  unreachable" and never after the SSH keepalive. `exec`/`run`/`compile
+  --run` leave the command running (text `vCPU halted while running (command
+  left running): <cmd>`, JSON `detached_output`: the file its further output
+  goes to); `compile`'s gcc step and `dmesg` are aborted (`SSH connection lost
+  while running: <cmd>`). `pry wait` then shows the stop.
 - **qmu's own SSH probe runs `uname`.** `status`/`list`/`launch` readiness
   probes execute `uname` in the guest, so a `__x64_sys_newuname` breakpoint
   fires on a `qmu status` with no trigger of yours. `status`/`list` therefore

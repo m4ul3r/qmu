@@ -322,13 +322,19 @@ linked in:`, `note: … exited`, the taint notice); ordinary kernel output in
 between proves the first event ended, so a resumed WARNING is never bridged
 into a later unrelated panic. The rule is also what splits a
 `kasan_multi_shot` flood into its reports, so only the newest is returned
-(#142). A report starts at the event's headline — `CRASH_START_PATTERNS`
+(#142) — the newest *complete* one when the last is still being printed. A
+report starts at the event's headline — `CRASH_START_PATTERNS`
 carries arm's `Unable to handle kernel`, `kernel BUG at`, and the die-header
 shape `<what>: <hex> [#N]` (`int3: 0000 [#1]`) because the abort decode and
-the faulting address precede the generic `Oops:` (#140). Lines after a
-panic's own `---[ end Kernel panic` banner are panic-path noise (the SMP
-`native_smp_send_reschedule` WARNING) until the next boot banner, never "the
-last crash".
+the faulting address precede the generic `Oops:` (#140). What a panic's
+kernel prints right after its own `---[ end Kernel panic` banner (the SMP
+`native_smp_send_reschedule` WARNING) is noise, never "the last crash" —
+only that adjacent splat (`_post_panic_noise`: its headline right after the
+banner, at most `cut here`/`sched: Unexpected reschedule` before it, within
+1 s on the banner's printk clock, through its end marker), NOT "the rest of
+the log": a `snapshot load` prints no boot banner and the restored guest's
+clock can pass the panic's within a second (measured: 27 ms short), so
+cutting after the banner hid every later crash from `crash --full-history`.
 
 A report printed while a guest command ran is attributed through the same
 keys on every path: `crash_detected: true` + `crash`, also when the command
@@ -340,7 +346,16 @@ transport.
 Every guest command passes `abort_when=panicked` to `SSHClient.run`, a serial
 watcher polled while the child runs: a terminal panic raises `SSHAborted` with
 the output collected so far, so exec/compile/dmesg/run report exit 3 within a
-second instead of after the 15 s ssh keepalive plus re-probes. Text mode
+second instead of after the 15 s ssh keepalive plus re-probes. A halted vCPU
+(debugger stop) aborts too, but `_run_guest_command` passes `detach_to` (#143):
+the ssh child is NOT killed, `ssh._spawn_drainer` hands its pipe read ends to
+a detached helper that appends the rest of the output to a spill file
+(`detached_output`, capped at 16 MiB, then discarded), so the remote command
+keeps its session and survives `pry continue`. Killing the mux client closed
+the channel and the command died of SIGPIPE on its next write. OpenSSH's
+keepalive does not drop the master while the vCPU is stopped (a 120 s halt
+was measured); `snapshot load`/reset/`kill` tearing the ControlMaster down
+still end it. The timeout path still kills. Text mode
 (`_run_guest_command`) prints guest stdout only on stdout; guest stderr and
 `[exit code: N]` (non-zero only) go to stderr so pipelines see guest bytes.
 

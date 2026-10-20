@@ -523,6 +523,7 @@ def _explain_lost_transport(
     *,
     start_offset: int,
     halted_status: Callable[[], str | None] | None = None,
+    session_note: bool = False,
 ) -> tuple[int, dict[str, Any], list[str]] | None:
     """Explain a dropped/expired SSH session from evidence qmu already holds.
 
@@ -551,15 +552,12 @@ def _explain_lost_transport(
         data, text = _stopped_guest_payload(inst, qemu_status)
         data["exit_code"] = None
         data["command"] = command
-        # #143: the abort closes the command's SSH session — and a halt longer
-        # than the keepalive window (ServerAlive 5 s x 3) drops the shared
-        # connection anyway — so the guest process dies of SIGPIPE on its
-        # next write once the vCPU runs again. The debugging loop must not
-        # assume the trigger is still there after `pry continue`.
-        data["hint"] += " " + _HALT_KILLS_SESSION
-        return 1, data, [
-            f"SSH connection lost while running: {command}", *text, _HALT_KILLS_SESSION,
-        ]
+        if session_note:
+            # #143: the session is gone (not detached), so the guest process
+            # dies of SIGPIPE on its next write once the vCPU runs again.
+            data["hint"] += " " + _HALT_KILLS_SESSION
+            text = [*text, _HALT_KILLS_SESSION]
+        return 1, data, [f"SSH connection lost while running: {command}", *text]
     return None
 
 
@@ -568,6 +566,34 @@ _HALT_KILLS_SESSION = (
     "its next stdout/stderr write (SIGPIPE). Start a trigger that must outlive "
     "a debugger stop detached: setsid nohup CMD > /root/out.log 2>&1 < /dev/null &"
 )
+
+
+def _detached_halt_payload(
+    command: str, inst: VMInstance, qemu_status: str, output: Path
+) -> tuple[int, dict[str, Any], list[str]]:
+    """A debugger stop mid-command, with the command left running (#143).
+
+    The paused envelope the preflight uses (exit 1), plus `detached_output`:
+    qmu did not close the command's SSH session, so the trigger continues
+    when the vCPU resumes and its further output lands in that file
+    (measured: a 120 s halt, the command finished after `qmu cont`). What
+    still ends it is its SSH connection going away — `snapshot load`,
+    `system_reset` and `kill` tear the ControlMaster down — so the hint names
+    the fully detached form for a trigger that must survive those.
+    """
+    data, text = _stopped_guest_payload(inst, qemu_status)
+    data["exit_code"] = None
+    data["command"] = command
+    data["detached_output"] = str(output)
+    note = (
+        "The command is still running in the guest: qmu left its SSH session "
+        f"open, so it continues when the vCPU resumes; its further output is "
+        f"appended to {output}. A snapshot load, reset or kill drops that "
+        "session; a trigger that must survive those runs detached: setsid "
+        "nohup CMD > /root/out.log 2>&1 < /dev/null &"
+    )
+    data["hint"] += " " + note
+    return 1, data, [f"vCPU halted while running (command left running): {command}", *text, note]
 
 
 # How long a watcher poll may wait for a QMP answer. Bounds the drain loop's
@@ -612,6 +638,9 @@ class _GuestWatcher:
         self._next_qmp = time.monotonic() + qmp_interval
         self._thread: threading.Thread | None = None
         self._status: str | None = None
+        # The QEMU status that made the predicate fire on a halted vCPU;
+        # None for a panic, or while it has not fired.
+        self.halt: str | None = None
 
     def _query(self) -> None:
         self._status = _qmp_stopped_status(self._inst)
@@ -636,7 +665,8 @@ class _GuestWatcher:
         if now < self._next_qmp:
             return False
         self._next_qmp = now + self._qmp_interval
-        return self.halted_status() is not None
+        self.halt = self.halted_status()
+        return self.halt is not None
 
 
 def _guest_abort_watcher(
@@ -1013,6 +1043,12 @@ def _run_guest_command(
     command_start_offset = serial_log_offset(inst.serial_log)
     watcher = _guest_abort_watcher(inst, start_offset=command_start_offset)
 
+    def detach_to() -> Path | None:
+        # A debugger stop is not the command's end (#143): leave its session
+        # open so the trigger is still there after `pry continue`. A panic
+        # ends the guest, so that abort kills the child as before.
+        return _spill_path("exec-detached", ".txt") if watcher.halt is not None else None
+
     note_stderr = sink is None or not sink.streams_stderr
     try:
         rc, stdout, stderr = ssh.run(
@@ -1020,21 +1056,27 @@ def _run_guest_command(
             timeout=timeout,
             abort_when=watcher,
             on_chunk=sink.on_chunk if sink is not None else None,
+            detach_to=detach_to,
         )
     except SSHError as exc:
-        # qmu stopped the child: the watcher saw a panic or a halted vCPU, or
-        # --timeout expired. The serial log and QMP explain the first two
-        # (instant, and authoritative); what is left is qmu's own deadline,
+        # qmu stopped waiting: the watcher saw a panic or a halted vCPU, or
+        # --timeout expired. A halt left the command running (detached); the
+        # serial log and QMP explain the rest (instant, and authoritative);
+        # what is left is qmu's own deadline,
         # which is a timeout (124) whether or not the guest still answers —
         # one readiness probe only says which, for the hint (#142). Probing
         # first and taking the crash/transport-loss path on no answer told the
         # caller a healthy kernel had died for a slow command (reproduced live
         # with `qmu run --timeout 1 -- 'sleep 10'`), and a guest wedged by a
         # report flood "crashed" 7 s after the deadline.
-        explained = _explain_lost_transport(
-            command, inst, start_offset=command_start_offset,
-            halted_status=watcher.halted_status,
-        )
+        detached = getattr(exc, "detached_output", None)
+        if detached is not None:
+            explained = _detached_halt_payload(command, inst, watcher.halt or "paused", detached)
+        else:
+            explained = _explain_lost_transport(
+                command, inst, start_offset=command_start_offset,
+                halted_status=watcher.halted_status, session_note=True,
+            )
         if explained is None:
             explained = _command_timeout_payload(
                 command, inst, timeout,
@@ -1054,7 +1096,7 @@ def _run_guest_command(
     # answers, the guest genuinely returned 255 and we take the normal path.
     if rc == 255:
         explained = _explain_lost_transport(
-            command, inst, start_offset=command_start_offset
+            command, inst, start_offset=command_start_offset, session_note=True
         )
         if explained is None and _transport_lost(ssh):
             explained = _ssh_lost_payload(

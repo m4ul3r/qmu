@@ -55,13 +55,12 @@ crash` returns (the command's exit stays 0/1 when it completed).
   itself spend its 2 s busy budget first), plus that probe. The budget wins outright: a guest
   command that finishes *after* the deadline — even while that bounded probe
   was blocked — is still 124, `timed_out: true`, never a late `ok: true`.
-- Neither the deadline nor a debugger-stop abort keeps the guest command
-  alive: qmu closes its SSH session, so the command dies of SIGPIPE on its
-  next stdout/stderr write (a command that stays silent, or a child it
-  backgrounded, survives). A halt also outlasts OpenSSH's keepalive (5 s × 3),
-  which drops the shared connection on its own. Detach anything that must
-  outlive the step: `qmu exec --vm X 'setsid nohup ./poc > /root/poc.log 2>&1
-  < /dev/null &'`, then read `/root/poc.log`.
+- The deadline kills the guest command's session: the command dies of
+  SIGPIPE on its next stdout/stderr write (a command that stays silent, or a
+  child it backgrounded, survives). A debugger stop does **not** (below).
+  Detach anything that must outlive the step regardless: `qmu exec --vm X
+  'setsid nohup ./poc > /root/poc.log 2>&1 < /dev/null &'`, then read
+  `/root/poc.log`.
 - A kernel panic while the command runs is reported as exit 3 as soon as the
   serial log shows `Kernel panic - not syncing` (sub-second), with the partial
   `stdout`/`stderr` on the crash envelope — not after the SSH keepalive
@@ -72,11 +71,20 @@ crash` returns (the command's exit stays 0/1 when it completed).
   command refuses in under a second: exit 1, `guest_state: "panicked" |
   `"paused"`, `hint` naming `qmu crash --vm X` / `qmu kill --vm X` or `qmu cont
   --vm X` (for `qemu_status: "restore-vm"` the hint is a known-good `snapshot
-  load` or `kill` + relaunch instead — never `cont`). A debugger stop that fires mid-command (`exec`, `compile --run`,
-  `dmesg`) aborts the SSH session within ~1 s and gives the same `paused`
-  envelope — never the 15–20 s keepalive wait — with the output that reached
-  the host before the stop (bytes the guest wrote just before it may still be
-  in the guest) and a `hint` that the command will not survive the resume.
+  load` or `kill` + relaunch instead — never `cont`). A debugger stop that
+  fires mid-command returns within ~1 s with the same `paused` envelope —
+  never the 15–20 s keepalive wait — and the output that reached the host
+  before the stop (bytes the guest wrote just before it may still be in the
+  guest). For `exec`, `run` and `compile --run` the command is **left
+  running**: qmu keeps its SSH session open (`text`: `vCPU halted while
+  running (command left running)`) and a detached helper appends its further
+  output to the file named by `detached_output`, so the trigger continues
+  after `pry continue` / `qmu cont` (measured with a 120 s halt; the
+  connection stays up while the vCPU is stopped, at most 16 MiB of output is
+  kept). What still ends it is the SSH connection going away: `snapshot
+  load`, a reset and `kill` drop the ControlMaster — use the `setsid nohup`
+  form for a trigger that must survive those. `compile`'s gcc step and
+  `dmesg` are aborted (their session closed).
 - Text mode: `reference/output-contract.md` → *Guest-command text mode*.
 
 ## `run`

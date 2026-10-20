@@ -644,6 +644,44 @@ def test_extract_crash_after_a_reboot_reports_the_new_boot(tmp_path):
     assert report.startswith("[    5.000000] WARNING: CPU: 1")
 
 
+def test_extract_crash_after_a_clean_reboot_still_reports_the_panic(tmp_path):
+    """A reboot ends the noise too: with a clean new boot after it, the
+    newest crash in the history is the panic, not its reschedule WARNING."""
+    report = extract_crash(
+        _write(
+            tmp_path,
+            "clean-reboot.serial.log",
+            INT3_PANIC_THEN_RESCHEDULE_WARNING_LOG + BANNER + "[    1.000000] systemd[1]: started\n",
+        )
+    )
+    assert report is not None
+    assert report.startswith("[   18.827244] int3: 0000 [#1]")
+    assert "native_smp_send_reschedule" not in report
+
+
+@pytest.mark.parametrize("clock", ["12.40", "18.97"], ids=["rewound", "past-the-panic"])
+def test_extract_crash_after_a_snapshot_load_reports_the_restored_guests_crash(
+    tmp_path, clock
+):
+    """`loadvm` rewinds the guest without a boot banner, and the restored
+    clock may already be past the panic's (live: 27 ms short of it after a
+    save one second before the panic). A crash the restored guest takes is
+    newer than the panic and must win a `--full-history` scan."""
+    report = extract_crash(
+        _write(
+            tmp_path,
+            "load.serial.log",
+            INT3_PANIC_THEN_RESCHEDULE_WARNING_LOG
+            + f"[   {clock}0000] nullmod: about to store through NULL (survivable oops)\n"
+            + f"[   {clock}0100] BUG: kernel NULL pointer dereference, address: 0000000000000000\n"
+            + f"[   {clock}0200] Oops: 0002 [#1] PREEMPT SMP KASAN NOPTI\n"
+            + f"[   {clock}0300] ---[ end trace 0000000000000000 ]---\n",
+        )
+    )
+    assert report is not None
+    assert report.startswith(f"[   {clock}0100] BUG: kernel NULL pointer dereference")
+    assert "int3" not in report
+
 
 # --- #142: a sanitizer report flood is many events, not one -------------------
 
@@ -709,6 +747,37 @@ def test_extract_crash_bridges_a_kasan_report_into_its_panic(tmp_path):
     assert report.count("BUG: KASAN") == 1
     assert "Kernel panic - not syncing: panic_on_warn" in report
     assert report.rstrip("\n").endswith("]---")
+
+
+def test_extract_crash_prefers_the_newest_complete_report_over_one_half_printed(tmp_path):
+    """A flood read mid-print ends in a report with only its headline: the
+    complete report before it carries the object/alloc/free detail."""
+    log = _write(
+        tmp_path,
+        "inflight.serial.log",
+        _kasan_report(17, "ffff888001f9d800")
+        + _kasan_report(18, "ffff888001f9d808")
+        + f"[  19.000000] {_RULE}\n"
+        + "[  19.000100] BUG: KASAN: slab-out-of-bounds in __perf_read_group_add+0x3e1/0x460\n"
+        + "[  19.000200] Read of size 8 at addr ffff888001f9d810 by task repro/171\n",
+    )
+    report = extract_crash(log)
+    assert report is not None
+    assert report.startswith("[  18.000100] BUG: KASAN:")
+    assert "The buggy address belongs to the object" in report
+    assert "ffff888001f9d810" not in report
+
+
+def test_extract_crash_returns_a_lone_report_still_being_printed(tmp_path):
+    log = _write(
+        tmp_path,
+        "lone.serial.log",
+        f"[  19.000000] {_RULE}\n"
+        "[  19.000100] BUG: KASAN: slab-out-of-bounds in f+0x1/0x2\n"
+        "[  19.000200] Read of size 8 at addr ffff888001f9d810 by task repro/171\n",
+    )
+    report = extract_crash(log)
+    assert report is not None and report.startswith("[  19.000100] BUG: KASAN:")
 
 
 # --- These guard the None / no-crash branches ---
