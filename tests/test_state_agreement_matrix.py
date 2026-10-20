@@ -3072,7 +3072,7 @@ def test_gdb_refuses_an_attached_stub_identically_in_text_and_json(
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm=None: inst)
     monkeypatch.setattr(qmp_cmds.shutil, "which", lambda name: "/usr/bin/pry")
     monkeypatch.setattr(qmp_cmds, "gdb_client_attached", lambda inst: True)
-    monkeypatch.setattr(qmp_cmds, "bridge_alive", lambda inst: True)
+    monkeypatch.setattr(qmp_cmds, "qmu_bridge_attached", lambda inst: True)
     spawned = []
     monkeypatch.setattr(
         qmp_cmds.subprocess, "run", lambda *a, **kw: spawned.append(a) or None

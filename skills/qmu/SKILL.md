@@ -75,7 +75,7 @@ Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `
 | `error_type: "SCPFileError"` (exit 1) | missing local file, a directory, bad remote dir | fix the path; archive directories first |
 | `error_type: "SnapshotError"` (exit 1) | HMP refused; on `load` read `restore_state`: `none` → nothing restored (a missing tag is caught before `loadvm`, guest never stopped; `resumed: true` only if QEMU refused a listed tag); `partial`/`unknown` → disks already rewound, guest **left paused** on purpose (`guest_paused: true`) | `none`: run the `hint` (`qmu snapshot list --vm X`); `partial`/`unknown`: load a known-good tag or `kill` + `launch` — never a blind `qmu cont`; `reference/snapshots.md` |
 | `error_type: "ConfigError"`, `errors[]` | every schema problem in the file, with `source`/`key`/`hint` | fix all listed keys; cleanup commands are blocked until it parses (or run them from outside the project dir) |
-| `A debugger client is already attached to port N (pry bridge pid P)` | the stub serves one client; `qmu gdb` spawned nothing | reuse it (`pry --instance qmu-X`, the `bridge_instance_id`) or `pry kill --instance qmu-X` |
+| `A debugger client is already attached to port N (pry bridge pid P)` | the stub serves one client; `qmu gdb` spawned nothing | reuse it (`pry --instance qmu-X`, the `bridge_instance_id`) or `pry kill --instance qmu-X`; without `(pry bridge pid P)` the client is not qmu's and has no `qmu-X` name: `pry doctor` → `pry --instance <pid> info target` finds it |
 | `[qmu] Output spilled to <path> (~N tokens)` | result exceeded ~10k tokens; text shows a preview capped at 40 lines **and** 4096 bytes, then `[qmu] Preview: first A of B bytes (…)` | read `<path>` (`artifact_path` under JSON) |
 
 ## Bootstrap a project
@@ -322,9 +322,9 @@ the same envelope. `qmu kbase` needs only SSH and `/proc/kallsyms` — no
 SSH probe (`ssh: "skipped (debugger attached)"`): that probe runs `uname`,
 which would trip `__x64_sys_newuname`. Address your bridge with `pry --instance
 qmu-<vm>` (`bridge_instance_id`; `bridge_pid` also works) on a shared host.
-`snapshot save/load`, `system_reset` and `kill` invalidate debugger state
-(stderr warnings) — the coherence table, KASLR re-slide, watchpoints under KVM:
-`reference/debugging.md`. ARM guests: `reference/cross-arch.md`.
+`snapshot save/load`, `system_reset`, a guest reboot and `kill` invalidate debugger state
+(stderr + `warnings[]`; `snapshot save` reports `breakpoints_in_image`) — coherence table,
+KASLR, KVM watchpoints: `reference/debugging.md`. ARM guests: `reference/cross-arch.md`.
 
 ## Raw QEMU access
 
