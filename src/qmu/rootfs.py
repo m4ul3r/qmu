@@ -3,13 +3,16 @@ from __future__ import annotations
 import base64
 import os
 import posixpath
+import re
 import shutil
 import stat as stat_mod
 import subprocess
+import tarfile
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple, Sequence
 
 from .instance import QMUError
 
@@ -163,17 +166,102 @@ def parse_mapping(spec: str) -> tuple[str, str]:
 
 
 SUPERMIN_KERNEL_HINT = (
-    "libguestfs could not build its appliance because it cannot READ the host "
-    "kernel: /boot/vmlinuz-* is commonly mode 0600 on Debian/Ubuntu, and the "
-    "appliance build runs unprivileged. Fix either way:\n"
+    "libguestfs could not build its appliance: supermin cannot READ a kernel "
+    "(/boot/vmlinuz-* is commonly mode 0600 on Debian/Ubuntu, and the build "
+    "runs unprivileged) and no cached appliance covers it. Point supermin at a "
+    "readable kernel for this host's arch (no root needed; a kernel with "
+    "virtio built in, such as a tools/kbuild.sh one, needs only an empty "
+    "modules.dep):\n"
+    "  mkdir -p /var/tmp/qmu-supermin-modules && touch /var/tmp/qmu-supermin-modules/modules.dep\n"
+    "  export SUPERMIN_KERNEL=<readable kernel image> \\\n"
+    "         SUPERMIN_KERNEL_VERSION=<its version> \\\n"
+    "         SUPERMIN_MODULES=/var/tmp/qmu-supermin-modules\n"
+    "or make the host kernels readable (system-wide, needs root):\n"
     "  sudo chmod 0644 /boot/vmlinuz-*\n"
-    "or point supermin at a readable copy (leaves system perms alone):\n"
-    "  sudo install -m 0644 /boot/vmlinuz-$(uname -r) /var/tmp/vmlinuz\n"
-    "  export SUPERMIN_KERNEL=/var/tmp/vmlinuz \\\n"
-    "         SUPERMIN_KERNEL_VERSION=$(uname -r) \\\n"
-    "         SUPERMIN_MODULES=/lib/modules/$(uname -r)\n"
     "Run `qmu doctor` to re-check."
 )
+
+# The envelope `hint` for the same failure: the fix as one line.
+SUPERMIN_ENV_HINT = (
+    "export SUPERMIN_KERNEL=<readable kernel> SUPERMIN_KERNEL_VERSION=<its version> "
+    "SUPERMIN_MODULES=<dir with its modules.dep>  (or: sudo chmod 0644 /boot/vmlinuz-*)"
+)
+
+
+def appliance_cache_dir() -> Path:
+    """Where libguestfs keeps the supermin appliance it built and reuses.
+
+    `$LIBGUESTFS_CACHEDIR`, else `$TMPDIR`, else `/var/tmp` — libguestfs's own
+    order — so a different TMPDIR is a different, possibly empty, cache.
+    """
+    base = os.environ.get("LIBGUESTFS_CACHEDIR") or os.environ.get("TMPDIR") or "/var/tmp"
+    return Path(base) / f".guestfs-{os.getuid()}" / "appliance.d"
+
+
+def fixed_appliance() -> str | None:
+    """The `LIBGUESTFS_PATH` directory holding a fixed appliance, or None.
+
+    libguestfs-make-fixed-appliance writes `README.fixed` beside `kernel`,
+    `initrd` and `root`; libguestfs then boots that and never runs supermin,
+    so no host kernel needs to be readable and there is no cache to go stale.
+    """
+    for entry in (os.environ.get("LIBGUESTFS_PATH") or "").split(":"):
+        if entry and all(
+            (Path(entry) / name).is_file() for name in ("README.fixed", "kernel", "initrd", "root")
+        ):
+            return entry
+    return None
+
+
+def appliance_kernel_problem(boot: Path = Path("/boot")) -> str | None:
+    """Why supermin cannot read a kernel to (re)build the appliance, or None.
+
+    Only an input check: a cached appliance runs without any kernel being
+    readable now, so this alone never says whether `rootfs *` works. A fixed
+    appliance needs no kernel at all.
+    """
+    if fixed_appliance() is not None:
+        return None
+    override = os.environ.get("SUPERMIN_KERNEL")
+    if override:
+        if os.access(override, os.R_OK):
+            return None
+        return f"SUPERMIN_KERNEL={override} is NOT readable"
+    kernels = sorted(boot.glob("vmlinuz-*")) if boot.is_dir() else []
+    if not kernels:
+        return "no /boot/vmlinuz-* found"
+    if any(os.access(k, os.R_OK) for k in kernels):
+        return None
+    return "no /boot/vmlinuz-* is readable (they are mode 0600)"
+
+
+# A warm cache starts in ~3 s and an unreadable-kernel build fails in ~1 s;
+# this only bounds a host where the appliance hangs, so `doctor` stays quick.
+APPLIANCE_PROBE_TIMEOUT = 20.0
+
+
+def probe_appliance(fish: str, timeout: float = APPLIANCE_PROBE_TIMEOUT) -> tuple[bool | None, str]:
+    """Start the appliance once, against no disk: the capability itself.
+
+    `(True, "")` when it runs (built now or served from the cache),
+    `(False, why)` when it does not, `(None, why)` when the probe could not
+    finish. ~3 s from a warm cache; a failed supermin build fails in ~1 s.
+    """
+    try:
+        proc = subprocess.run(
+            [fish, "--ro", "-a", "/dev/null", "run"],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"`guestfish -a /dev/null run` did not finish in {timeout:g}s"
+    except OSError as exc:
+        return False, str(exc)
+    if proc.returncode == 0:
+        return True, ""
+    lines = _failure_text(proc).splitlines()
+    if not lines:
+        return False, f"exit {proc.returncode}"
+    return False, re.sub(r"^\*stdin\*:\d+: ", "", lines[0])
 
 
 def _missing_dirs(
@@ -203,7 +291,8 @@ def _missing_dirs(
         diagnosis = _diagnose_guestfish_failure(out, image, partition)
         raise QMUError(
             f"guestfish could not inspect {image} (exit {proc.returncode}).\n"
-            f"{diagnosis or ''}\n\nguestfish said:\n{out}".strip()
+            f"{diagnosis.cause if diagnosis else ''}\n\nguestfish said:\n{out}".strip(),
+            hint=diagnosis.hint if diagnosis else _shell_hint(image),
         )
 
     answers = proc.stdout.split()
@@ -214,7 +303,20 @@ def _missing_dirs(
     return [d for d, ok in zip(wanted, answers) if ok.strip().lower() != b"true"]
 
 
-def _diagnose_guestfish_failure(output: str, image: str, partition: int) -> str | None:
+class Diagnosis(NamedTuple):
+    """A recognised guestfish failure: the cause for the message, and the
+    one-line recovery for the envelope `hint`."""
+
+    cause: str
+    hint: str
+
+
+def _shell_hint(image: str) -> str:
+    """The recovery for a guestfish failure nothing more specific explains."""
+    return f"qmu rootfs shell {image} --partition <N> to inspect the image"
+
+
+def _diagnose_guestfish_failure(output: str, image: str, partition: int) -> Diagnosis | None:
     """Translate a known guestfish/supermin failure into an actionable cause.
 
     libguestfs reports several unrelated problems through the same opaque
@@ -228,30 +330,46 @@ def _diagnose_guestfish_failure(output: str, image: str, partition: int) -> str 
     # it catches cases the instance-metadata pre-check cannot see. Check it
     # before the generic appliance banner, which this failure also prints.
     if "failed to get" in lowered and "lock" in lowered:
-        return (
+        return Diagnosis(
             f"Another process still has {image} open for writing (QEMU holds an "
             f"image lock while a VM runs). Run `qmu list` and `qmu kill --vm <id>`; "
             f"if qmu lists nothing, an untracked QEMU survived — check "
-            f"`pgrep -af qemu-system` and kill it."
+            f"`pgrep -af qemu-system` and kill it.",
+            "qmu list, then qmu kill --vm <id> for the VM holding the image",
         )
 
-    if "supermin" in lowered and "permission denied" in lowered:
-        return SUPERMIN_KERNEL_HINT
+    # Without LIBGUESTFS_DEBUG libguestfs prints only "supermin exited with
+    # error status 1" — never supermin's own "Permission denied" — so the
+    # unreadable kernel is confirmed on the host instead of in the text.
+    if "supermin" in lowered and (
+        "permission denied" in lowered or "exited with error status" in lowered
+    ):
+        if "permission denied" in lowered or appliance_kernel_problem() is not None:
+            return Diagnosis(SUPERMIN_KERNEL_HINT, SUPERMIN_ENV_HINT)
+        return Diagnosis(
+            "libguestfs could not build its appliance (supermin failed) although "
+            "a kernel is readable. Rerun with LIBGUESTFS_DEBUG=1 "
+            "LIBGUESTFS_TRACE=1 for supermin's own error; `qmu doctor` "
+            "re-checks the appliance.",
+            "rerun with LIBGUESTFS_DEBUG=1 LIBGUESTFS_TRACE=1 for supermin's error; qmu doctor",
+        )
 
     # Distinguish "the image has no such partition" from "the image has no
     # such path". Both surface as ENOENT; only the first is about --partition,
     # and pointing at --partition for a typo'd path sends the reader after the
     # wrong thing.
     if "no such file or directory" in lowered and "/dev/sda" not in output:
-        return (
+        return Diagnosis(
             f"That path does not exist inside {image}. List what is actually "
-            f"there with `qmu rootfs ls {image} <dir> --partition {partition}`."
+            f"there with `qmu rootfs ls {image} <dir> --partition {partition}`.",
+            f"qmu rootfs ls {image} <dir> --partition {partition}",
         )
 
     if "is a directory" in lowered or "not a regular file" in lowered:
-        return (
+        return Diagnosis(
             "That path is a directory. Use `qmu rootfs ls` to list it, or "
-            "`qmu rootfs rm --recursive` to delete it."
+            "`qmu rootfs rm --recursive` to delete it.",
+            "qmu rootfs ls to list it, or qmu rootfs rm --recursive to delete it",
         )
 
     # guestfish prints the partitions it DID find; surface its own answer.
@@ -259,11 +377,12 @@ def _diagnose_guestfish_failure(output: str, image: str, partition: int) -> str 
         "no such file or directory" in lowered and "/dev/sda" in output
     ):
         suggestion = "--partition 0" if partition != 0 else "--partition 1"
-        return (
+        return Diagnosis(
             f"Partition /dev/sda{partition or ''} was not found in {image}. "
             f"A whole-disk (partitionless) image needs --partition 0; a "
             f"partitioned one needs the partition number. Try {suggestion}, or "
-            f"run `qmu rootfs shell {image} --partition 0` and use `list-filesystems`."
+            f"run `qmu rootfs shell {image} --partition 0` and use `list-filesystems`.",
+            f"retry with {suggestion}",
         )
 
     if "closed the connection unexpectedly" in lowered:
@@ -271,13 +390,14 @@ def _diagnose_guestfish_failure(output: str, image: str, partition: int) -> str 
         # an orphaned QEMU is the leading suspect. `qmu list` DOES surface those
         # now, as [ORPHANED — process alive] — saying otherwise steers the
         # reader away from the one command that answers the question.
-        return (
+        return Diagnosis(
             f"libguestfs could not open {image}. The usual causes, in order: "
             f"an orphaned QEMU still holds it — `qmu list` shows those as "
             f"[ORPHANED — process alive]; reap it with `qmu kill --vm <id>` or "
             f"`qmu prune --orphans` (add --dry-run to look first). Otherwise "
             f"the appliance failed to build: run `qmu doctor`, and "
-            f"LIBGUESTFS_DEBUG=1 for detail."
+            f"LIBGUESTFS_DEBUG=1 for detail.",
+            "qmu list (an [ORPHANED] VM may hold the image); otherwise qmu doctor",
         )
 
     return None
@@ -379,13 +499,8 @@ def inject(
     cmd = [fish, "--rw", "-a", str(img_path)] + _mount_args(partition)
     proc = _invoke(cmd, script)
     if proc.returncode != 0:
-        out = _failure_text(proc)
-        diagnosis = _diagnose_guestfish_failure(out, image, partition)
-        if diagnosis is None:
-            diagnosis = f"Try `qmu rootfs shell {image} --partition <N>` to inspect."
-        raise QMUError(
-            f"guestfish inject failed (exit {proc.returncode}).\n{diagnosis}\n\n"
-            f"guestfish said:\n{out}"
+        raise _guestfish_failure(
+            proc.returncode, proc.stderr or proc.stdout or b"", image, partition, "inject"
         )
 
 
@@ -485,12 +600,13 @@ def _guestfish_failure(
     returncode: int, stderr: bytes, image: str, partition: int, action: str
 ) -> QMUError:
     out = stderr.decode("utf-8", "replace").strip()
-    diagnosis = _diagnose_guestfish_failure(out, image, partition)
-    if diagnosis is None:
-        diagnosis = f"Try `qmu rootfs shell {image} --partition <N>` to inspect."
+    diagnosis = _diagnose_guestfish_failure(out, image, partition) or Diagnosis(
+        f"Try `qmu rootfs shell {image} --partition <N>` to inspect.", _shell_hint(image),
+    )
     return QMUError(
-        f"guestfish {action} failed (exit {returncode}).\n{diagnosis}\n\n"
-        f"guestfish said:\n{out}"
+        f"guestfish {action} failed (exit {returncode}).\n{diagnosis.cause}\n\n"
+        f"guestfish said:\n{out}",
+        hint=diagnosis.hint,
     )
 
 
@@ -796,27 +912,153 @@ def read_file(image: str, guest_path: str, partition: int = 1) -> bytes:
         tmp_path.unlink(missing_ok=True)
 
 
-# Provenance stamp `tools/mkrootfs.sh` writes; its `sshd_policy` records
-# whether sshd was built key-only (#68). Images built earlier carry no stamp
-# (or one without the field) and accept root with ANY key.
+# Provenance stamps. `tools/mkrootfs.sh` writes STAMP_PATH; its `sshd_policy`
+# records whether sshd was built key-only (#68). `tools/mktarget.sh` writes
+# TARGET_STAMP_PATH and has built key-only targets since its first version.
+# Neither stamp's absence says anything about sshd by itself: an image either
+# tool did not build has none, whatever its sshd does (#145).
 STAMP_PATH = "/etc/qmu-rootfs.json"
+TARGET_STAMP_PATH = "/etc/qmu-target.json"
+
+_EVIDENCE_MARK = "@@qmu-sshd-evidence@@"
 
 
-def read_stamp(image: str, partition: int = 0) -> bytes | None:
-    """The raw `/etc/qmu-rootfs.json` bytes, or None when the image has none.
+@dataclass(frozen=True)
+class SshdEvidence:
+    """What an image says about root's SSH login, read in one session."""
 
-    Read-only and busy-safe, so `doctor` can ask while a VM holds the image.
-    Whole-disk by default: that is the mkrootfs layout the stamp belongs to.
+    rootfs_stamp: str | None    # /etc/qmu-rootfs.json, None when absent
+    target_stamp: str | None    # /etc/qmu-target.json, None when absent
+    root_shadow: str | None     # root's /etc/shadow line, None when unreadable
+    sshd_config: str            # /etc/ssh/sshd_config ("" when absent)
+    sshd_config_d: tuple[str, ...]  # /etc/ssh/sshd_config.d/*.conf, one per file, glob order
+
+
+def read_sshd_evidence(image: str, partition: int = 0) -> SshdEvidence:
+    """Both qmu stamps, root's shadow entry and the sshd config, read-only.
+
+    Busy-safe, so `doctor` can ask while a VM holds the image. Whole-disk by
+    default: the mkrootfs and mktarget layout. `-` prefixes keep a missing
+    file from ending the script; the `exists` answers tell absent from empty.
     Raises QMUError when guestfish is missing or cannot open the image.
     """
-    out = _run_script(
-        image, partition,
-        f"exists {STAMP_PATH}\n-cat {STAMP_PATH}\n", "stamp", read_only=True,
+    sections = ("rootfs", "target", "shadow", "sshd")
+    with tempfile.TemporaryDirectory(prefix="qmu-sshd-") as scratch:
+        dropins = Path(scratch) / "sshd_config.d.tar"
+        script = (
+            f"exists {STAMP_PATH}\nexists {TARGET_STAMP_PATH}\n"
+            f"echo {_EVIDENCE_MARK} rootfs\n-cat {STAMP_PATH}\n"
+            f"echo {_EVIDENCE_MARK} target\n-cat {TARGET_STAMP_PATH}\n"
+            f"echo {_EVIDENCE_MARK} shadow\n-egrep ^root: /etc/shadow\n"
+            f"echo {_EVIDENCE_MARK} sshd\n-cat /etc/ssh/sshd_config\n"
+            # Per file, not concatenated: sshd ends a drop-in's `Match`
+            # block at the end of that file.
+            f"-tar-out /etc/ssh/sshd_config.d {guestfish_quote(str(dropins))}\n"
+        )
+        out = _run_script(image, partition, script, "sshd", read_only=True)
+        included = _read_dropins(dropins)
+    lines = out.decode("utf-8", "replace").splitlines()
+    has_rootfs, has_target = (
+        [answer.strip().lower() == "true" for answer in lines[:2]] + [False, False]
+    )[:2]
+    body: dict[str, list[str]] = {name: [] for name in sections}
+    current: str | None = None
+    for line in lines[2:]:
+        if line.startswith(_EVIDENCE_MARK + " "):
+            current = line[len(_EVIDENCE_MARK) + 1:].strip()
+            continue
+        if current in body:
+            body[current].append(line)
+    text = {name: "\n".join(body[name]).strip() for name in sections}
+    shadow = text["shadow"].splitlines()
+    return SshdEvidence(
+        rootfs_stamp=text["rootfs"] if has_rootfs else None,
+        target_stamp=text["target"] if has_target else None,
+        root_shadow=shadow[0] if shadow else None,
+        sshd_config=text["sshd"],
+        sshd_config_d=included,
     )
-    answer, _, content = out.partition(b"\n")
-    if answer.strip().lower() != b"true":
-        return None
-    return content
+
+
+def _read_dropins(archive: Path) -> tuple[str, ...]:
+    """The `*.conf` files of a `tar-out` of sshd_config.d, in glob order.
+    No archive (the directory is absent) is no drop-ins."""
+    if not archive.is_file() or archive.stat().st_size == 0:
+        return ()
+    texts: list[tuple[str, str]] = []
+    try:
+        with tarfile.open(archive) as tar:
+            for member in tar.getmembers():
+                name = posixpath.normpath(member.name)
+                if member.isfile() and "/" not in name and name.endswith(".conf"):
+                    data = tar.extractfile(member)
+                    if data is not None:
+                        texts.append((name, data.read().decode("utf-8", "replace")))
+    except tarfile.TarError:
+        return ()
+    return tuple(text for _, text in sorted(texts))
+
+
+_SSHD_LINE = re.compile(r"^\s*([A-Za-z]\w*)\s*(?:=\s*|\s+)(.*)$")
+
+
+def _sshd_settings(main: str, included: Sequence[str]) -> dict[str, str]:
+    """First value of each keyword, as sshd resolves them outside `Match`.
+
+    sshd keeps the FIRST value it reads, and a `Match` line makes everything
+    after it in that file conditional — the state resets at the end of each
+    included file. An `Include` of sshd_config.d expands to `included` in
+    place (Debian/Ubuntu put it on the first line).
+    """
+    settings: dict[str, str] = {}
+
+    def walk(text: str, expand: bool) -> None:
+        for raw in text.splitlines():
+            m = _SSHD_LINE.match(raw)
+            if m is None:
+                continue
+            key, value = m.group(1).lower(), m.group(2).split()
+            if key == "match":
+                return
+            if key == "include":
+                if expand and any("sshd_config.d" in v for v in value):
+                    for dropin in included:
+                        walk(dropin, False)
+                continue
+            settings.setdefault(key, value[0].lower() if value else "")
+
+    walk(main, True)
+    return settings
+
+
+def root_login_without_key(evidence: SshdEvidence) -> tuple[bool | None, str]:
+    """Does sshd let root in with an empty password, i.e. with ANY key or none?
+
+    That is OpenSSH's `none` authentication: it succeeds for root when root's
+    password is empty, `PermitEmptyPasswords yes`, `PasswordAuthentication`
+    is not `no` and `PermitRootLogin yes` — the legacy mkrootfs setup.
+    `(None, why)` when the image does not let that be decided.
+    """
+    if evidence.root_shadow is None:
+        return None, "root's /etc/shadow entry is unreadable"
+    if not evidence.sshd_config:
+        return None, "no /etc/ssh/sshd_config"
+    fields = evidence.root_shadow.split(":")
+    password = fields[1] if len(fields) > 1 else "?"
+    settings = _sshd_settings(evidence.sshd_config, evidence.sshd_config_d)
+    if password != "":
+        state = "locked" if password.startswith(("!", "*")) else "set"
+        return False, f"root's password is {state}"
+    if settings.get("permitemptypasswords", "no") != "yes":
+        return False, "root's password is empty but sshd refuses empty passwords"
+    if settings.get("passwordauthentication", "yes") == "no":
+        return False, "root's password is empty but PasswordAuthentication is no"
+    if settings.get("permitrootlogin", "prohibit-password") != "yes":
+        return False, "root's password is empty but PermitRootLogin is not yes"
+    return True, (
+        "root's password is empty and sshd_config sets PermitEmptyPasswords "
+        "yes and PermitRootLogin yes"
+    )
 
 
 def remove(

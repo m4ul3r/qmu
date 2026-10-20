@@ -130,8 +130,8 @@ def test_appliance_failure_points_at_the_untracked_holder():
     diagnosis = _diagnose_guestfish_failure(out, "./rootfs.img", 1)
 
     assert diagnosis is not None
-    assert "qmu prune --orphans" in diagnosis
-    assert "qmu doctor" in diagnosis
+    assert "qmu prune --orphans" in diagnosis.cause
+    assert "qmu doctor" in diagnosis.cause
 
 
 def test_unreadable_boot_kernel_is_diagnosed_as_a_permissions_problem():
@@ -144,8 +144,38 @@ def test_unreadable_boot_kernel_is_diagnosed_as_a_permissions_problem():
     diagnosis = _diagnose_guestfish_failure(out, "./rootfs.img", 1)
 
     assert diagnosis is not None
-    assert "SUPERMIN_KERNEL" in diagnosis
-    assert "chmod" in diagnosis
+    assert "SUPERMIN_KERNEL" in diagnosis.cause
+    assert "chmod" in diagnosis.cause
+
+
+_SUPERMIN_EXIT = (
+    "libguestfs: error: /usr/bin/supermin exited with error status 1.\n"
+    "To see full error messages you may need to enable debugging.\n"
+    "Do:\n  export LIBGUESTFS_DEBUG=1 LIBGUESTFS_TRACE=1\nand run the command again."
+)
+
+
+def test_supermin_exit_status_with_an_unreadable_kernel_gets_the_kernel_fix(monkeypatch):
+    """#147: without LIBGUESTFS_DEBUG libguestfs never prints supermin's own
+    "Permission denied", so the kernel fix was unreachable."""
+    monkeypatch.setattr(
+        rootfs_mod, "appliance_kernel_problem",
+        lambda: "no /boot/vmlinuz-* is readable (they are mode 0600)",
+    )
+
+    diagnosis = _diagnose_guestfish_failure(_SUPERMIN_EXIT, "./rootfs.img", 0)
+
+    assert diagnosis == (rootfs_mod.SUPERMIN_KERNEL_HINT, rootfs_mod.SUPERMIN_ENV_HINT)
+
+
+def test_supermin_exit_status_with_a_readable_kernel_is_not_blamed_on_it(monkeypatch):
+    monkeypatch.setattr(rootfs_mod, "appliance_kernel_problem", lambda: None)
+
+    diagnosis = _diagnose_guestfish_failure(_SUPERMIN_EXIT, "./rootfs.img", 0)
+
+    assert diagnosis is not None
+    assert diagnosis.cause != rootfs_mod.SUPERMIN_KERNEL_HINT
+    assert "LIBGUESTFS_DEBUG=1" in diagnosis.hint
 
 
 def test_wrong_partition_is_diagnosed_from_guestfish_own_output():
@@ -158,7 +188,7 @@ def test_wrong_partition_is_diagnosed_from_guestfish_own_output():
     diagnosis = _diagnose_guestfish_failure(out, "./trixie.img", 1)
 
     assert diagnosis is not None
-    assert "--partition 0" in diagnosis
+    assert "--partition 0" in diagnosis.cause
 
 
 def test_unknown_failure_returns_no_false_diagnosis():
@@ -333,50 +363,72 @@ def test_unrecognizable_key_lists_the_valid_ones(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_doctor_flags_an_unreadable_appliance_kernel(monkeypatch, tmp_path):
-    monkeypatch.setattr(lifecycle.shutil, "which", lambda name: "/usr/bin/guestfish")
+def test_appliance_kernel_problem_reads_boot_kernel_permissions(monkeypatch, tmp_path):
     monkeypatch.delenv("SUPERMIN_KERNEL", raising=False)
-
     boot = tmp_path / "boot"
+    assert rootfs_mod.appliance_kernel_problem(boot) == "no /boot/vmlinuz-* found"
     boot.mkdir()
     (boot / "vmlinuz-6.8.0-137-generic").write_text("kernel")
-    monkeypatch.setattr(lifecycle, "Path", lambda p="": _FakePath(p, boot))
+    assert rootfs_mod.appliance_kernel_problem(boot) is None
     # Mode 0600 on the real host; patched rather than chmod'd so the result
     # does not depend on the uid running the suite.
-    monkeypatch.setattr(lifecycle.os, "access", lambda path, mode: False)
+    monkeypatch.setattr(rootfs_mod.os, "access", lambda path, mode: False)
+    assert "readable" in rootfs_mod.appliance_kernel_problem(boot)
 
-    result = lifecycle._check_libguestfs()
+
+def test_a_fixed_appliance_needs_no_readable_kernel_and_no_probe(monkeypatch, tmp_path):
+    """A LIBGUESTFS_PATH fixed appliance never runs supermin, so there is no
+    cache to go stale and nothing for the kernel check to warn about."""
+    fixed = tmp_path / "fixed"
+    fixed.mkdir()
+    for name in ("README.fixed", "kernel", "initrd", "root"):
+        (fixed / name).write_text("x")
+    monkeypatch.setenv("LIBGUESTFS_PATH", str(fixed))
+    monkeypatch.delenv("SUPERMIN_KERNEL", raising=False)
+    monkeypatch.setattr(rootfs_mod.os, "access", lambda path, mode: False)
+    monkeypatch.setattr(lifecycle.shutil, "which", lambda name: "/usr/bin/guestfish")
+    monkeypatch.setattr(
+        rootfs_mod, "probe_appliance", lambda fish: pytest.fail("a fixed appliance needs no probe"),
+    )
+
+    assert rootfs_mod.appliance_kernel_problem(tmp_path / "boot") is None
+    row, runs = lifecycle._check_libguestfs()
+    assert row["status"] == "ok" and runs is True
+    assert str(fixed) in row["detail"]
+
+
+def test_doctor_flags_an_unreadable_appliance_kernel(monkeypatch):
+    monkeypatch.setattr(lifecycle.shutil, "which", lambda name: "/usr/bin/guestfish")
+    monkeypatch.delenv("SUPERMIN_KERNEL", raising=False)
+    monkeypatch.setattr(
+        rootfs_mod, "appliance_kernel_problem",
+        lambda: "no /boot/vmlinuz-* is readable (they are mode 0600)",
+    )
+    monkeypatch.setattr(
+        rootfs_mod, "probe_appliance",
+        lambda fish: (False, "libguestfs: error: /usr/bin/supermin exited with error status 1."),
+    )
+
+    result, runs = lifecycle._check_libguestfs()
 
     # Optional tooling: a warning with the fix text, never a doctor blocker.
     assert result["status"] == "warn"
     assert result["blocking"] is False
-    assert "SUPERMIN_KERNEL" in result["detail"]
+    assert runs is False
+    assert "SUPERMIN_KERNEL" in result["hint"]
 
 
-def test_doctor_passes_when_a_boot_kernel_is_readable(monkeypatch, tmp_path):
+def test_doctor_passes_when_a_boot_kernel_is_readable(monkeypatch):
     monkeypatch.setattr(lifecycle.shutil, "which", lambda name: "/usr/bin/guestfish")
     monkeypatch.delenv("SUPERMIN_KERNEL", raising=False)
+    monkeypatch.setattr(rootfs_mod, "appliance_kernel_problem", lambda: None)
+    monkeypatch.setattr(
+        rootfs_mod, "probe_appliance", lambda fish: pytest.fail("a readable kernel needs no probe"),
+    )
 
-    boot = tmp_path / "boot"
-    boot.mkdir()
-    (boot / "vmlinuz-6.8.0-137-generic").write_text("kernel")
-    monkeypatch.setattr(lifecycle, "Path", lambda p="": _FakePath(p, boot))
-
-    assert lifecycle._check_libguestfs()["status"] == "ok"
-
-
-class _FakePath:
-    """Minimal Path stand-in that redirects /boot and reports it unreadable."""
-
-    def __init__(self, raw, boot_dir):
-        self._raw = str(raw)
-        self._boot = boot_dir
-
-    def is_dir(self):
-        return self._raw == "/boot"
-
-    def glob(self, pattern):
-        return list(self._boot.glob(pattern))
+    assert lifecycle._check_libguestfs() == (lifecycle._doctor_row(
+        "libguestfs (rootfs inject / launch --inject)", "ok", "/usr/bin/guestfish",
+    ), True)
 
 
 def test_doctor_accepts_an_explicit_readable_supermin_kernel(monkeypatch, tmp_path):
@@ -385,19 +437,19 @@ def test_doctor_accepts_an_explicit_readable_supermin_kernel(monkeypatch, tmp_pa
     kernel.write_text("kernel")
     monkeypatch.setenv("SUPERMIN_KERNEL", str(kernel))
 
-    result = lifecycle._check_libguestfs()
+    result, runs = lifecycle._check_libguestfs()
 
-    assert result["status"] == "ok"
+    assert result["status"] == "ok" and runs is True
     assert str(kernel) in result["detail"]
 
 
 def test_doctor_reports_missing_guestfish_as_optional(monkeypatch):
     monkeypatch.setattr(lifecycle.shutil, "which", lambda name: None)
 
-    result = lifecycle._check_libguestfs()
+    result, runs = lifecycle._check_libguestfs()
 
     # Informational, not a failure: libguestfs is only needed for inject.
-    assert result["status"] == "info"
+    assert result["status"] == "info" and runs is False
     assert "libguestfs-tools" in result["detail"]
 
 
@@ -642,10 +694,10 @@ def test_missing_path_is_not_blamed_on_the_partition():
     assert diagnosis is not None
     # The fix is to check the path, not to change the partition. (The suggested
     # `ls` command still carries --partition because it has to be correct.)
-    assert "needs --partition" not in diagnosis
-    assert "was not found in" not in diagnosis
-    assert "path does not exist" in diagnosis
-    assert "rootfs ls" in diagnosis
+    assert "needs --partition" not in diagnosis.cause
+    assert "was not found in" not in diagnosis.cause
+    assert "path does not exist" in diagnosis.cause
+    assert "rootfs ls" in diagnosis.cause
 
 
 def test_directory_target_is_named_as_such():
@@ -654,7 +706,7 @@ def test_directory_target_is_named_as_such():
     diagnosis = _diagnose_guestfish_failure(out, "./i.img", 0)
 
     assert diagnosis is not None
-    assert "--recursive" in diagnosis
+    assert "--recursive" in diagnosis.cause
 
 
 def test_busy_image_is_refused_before_guestfish_runs(monkeypatch, tmp_path):
@@ -684,5 +736,5 @@ def test_image_lock_failure_names_an_untracked_qemu():
     diagnosis = _diagnose_guestfish_failure(out, "./rootfs.img", 0)
 
     assert diagnosis is not None
-    assert "pgrep -af qemu-system" in diagnosis
-    assert "qmu kill" in diagnosis
+    assert "pgrep -af qemu-system" in diagnosis.cause
+    assert "qmu kill" in diagnosis.cause

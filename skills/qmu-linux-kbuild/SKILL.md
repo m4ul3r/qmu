@@ -8,7 +8,8 @@ description: Build Linux kernels (v4.x–latest) for QEMU exploit development in
 `tools/kbuild.sh` downloads a kernel.org tarball, builds it in a
 `qmu-kbuild:<ubuntu>-<arch>` container whose GCC matches the kernel's era, and
 prints eval-able paths to the boot image, `vmlinux`, `.config`, the retained
-source tree and the GDB helper loader. It answers "is this a bug?" against a
+source tree, the GDB helper loader and a per-arch out-of-tree module build
+directory. It answers "is this a bug?" against a
 kernel whose config you control. For "does this work on Ubuntu?" use
 `qmu-ubuntu-target` (`tools/mktarget.sh`), which installs Ubuntu's own kernel
 at a pinned ABI.
@@ -26,6 +27,7 @@ form used below); from this skill's directory, `../../tools/kbuild.sh`.
 | i386 / arm32 / arm32hf | `--arch i386` (`bzImage`), `--arch arm32` or `--arch arm32hf` (`zImage`; `<5.0` uses `vexpress_defconfig`, else `multi_v7_defconfig`) |
 | Inspect the config before a long build | `tools/kbuild.sh --version 6.6.75 --config-only` → prints only `CONFIG=`. Read-only value: every build regenerates `.config` from defconfig + overlays, so a hand-edited `.config` is never consumed by kbuild — for a custom config run `make -C "$KERNEL_SRC"` yourself (after a `--keep-residue` build) |
 | GDB/pry source-level debugging | after a normal build: `pry gdb "add-auto-load-safe-path $(dirname "$VMLINUX_GDB")"; pry gdb "set substitute-path /src $KERNEL_SRC"; pry gdb "source $VMLINUX_GDB"` |
+| Build a `.ko` for the guest (e.g. a survivable Oops on a config without LKDTM) | `cd mymod && "$KDIR/qmu-kmake" modules` — see *Out-of-tree modules* |
 | Constrained host | `--jobs 4` (default `nproc`) |
 | Build fails with a GCC error | `--container focal` (one newer than auto-selected; table below) |
 | Keep `*.o`/`.cmd` for an incremental `make -C "$KERNEL_SRC"` | `--keep-residue` (default removes them after a successful build) |
@@ -44,6 +46,7 @@ VMLINUX=/home/user/.cache/qmu/kernels/6.6.75/x86_64/vmlinux
 CONFIG=/home/user/.cache/qmu/kernels/6.6.75/x86_64/.config
 KERNEL_SRC=/home/user/.cache/qmu/kernels/src/linux-6.6.75
 VMLINUX_GDB=/home/user/.cache/qmu/kernels/6.6.75/x86_64/vmlinux-gdb.py
+KDIR=/home/user/.cache/qmu/kernels/6.6.75/x86_64/build
 ```
 
 | Variable | Meaning |
@@ -51,8 +54,9 @@ VMLINUX_GDB=/home/user/.cache/qmu/kernels/6.6.75/x86_64/vmlinux-gdb.py
 | `KERNEL` | boot image: `bzImage` (x86_64, i386), `Image` (arm64), `zImage` (arm32, arm32hf) |
 | `VMLINUX` | unstripped ELF with DWARF; `qmu gdb --symbols "$VMLINUX"`, `pry load` |
 | `CONFIG` | the final `.config` the kernel was built with |
-| `KERNEL_SRC` | retained source tree, mounted at `/src` during the build (DWARF paths start with `/src`) |
+| `KERNEL_SRC` | retained source tree, mounted at `/src` during the build (DWARF paths start with `/src`). Shared by every arch of the version and left in the state of the last build — a source listing for `pry load --src`, **never** a module build tree |
 | `VMLINUX_GDB` | `vmlinux-gdb.py` loader next to a copied `scripts/gdb/` tree; never move it out of that directory |
+| `KDIR` | this arch's prepared module build tree (`.config`, `Module.symvers`, generated headers, the build's host tools) plus `qmu-kmake`; see *Out-of-tree modules* |
 | *(no variable)* | `System.map` and `build.log` are also written next to `KERNEL` |
 
 `--config-only` prints only `CONFIG=…` (no kernel, no `VMLINUX_GDB`, no `lx-*`
@@ -119,19 +123,22 @@ after.
   src/linux-6.6.75.tar.xz
   .src-linux-6.6.75.lock
   6.6.75/x86_64/               # bzImage, vmlinux, .config, System.map, build.log,
-                               # vmlinux-gdb.py, scripts/gdb/…
+                               # vmlinux-gdb.py, scripts/gdb/…, build/ (KDIR)
   6.6.75/arm64/                # Image, …
 ```
 
 A cache hit requires **all** of: `KERNEL`, `vmlinux`, `.config`,
 `vmlinux-gdb.py`, `scripts/gdb/vmlinux-gdb.py`, `scripts/gdb/linux/constants.py`
-(when the source has `constants.py.in`) **and** `KERNEL_SRC/Makefile`. A
-missing piece logs `cached build is incomplete; rebuilding debugger
-artifacts` and runs a full build — including when only the source tree was
-deleted, which re-downloads the tarball and recompiles. `qmu prune
+(when the source has `constants.py.in`), `KDIR/{Makefile,.config,Module.symvers,qmu-kmake}`
+**and** `KERNEL_SRC/Makefile`. A missing piece logs `cached build is
+incomplete; rebuilding debugger artifacts and module build dir` and runs a
+full build — including for a kernel cached before kbuild shipped `KDIR`, and
+when only the source tree was deleted, which re-downloads the tarball and
+recompiles. `qmu prune
 --build-residue` never removes `Makefile`, `.config`, `vmlinux`, `System.map`
 or `arch/*/boot/`, so it keeps the hit intact; `rm -rf src/linux-<ver>` does
-not. `--config-only` hits on `.config` alone.
+not. It only looks under `src/`, so `KDIR` is never touched. `--config-only`
+hits on `.config` alone.
 
 Build residue (`*.o`, `*.a`, `*.ko`, `*.mod*`, `*.symtypes`, `.*.cmd`,
 `.tmp_vmlinux*`) is removed from the tree after every successful build unless
@@ -181,6 +188,47 @@ Extra QEMU args go after `--` (there is no `--extra-args` flag), and the
 built-in profiles carry an x86 cmdline, so ARM needs `--cmdline`. Full
 recipes, the arch-aware `qmu.toml` and pry rebasing:
 `skill://qmu/reference/cross-arch.md`.
+
+## Out-of-tree modules (`KDIR`)
+
+`KDIR` (`<outdir>/build`) is exported from the build container right after the
+kernel build: the linux-headers file set (top and arch `Makefile*`,
+`include/`, `scripts/` with the host tools the container compiled,
+`arch/<arch>/include` — plus `arch/arm/include/asm/opcodes.h` on arm64, which
+4.x arm64 headers include — `module.lds`, `objtool` where built), the build's
+`.config`, and `Module.symvers` — `vmlinux.symvers` on 5.10+, the one 4.x–5.9
+write while linking vmlinux, else written by `make modules`. It covers the
+core kernel's exports (modules that need another module's exports set
+`KBUILD_EXTRA_SYMBOLS`). It is per arch and survives later builds of other
+arches, which is exactly what `KERNEL_SRC` does not. Before kbuild accepts the
+export it builds a trivial module against it in the container; an export that
+cannot is a failed build (exit 1), never a cache hit.
+
+`KDIR/qmu-kmake` runs `make -C "$KDIR" M="$PWD" ARCH=… CROSS_COMPILE=…` in
+the `qmu-kbuild` image that built the kernel (`KDIR` mounted read-only, the
+module directory read-write): the same GCC as the kernel — a host GCC of
+another version is a silent ABI risk — and the libc the host tools were
+linked against. Extra arguments go to make. The image must still exist
+(`docker image ls qmu-kbuild`); a removed one only comes back with a kbuild
+run that builds (`--no-cache`), since a cache hit never starts Docker.
+
+```bash
+eval "$(tools/kbuild.sh --version 6.6.75 --arch arm64)"
+mkdir oops && cd oops
+cat > oops.c <<'EOF'
+#include <linux/module.h>
+static int __init oops_init(void) { *(volatile int *)0 = 0; return 0; }
+module_init(oops_init);
+MODULE_DESCRIPTION("null write in init: a survivable Oops");
+MODULE_LICENSE("GPL");
+EOF
+echo 'obj-m += oops.o' > Kbuild
+"$KDIR/qmu-kmake" modules            # → oops.ko, vermagic = the cached kernel's
+qmu push oops.ko /root/oops.ko --vm arm66
+qmu exec --vm arm66 'insmod /root/oops.ko'  # exit 1, kernel_warning + hint: insmod died in the Oops
+qmu status --vm arm66                       # guest: crashed — the report is retained, the guest still serves
+qmu crash --vm arm66                        # Internal error: Oops … pc : oops_init+…
+```
 
 ## GDB helpers
 
