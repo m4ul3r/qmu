@@ -79,16 +79,25 @@ def _require_running_vm(vm_id: str | None, command: str) -> None:
     describer is what keeps `exec` from contradicting `list` about whether a VM
     exists — the invariant that six rounds of dogfooding kept catching.
     """
-    if not vm_id:
-        return
-    from .lifecycle import describe_non_running
+    from .lifecycle import _require_running
 
-    explanation = describe_non_running(vm_id, command=command)
-    if explanation is not None:
-        raise QMUError(
-            explanation,
-            hint=f"qmu status --vm {vm_id} describes it; qmu launch --name {vm_id} --no-replace starts a fresh one",
-        )
+    _require_running(vm_id, command)
+
+
+def _choose_running(vm_id: str | None, command: str) -> VMInstance:
+    """`choose_instance`, with a listed-but-not-running name described.
+
+    The running-only lookup answers "not found" for a stopped or orphaned
+    VM that `qmu list` displays; on that miss the shared describer answers
+    instead (the same words and `vm_id` `exec` gives), and only a name no
+    command knows keeps the "not found" listing. Paid on the failure path
+    only, so a running VM costs no extra classification.
+    """
+    try:
+        return choose_instance(vm_id)
+    except QMUError:
+        _require_running_vm(vm_id, command)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +334,7 @@ def _add_push(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_push(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "push")
     _require_ssh(inst)
     if (refused := _preflight_ssh_guest(inst, stem="push")) is not None:
         return refused
@@ -360,7 +369,7 @@ def _add_pull(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_pull(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "pull")
     _require_ssh(inst)
     if (refused := _preflight_ssh_guest(inst, stem="pull")) is not None:
         return refused
@@ -1238,7 +1247,7 @@ def _compile_on_host(
 
 
 def _handle_compile(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "compile")
     _require_ssh(inst)
     if (refused := _preflight_ssh_guest(inst, stem="compile")) is not None:
         return refused
@@ -1425,7 +1434,7 @@ def _add_dmesg(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_dmesg(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "dmesg")
     _require_ssh(inst)
     if (refused := _preflight_ssh_guest(inst, stem="dmesg")) is not None:
         return refused

@@ -15,7 +15,7 @@ from difflib import get_close_matches
 from pathlib import Path
 
 from .config import QMUConfig
-from .instance import QMUError, VMInstance, proc_pid_start, save_instance
+from .instance import QMUError, VMInstance, list_instances, proc_pid_start, save_instance
 from .paths import instances_dir, qmp_socket_path, qemu_log_path, serial_log_path
 from .qemu import native_passt_problem, probe_qemu_netdevs
 from .qmp import QMPBusyError, QMPClient, QMPError
@@ -291,9 +291,14 @@ class PortAllocationLock:
     rule`). The retry loop re-runs the same deterministic search and loses
     again. Holding this lock from allocation until QEMU has bound — the first
     QMP connect succeeding proves it, QEMU sets up hostfwd before it serves
-    QMP — makes the next launcher's probe see the port as taken. Only the
-    ~1 s allocation window is serialised; flock releases on process death, so a
-    launcher killed mid-window cannot wedge its siblings.
+    QMP — makes the next launcher's probe see the port as taken. Normally that
+    window is ~1 s; a QEMU slow to reach its main loop holds it for its whole
+    first-handshake wait (up to `QMP_STARTUP_SECONDS` plus one attempt), and
+    one retained with the handshake still pending holds it until its instance
+    record — which `_recorded_ports` treats as the claim — is saved, so
+    siblings on the same cache queue behind it (`Waited Ns for the
+    port-allocation lock` in their warnings). flock releases on process death,
+    so a launcher killed mid-window cannot wedge its siblings.
     """
 
     def __init__(self, home: Path) -> None:
@@ -347,6 +352,34 @@ def find_free_port(start: int, max_tries: int = 100) -> int:
             except OSError:
                 continue
     raise QMUError(f"No free port found in range {start}-{start + max_tries - 1}")
+
+
+def _recorded_ports() -> set[int]:
+    """SSH/gdb ports recorded by this cache's live VMs.
+
+    `find_free_port` only sees ports something is listening on. A VM retained
+    with its first QMP handshake still pending (#157) may not have bound its
+    hostfwd/gdb stub yet, so its ports look free to a probe; its record is
+    the claim. Called under `PortAllocationLock`.
+    """
+    taken: set[int] = set()
+    for inst in list_instances():
+        for port in (inst.ssh_port, inst.gdb_port):
+            if port is not None:
+                taken.add(port)
+    return taken
+
+
+def _allocate_port(start: int, taken: set[int]) -> int:
+    """`find_free_port` from `start`, skipping ports a live record claims."""
+    port = find_free_port(start)
+    for _ in range(len(taken)):
+        if port not in taken:
+            break
+        port = find_free_port(port + 1)
+    if port in taken:
+        raise QMUError(f"No unclaimed free port found from {start}")
+    return port
 
 
 def _preflight_native_passt(
@@ -739,13 +772,18 @@ def launch_vm(
     cmd: list[str] = []
     port_lock = PortAllocationLock(idir)
     for attempt_idx in range(3):
+        qmp_pending = False
         try:
             if auto_ssh or auto_gdb:
                 port_lock.acquire()
+                # Ports a live VM of this cache recorded are taken even when
+                # nothing listens on them yet: a VM retained with its QMP
+                # handshake pending may not have bound its hostfwd (#157).
+                taken = _recorded_ports()
             if auto_ssh:
-                ssh_port = find_free_port(config.ssh_port_start)
+                ssh_port = _allocate_port(config.ssh_port_start, taken)
             if auto_gdb:
-                gdb_port = find_free_port(config.gdb_port_start)
+                gdb_port = _allocate_port(config.gdb_port_start, taken)
 
             if name:
                 vm_id = name
@@ -829,7 +867,6 @@ def launch_vm(
                 raise primary
 
             qmp_error: Exception | None = None
-            qmp_pending = False
             if not exited:
                 # QMP socket appeared — verify connectivity. A transient reset or
                 # refusal on this first connect is retried while QEMU lives; a
@@ -841,8 +878,11 @@ def launch_vm(
                     notes.append(qmp_note)
         finally:
             # QEMU has bound its ports (QMP answered) or is gone: either way a
-            # sibling's probe now sees the truth, so stop serialising it.
-            port_lock.release()
+            # sibling's probe now sees the truth, so stop serialising it. A
+            # pending handshake proves neither, so its lock is held until the
+            # VM's record claims the ports (released after save below).
+            if not qmp_pending:
+                port_lock.release()
         if port_lock.waited >= PORT_LOCK_WAIT_NOTE_SECONDS and notes is not None:
             notes.append(
                 f"Waited {port_lock.waited:.1f}s for the port-allocation lock "
@@ -909,58 +949,69 @@ def launch_vm(
             primary.hint = _ROLLED_BACK_HINT.format(vm=vm_id)
             raise primary from qmp_error
 
-        if qmp_pending and notes is not None:
-            # Retained, never rolled back: the process is alive and its serial
-            # and QEMU logs are the only evidence of why it is slow. The SSH
-            # readiness wait that follows decides the launch's outcome — ready,
-            # `no-console-output` (4) or a timeout (124), the VM kept in each.
-            notes.append(
-                f"QMP did not complete its handshake within "
-                f"{QMP_STARTUP_SECONDS:g}s of launch, but QEMU (pid {proc.pid}) "
-                f"is alive. A fresh VM has no other QMP client, so QEMU is still "
-                f"initialising (host load or a slow TCG start); VM '{vm_id}' is "
-                f"retained — `qmu status --vm {vm_id}` re-checks QMP, "
-                f"`qmu log --vm {vm_id}` shows the console"
-            )
-
-        # Build and save instance under the attempt transaction.
-        inst = VMInstance(
-            vm_id=vm_id,
-            pid=proc.pid,
-            qmp_socket=str(qmp_path),
-            ssh_port=ssh_port,
-            ssh_key=str(key_path) if key_path else None,
-            ssh_user=config.ssh_user,
-            gdb_port=gdb_port,
-            serial_log=str(serial_path),
-            kernel=str(kernel_path),
-            arch=config.arch,
-            rootfs=str(rootfs_path) if rootfs_path else None,
-            memory=config.memory,
-            cpus=config.cpus,
-            cmdline=cmdline,
-            profile=profile,
-            cmdline_override=cmdline_override,
-            started_at=datetime.now(timezone.utc).isoformat(),
-            harness=harness,
-            nic_model=resolved_nic,
-            pid_start=pid_start,
-            # Record the effective acceleration so `qmu gdb` can surface the
-            # hardware-watchpoint caveats that apply under KVM (#39) without
-            # re-deriving host state that may have changed since launch. This is
-            # the same predicate build_qemu_command used to decide -enable-kvm.
-            kvm=config.use_kvm(),
-        )
         try:
-            save_instance(inst)
-        except BaseException as primary:
+            if qmp_pending and notes is not None:
+                # Retained, never rolled back: the process is alive and its
+                # serial and QEMU logs are the only evidence of why it is slow.
+                # The SSH readiness wait that follows decides the launch's
+                # outcome — ready, `no-console-output` (4) or a timeout (124),
+                # the VM kept in each.
+                notes.append(
+                    f"QMP did not complete its handshake within "
+                    f"{QMP_STARTUP_SECONDS:g}s of launch, but QEMU (pid {proc.pid}) "
+                    f"is alive. A fresh VM has no other QMP client, so QEMU is still "
+                    f"initialising (host load or a slow TCG start); VM '{vm_id}' is "
+                    f"retained — `qmu status --vm {vm_id}` re-checks QMP, "
+                    f"`qmu log --vm {vm_id}` shows the console"
+                )
+
+            # Build and save instance under the attempt transaction.
+            inst = VMInstance(
+                vm_id=vm_id,
+                pid=proc.pid,
+                qmp_socket=str(qmp_path),
+                ssh_port=ssh_port,
+                ssh_key=str(key_path) if key_path else None,
+                ssh_user=config.ssh_user,
+                gdb_port=gdb_port,
+                serial_log=str(serial_path),
+                kernel=str(kernel_path),
+                arch=config.arch,
+                rootfs=str(rootfs_path) if rootfs_path else None,
+                memory=config.memory,
+                cpus=config.cpus,
+                cmdline=cmdline,
+                profile=profile,
+                cmdline_override=cmdline_override,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                harness=harness,
+                nic_model=resolved_nic,
+                pid_start=pid_start,
+                # Record the effective acceleration so `qmu gdb` can surface the
+                # hardware-watchpoint caveats that apply under KVM (#39) without
+                # re-deriving host state that may have changed since launch. This
+                # is the same predicate build_qemu_command used to decide
+                # -enable-kvm.
+                kvm=config.use_kvm(),
+            )
             try:
-                attempt.rollback()
-            except QMUError as cleanup_exc:
-                raise cleanup_exc from primary
-            raise
-        attempt.commit()
-        return inst
+                save_instance(inst)
+            except BaseException as primary:
+                try:
+                    attempt.rollback()
+                except QMUError as cleanup_exc:
+                    raise cleanup_exc from primary
+                raise
+            attempt.commit()
+            return inst
+        finally:
+            # A pending VM kept the lock this far: nothing proves its QEMU has
+            # bound the hostfwd/gdb ports yet, so until its record exists a
+            # sibling's probe would see them free and take them — then report
+            # `ssh_status: ready` from the other VM's sshd while this QEMU died
+            # on `Could not set up host forwarding rule` (#157 review). Once
+            # saved, `_recorded_ports` makes every later allocation skip them.
+            port_lock.release()
 
     # Unreachable: the loop always returns or raises. Keep mypy happy.
     raise QMUError("VM launch failed after retries")

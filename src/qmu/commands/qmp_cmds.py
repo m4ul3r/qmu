@@ -60,6 +60,23 @@ from .._cliutil import (
 )
 
 
+def _choose_running(vm_id: str | None, command: str) -> VMInstance:
+    """`choose_instance`, with a listed-but-not-running name described.
+
+    Same contract as `guest._choose_running`: on a miss, a stopped/orphaned
+    VM `qmu list` shows gets the shared describer's answer and `vm_id`
+    (lifecycle imported lazily — it sits beside this module), never "not
+    found"; a name no command knows keeps the "not found" listing.
+    """
+    try:
+        return choose_instance(vm_id)
+    except QMUError:
+        from .lifecycle import _require_running
+
+        _require_running(vm_id, command)
+        raise
+
+
 # ---------------------------------------------------------------------------
 # snapshot
 # ---------------------------------------------------------------------------
@@ -305,7 +322,7 @@ def _snapshot_result(
 
 
 def _handle_snapshot_save(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "snapshot save")
     timeout = getattr(args, "timeout", None)
     if timeout is None:
         timeout = savevm_timeout(inst.memory)
@@ -350,7 +367,7 @@ def _snapshot_load_mentions_slirp(msg: str) -> bool:
 
 
 def _handle_snapshot_load(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "snapshot load")
     epoch_offset = serial_log_offset(inst.serial_log)
     _drop_ssh_master(inst)
     with _qmp_ctx(inst) as qmp:
@@ -384,7 +401,7 @@ def _handle_snapshot_load(args: argparse.Namespace) -> Result:
 
 
 def _handle_snapshot_list(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "snapshot list")
     timeout = getattr(args, "timeout", None)
     if timeout is None:
         timeout = SNAPSHOT_LIST_TIMEOUT
@@ -405,7 +422,7 @@ def _handle_snapshot_list(args: argparse.Namespace) -> Result:
 
 
 def _handle_snapshot_delete(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "snapshot delete")
     with _qmp_ctx(inst) as qmp:
         result = delete_snapshot(qmp, args.name)
     return _snapshot_result(args, "delete", inst, result)
@@ -512,7 +529,7 @@ def _add_kbase(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_kbase(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "kbase")
     _require_ssh(inst)
 
     if (refused := _preflight_ssh_guest(inst, stem="kbase")) is not None:
@@ -606,7 +623,7 @@ def _pry_launch_pid(result: subprocess.CompletedProcess) -> int | None:
 
 
 def _handle_gdb(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "gdb")
     if inst.gdb_port is None:
         raise QMUError(
             "VM was launched without --gdb. Relaunch with: qmu launch --gdb --kernel ...",
@@ -782,7 +799,7 @@ def _add_cont(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_cont(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "cont")
     with _qmp_ctx(inst) as qmp:
         before = qmp.execute("query-status")
         before_state = (
@@ -1159,7 +1176,7 @@ def _handle_qmp(args: argparse.Namespace) -> Result:
         except json.JSONDecodeError as exc:
             raise QMUError(f"Invalid --args JSON: {exc}") from exc
     method, qmp_args = _parse_qmp_command(args.command, args.args)
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "qmp")
     # Both raw paths reach a VM-reality mutation -- the QMP method itself
     # (keyed on the NORMALIZED method, so the envelope form counts too) and
     # `human-monitor-command`, whose HMP verb rides inside
@@ -1219,7 +1236,7 @@ def _add_monitor(sub: argparse._SubParsersAction) -> None:
 
 
 def _handle_monitor(args: argparse.Namespace) -> Result:
-    inst = choose_instance(args.vm)
+    inst = _choose_running(args.vm, "monitor")
     command = " ".join(args.command)
     # HMP is a raw escape hatch, so `qmu monitor {system_reset,savevm,loadvm}`
     # reach the same VM-reality mutations as the dedicated handlers / `qmu qmp`

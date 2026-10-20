@@ -226,7 +226,13 @@ slow TCG start). `_validate_qmp_with_retry` waits for it (paced, up to
 `QMP_STARTUP_SECONDS`) and past that **retains** the live VM with a warning;
 the SSH wait then decides the exit. It used to roll the VM back, exit 1, and
 blame "another qmu command such as `wait`" (#157). Post-spawn failures that
-do roll back carry `vm_id` and a hint saying the VM is gone.
+do roll back carry `vm_id` and a hint saying the VM is gone. QEMU creates the
+QMP listener *before* it binds `-netdev hostfwd`, so a pending VM has not
+proved it owns its ports: `launch_vm` keeps `ports.lock` until its record is
+saved, and `_recorded_ports` makes every allocation skip ports a live record
+claims — otherwise a sibling took the same port, this QEMU died on `Could not
+set up host forwarding rule`, and its launch said `ready` off the sibling's
+sshd. The cost: siblings on that cache wait behind a slow handshake.
 
 ### VM state has TWO orthogonal axes
 
@@ -597,7 +603,10 @@ envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
   and `is_ready` floors it at `EMULATED_PROBE_SECONDS` (8 s) — an emulated
   sshd takes 4–6 s to log in on a loaded host, and the KVM budget reported a
   serving TCG guest `ssh: down` / `guest: unknown` (#161). `kvm: null` (a
-  pre-#39 record) keeps the KVM budget.
+  pre-#39 record) keeps the KVM budget. The probe passes its budget as
+  `_ssh_base(connect_timeout=)`, never as an appended `-o`: OpenSSH keeps the
+  FIRST value of a repeated option (`ssh -G` shows it), so an appended
+  `ConnectTimeout=8` behind the base `=5` was silently a 5 s banner wait.
 - **`rootfs inject` treats GUEST as a directory** (with or without a trailing
   slash); the local filename is preserved. A missing GUEST directory is an
   ERROR unless `--mkdir` — silently creating it turns a typo'd destination into
@@ -682,9 +691,10 @@ envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
   the real CLI produces on a shared box. The empty-running-set branch has its
   own row: `choose_instance(vm_id)` names the VM there too and only a bare
   (no `--vm`) lookup answers "No running VMs" (#144). A name `list` shows
-  (stopped/orphaned remnant) is described there, never "not found", for the
-  commands that do not pre-describe through `describe_non_running`
-  (push/pull/dmesg/snapshot/cont/gdb/qmp/monitor).
+  (stopped/orphaned remnant) gets the one `describe_non_running` answer,
+  `vm_id` included, from every command that needs a live VM — exec/wait up
+  front, the rest via `_choose_running` (guest/qmp_cmds) when the
+  running-only lookup misses — never "not found".
 
 ## Tests
 

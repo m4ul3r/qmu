@@ -598,25 +598,12 @@ def choose_instance(vm_id: str | None = None) -> VMInstance:
         # the empty-running-set refusal: "No running VMs" answers a question
         # nobody asked, never names the VM, and its "launch something" hint is
         # the wrong next step for "what happened to my VM?" (#144) — exactly
-        # the post-run state of every auto-cleaned harness `wait`.
+        # the post-run state of every auto-cleaned harness `wait`. A name that
+        # `qmu list` shows is not answered here: every command-layer caller
+        # describes it through `lifecycle.describe_non_running` (before this
+        # lookup or, on its failure, `_choose_running`), so one describer owns
+        # that wording.
         stopped = list_stopped_instances()
-        if any(inst.vm_id == vm_id for inst in stopped):
-            # `qmu list` displays it, so "not found" would deny it — the
-            # recurring matrix defect. Commands that route through
-            # `lifecycle.describe_non_running` first (status/kill/exec/wait)
-            # never get here; this is the domain-level answer for the rest
-            # (push/pull/snapshot/gdb/qmp/…), worded like that describer.
-            raise QMUError(
-                f"VM '{vm_id}' is not running: `qmu list` shows its remnant, "
-                "but no tracked QEMU serves it, so there is no live VM to act "
-                f"on. Read its logs with `qmu log --vm {vm_id}` or "
-                f"`qmu crash --vm {vm_id}`.",
-                hint=(
-                    f"qmu status --vm {vm_id} describes it; qmu launch --name "
-                    f"{vm_id} --no-replace starts a fresh one"
-                ),
-                vm_id=vm_id,
-            )
         raise QMUError(
             f"VM '{vm_id}' not found. "
             f"Running: {', '.join(i.vm_id for i in instances) or 'none'}; "

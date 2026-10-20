@@ -618,18 +618,21 @@ def test_kill_of_an_absent_vm_still_says_not_found(cache, monkeypatch, capsys):
     assert VM in payload["error"]
 
 
-# The commands that need a live VM and do not pre-describe through
-# `describe_non_running` (status/kill/exec/wait do) answer from
-# `choose_instance`. Asked about a VM `list` shows, they must not deny it —
-# with or without another VM running (#144 made the zero-running branch reach
-# the same lookup, so both are rows).
+# Every command that needs a live VM, asked about one `list` shows but no
+# tracked QEMU serves, must give the SAME answer `exec` gives (one describer)
+# and name it in `vm_id` — with or without another VM running. #144 made the
+# zero-running branch reach the running-only lookup, where push/pull/snapshot
+# /gdb/qmp/… said "not found … Stopped: X" while `exec` said "is stopped".
 _RUNNING_ONLY_ARGV = {
+    "exec": ["exec", "--vm", VM, "true"],
     "push": ["push", "--vm", VM, "/tmp/payload", "/root/"],
     "pull": ["pull", "--vm", VM, "/root/payload"],
+    "compile": ["compile", "--vm", VM, "/tmp/payload.c"],
     "dmesg": ["dmesg", "--vm", VM],
     "snapshot list": ["snapshot", "list", "--vm", VM],
     "cont": ["cont", "--vm", VM],
     "gdb": ["gdb", "--vm", VM],
+    "kbase": ["kbase", "--vm", VM, "--symbols", "/tmp/System.map"],
     "qmp": ["qmp", "--vm", VM, "query-status"],
     "monitor": ["monitor", "--vm", VM, "info", "status"],
 }
@@ -656,16 +659,22 @@ def test_running_only_commands_never_deny_a_listed_vm(
     cli.main(["list"])
     assert VM in capsys.readouterr().out, "fixture did not produce a listed VM"
 
-    rc = cli.main(["--format", "json", *_RUNNING_ONLY_ARGV[command]])
-    payload = json.loads(capsys.readouterr().out)
+    answers = {}
+    for name in ("exec", command):
+        rc = cli.main(["--format", "json", *_RUNNING_ONLY_ARGV[name]])
+        answers[name] = json.loads(capsys.readouterr().out)
+        assert rc == 1, name
+    payload = answers[command]
 
-    assert rc == 1
     assert "not found" not in payload["error"], (
         f"`qmu {command}` denies a VM that `qmu list` displays"
     )
-    assert "No running VMs" not in payload["error"]
-    assert payload["vm_id"] == VM
-    assert f"qmu status --vm {VM}" in payload["hint"]
+    assert payload["vm_id"] == answers["exec"]["vm_id"] == VM
+    assert payload["hint"] == answers["exec"]["hint"]
+    assert payload["error"].replace(f"`qmu {command}`", "`qmu exec`") == (
+        answers["exec"]["error"]
+    ), f"`qmu {command}` and `qmu exec` describe the same VM differently"
+
 
 # The empty-running-set branch (#144): with no VM running — the normal state
 # after an auto-cleaned harness `wait` — status/wait/kill answered "No running

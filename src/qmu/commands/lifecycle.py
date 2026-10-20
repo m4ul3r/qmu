@@ -3162,7 +3162,13 @@ def _add_status(sub: argparse._SubParsersAction) -> None:
 
 
 def _require_running(vm_id: str | None, command: str) -> None:
-    """Reject a non-running VM with a description, never with "not found"."""
+    """Reject a non-running VM with a description, never with "not found".
+
+    The one refusal for every command that needs a live VM — exec/wait call
+    it up front, the rest (`_choose_running` in guest/qmp_cmds) when their
+    running-only lookup misses — so all of them say the same thing about the
+    same remnant, and name it in `vm_id`.
+    """
     if not vm_id:
         return
     explanation = describe_non_running(vm_id, command=command)
@@ -3170,6 +3176,7 @@ def _require_running(vm_id: str | None, command: str) -> None:
         raise QMUError(
             explanation,
             hint=f"qmu status --vm {vm_id} describes it; qmu launch --name {vm_id} --no-replace starts a fresh one",
+            vm_id=vm_id,
         )
 
 
@@ -3224,7 +3231,7 @@ def describe_non_running(
             f"VM '{vm_id}' is an orphaned remnant: its metadata is gone but its "
             f"QEMU process (pid {info['pid']}) is still running."
         )
-        if command in ("exec", "wait"):
+        if command is not None:
             lead += f" `qmu {command}` needs a tracked VM, so it cannot act on it."
         lead += _crash_warning(info.get("guest"), vm_id)
         return (
@@ -3234,7 +3241,7 @@ def describe_non_running(
     if state in (VM_STOPPED, VM_HELD_BACK):
         verb = (
             f"`qmu {command}` needs a running VM"
-            if command in ("exec", "wait")
+            if command is not None
             else "there is no live state to report"
         )
         retained = _retained_logs(info["instance"])

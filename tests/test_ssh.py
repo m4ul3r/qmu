@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -337,10 +338,16 @@ def test_is_ready_subprocess_cap_is_connect_timeout_plus_a_small_grace(monkeypat
 def test_an_emulated_guest_probe_gets_the_tcg_budget(monkeypatch):
     """#161: a TCG sshd under host load needs >2 s just to send its banner,
     so the KVM-sized probe called a serving guest `ssh: down`. The budget
-    is floored for `kvm: false`; KVM and unknown-accel guests keep 2 s."""
+    is floored for `kvm: false`; KVM and unknown-accel guests keep 2 s.
+
+    The budget is checked as OpenSSH resolves it (`ssh -G`), not as argv
+    text: ssh keeps the FIRST value of a repeated `-o`, so an appended
+    `ConnectTimeout=8` behind the base `ConnectTimeout=5` was in argv yet
+    held the banner wait at 5 s."""
     from qmu._cliutil import _make_ssh
     from qmu.instance import VMInstance
 
+    real_run = subprocess.run
     seen: dict[str, object] = {}
 
     def fake_run(cmd, **kwargs):
@@ -362,4 +369,13 @@ def test_an_emulated_guest_probe_gets_the_tcg_budget(monkeypatch):
     for kvm, budget in expected.items():
         assert _make_ssh(inst(kvm)).is_ready() is False
         assert seen["timeout"] == budget + ssh.PROBE_GRACE_SECONDS, kvm
-        assert f"ConnectTimeout={budget}" in _options(seen["cmd"]), kvm
+        cmd = list(seen["cmd"])
+        timeouts = [o for o in cmd if o.startswith("ConnectTimeout=")]
+        assert timeouts == [f"ConnectTimeout={budget}"], kvm
+        if shutil.which("ssh"):
+            # `ssh -G` prints the resolved config without connecting.
+            resolved = real_run(
+                [cmd[0], "-G", *cmd[1:-1]], capture_output=True, text=True,
+                timeout=10,
+            ).stdout
+            assert f"connecttimeout {budget}\n" in resolved, kvm

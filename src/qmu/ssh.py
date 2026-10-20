@@ -290,14 +290,20 @@ class SSHClient:
         # TCG guest: readiness probes get at least EMULATED_PROBE_SECONDS.
         self.emulated = emulated
 
-    def _ssh_base(self, *, multiplex: bool = True) -> list[str]:
+    def _ssh_base(
+        self, *, multiplex: bool = True, connect_timeout: int = 5
+    ) -> list[str]:
+        # ConnectTimeout is a parameter, never re-appended by a caller:
+        # OpenSSH keeps the FIRST value of a repeated `-o`, so a later
+        # `-o ConnectTimeout=8` is silently ignored (`ssh -G` shows 5) — which
+        # held the TCG probe's banner budget at 5 s (#161 review).
         base = [
             "ssh",
             "-i", self.key_path,
             "-p", str(self.port),
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=5",
+            "-o", f"ConnectTimeout={connect_timeout}",
             "-o", "ServerAliveInterval=5",
             "-o", "ServerAliveCountMax=3",
             "-o", "LogLevel=ERROR",
@@ -337,8 +343,7 @@ class SSHClient:
         """
         if self.emulated:
             timeout = max(timeout, EMULATED_PROBE_SECONDS)
-        cmd = self._ssh_base(multiplex=False) + [
-            "-o", f"ConnectTimeout={timeout}",
+        cmd = self._ssh_base(multiplex=False, connect_timeout=timeout) + [
             "-o", "BatchMode=yes",
             self._target(),
             "true",

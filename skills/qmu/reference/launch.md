@@ -96,7 +96,11 @@ alive …` in `warnings[]`, and the SSH wait decides the exit as usual
 fails after QEMU started (exited immediately, QMP refused) is rolled back;
 its `ok: false` envelope still carries `vm_id`, every lint already printed in
 `warnings[]`, and a hint that says the VM is gone (never `qmu status --vm
-<vm_id>`).
+<vm_id>`). While a slow handshake is waited for, the port-allocation lock
+stays held (QEMU binds its SSH/gdb ports only after the QMP listener), so a
+concurrent launch on the same cache waits behind it — `Waited Ns for the
+port-allocation lock` in its `warnings[]` — and is never handed the slow
+VM's port.
 
 ## Profiles
 
