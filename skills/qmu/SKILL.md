@@ -42,7 +42,7 @@ Branch on the exit code and `ok`, never on the presence of `error`.
 | `2` | usage error (argparse) ONLY; `error_type: "UsageError"` under JSON | `usage`, `hint` | fix the flags — e.g. quote the guest command |
 | `3` | guest kernel crash, always corroborated by a fresh serial crash report | `crash`, `crash_detected: true`. The guest axis (`guest` on `wait`/`status`) can be either: `"panicked"` for a terminal `Kernel panic - not syncing`, `"crashed"` when the report was **survived** (KASAN `fault=report`, an Oops) but the SSH transport dropped | `qmu crash --vm X`, then `qmu status --vm X`: `qmu kill --vm X` only on `guest: "panicked"`; on `"crashed"` do **not** reap |
 | `4` | transport/infra: `SSHError`/`QMPError`, `no-console-output`, dropped SSH with NO fresh crash, `wait --pattern` `inconclusive`, internal error | `error_type` + `hint` (exception paths); a guest-command envelope has **no** `error_type` — read `ssh_error: true`, `crash_detected: false`, `hint`; `inconclusive`, `ssh_status` | `qmu status --vm X`, `qmu log --vm X --tail 200` |
-| `124` | timeout: `wait` elapsed, `launch`/`run` `--ssh-timeout` expired before SSH answered (`launch` keeps the VM, `ssh_status: "timeout"`), `exec`/`run`/`compile --run` outran `--timeout` on a reachable guest, `snapshot save` outran its budget (result **unknown**, not failed) | `timed_out: true`, `error_type: "TimeoutError"` + `hint` on an SSH timeout, `reason: "timeout"`, partial `stdout`/`stderr`; `may_have_landed: true` + `hint` on a save; `hint` on every one | raise `--timeout`/`--ssh-timeout` (the `hint` names which); `qmu log --vm X --tail 50` after a launch or `wait` timeout; check `crash` on a bare `wait`; after a save, `qmu snapshot list --vm X --timeout 300` |
+| `124` | timeout: `wait` elapsed, `launch`/`run` `--ssh-timeout` expired before SSH answered (`launch` keeps the VM, `ssh_status: "timeout"`), `exec`/`run`/`compile --run` outran `--timeout` (whether or not the guest still answers — `ssh_error: true` when it does not; a report printed meanwhile is `crash_detected`/`crash`), `snapshot save` outran its budget (result **unknown**, not failed) | `timed_out: true`, `error_type: "TimeoutError"` + `hint` on an SSH timeout, `reason: "timeout"`, partial `stdout`/`stderr`; `may_have_landed: true` + `hint` on a save; `hint` on every one | raise `--timeout`/`--ssh-timeout` (the `hint` names which); `qmu log --vm X --tail 50` after a launch or `wait` timeout; check `crash` on a bare `wait` or a guest command; after a save, `qmu snapshot list --vm X --timeout 300` |
 
 Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `--out`): `reference/output-contract.md`.
 
@@ -55,7 +55,7 @@ Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `
 | `guest: "paused"`, `qemu_status: "paused"` / `"debug"` | vCPU halted by `qmu gdb`, a debugger stop, a `snapshot load` into a debug stop (can survive a *clean* `pry kill`), or an unclean bridge death; `crash_detected` is independent — `paused` + `crash_detected: true` means a report is waiting | `qmu cont --vm X` (or `pry continue`); `qmu crash --vm X` if `crash_detected` |
 | `guest: "paused"`, `qemu_status: "restore-vm"` (after a `snapshot load` with `restore_state: "partial"` / `"unknown"`) | the load failed mid-restore: disks already rewound under un-restored devices/RAM; qmu left it paused on purpose | **never** `cont` (`qmu cont` refuses this state, exit 1); recover with `qmu snapshot load <known-good> --vm X` (resumes it) or `qmu kill --vm X` + relaunch. `qmu cont --force --vm X` only if you accept an inconsistent machine |
 | `guest: "unknown"` + `guest_detail` | no positive evidence of a serving guest (`SSH down, 0 bytes of console output`) | `qmu log --vm X --tail 50`; wrong `console=`/arch? see `warnings[]` |
-| `qmp: "busy"`, `qemu_status: "unknown"` | another client holds QEMU's single QMP slot (debugger bridge; a `savevm` still running after `snapshot save` exited 124; bare `wait` never holds it) | wait for it; `qmu kill --vm X` still works (signals after 1 s) |
+| `qmp: "busy"`, `qemu_status: "unknown"` | another client holds QEMU's single QMP slot, or QEMU's main loop is held by a command (debugger bridge; a `snapshot save` in progress, also when it runs through the daemon; a `savevm` still running after `snapshot save` exited 124; bare `wait` never holds it) | wait for it; `qmu kill --vm X` still works (signals after 1 s) |
 | `qmp: "unreachable"` with pid alive | socket gone or hung | `qmu status --vm X` again; `qmu kill --vm X` falls back to signals |
 | `ssh: "n/a (harness)"` / `ssh: "none"` (launch `ssh_status`: `"n/a (harness)"` / `"none (--no-net, no --ssh-port)"` — match the prefix) / SSH command refuses naming no endpoint | `n/a (harness)`: `--harness`, no SSH port by design. `none`: `--no-net` without `--ssh-port` | use `log`/`wait`/`crash`/`qmp`; for SSH relaunch **without** `--harness` (it ignores `--ssh-port`), or add `--ssh-port N` to a `--no-net` launch |
 | `ssh: "skipped"` / `"skipped (debugger attached)"` | guest paused/panicked, or a gdb client is attached (the probe's `uname` would trip breakpoints), so SSH was not probed | see the `guest` row above; `pry wait` for the stop |
@@ -199,15 +199,15 @@ then `[exit code: N]` only when N ≠ 0 (`exec true` prints nothing); `compile
 `stdout_lossy: true` / `stderr_lossy: true` present exactly when a byte was
 replaced), `timed_out`, `crash_detected`, `crash`. One argument is passed to
 the guest shell verbatim; several are shell-quoted and joined; an unquoted
-dash-word (`uname -a`) is exit 2 with a hint. `--timeout` keeps the partial
-output (exit 124 for `exec`, `run` and `compile --run` alike — `run_exit:
-null`, `timed_out: true`, `hint` says the guest still answers SSH; the remote
-command is not killed). A panic mid-command is exit 3 within a second (serial
-watcher), not after the SSH keepalive; a debugger stop mid-command (QMP
-`running:false`) aborts within ~1 s with the exit 1 `guest_state: "paused"`
-envelope the preflight uses; every SSH command refuses a `panicked`/`paused`
-guest in under a second (exit 1, `guest_state`). `compile --host`, `--cflags`,
-`--cc`: `reference/guest-commands.md`, `reference/cross-arch.md`.
+dash-word (`uname -a`) is exit 2 with a hint. A report the command provoked is
+`crash_detected: true` + `crash` even when the guest survived (exit stays 0/1).
+`--timeout` keeps the partial output: exit 124 for `exec`/`run`/`compile --run`
+whether or not the guest still answers (`ssh_error: true` if not). A panic
+mid-command is exit 3 within a second; a debugger stop (QMP `running:false`)
+aborts within ~1 s with the exit 1 `guest_state: "paused"` envelope; every SSH
+command refuses a `panicked`/`paused` guest (exit 1). A stop leaves the command
+running (output → `detached_output`) until the vCPU resumes; a timeout kills it
+on its next write. `setsid nohup … &` survives both. Detail: `reference/guest-commands.md`.
 
 ## One-shot runs
 
@@ -221,7 +221,7 @@ Exit 0 when the guest command exited 0, 1 when it exited non-zero (the guest's
 own code is JSON `exit_code`, never qmu's exit); `3` terminal panic; `124` the
 guest never answered SSH within `--ssh-timeout` or the command outran
 `--timeout` (default 60 s). A clean run reaps the VM; anything left to inspect (crash,
-survived report under `kernel_warning`, timeout, boot failure) keeps it and
+survived report (`crash_detected`), timeout, boot failure) keeps it and
 prints `Inspect: qmu log --vm X --tail 200, or qmu crash --vm X` / `Clean up:
 qmu prune --vm X` on stderr. Raw QEMU args: `--qemu-arg=-M --qemu-arg=virt`.
 `--harness`/`--no-wait-ssh` are exit 2 (`run` needs SSH). ≈7 s end to end.
@@ -238,9 +238,9 @@ qmu prune --vm X                 # finally drop the retained state (no age gate)
 ```
 
 `crash` exit 0/`crash_detected: true` means a report was found, not that the VM
-is healthy; "no crash" is exit 1 with `crash_detected: false` and no `error`.
-Detects KASAN, BUG/Oops, panic, GPF, UBSAN, slab UAF and more. Command-
-attributed crashes (`exec`, `compile --run`) use only bytes after it began.
+is healthy; "no crash" is exit 1 with `crash_detected: false` and no `error`. Detects KASAN, BUG/Oops,
+panic, GPF, UBSAN, slab UAF and more, from the event's headline; of a report flood, the newest. Command-
+attributed crashes use bytes after the command began; `snapshot load` restarts the scope for every reader.
 
 ## Harness mode (boot-and-die kernels)
 
