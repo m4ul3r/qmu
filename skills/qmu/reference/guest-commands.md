@@ -114,15 +114,20 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
   `stdout`/`stderr` on the crash envelope — without waiting on ssh or a
   re-probe.
 - A dropped transport with no fresh crash report is exit 4 (`ssh_error:
-  true`, `crash_detected: false`). So is ssh never reaching the guest at all
-  (`Connection timed out during banner exchange` right after a boot or
-  reboot): `exit_code: null`, text `SSH could not connect; the command was
-  not started`, safe to re-run — never "the guest command exited 255".
+  true`, `crash_detected: false`). So is qmu's own ssh never reaching the
+  guest at all (`Connection timed out during banner exchange` right after a
+  boot or reboot): `exit_code: null`, text `SSH could not connect; the
+  command was not started`, safe to re-run — never "the guest command exited
+  255". qmu's ssh client logs apart from the guest's stderr, so a guest
+  command that itself runs `ssh`, fails to connect and exits 255 is exit 1,
+  `exit_code: 255`, `ssh_error: false` like any other 255.
 - A guest that stops answering without a panic or a halt (wedged) holds the
   command until `--timeout` (124); ssh itself never gives up on silence.
-- sshd refusing the VM's recorded `[ssh] user`/key (`Permission denied
-  (publickey,…)`) is exit 4 `error_type: "SSHAuthError"` with `ssh_status:
-  "auth-failed"`, `ssh_user`, `ssh_key` and a relaunch `hint` — on `exec`,
+- qmu logs in with its key only (`BatchMode=yes`; never a password prompt,
+  with or without a terminal). sshd refusing the VM's recorded `[ssh]
+  user`/key (`Permission denied (publickey,…)`) is exit 4 within a few
+  seconds, `error_type: "SSHAuthError"` with `ssh_status: "auth-failed"`,
+  `vm_id`, `ssh_user`, `ssh_key` and a relaunch `hint` — on `exec`,
   `compile`, `dmesg`, `push`/`pull` alike — never "unreachable".
 - Against a `panicked` or `paused` guest (any QMP `running: false` state) the
   command refuses in under a second: exit 1, `guest_state: "panicked" |

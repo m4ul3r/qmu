@@ -102,9 +102,11 @@ def _auth_refused_hint(inst: VMInstance) -> str:
 def _auth_refused_error(
     inst: VMInstance, ssh: Any, stderr: str | None = None
 ) -> SSHAuthError:
-    """The SSHAuthError (exit 4) for `inst`, with the relaunch hint."""
+    """The SSHAuthError (exit 4) for `inst`, with the relaunch hint and the
+    VM's `vm_id` (#196)."""
     exc = ssh.auth_error(stderr)
     exc.hint = _auth_refused_hint(inst)
+    exc.vm_id = inst.vm_id
     return exc
 
 

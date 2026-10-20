@@ -757,6 +757,9 @@ def _handle_launch(args: argparse.Namespace) -> Result:
     error: str | None = None
     error_type = "SSHError"
     hint: str | None = None
+    # The SSHAuthError's own envelope keys (`ssh_key`, …), as exec/push/run
+    # carry them, when the wait ended in a refused login (#196).
+    auth_fields: dict[str, Any] = {}
     if inst.harness:
         ssh_status = "n/a (harness)"
     elif inst.ssh_port is None:
@@ -789,6 +792,7 @@ def _handle_launch(args: argparse.Namespace) -> Result:
             auth = _auth_refused_error(inst, ssh)
             error = f"{auth} VM state retained."
             hint = auth.hint
+            auth_fields = auth.envelope_fields()
         else:
             # The window closed with the guest still booting: the timeout
             # code (124), the same `run` exits for the same condition, not
@@ -908,7 +912,7 @@ def _handle_launch(args: argparse.Namespace) -> Result:
             result["timed_out"] = True
             result["ssh_error"] = True
         elif ssh_status == "auth-failed":
-            result["ssh_error"] = True
+            result.update(auth_fields)
         # Text-mode stderr trailer, after the launch block it qualifies.
         notes = (f"[qmu] Error: {error}", f"[qmu] Hint: {hint}")
     return Result(
