@@ -685,19 +685,26 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   only when there is something to act on (not-armed locations, a teardown, a
   skipped re-sync; `elf_match: false` is only a note, since the symbols sit at
   the kernel's base — nokaslr, or the base `pry kbase` just validated). The
-  operation's exit code never changes. On a KASLR guest every re-sync is
-  preceded by `pry kbase` (`_kbase_or_not_resynced`); a base it cannot
-  validate is `not_resynced`, never a re-sync at the bridge's old base,
-  which would plant int3s inside unrelated code. A load is re-synced at
+  operation's exit code never changes. On a KASLR guest every re-sync goes
+  through `_rebase_and_resync`, at a stop qmu holds: `pry interrupt`, `pry
+  kbase`, `pry resync`, then `pry continue --background` only if qmu's
+  interrupt took the stop. Never let `pry kbase`/`pry resync` stop a running
+  target themselves there: pry resumes whatever happened, and under KVM that
+  resume re-inserts every breakpoint at the bridge's current, possibly stale,
+  base — a failed `pry kbase` armed exactly what it was meant to prevent,
+  under a warning saying nothing was armed (review of #200). A base `pry
+  kbase` cannot validate keeps the stop (`_left_stopped_unrebased`:
+  `not_resynced`, `interrupted`, `resumed: false`, no breakpoint in guest
+  RAM, one warning with both rebase routes). A load is re-synced at
   once. A reset is re-synced only when QEMU reports `running` right after it
   (the `_status_after_mutation` read), and only once the new boot's console
   shows the end of kernel init (`serial.kernel_init_done`, bounded by
   `RESET_KERNEL_WAIT_SECONDS`): the banner is too early, because the kernel
   still patches its own text (alternatives, return thunks) and a breakpoint
   on a patched site makes `apply_returns` WARN, which qmu then reports as a
-  crash it caused. No end of init in time (`quiet`), no validated base, or
-  no `pry` on qmu's PATH: `not_resynced`, the bridge is left alone with the
-  manual recovery — never tear down a healthy bridge for a qmu-side reason.
+  crash it caused. No end of init in time (`quiet`) or no `pry` on qmu's
+  PATH: `not_resynced`, the bridge is left alone with the manual recovery —
+  never tear down a healthy bridge for a qmu-side reason.
   A reset at a debugger stop (`prelaunch`; GDB cannot even resume it) is
   torn down, listing `breakpoints_dropped` (a KASLR reset used to be torn
   down too, when its base was readable only over SSH; `pry kbase` reads it
@@ -715,8 +722,9 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   `breakpoints_lifted`. A target that stopped by itself before the interrupt
   is not resumed; a save that outran its budget (124) leaves the bridge
   stopped and warns, since resuming would put int3s back into RAM QEMU may
-  still be saving; a failed save resumes it; a failure leaving a raw route
-  records the warnings through `debug.note_coherence_warnings`.
+  still be saving; a failed save resumes it; any other exception leaving a
+  save route (dedicated or raw) resumes it and records the drive's warnings
+  through `_SaveStop.record_on_failure` → `debug.note_coherence_warnings`.
 - `debug_session_present(inst)` is the gate for divergences a *live* client
   would see: true when `gdb_port` is set AND `gdb_client_attached()` cannot
   positively rule out a connected client. The attach probe parses

@@ -405,7 +405,7 @@ PRY_RESYNC_TIMEOUT = 20
 _PRY_CALL_SLACK = 15.0
 # `pry kbase` takes no --timeout; pry's default transport budget is 30 s.
 _PRY_KBASE_TIMEOUT = 30 + _PRY_CALL_SLACK
-# `pry interrupt` / `pry continue --background` around a save.
+# `pry interrupt` / `pry continue --background` around a save or a rebase.
 _PRY_STOP_TIMEOUT = 15.0
 # How long a reset waits for the new kernel to finish init (the end of its
 # boot-time text patching) before it re-syncs; past it, qmu does not re-sync
@@ -486,8 +486,9 @@ def _pry_resync(inst: Any) -> tuple[dict[str, Any] | None, str | None]:
 
 def _pry_kbase(inst: Any) -> tuple[dict[str, Any] | None, str | None]:
     """`pry kbase` on the owned bridge: the running kernel's validated `_text`,
-    with the loaded vmlinux rebased to it (pry #66). pry stops a running
-    target for it and resumes it, like `pry load`."""
+    with the loaded vmlinux rebased to it (pry #66). Run it only at a stop:
+    on a running target pry stops it and resumes it, success or not, and
+    that resume re-inserts every breakpoint where the bridge has it."""
     report, error = _pry_json(
         ["kbase", "--instance", str(inst.gdb_bridge_pid), "--format", "json"],
         timeout=_PRY_KBASE_TIMEOUT,
@@ -547,16 +548,44 @@ def _owned_ref(inst: Any) -> dict[str, Any]:
     }
 
 
+def _pry_interrupt(inst: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """`pry interrupt` on the owned bridge; `interrupted` in the report is
+    False when the target was stopped already (by itself, or by the user)."""
+    report, error = _pry_json(
+        ["interrupt", "--instance", str(inst.gdb_bridge_pid), "--format", "json"],
+        timeout=_PRY_STOP_TIMEOUT,
+    )
+    if error is not None:
+        return None, error
+    if not (isinstance(report, dict) and report.get("stopped") is True):
+        return None, "`pry interrupt` did not report a stop"
+    return report, None
+
+
+def _pry_continue(inst: Any) -> str | None:
+    """`pry continue --background` on the owned bridge; the error, if any."""
+    _, error = _pry_json(
+        ["continue", "--background", "--instance", str(inst.gdb_bridge_pid),
+         "--format", "json"],
+        timeout=_PRY_STOP_TIMEOUT,
+    )
+    return error
+
+
 def _resynced(
     inst: Any, event: str, report: dict[str, Any], *,
-    kbase: dict[str, Any] | None = None, **extra: Any,
+    kbase: dict[str, Any] | None = None, interrupted: bool = False,
+    resume_error: str | None = None, **extra: Any,
 ) -> BridgeDrive:
     """The owned bridge re-synced. Its symbols are known to be the running
     kernel's: a nokaslr kernel cannot move, and on a KASLR one `kbase` is
-    the base `pry kbase` validated just before."""
+    the base `pry kbase` validated just before. `interrupted`: qmu took the
+    stop the rebase ran at, and resumed the target after the re-sync
+    (`resume_error` when that failed)."""
     ident = bridge_instance_id(inst.vm_id)
     summary = report.get("summary") or {}
-    state = report.get("state", "unknown")
+    resumed = interrupted and resume_error is None
+    state = "running (qmu resumed it)" if resumed else report.get("state", "unknown")
     entries = _entries(report)
     notes = [_kbase_note(ident, kbase)] if kbase is not None else []
     notes += [
@@ -565,12 +594,19 @@ def _resynced(
         f"{summary.get('not_armed', 0)} not armed; target {state}.",
         *(f"  {_entry_line(e)}" for e in entries),
     ]
-    if state == "stopped":
+    warnings: list[str] = []
+    if resume_error is not None:
+        warnings.append(
+            f"[qmu] WARNING: VM '{inst.vm_id}': qmu stopped the pry bridge {ident} "
+            f"to rebase it after {event} and could not resume it ({resume_error}); "
+            "the guest is halted in the debugger: `pry --instance "
+            f"{ident} continue --background`.\n"
+        )
+    elif state == "stopped":
         notes.append(
             f"[qmu] The target is stopped in the debugger: resume it with "
             f"`pry --instance {ident} continue --background`."
         )
-    warnings: list[str] = []
     not_armed = [e for e in entries if e.get("status") in _NOT_ARMED]
     mismatch = [
         e for e in entries
@@ -600,6 +636,11 @@ def _resynced(
             + f". Re-run `pry --instance {ident} resync` once that code is mapped.\n"
         )
     data: dict[str, Any] = {"action": "resynced", "event": event, **_owned_ref(inst), **extra}
+    if interrupted:
+        data["interrupted"] = True
+        data["resumed"] = resumed
+        if resume_error is not None:
+            data["resume_error"] = resume_error
     if kbase is not None:
         data["kbase"] = kbase
     data["resync"] = report
@@ -683,24 +724,91 @@ def _pry_missing() -> bool:
 _NO_PRY = "`pry` is not on qmu's PATH"
 
 
-def _kbase_or_not_resynced(
-    inst: Any, event: str, what: str, recovery: str
-) -> tuple[dict[str, Any] | None, BridgeDrive | None]:
-    """On a KASLR guest, `pry kbase` before the re-sync; `(None, None)` on a
-    nokaslr one. A failure leaves the bridge alone (`not_resynced`): it is
-    qmu that cannot place the kernel, and arming at the bridge's current
-    base would plant int3s in unrelated code."""
-    if _kaslr_off(inst):
-        return None, None
+# What a bridge whose base `pry kbase` could not validate has at stake, per
+# event, and the first step back.
+_LOAD_BASE = (
+    "which is right only if the image was saved in this boot: if nothing reset "
+    "or rebooted the guest since the save, `pry --instance {ident} continue "
+    "--background` re-arms them in place. Otherwise rebase first:"
+)
+_RESET_BASE = "which the reset re-slid, so they are stale. Rebase first:"
+
+
+def _left_stopped_unrebased(
+    inst: Any, event: str, error: str, interrupted: bool, at_stake: str
+) -> BridgeDrive:
+    """`pry kbase` failed at the stop qmu took: keep that stop.
+
+    At a stop GDB holds none of its breakpoints in guest RAM; resuming puts
+    every one back at the address the bridge has, which is the stale base
+    if the kernel moved. So the target is left stopped and the warning says
+    how to rebase before resuming it.
+    """
+    ref = _owned_ref(inst)
+    ident = ref["bridge_instance_id"]
+    held = (
+        "left at the stop qmu took for the rebase"
+        if interrupted
+        else "left at the debugger stop it was already at"
+    )
+    reason = f"`pry kbase` could not validate the kernel's base: {error}"
+    warning = (
+        f"[qmu] WARNING: VM '{inst.vm_id}': qmu did not re-sync the pry bridge "
+        f"`qmu gdb` spawned ({ident}, pid {ref['bridge_pid']}) after {event}: "
+        f"{reason}. The target is {held}, with none of its breakpoints in "
+        "guest RAM, rather than resume it: resuming re-inserts every breakpoint "
+        "at the address the bridge has now, "
+        + at_stake.format(ident=ident)
+        + f" `pry --instance {ident} load <vmlinux>` if `pry kbase` found no "
+        f"kernel symbol file, then `pry --instance {ident} kbase` and `pry "
+        f"--instance {ident} resync`; or, over SSH, `qmu cont --vm {inst.vm_id}` "
+        "(the guest runs with no breakpoint in RAM), `eval \"$(qmu kbase --vm "
+        f"{inst.vm_id} --symbols <vmlinux>)\"`, then `pry --instance {ident} "
+        "resync --base $KBASE --symbols <vmlinux>` (it stops the guest again). "
+        f"Then `pry --instance {ident} continue --background`. A breakpoint set "
+        "at a raw address (`*0x…`) does not follow a rebase: delete it and set "
+        "it again.\n"
+    )
+    data = {
+        "action": "not_resynced", "event": event, **ref, "reason": reason,
+        "interrupted": interrupted, "resumed": False,
+    }
+    return BridgeDrive(data=data, warnings=(warning,))
+
+
+def _rebase_and_resync(
+    inst: Any, event: str, *, happened: str, at_stake: str, recovery: str,
+    **extra: Any,
+) -> BridgeDrive:
+    """KASLR: rebase the owned bridge, re-sync it and resume it, at a stop
+    qmu holds.
+
+    `pry kbase` and `pry resync` each stop a running target and resume it,
+    and under KVM that resume re-inserts every breakpoint where the bridge
+    has it now: at the stale base when the kernel moved, even after a `pry
+    kbase` that failed. So qmu takes the stop first (`pry interrupt`), both
+    run at it and resume nothing, and qmu resumes the target only once the
+    symbols sit at a validated base. A target that was stopped already is
+    the operator's stop and is not resumed. When `pry kbase` cannot validate
+    a base, the stop is kept (`_left_stopped_unrebased`).
+    """
+    stop, error = _pry_interrupt(inst)
+    if error is not None:
+        return _not_resynced(
+            inst, event, f"qmu could not stop the bridge to rebase it ({error})",
+            recovery,
+        )
+    interrupted = stop.get("interrupted") is True
     kbase, error = _pry_kbase(inst)
-    if error is None:
-        return kbase, None
-    return None, _not_resynced(
-        inst, event,
-        f"`pry kbase` could not validate {what}'s base ({error}), and re-arming "
-        "at the bridge's current base would put int3s inside unrelated code if "
-        "the kernel moved",
-        recovery,
+    if error is not None:
+        return _left_stopped_unrebased(inst, event, error, interrupted, at_stake)
+    report, error = _pry_resync(inst)
+    if error is not None:
+        return _torn_down(inst, event, happened, f"`pry resync` failed: {error}")
+    resume_error = _pry_continue(inst) if interrupted else None
+    return _resynced(
+        inst, event, report, kbase=kbase, interrupted=interrupted,
+        resume_error=resume_error, **extra,
     )
 
 
@@ -711,21 +819,21 @@ def drive_bridge_after_loadvm(inst: Any, event: str) -> BridgeDrive:
     one `pry resync` re-reads the stop state and re-arms every breakpoint at
     once. On a KASLR guest that boot need not be the current one (the guest
     was reset or rebooted since the save, #200), so `pry kbase` first rebases
-    the symbols to the restored kernel. A re-sync that fails leaves a view
-    nobody can correct: tear down.
+    the symbols to the restored kernel (`_rebase_and_resync`). A re-sync that
+    fails leaves a view nobody can correct: tear down.
     """
     recovery = loadvm_stale_session_warning(inst) + "\n"
     if _pry_missing():
         return _not_resynced(inst, event, _NO_PRY, recovery)
-    kbase, refused = _kbase_or_not_resynced(inst, event, "the restored kernel", recovery)
-    if refused is not None:
-        return refused
+    happened = f"rewound by {event}"
+    if not _kaslr_off(inst):
+        return _rebase_and_resync(
+            inst, event, happened=happened, at_stake=_LOAD_BASE, recovery=recovery,
+        )
     report, error = _pry_resync(inst)
     if error is not None:
-        return _torn_down(
-            inst, event, f"rewound by {event}", f"`pry resync` failed: {error}"
-        )
-    return _resynced(inst, event, report, kbase=kbase)
+        return _torn_down(inst, event, happened, f"`pry resync` failed: {error}")
+    return _resynced(inst, event, report)
 
 
 def drive_bridge_after_reset(
@@ -739,15 +847,16 @@ def drive_bridge_after_reset(
     thunk` from `apply_returns`) that reads as a guest crash. So on a running
     guest qmu waits until the new boot's console shows the end of kernel init
     (`serial.kernel_init_done`, bounded by `RESET_KERNEL_WAIT_SECONDS`); on a
-    KASLR guest `pry kbase` then finds the re-slid base and rebases the
-    symbols, and one `pry resync` re-arms. If the end of init never shows (a
-    `quiet` cmdline hides it, a slow boot, QEMU gone) or `pry kbase` cannot
-    validate a base, qmu does not re-sync and says so. `qemu_status` is
-    QEMU's run state right after the reset. A guest halted when it was reset
-    cannot be made true and is torn down instead: it stays at the reset
-    vector, where no kernel address is readable, and GDB cannot resume it
-    past breakpoints it cannot insert (measured: `pry continue` → `Command
-    aborted`).
+    KASLR guest `_rebase_and_resync` then finds the re-slid base with `pry
+    kbase` at a stop qmu holds, re-arms and resumes; on a nokaslr one `pry
+    resync` re-arms. If the end of init never shows (a `quiet` cmdline hides
+    it, a slow boot, QEMU gone) qmu does not re-sync and says so; if `pry
+    kbase` cannot validate a base, the target is left stopped with no
+    breakpoint in guest RAM. `qemu_status` is QEMU's run state right after
+    the reset. A guest halted when it was reset cannot be made true and is
+    torn down instead: it stays at the reset vector, where no kernel address
+    is readable, and GDB cannot resume it past breakpoints it cannot insert
+    (measured: `pry continue` → `Command aborted`).
     """
     event = "system_reset"
     if qemu_status != "running":
@@ -793,16 +902,16 @@ def drive_bridge_after_reset(
                 recovery,
             )
         time.sleep(0.1)
-    kbase, refused = _kbase_or_not_resynced(inst, event, "the re-slid kernel", recovery)
-    if refused is not None:
-        return refused
+    waited = round(time.monotonic() - started, 2)
+    if not _kaslr_off(inst):
+        return _rebase_and_resync(
+            inst, event, happened="reset", at_stake=_RESET_BASE, recovery=recovery,
+            waited_seconds=waited,
+        )
     report, error = _pry_resync(inst)
     if error is not None:
         return _torn_down(inst, event, "reset", f"`pry resync` failed: {error}")
-    return _resynced(
-        inst, event, report, kbase=kbase,
-        waited_seconds=round(time.monotonic() - started, 2),
-    )
+    return _resynced(inst, event, report, waited_seconds=waited)
 
 
 # --- A save under the bridge qmu owns (#201) ---------------------------------
@@ -841,14 +950,9 @@ def stop_bridge_for_save(
         or not qmu_bridge_attached(inst)
     ):
         return None, None
-    report, error = _pry_json(
-        ["interrupt", "--instance", str(inst.gdb_bridge_pid), "--format", "json"],
-        timeout=_PRY_STOP_TIMEOUT,
-    )
+    report, error = _pry_interrupt(inst)
     if error is not None:
         return None, error
-    if not (isinstance(report, dict) and report.get("stopped") is True):
-        return None, "`pry interrupt` did not report a stop"
     return SaveStop(inst, report.get("interrupted") is True, report), None
 
 
@@ -881,11 +985,7 @@ def resume_bridge_after_save(stop: SaveStop, event: str) -> BridgeDrive:
             f"{event}; the image was saved at that stop, and the target is left "
             f"there: `pry --instance {ident} continue --background` resumes it.",
         ))
-    _, error = _pry_json(
-        ["continue", "--background", "--instance", str(inst.gdb_bridge_pid),
-         "--format", "json"],
-        timeout=_PRY_STOP_TIMEOUT,
-    )
+    error = _pry_continue(inst)
     data["resumed"] = error is None
     if error is None:
         return BridgeDrive(data=data, notes=(

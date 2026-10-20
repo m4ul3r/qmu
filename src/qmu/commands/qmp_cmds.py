@@ -161,23 +161,31 @@ class _SaveStop:
     Under KVM, with that bridge attached and QEMU running, qmu interrupts it
     so GDB lifts its breakpoints from guest RAM, takes the save at that stop
     and resumes it after; otherwise (TCG, another client, already stopped)
-    the save runs as it is. `before` is QEMU's run state the save starts in,
-    re-read after the interrupt. `finish` classifies the image
-    (`breakpoints_in_image`, which may ask the bridge whether it is stopped)
-    BEFORE it resumes the bridge. A save that outran its budget leaves the
-    bridge stopped: QEMU may still be writing the image.
+    the save runs as it is. `begin` takes `before`, QEMU's run state the save
+    starts in, and re-reads it after the interrupt. `finish` classifies the
+    image (`breakpoints_in_image`, which may ask the bridge whether it is
+    stopped) BEFORE it resumes the bridge. A save that outran its budget
+    leaves the bridge stopped: QEMU may still be writing the image. Any other
+    failure resumes it, and `record_on_failure` hands what qmu did to the
+    error envelope.
     """
 
-    def __init__(self, qmp: object, inst: VMInstance, before: str | None, event: str):
+    def __init__(self, inst: VMInstance, event: str):
         self.inst = inst
         self.event = event
-        self.before = before
+        self.before: str | None = None
+        self.stop: SaveStop | None = None
+        self.warnings: tuple[str, ...] = ()
         self.drive: BridgeDrive | None = None
         self.coherence: tuple[str | None, str | None] = (None, None)
-        self.stop, error = stop_bridge_for_save(inst, before)
-        self.warnings = (save_stop_failed_warning(inst, error),) if error else ()
+
+    def begin(self, qmp: object, before: str | None) -> None:
+        self.before = before
+        self.stop, error = stop_bridge_for_save(self.inst, before)
+        if error:
+            self.warnings = (save_stop_failed_warning(self.inst, error),)
         if self.stop is not None:
-            self.before = self.save(lambda: _status_before_save(qmp, inst))
+            self.before = self.save(lambda: _status_before_save(qmp, self.inst))
 
     def save(self, run):
         """`run()`, resuming the bridge first when it fails other than by
@@ -209,8 +217,9 @@ class _SaveStop:
         return self.warnings + (save_left_stopped_warning(self.stop, self.event),)
 
     def record_on_failure(self) -> None:
-        """An exception is leaving a raw savevm: what qmu did to its bridge
-        reaches the error envelope through the dispatch warnings."""
+        """An exception other than the save's own timeout is leaving the
+        handler: what qmu did to its bridge reaches the error envelope
+        through the dispatch warnings."""
         drive = self.drive.warnings if self.drive is not None else ()
         note_coherence_warnings(*self.left_stopped(), *drive)
 
@@ -484,14 +493,14 @@ def _handle_snapshot_save(args: argparse.Namespace) -> Result:
     # guest sshd session that every later load resurrects as an orphan; close
     # it first so the checkpoint carries no half-open connection.
     _drop_ssh_master(inst)
-    stop: _SaveStop | None = None
+    stop = _SaveStop(inst, "snapshot save")
     try:
         with _qmp_ctx(inst) as qmp:
             # QEMU's run state across the save decides what the image holds
             # of the debugger's breakpoints (#188): read on both sides, since
             # savevm resumes a running guest before it returns. The bridge
             # `qmu gdb` spawned is stopped for the save (#201).
-            stop = _SaveStop(qmp, inst, _status_before_save(qmp, inst), "snapshot save")
+            stop.begin(qmp, _status_before_save(qmp, inst))
             result = stop.save(lambda: save_snapshot(qmp, args.name, timeout=timeout))
             after = (
                 _qemu_status(qmp) if result.ok and debug_stub_present(inst) else None
@@ -501,8 +510,10 @@ def _handle_snapshot_save(args: argparse.Namespace) -> Result:
         # The client has already closed its socket (`QMPClient.execute`), so
         # the next command connects fresh instead of reading savevm's late
         # reply as its own answer.
-        res = _snapshot_save_timeout(args, inst, timeout)
-        return res.warn(*stop.left_stopped()) if stop else res
+        return _snapshot_save_timeout(args, inst, timeout).warn(*stop.left_stopped())
+    except BaseException:
+        stop.record_on_failure()
+        raise
     res = _snapshot_result(args, "save", inst, result)
     res = res.warn(*stop.warnings)
     if drive is not None:
@@ -1447,8 +1458,9 @@ def _raw_mutation(
     if verb != "savevm":
         result = run()
         return result, _status_after_mutation(qmp, inst, verb), None
-    stop = _SaveStop(qmp, inst, _status_before_save(qmp, inst), "savevm")
+    stop = _SaveStop(inst, "savevm")
     try:
+        stop.begin(qmp, _status_before_save(qmp, inst))
         result = stop.save(run)
     except BaseException:
         stop.record_on_failure()

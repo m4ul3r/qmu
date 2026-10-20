@@ -290,9 +290,9 @@ savevm`, `qmp human-monitor-command savevm`).
 
 | Event | qmu's action |
 |---|---|
-| load succeeded | On a KASLR guest (no `nokaslr` on the recorded cmdline) `pry kbase` first: the image restores the kernel at the base of the boot it was saved in, which a reset or reboot since the save has moved (#200; measured: rebased `0x6600000` → `0x4e00000`, the canary fired at the restored kernel's address). Then `pry resync` at once (the restored image is mapped). If `pry kbase` cannot validate a base, nothing is armed and the bridge is left alone (`not_resynced`) with the manual recovery; if the re-sync fails, the bridge is torn down; if qmu cannot find `pry` on its own PATH, the bridge is left alone (`not_resynced`). |
+| load succeeded | On a nokaslr guest, `pry resync` at once (the restored image is mapped). On a KASLR guest (no `nokaslr` on the recorded cmdline) the image restores the kernel at the base of the boot it was saved in, which a reset or reboot since the save has moved (#200), so qmu rebases first, at a stop it holds: `pry interrupt`, `pry kbase`, `pry resync`, then `pry continue --background` (measured: rebased `0x1a000000` → `0xc200000`, the canary fired at the restored kernel's address). The stop comes first because `pry kbase` and `pry resync` each stop a running target and resume it, and that resume re-inserts every breakpoint at the address the bridge has, successful or not (measured before this order: a failed `pry kbase` left `0xcc` at the old address and the canary fired). A target that was already at a debugger stop is rebased there and not resumed. If `pry kbase` cannot validate a base (e.g. `no kernel symbol file is loaded`), the target stays at that stop with none of its breakpoints in guest RAM (measured: `0x41` at the breakpoint, `exec` refused with `guest_state: "paused"`), `not_resynced` with `interrupted: true`, `resumed: false`, and the warning gives both ways on: `continue --background` if the image is from this boot, else rebase first (`pry load <vmlinux>` if needed, `pry kbase`, `pry resync`; or `qmu cont`, `qmu kbase`, `pry resync --base $KBASE --symbols <vmlinux>`) — each run as written. If the re-sync fails, the bridge is torn down; if qmu cannot find `pry` on its own PATH, the bridge is left alone (`not_resynced`). |
 | load failed mid-restore (`restore_state: "partial"`/`"unknown"`) | Nothing, to any client: `pry continue`, a re-sync of a target pry believes running, or a detach can each resume the half-restored machine. The warning says so; load a known-good snapshot first (that re-syncs), or `qmu kill`. |
-| reset, QEMU `running` after it | qmu waits until the new boot's console shows the **end of kernel init** (`Freeing unused kernel image (initmem) memory` / `Write protecting the kernel read-only data` / `Run /sbin/init as init process`), then, on a KASLR guest, runs `pry kbase` (the re-slid base, read through the IDT with no SSH and validated against the vmlinux, pry #66), then `pry resync` once. The banner alone is too early: the new kernel still patches its own text (alternatives, return thunks, static keys), and a breakpoint armed on a patched site trips the patcher (`missing return thunk` WARNING from `apply_returns`, which then reads as a guest crash). Measured on KVM: init done and armed ≈2 s after the reset (KASLR: rebased `0x4e00000` → `0x6600000`, the canary fired in the new boot, no crash reported); under TCG the same after a slower boot. If the end of init never shows within 30 s (a `quiet` cmdline hides those lines, a slow or stuck boot), `pry kbase` cannot validate a base, or `pry` is not on qmu's PATH, qmu arms nothing and leaves the bridge alone (`not_resynced`) with the manual recovery. A boot-time hit of the canary (e.g. `__x64_sys_newuname`, which systemd calls) stops the guest in the debugger like any hit. |
+| reset, QEMU `running` after it | qmu waits until the new boot's console shows the **end of kernel init** (`Freeing unused kernel image (initmem) memory` / `Write protecting the kernel read-only data` / `Run /sbin/init as init process`), then runs `pry resync` once on a nokaslr guest, or, on a KASLR one, rebases at a stop it holds exactly as for a load (`pry interrupt`, `pry kbase` — the re-slid base, read through the IDT with no SSH and validated against the vmlinux, pry #66 — `pry resync`, `pry continue --background`). The banner alone is too early: the new kernel still patches its own text (alternatives, return thunks, static keys), and a breakpoint armed on a patched site trips the patcher (`missing return thunk` WARNING from `apply_returns`, which then reads as a guest crash). Measured on KVM: init done and armed ≈2 s after the reset (KASLR: rebased `0xc200000` → `0x1a000000`, the canary fired in the new boot, no crash reported); under TCG the same after a slower boot. If `pry kbase` cannot validate a base, the target stays at qmu's stop with no breakpoint in guest RAM (`not_resynced`, `interrupted: true`, `resumed: false`; the warning's rebase steps, both routes, were run as written — a breakpoint set at a raw address does not follow a rebase and is set again). If the end of init never shows within 30 s (a `quiet` cmdline hides those lines, a slow or stuck boot) or `pry` is not on qmu's PATH, qmu arms nothing and leaves the bridge alone (`not_resynced`) with the manual recovery. A boot-time hit of the canary (e.g. `__x64_sys_newuname`, which systemd calls) stops the guest in the debugger like any hit. |
 | reset of a guest the debugger had halted (QEMU not `running` after it) | **Torn down.** The vCPU sits at the reset vector (`prelaunch`), where no kernel address is readable: `pry resync` reports every breakpoint `unreadable` and `pry continue` fails (`Command aborted`, measured). A clean detach lets QEMU run the guest, so it boots (measured 7 of 8 times); once it stayed halted until `qmu cont`, and the warning says to `qmu cont` it first when `qmu status` shows it `paused`. |
 | save of a guest QEMU reports `running`, under KVM (#201) | `pry interrupt`, so GDB lifts its breakpoints from guest RAM; the save at that stop; then `pry continue --background`. A target that had stopped by itself (a breakpoint hit before the interrupt) is the operator's stop: saved there, not resumed. A save that outran its budget leaves the bridge stopped (resuming would put the breakpoints back into RAM QEMU may still be saving) and says how to resume it; a failed save still resumes it. If `pry interrupt` fails, the save runs with the guest running and warns. Under TCG nothing is done (breakpoints never reach guest RAM). |
 
@@ -304,24 +304,32 @@ JSON (`--format json`): `debugger` carries `action` (`resynced` /
   (`state`, `run_state`, `breakpoints[]` with per-location `status`/`detail`,
   `summary.{armed,not_armed,elf_mismatch,…}`); on a KASLR guest `kbase` —
   `pry kbase --format json` as pry returns it (`base`, `slide`, `method`,
-  `validated`, `apply`); a reset adds `waited_seconds`. Locations not armed
+  `validated`, `apply`), plus `interrupted: true` and `resumed` when qmu
+  took the stop the rebase ran at (`resume_error` and a warning if `pry
+  continue` failed); a reset adds `waited_seconds`. Locations not armed
   produce one `warnings[]` entry naming them. Armed locations over code that
   differs from the symbol file (`elf_match: false`) are the kernel's own
   boot-time patching (the breakpoint is where you set it), since the symbols
   sit at the kernel's base — `nokaslr`, or the base `pry kbase` validated: a
   text note only. Text mode prints the receipt (the `pry kbase` line, then
   `Re-synced the pry bridge qmu-<vm> …: N armed, M not armed; target S.`
-  plus one line per location) on stderr, never on stdout. `state:
-  "stopped"` (a load into a debug stop) means resume with `pry --instance
-  qmu-<vm> continue --background`; qmu does not resume it.
+  plus one line per location) on stderr, never on stdout; `target running
+  (qmu resumed it)` after a rebase at qmu's stop. `state: "stopped"` (a load
+  into a debug stop) means resume with `pry --instance qmu-<vm> continue
+  --background`; qmu does not resume it.
 - `torn_down`: `reason`, `bridge_reaped`, and `breakpoints_dropped` (`pry break
   list --format json` as read just before the teardown, `null` if the bridge
   could not answer), plus a `warnings[]` entry with the reattach steps (`qmu
   gdb`, which leaves the guest halted, `pry kbase` on a KASLR guest, the
   breakpoints again, and `pry --instance qmu-<vm> continue --background`:
   GDB arms breakpoints only when it resumes).
-- `not_resynced`: `reason`; the bridge is untouched, and `warnings[]` carries
-  why plus the same recovery a client qmu does not drive gets.
+- `not_resynced`: `reason`; when qmu could not re-sync for a reason of its
+  own (no `pry`, no end of init) the bridge is untouched and `warnings[]`
+  carries why plus the same recovery a client qmu does not drive gets. When
+  `pry kbase` could not validate a base, the data also carries
+  `interrupted` (qmu took the stop) and `resumed: false`: the target is at a
+  debugger stop with no breakpoint in guest RAM, and the one warning names
+  how to rebase and resume it.
 - `stopped_for_save`: `interrupted` (false when the target had stopped by
   itself), `resumed`, and `resume_error` when `pry continue` failed (then a
   warning says the guest is halted in the debugger). `snapshot save` adds
@@ -336,6 +344,9 @@ bridge.
 qmu rebases only the bridge it spawned, and only after a load or reset it
 issued (`pry kbase`, validated against the vmlinux); any other bridge's base
 is the operator's to apply. Neither `gdb` nor `kbase` silently resumes or
-re-halts the guest; a save resumes only the stop it took itself, and qmu
-does not resume a target its re-sync found stopped. `qmu gdb --help`,
+re-halts the guest. A save resumes only the stop it took itself; the rebase
+of a KASLR load or reset takes a stop too and resumes it only once the
+symbols sit at a validated base — a rebase `pry kbase` could not validate
+keeps that stop. qmu does not resume a
+target its re-sync found stopped. `qmu gdb --help`,
 `kbase --help` and `cont --help` carry no epilog; this file is the reference.
