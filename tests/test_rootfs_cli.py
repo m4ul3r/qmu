@@ -704,7 +704,7 @@ def test_rm_of_a_missing_path_hints_the_listing_of_an_existing_ancestor(
     monkeypatch.setattr(
         rootfs_mod, "_run_script",
         lambda img, part, script, action: scripts.append(script)
-        or b"false\n" * script.count("exists "),
+        or b"false\n" * script.count("\n"),
     )
 
     rc = cli.main([
@@ -718,25 +718,31 @@ def test_rm_of_a_missing_path_hints_the_listing_of_an_existing_ancestor(
     assert len(scripts) == 1  # the ancestors ride the one appliance run
 
 
-def test_rm_of_a_missing_path_hints_its_directory_when_that_exists(
-    tmp_path, monkeypatch, capsys
+@pytest.mark.parametrize("guest_path, answers, parent", [
+    # Probed: the path, then its ancestors nearest-first, as `is-dir`.
+    ("/root/a/x", b"false\ntrue\ntrue\n", "/root/a"),
+    # /etc/passwd exists but is a file (or a dangling link): `ls` cannot list it.
+    ("/etc/passwd/foo", b"false\nfalse\ntrue\n", "/etc"),
+    # A parent with a space is quoted so the hint runs as printed.
+    ("/a b/nope/x", b"false\nfalse\ntrue\n", "'/a b'"),
+    ("//no//such", b"false\nfalse\n", "/"),
+])
+def test_rm_of_a_missing_path_hints_the_nearest_listable_directory(
+    tmp_path, monkeypatch, capsys, guest_path, answers, parent
 ):
     from qmu import cli
 
     image = tmp_path / "rootfs.img"
     image.write_text("disk")
     monkeypatch.setattr(rootfs_mod, "_require_guestfish", lambda: "guestfish")
-    # Probed: /root/a/x, then ancestors /root/a, /root.
-    monkeypatch.setattr(
-        rootfs_mod, "_run_script", lambda *a, **k: b"false\ntrue\ntrue\n"
-    )
+    monkeypatch.setattr(rootfs_mod, "_run_script", lambda *a, **k: answers)
 
     cli.main([
-        "--format", "json", "rootfs", "rm", str(image), "/root/a/x", "--partition", "0",
+        "--format", "json", "rootfs", "rm", str(image), guest_path, "--partition", "0",
     ])
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload["hint"].startswith(f"qmu rootfs ls {image} /root/a --partition 0")
+    assert payload["hint"].startswith(f"qmu rootfs ls {image} {parent} --partition 0")
 
 
 @pytest.mark.parametrize("spec, corrected", [

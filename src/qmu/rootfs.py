@@ -4,6 +4,7 @@ import base64
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import stat as stat_mod
 import subprocess
@@ -1101,36 +1102,39 @@ def remove(
     present = list(guest_paths)
     missing: list[str] = []
     # The ancestors ride the same appliance run: the missing-path hint names
-    # the nearest one that exists, since a parent missing too would make the
-    # suggested `rootfs ls` fail as well (#202).
+    # the nearest one `rootfs ls` can list, since a parent that is missing —
+    # or a file, or a dangling link — would make the suggested `ls` fail as
+    # well (#202). `is-dir` follows symlinks, as `ls` does.
     ancestors: list[str] = []
     for p in guest_paths:
-        a = posixpath.dirname(p.rstrip("/")) or "/"
+        # normpath keeps a leading `//` (POSIX lets it mean something else).
+        a = posixpath.dirname(posixpath.normpath("/" + p.lstrip("/")))
         while a not in ancestors and a != "/":
             ancestors.append(a)
-            a = posixpath.dirname(a) or "/"
-    probed = list(guest_paths) + ancestors
-    script = "".join(f"exists {guestfish_quote(p)}\n" for p in probed)
+            a = posixpath.dirname(a)
+    script = "".join(f"exists {guestfish_quote(p)}\n" for p in guest_paths)
+    script += "".join(
+        f"is-dir {guestfish_quote(a)} followsymlinks:true\n" for a in ancestors
+    )
     out = _run_script(image, partition, script, "rm")
-    answers = out.split()
-    exists: dict[str, bool] = {"/": True}
-    if len(answers) == len(probed):
-        exists.update(
-            (p, a.strip().lower() == b"true") for p, a in zip(probed, answers)
-        )
+    answers = [a.strip().lower() == b"true" for a in out.split()]
+    listable: dict[str, bool] = {}
+    if len(answers) == len(guest_paths) + len(ancestors):
+        listable = dict(zip(ancestors, answers[len(guest_paths):]))
         present = []
-        for guest_path in guest_paths:
-            (present if exists[guest_path] else missing).append(guest_path)
+        for guest_path, found in zip(guest_paths, answers):
+            (present if found else missing).append(guest_path)
     if missing and not force:
-        parent = posixpath.dirname(missing[0].rstrip("/")) or "/"
-        while not exists.get(parent, True):
-            parent = posixpath.dirname(parent) or "/"
+        parent = posixpath.dirname(posixpath.normpath("/" + missing[0].lstrip("/")))
+        while parent != "/" and not listable.get(parent, True):
+            parent = posixpath.dirname(parent)
         raise QMUError(
             f"Not found in {image}: {', '.join(missing)}. "
             f"Nothing was removed. Pass --force to ignore missing paths, "
             f"or check with `qmu rootfs ls`.",
             hint=(
-                f"qmu rootfs ls {image} {parent} --partition {partition}; "
+                f"qmu rootfs ls {shlex.quote(str(image))} {shlex.quote(parent)} "
+                f"--partition {partition}; "
                 "or re-run with --force to skip missing paths"
             ),
         )

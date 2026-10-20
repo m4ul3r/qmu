@@ -606,11 +606,13 @@ def test_missing_dirs_is_inconclusive_on_a_short_read(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _exists_probe(*existing):
-    """A `_run_script` fake answering each `exists` line like guestfish."""
+    """A `_run_script` fake answering each `exists`/`is-dir` line like guestfish."""
     def run(img, part, script, action):
-        lines = [l for l in script.splitlines() if l.startswith("exists ")]
+        lines = [
+            l for l in script.splitlines() if l.startswith(("exists ", "is-dir "))
+        ]
         return b"".join(
-            b"true\n" if l.split(" ", 1)[1].strip('"') in existing else b"false\n"
+            b"true\n" if l.split(" ")[1].strip('"') in existing else b"false\n"
             for l in lines
         )
     return run
