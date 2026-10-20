@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import time
 
 import pytest
@@ -293,6 +294,26 @@ def test_floor_refusal_hint_is_a_command_prune_accepts(cache_root, capsys):
     advised = _advised_older_than(_json(capsys)["hint"])
     assert cli.main(["prune", "--build-residue", "--dry-run",
                      "--older-than", advised]) == 0
+
+
+def test_held_back_advice_keeps_the_tree_scope(cache_root, capsys):
+    """Advice given after previewing one tree must not reclaim the others."""
+    mine = _tree(cache_root, "linux-7.0")
+    other = _tree(cache_root, "linux-6.9")
+    _age_tree(mine, cache_mod.MIN_BUILD_RESIDUE_AGE + 3600)
+    _age_tree(other, cache_mod.MIN_BUILD_RESIDUE_AGE + 3600)
+    cli.main(["prune", "--build-residue", "--tree", "linux-7.0", "--dry-run"])
+    out = capsys.readouterr().out
+    advised = re.search(r"qmu (prune --build-residue[^\n]*--older-than \d+)", out)
+    assert advised, out
+    argv = shlex.split(advised.group(1))
+    assert "--dry-run" in argv  # a preview's advice is still a preview
+    argv.remove("--dry-run")
+
+    assert cli.main([*argv, "--format", "json"]) == 0
+    removed = _json(capsys)["build_residue"]["removed"]
+    assert removed and all("linux-7.0" in entry["path"] for entry in removed)
+    assert list((other / "kernel").glob("*.o"))
 
 
 def test_keep_logs_is_rejected(cache_root):

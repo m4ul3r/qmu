@@ -77,7 +77,8 @@ Optional:
   --no-cache             Rebuild even if output exists
   --config-only          Generate .config and exit (don't build); prints
                          CONFIG and KERNEL_SRC (the source tree, configured
-                         with that .config)
+                         with that .config); with --keep-residue it skips
+                         mrproper, so the tree keeps its objects
   --config-enable SYM    Set CONFIG_SYM=y after the built-in overlays, before
                          the final olddefconfig (repeatable; SYM or CONFIG_SYM,
                          comma-separated lists allowed)
@@ -301,6 +302,11 @@ esac
 # (one SYM=VALUE per symbol, sorted, so equivalent flag/fragment spellings
 # agree) hashed into its own output directory, and stamped there in
 # kconfig-overlay so no cache check accepts another config's build.
+if [[ "${OVERLAY[MODULES]:-}" == n ]]; then
+  # Every build exports KDIR and proves it with a module build; a kernel
+  # without module support can never pass that, so refuse before compiling.
+  die "CONFIG_MODULES=n is not supported: kbuild's output contract includes KDIR (an out-of-tree module build tree), which needs CONFIG_MODULES=y"
+fi
 OVERLAY_SPEC=""
 if (( ${#OVERLAY[@]} )); then
   OVERLAY_SPEC="$(for sym in "${!OVERLAY[@]}"; do
@@ -506,6 +512,10 @@ write_overlay_script() {
     cat <<'EOF'
 kbuild_overlay_expect() {
   local sym=$1 want=$2 got
+  if ! grep -qxF "$sym" "$KBUILD_KCONFIG_SYMBOLS"; then
+    echo "kbuild: requested CONFIG_${sym}=${want}, but this kernel's Kconfig declares no symbol ${sym} (misspelled, or not in this version)" >&2
+    return 1
+  fi
   got=$(grep -E "^(CONFIG_${sym}=|# CONFIG_${sym} is not set$)" .config | head -n 1 || true)
   if [[ $want == n ]]; then
     [[ -z $got || $got == "# CONFIG_${sym} is not set" ]] && return 0
@@ -518,9 +528,13 @@ kbuild_overlay_expect() {
 EOF
     echo 'kbuild_overlay_verify() {'
     echo '  local bad=0'
+    # every symbol any Kconfig file of this tree declares, read once
+    echo '  KBUILD_KCONFIG_SYMBOLS=$(mktemp)'
+    echo "  grep -rhoE --include='Kconfig*' '^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+' . | awk '{print \$NF}' | sort -u > \"\$KBUILD_KCONFIG_SYMBOLS\" || true"
     while IFS= read -r line; do
       printf '  kbuild_overlay_expect %q %q || bad=1\n' "${line%%=*}" "${line#*=}"
     done <<< "$OVERLAY_SPEC"
+    echo '  rm -f "$KBUILD_KCONFIG_SYMBOLS"'
     echo '  return $bad'
     echo '}'
   } > "$OVERLAY_SCRIPT"
@@ -681,6 +695,7 @@ docker run --rm \
     MINOR='$MINOR'
     ARCH_ARG='$ARCH'
     CONFIG_ONLY='$CONFIG_ONLY'
+    KEEP_RESIDUE='$KEEP_RESIDUE'
     GDB_TARGET='$GDB_TARGET'
     MAKE_VERBOSE='$MAKE_VERBOSE'
     SRC_ARCH='$SRC_ARCH'
@@ -697,8 +712,13 @@ docker run --rm \
       echo \"cross compiler: \$(\${CROSS_COMPILE}gcc --version | head -1)\" >&2
     fi
 
-    # clean previous build state
-    make ARCH=\$MAKE_ARCH \$MAKE_VERBOSE mrproper
+    # clean previous build state -- except for --config-only --keep-residue,
+    # whose point is a hand build that reuses the previous objects
+    if [[ \"\$CONFIG_ONLY\" == true && \"\$KEEP_RESIDUE\" == true ]]; then
+      echo 'config-only --keep-residue: skipping mrproper, the tree keeps its objects' >&2
+    else
+      make ARCH=\$MAKE_ARCH \$MAKE_VERBOSE mrproper
+    fi
 
     # base defconfig
     make ARCH=\$MAKE_ARCH CROSS_COMPILE=\$CROSS_COMPILE \$MAKE_VERBOSE \$DEFCONFIG
@@ -785,6 +805,10 @@ docker run --rm \
 
     if [[ -f /output/.kbuild-overlay.sh ]]; then
       kbuild_overlay_verify || exit 42
+    fi
+    if [[ \"\$CONFIG_ONLY\" != true ]] && ! grep -qx CONFIG_MODULES=y .config; then
+      echo 'kbuild: the resolved .config has CONFIG_MODULES off; KDIR (module build tree) cannot be exported' >&2
+      exit 43
     fi
 
     if [[ \"\$CONFIG_ONLY\" == true ]]; then
@@ -875,6 +899,10 @@ docker run --rm \
 rm -f "$OVERLAY_SCRIPT"
 if [[ $RC -eq 42 && -n "$OVERLAY_SPEC" ]]; then
   log "the requested kconfig overlay did not survive olddefconfig (see above); nothing was built"
+  exit 1
+fi
+if [[ $RC -eq 43 ]]; then
+  log "refusing to build a kernel without module support (see above); nothing was built"
   exit 1
 fi
 if [[ $RC -ne 0 ]]; then

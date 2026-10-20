@@ -59,9 +59,12 @@ below):
 | transport lost / terminal panic | 3 (fresh report) / 4 | `command`, `crash` (report or `null`), `hint`, partial `stdout`/`stderr` |
 | vCPU halted mid-command | 1 | `command`, `guest_state: "paused"`, `qemu_status`, `hint`, partial `stdout`/`stderr`, and `detached_output` (the file the still-running command's further output is appended to) when qmu left its session open |
 
-Branch on `crash_detected` on every path: it is `true` with the report in
-`crash` whenever the kernel printed one during the command, whether the guest
-survived it or not. `timed_out` and `command` are absent from a finished
+Branch on `crash_detected`: on the finished, timeout and transport-lost
+paths it is `true` with the report in `crash` whenever the kernel printed
+one during the command, whether the guest survived it or not. The
+vCPU-halted envelope is the exception: `crash_detected` is always `false`
+there and it has no `crash` key — check `qmu crash --vm X` after a halt.
+`timed_out` and `command` are absent from a finished
 command's envelope (read `env.get("timed_out")`); `detached_output` is absent
 unless the halted command was left running. `stdout_lossy`/
 `stderr_lossy: true` appear only when invalid UTF-8 was replaced.

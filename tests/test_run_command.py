@@ -197,6 +197,8 @@ def test_crash_during_the_command_exits_3_and_preserves_state(harness, capsys):
     assert "Kernel panic - not syncing" in captured.err
     assert "qmu crash --vm run-vm" in captured.err
     assert "state preserved" in captured.err
+    # the cause reads before the cleanup advice
+    assert captured.err.index("Kernel panic") < captured.err.index("state preserved")
 
 
 def test_boot_panic_exits_3_with_the_report(harness, capsys):

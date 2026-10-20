@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sys
@@ -1693,7 +1694,7 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
             f"{floor}` or higher, or inspect first with "
             f"`qmu cache du --older-than {older_than:g}`.",
             hint=(
-                f"qmu prune --build-residue --dry-run --older-than {floor} "
+                f"{_residue_floor_command(getattr(args, 'tree', None), dry_run=True)} "
                 f"(the lowest threshold prune accepts; residue modified in the "
                 f"last {floor}s stays held back)"
             ),
@@ -1741,7 +1742,8 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
             "build_residue": payload,
             "unmanaged_cache": unmanaged,
         }
-        return Result(data=data, text=_residue_lines(report, dry_run=True, older_than=older_than),
+        return Result(data=data, text=_residue_lines(report, dry_run=True, older_than=older_than,
+                                                     trees=trees),
                       stem="prune-build-residue")
 
     removed, failed = remove_items(report.bucket_items("eligible"))
@@ -1777,7 +1779,7 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
     return Result(
         data=data,
         text=_residue_lines(
-            report, dry_run=False, older_than=older_than,
+            report, dry_run=False, older_than=older_than, trees=trees,
             removed_bytes=sum(i.bytes for i in removed),
             removed_files=len(removed), failed=len(failed),
         ),
@@ -1785,11 +1787,24 @@ def _handle_prune_build_residue(args: argparse.Namespace) -> Result:
     )
 
 
+def _residue_floor_command(trees: Sequence[str] | None, *, dry_run: bool) -> str:
+    """The prune at the 600 s floor, scoped like the invocation that asked:
+    advice given after previewing one tree must not reclaim every tree."""
+    words = ["qmu", "prune", "--build-residue"]
+    for tree in trees or ():
+        words += ["--tree", tree]
+    if dry_run:
+        words.append("--dry-run")
+    words += ["--older-than", f"{MIN_BUILD_RESIDUE_AGE:g}"]
+    return shlex.join(words)
+
+
 def _residue_lines(
     report: Any,
     *,
     dry_run: bool,
     older_than: float,
+    trees: Sequence[str] | None = None,
     removed_bytes: int = 0,
     removed_files: int = 0,
     failed: int = 0,
@@ -1830,7 +1845,7 @@ def _residue_lines(
             recovery = (
                 f"Once the build has finished, re-run with a smaller "
                 f"--older-than, down to the {floor}s floor: "
-                f"qmu prune --build-residue --older-than {floor}"
+                f"{_residue_floor_command(trees, dry_run=dry_run)}"
             )
         else:
             recovery = (

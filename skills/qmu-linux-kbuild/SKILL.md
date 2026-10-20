@@ -27,7 +27,7 @@ form used below); from this skill's directory, `../../tools/kbuild.sh`.
 | i386 / arm32 / arm32hf | `--arch i386` (`bzImage`), `--arch arm32` or `--arch arm32hf` (`zImage`; `<5.0` uses `vexpress_defconfig`, else `multi_v7_defconfig`) |
 | A custom config (subsystem the overlays leave off, KASAN off for a realistic slab layout) | `eval "$(tools/kbuild.sh --version 6.1.75 --config-enable NF_TABLES,USER_NS --config-disable KASAN)"`, or `--config-fragment nft.config` (kconfig fragment lines) — applied after the built-in overlays, before the final `olddefconfig`, under the same lock and output contract, cached in its own `6.1.75/x86_64-kconfig-<hash>/`; see *Config* |
 | Inspect the config before a long build | `tools/kbuild.sh --version 6.6.75 --config-only` (with the same `--config-*` flags) → prints `CONFIG=` and `KERNEL_SRC=`. A hand-edited `.config` is never consumed by kbuild (every build regenerates it); express the change as `--config-enable`/`--config-disable`/`--config-fragment` instead |
-| Build what the flags cannot express (a patched tree) | `eval "$(tools/kbuild.sh --version 6.6.75 --config-only --keep-residue)"` leaves `KERNEL_SRC` configured with `CONFIG`; build it in the toolchain image, not with the host GCC: `docker run --rm --user "$(id -u):$(id -g)" -v "$KERNEL_SRC:/src" -w /src qmu-kbuild:jammy-x86_64 make -j8 bzImage` (outside kbuild's lock: run no kbuild of that version meanwhile) |
+| Build what the flags cannot express (a patched tree) | after a `--keep-residue` build of the same arch, `eval "$(tools/kbuild.sh --version 6.6.75 --config-only --keep-residue)"` reconfigures `KERNEL_SRC` with `CONFIG` **without** mrproper, so the previous objects stay for an incremental build; build it in the toolchain image, not with the host GCC: `docker run --rm --user "$(id -u):$(id -g)" -v "$KERNEL_SRC:/src" -w /src qmu-kbuild:jammy-x86_64 make -j8 bzImage` (outside kbuild's lock: run no kbuild of that version meanwhile) |
 | GDB/pry source-level debugging | after a normal build: `pry gdb "add-auto-load-safe-path $(dirname "$VMLINUX_GDB")"; pry gdb "set substitute-path /src $KERNEL_SRC"; pry gdb "source $VMLINUX_GDB"` |
 | Build a `.ko` for the guest (e.g. a survivable Oops on a config without LKDTM) | `cd mymod && "$KDIR/qmu-kmake" modules` — see *Out-of-tree modules* |
 | Constrained host | `--jobs 4` (default `nproc`) |
@@ -68,7 +68,7 @@ configured with that `.config`, ready for `make -C`.
 | Exit | Meaning | Next |
 |---|---|---|
 | `0` | built, or served from cache; assignments on stdout | `qmu launch --kernel "$KERNEL"` |
-| `1` | the containerised build failed; last stderr line is `kbuild: build failed (exit N) — check <outdir>/build.log`. Or a requested `--config-*` setting did not survive `olddefconfig` (`kbuild: requested CONFIG_X=y, but olddefconfig resolved it to: not set (an unmet depends on …)`, then `… nothing was built`) | read `build.log`; GCC errors → `--container` one step newer; apt/network errors → retry; a dropped setting → enable its `depends on` symbols too (`grep -rn -A8 '^config X$' "$KERNEL_SRC" --include='Kconfig*'`) |
+| `1` | the containerised build failed; last stderr line is `kbuild: build failed (exit N) — check <outdir>/build.log`. Or a requested `--config-*` setting did not survive `olddefconfig` (`kbuild: requested CONFIG_X=y, but olddefconfig resolved it to: not set (an unmet depends on …)`, or `… this kernel's Kconfig declares no symbol X (misspelled, or not in this version)`, then `… nothing was built`). Or the resolved config has `MODULES` off (`… refusing to build a kernel without module support`) | read `build.log`; GCC errors → `--container` one step newer; apt/network errors → retry; a dropped setting → enable its `depends on` symbols too (`grep -rn -A8 '^config X$' "$KERNEL_SRC" --include='Kconfig*'`); an unknown symbol → fix the spelling |
 | `2` | usage: missing/invalid `--version` (`major.minor[.patch]`), unsupported `--arch` or `--container`, unknown flag, `--help`, an invalid `--config-*` symbol or fragment line (`kbuild: error: <file>:<line>: …`); lock file unusable (e.g. NFS); extraction failed; products missing after an apparently successful build. Message is `kbuild: error: …` on stderr | fix the argument; for the lock, use a local `QMU_CACHE_DIR` |
 | `130` / `143` | interrupted by SIGINT / SIGTERM; the build container is removed on the way out | rerun; nothing partial is served as a cache hit |
 | other | a host step failed under `set -e` (`curl` download, `tar`, `docker build` of the toolchain image); the status is that tool's | `curl` 22 ⇒ version does not exist on the mirror; retry apt failures |
@@ -83,9 +83,9 @@ configured with that `.config`, ready for `make -C`.
 | `--outdir DIR` | artifact directory (default `$CACHE/kernels/VER/ARCH`, or `VER/ARCH-kconfig-<hash>` with `--config-*`) |
 | `--jobs N` | `make -jN` (default `nproc`) |
 | `--no-cache` | rebuild even if a complete cached build exists |
-| `--config-only` | generate `.config` and exit; prints `CONFIG=` and `KERNEL_SRC=` (with `--keep-residue`, leaves the tree's residue alone) |
+| `--config-only` | generate `.config` and exit; prints `CONFIG=` and `KERNEL_SRC=`. With `--keep-residue` it skips the `mrproper` and the residue clean, so the tree keeps the previous build's objects (after a build of another arch, run it without `--keep-residue`) |
 | `--config-enable SYM[,SYM…]` | `CONFIG_SYM=y` after the built-in overlays (repeatable; `SYM` or `CONFIG_SYM`) |
-| `--config-disable SYM[,SYM…]` | `CONFIG_SYM=n` likewise — e.g. `--config-disable KASAN` |
+| `--config-disable SYM[,SYM…]` | `CONFIG_SYM=n` likewise — e.g. `--config-disable KASAN`. `MODULES` is refused (exit 2): every build exports `KDIR`, which needs module support; a config that resolves to `MODULES` off any other way fails (exit 1) before compiling |
 | `--config-fragment FILE` | apply a kconfig fragment: `CONFIG_X=y\|m\|n\|"str"\|<number>` and `# CONFIG_X is not set` lines, other `#` lines ignored (repeatable; the last setting of a symbol wins) |
 | `--keep-residue` | keep `*.o`, `*.a`, `*.ko`, `.*.cmd`, `.tmp_vmlinux*` in `KERNEL_SRC` after a successful build |
 | `--verbose` | show the Docker image build and full make output (default passes `-s` to make) |
@@ -116,10 +116,10 @@ for a `--config-only` or a different-arch build, means mrproper on the tree
 the previous invocation just built in; the previous invocation's artifacts are
 already copied to its `--outdir`, so nothing it printed becomes stale.
 
-Consequence for `--config-only`: it is safe to run beside a build (it waits),
-but it still wipes residue of the finished build from the shared tree, so run
-it before a `--keep-residue` build you intend to `make -C` afterwards, not
-after.
+Consequence for `--config-only`: it is safe to run beside a build (it waits).
+Without `--keep-residue` it mrpropers the shared tree, wiping the finished
+build's residue; with `--keep-residue` it reconfigures in place and keeps it,
+which is the start of a hand `make -C "$KERNEL_SRC"`.
 
 ## Cache
 
@@ -185,7 +185,8 @@ Base: `defconfig` (x86_64, arm64), `i386_defconfig`, `multi_v7_defconfig` /
 Overlays, then the caller's `--config-*` settings (so they can override an
 overlay, e.g. turn KASAN off), then `olddefconfig`. Each caller setting is
 then checked in the resolved `.config`; one `olddefconfig` dropped (unmet
-`depends on`) fails the run with exit 1 before anything is built. The
+`depends on`), or a symbol no `Kconfig` file of the tree declares (a typo),
+fails the run with exit 1 before anything is built. The
 built-in overlays:
 
 - storage `EXT4_FS ATA ATA_PIIX SATA_AHCI`; network `E1000 E1000E VIRTIO_NET`;

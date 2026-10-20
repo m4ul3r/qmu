@@ -213,8 +213,9 @@ def _use_real_helper_targets(kbuild_env, mode):
 .PHONY: mrproper defconfig kvm_guest.config olddefconfig bzImage modules_prepare prepare scripts_gdb
 mrproper:
 \trm -f .config vmlinux System.map vmlinux-gdb.py scripts/gdb/linux/constants.py Module.symvers vmlinux.symvers
+\tfind . -name '*.o' -delete
 defconfig:
-\tprintf 'CONFIG_DEBUG_INFO=y\\nCONFIG_GDB_SCRIPTS=y\\n' > .config
+\tprintf 'CONFIG_DEBUG_INFO=y\\nCONFIG_GDB_SCRIPTS=y\\nCONFIG_MODULES=y\\n' > .config
 kvm_guest.config olddefconfig:
 \t@:
 modules_prepare:
@@ -674,16 +675,19 @@ def test_clean_is_scoped_to_the_source_tree_and_spares_arch_boot(kbuild_env):
 
 def test_config_only_keep_residue_leaves_the_tree_for_a_hand_build(kbuild_env):
     """#165: `--config-only --keep-residue` is the start of a hand `make -C
-    "$KERNEL_SRC"`; it must not strip what is already in the tree."""
-    src = kbuild_env.source_makefile.parent
+    "$KERNEL_SRC"`; it must not strip what is already in the tree — neither
+    the host-side clean nor the container's mrproper (the real body runs)."""
+    src = _use_real_helper_targets(kbuild_env, "modern")
     (src / "kernel").mkdir(parents=True, exist_ok=True)
     (src / "kernel/fork.o").write_text("obj\n")
 
     kept = kbuild_env.run("--config-only", "--keep-residue")
     assert kept.returncode == 0, kept.stderr
     assert (src / "kernel/fork.o").is_file()
+    assert Path(_parse_assignments(kept.stdout)["KERNEL_SRC"], ".config").is_file()
 
-    kbuild_env.run("--config-only", "--no-cache")
+    wiped = kbuild_env.run("--config-only", "--no-cache")
+    assert wiped.returncode == 0, wiped.stderr
     assert not (src / "kernel/fork.o").exists()
 
 
@@ -723,6 +727,10 @@ def _use_real_kconfig(kbuild_env):
         "\t@if test -n \"$$KBUILD_TEST_UNMET\"; then "
         "sed -i \"/^CONFIG_$$KBUILD_TEST_UNMET=/d\" .config; fi\n",
     ))
+    # the symbols this tree's Kconfig declares (anything else is a typo)
+    (source / "Kconfig").write_text(
+        "config NF_TABLES\n\ttristate\nconfig USER_NS\n\tbool\nmenuconfig KASAN\n\tbool\n"
+    )
     return source
 
 
@@ -769,6 +777,38 @@ def test_a_custom_config_never_shares_another_configs_cache(kbuild_env, tmp_path
     assert _parse_assignments(other.stdout)["KERNEL"] not in (custom_kernel, stock_kernel)
     kbuild_env.clear_docker_log()
     assert kbuild_env.run(fail_if_docker_runs=True).returncode == 0
+
+
+def test_a_misspelled_symbol_is_named_as_unknown(kbuild_env):
+    _use_real_kconfig(kbuild_env)
+    result = kbuild_env.run("--config-only", "--config-enable", "NF_TABLE")
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "declares no symbol NF_TABLE" in result.stderr
+    assert "unmet depends on" not in result.stderr
+
+
+def test_modules_off_is_refused_before_anything_runs(kbuild_env, tmp_path):
+    """KDIR is part of the output contract and needs module support: a
+    MODULES=n request must not compile a whole kernel and then fail."""
+    fragment = tmp_path / "nomod.config"
+    fragment.write_text("# CONFIG_MODULES is not set\n")
+    for spelling in (["--config-disable", "MODULES"], ["--config-fragment", str(fragment)]):
+        result = kbuild_env.run(*spelling, fail_if_docker_runs=True)
+        assert result.returncode == 2, spelling
+        assert "CONFIG_MODULES" in result.stderr
+    assert kbuild_env.docker_runs() == []
+
+
+def test_a_config_resolved_without_modules_fails_before_compiling(kbuild_env):
+    source = _use_real_kconfig(kbuild_env)
+    kbuild_env.env["KBUILD_TEST_UNMET"] = "MODULES"
+    result = kbuild_env.run()
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "without module support" in result.stderr
+    assert not (source / "helper-called").exists()
+    assert not (source / "arch/x86/boot/bzImage").exists()
 
 
 def test_an_outdir_holding_another_config_is_rebuilt(kbuild_env, tmp_path):

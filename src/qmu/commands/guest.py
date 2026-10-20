@@ -934,6 +934,12 @@ class _TextStreamSink:
         self._path = path
         self._file = path.open("wb")
 
+    @property
+    def wrote_to_file(self) -> bool:
+        """True when stdout ended with a pointer line (`--out` or a spill),
+        not with the guest's last byte."""
+        return self._path is not None
+
     def on_chunk(self, stream: str, data: bytes) -> None:
         if stream == "stderr":
             self._err_received += len(data)
@@ -1245,6 +1251,13 @@ def _guest_exit_hint(inst: VMInstance, rc: int, kernel_report: bool) -> str:
     )
 
 
+def _stdout_is_terminal() -> bool:
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def _guest_result(
     *,
     data: dict[str, Any],
@@ -1252,6 +1265,7 @@ def _guest_result(
     stderr: str = "",
     text: list[str] = (),
     notes: list[str | bytes] = (),
+    followups: list[str] = (),
     stem: str,
     exit_code: int,
     sink: _TextStreamSink | _NdjsonStreamSink | None = None,
@@ -1266,7 +1280,10 @@ def _guest_result(
     stderr, verbatim; `str` entries (`[exit code: N]`, kernel warnings,
     follow-up hints) are qmu's lines and start on a fresh line. `text` (the
     crash report, timeout or debugger-stop notice when the command was lost)
-    is the last of them. `exec` used to print all of it on stdout as
+    follows them, then `followups` (`run`'s preserved-VM hints: the cause
+    reads before the cleanup advice). When guest stdout on a terminal ended
+    mid-line, the text starts on a fresh terminal line. `exec` used to
+    print all of it on stdout as
     `[stderr] ...` / `[exit code: N]` lines, so a pipeline or a redirect
     collected the decorations as if the guest had printed them; then it
     rendered the stdout as text, so `printf x` arrived as `x\\n` and a 0xff
@@ -1279,8 +1296,15 @@ def _guest_result(
     stderr, on a fresh line after streamed stderr that ended without one.
     An ndjson sink has nothing left to do: the envelope renders as usual.
     """
+    raw = guest_bytes(stdout)
     if text:
+        if (raw and not raw.endswith(b"\n") and _stdout_is_terminal()
+                and not (isinstance(sink, _TextStreamSink) and sink.wrote_to_file)):
+            # The old stdout trailer started on a fresh line; on a shared
+            # terminal the stderr text must too, without touching stdout.
+            notes = [*notes, b"\n"]
         notes = [*notes, "\n".join(text)]
+    notes = [*notes, *followups]
     if isinstance(sink, _TextStreamSink):
         exit_rc = data.get("exit_code")
         sink.finish(
@@ -1299,7 +1323,7 @@ def _guest_result(
         data=data,
         stem=stem,
         exit_code=exit_code,
-        raw=guest_bytes(stdout),
+        raw=raw,
         suffix=".txt",
         notes=tuple(notes),
     )

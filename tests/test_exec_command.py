@@ -796,6 +796,23 @@ def test_timeout_text_mode_prints_partial_stdout_and_the_notice_on_stderr(wired,
     assert "timed out" in captured.err
 
 
+@pytest.mark.parametrize("terminal", [True, False])
+def test_notice_after_open_stdout_line_starts_a_fresh_terminal_line(
+    wired, capsys, monkeypatch, terminal
+):
+    """Guest stdout that ends mid-line must not glue the stderr notice onto
+    it on a terminal; piped stdout stays byte-exact either way."""
+    monkeypatch.setattr(guest, "_stdout_is_terminal", lambda: terminal)
+    wired(raises=SSHError("SSH command timed out after 2.0s: cmd", stdout="partial"))
+
+    rc = cli.main(["exec", "--vm", "exec-vm", "--timeout", "2", "cmd"])
+
+    captured = capsys.readouterr()
+    assert rc == 124
+    assert captured.out == "partial"
+    assert captured.err.startswith("\nGuest command timed out" if terminal else "Guest command timed out")
+
+
 @pytest.mark.parametrize("fmt", ["json", "text"])
 def test_compile_run_timeout_on_a_serving_guest_is_124_with_partial_output(
     wired, tmp_path, capsys, fmt
