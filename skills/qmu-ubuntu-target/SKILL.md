@@ -321,7 +321,8 @@ qmu exec --vm ubu 'sysctl kernel.kptr_restrict kernel.dmesg_restrict kernel.unpr
 # one modprobe per module: `modprobe a b c` treats b and c as PARAMETERS of a
 qmu exec --vm ubu 'for m in nf_tables ksmbd hfsplus n_gsm; do modprobe "$m" || { echo "MISSING $m" >&2; exit 1; }; echo "ok $m"; done'
 qmu exec --vm ubu 'grep " _text$" /proc/kallsyms'   # differs across boots => KASLR live
-qmu exec --vm ubu 'echo c > /proc/sysrq-trigger'; qmu crash --vm ubu   # exit 3 + report
+qmu exec --vm ubu 'echo c > /proc/sysrq-trigger'   # exit 3 (crash report attached)
+qmu crash --vm ubu                                 # exit 0 + report (exit 1 = none found)
 ```
 
 `echo c > /proc/sysrq-trigger` works despite the restricted `kernel.sysrq`

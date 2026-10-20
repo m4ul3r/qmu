@@ -829,9 +829,10 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
     else:
         ssh_timeout_help = (
             "Seconds to wait for the guest to answer SSH (default: 60). On "
-            "expiry `launch` exits 4 (SSHError) and RETAINS the VM for "
-            "inspection — `qmu status`/`qmu log --vm <id>` — unlike `run`, "
-            "which exits 124. A serial log still empty after ~10 s fails "
+            "expiry `launch` exits 124 (TimeoutError, timed_out: true, "
+            "ssh_status 'timeout') and RETAINS the VM for inspection — `qmu "
+            "status`/`qmu log --vm <id>` — the same code `run` returns, "
+            "which does not retain it. A serial log still empty after ~10 s fails "
             "earlier with ssh_status 'no-console-output' (wrong console= or "
             "machine type for this arch)."
         )

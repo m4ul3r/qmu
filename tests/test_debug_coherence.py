@@ -593,13 +593,14 @@ def test_gdb_attach_warns_about_kvm_watchpoints(monkeypatch, tmp_path, capsys):
 
 def test_gdb_attach_no_kvm_warning_when_tcg_or_unknown(monkeypatch, tmp_path, capsys):
     # kvm=None (older instance JSON) and kvm=False must both omit the warning:
-    # only a positively-KVM VM gets it.
+    # only a positively-KVM VM gets it. `kvm` itself is always present with the
+    # recorded value, as launch/status/list report it (#134).
     for kvm in (None, False):
         _install_gdb_seams(monkeypatch, _gdb_vm(tmp_path, kvm=kvm))
         rc = cli.main(["--format", "json", "gdb", "--vm", "debug-vm"])
         payload = json.loads(capsys.readouterr().out)
         assert rc == 0
-        assert "kvm" not in payload
+        assert payload["kvm"] is kvm
         assert "kvm_watchpoint_warning" not in payload
 
 

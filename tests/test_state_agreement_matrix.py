@@ -4025,13 +4025,12 @@ def test_status_and_list_agree_on_the_ssh_probe_duration(ready, cache, monkeypat
         assert isinstance(payload["ssh_probe_ms"], int)
         assert payload["ssh_probe_ms"] >= 50
         assert payload["ssh"] == ("ready" if ready else "down")
-    # The text run sends its own probe, so its millisecond count can differ
-    # from the JSON run's by scheduler jitter (51 vs 52 ms under load): pin the
-    # shape and the SSH word, and that the number is a real measured probe.
-    match = re.search(r"SSH:       port 10099 \((\w+), probe (\d+) ms\)", text)
-    assert match is not None, text
-    assert match.group(1) == status["ssh"]
-    assert int(match.group(2)) >= 50
+    # The text run sends its own probe, so its duration is its own (two real
+    # sleeps differ by a millisecond under load); it must carry a number of
+    # the same kind next to the same SSH word.
+    m = re.search(r"SSH:       port 10099 \((\w+), probe (\d+) ms\)", text)
+    assert m is not None, text
+    assert m.group(1) == status["ssh"] and int(m.group(2)) >= 50
 
 
 def test_ssh_probe_duration_is_null_when_no_probe_was_sent(cache, monkeypatch, capsys):
