@@ -554,12 +554,19 @@ def test_wait_reset_warning_rides_the_result_once(daemon_env, vm, monkeypatch, c
     monkeypatch.setattr(lifecycle, "save_guest_epoch_serial_offset", lambda inst, off, **kw: inst)
 
     def reset_twice() -> None:
+        # Emit only once the daemon is serving the `wait`: a fixed 0.2 s
+        # timer fired before the subscription on a loaded host, and the
+        # missed events left the envelope without `warnings[]`.
+        deadline = time.monotonic() + 10
+        while daemon_env._waits_in_flight == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.1)
         vm["server"].emit("RESET", {"guest": True, "reason": "guest-reset"})
         time.sleep(0.2)
         vm["server"].emit("RESET", {"guest": True, "reason": "guest-reset"})
 
-    threading.Timer(0.2, reset_twice).start()
-    rc = cli.main(["--format", "json", "wait", "--vm", "fake-vm", "--timeout", "1.2"])
+    threading.Thread(target=reset_twice, daemon=True).start()
+    rc = cli.main(["--format", "json", "wait", "--vm", "fake-vm", "--timeout", "2"])
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert rc == 124 and payload["last_event"] == "RESET"
