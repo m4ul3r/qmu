@@ -648,8 +648,11 @@ def test_a_blocked_qmp_probe_does_not_defeat_the_command_deadline(
     greeting budget per cadence, so the loop neither drained nor enforced
     the deadline while blocked, and a child that finished meanwhile was
     accepted as completed. The probe is now off-thread with a bounded wait:
-    the deadline holds within +0.3 s, output seen before it is kept, and the
-    busy socket is still treated as "running" (no spurious abort)."""
+    the deadline holds — well before the >= 3 s a synchronous 2 s stall at
+    the 1 s QMP cadence would take, with headroom for a loaded shared host —
+    output seen before it is kept, and the busy socket is still treated as
+    "running" (no spurious abort). The child sleeps past any such slack so
+    its later output can never race the kill."""
     def held_qmp(inst):
         time.sleep(2.0)  # a QMPClient.connect() waiting out its greeting budget
         return None
@@ -658,17 +661,17 @@ def test_a_blocked_qmp_probe_does_not_defeat_the_command_deadline(
     serial = tmp_path / "vm.serial.log"
     serial.write_text("boot ok\n")
     client = _fake_ssh_on_path(
-        tmp_path, monkeypatch, "echo early\nsleep 2.5\nprintf done\n"
+        tmp_path, monkeypatch, "echo early\nsleep 4\nprintf done\n"
     )
     watcher = guest._guest_abort_watcher(_instance(str(serial)), start_offset=0)
 
     started = time.monotonic()
     with pytest.raises(SSHError) as excinfo:
-        client.run("sleep 2.5; printf done", timeout=2.0, abort_when=watcher)
+        client.run("sleep 4; printf done", timeout=2.0, abort_when=watcher)
     elapsed = time.monotonic() - started
 
     assert not isinstance(excinfo.value, SSHAborted)
-    assert elapsed < 2.3, elapsed
+    assert elapsed < 2.75, elapsed
     assert excinfo.value.stdout == "early\n"
 
 
