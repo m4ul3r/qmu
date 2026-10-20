@@ -1264,6 +1264,10 @@ def _handle_exec(args: argparse.Namespace) -> Result:
 # ---------------------------------------------------------------------------
 
 
+_COMPILE_DEFAULT_CFLAGS = "-static -lpthread"
+_COMPILE_DEFAULT_TIMEOUT = 60.0
+
+
 def _add_compile(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("compile", help="Compile C file in guest (or on the host with --host)")
     p.add_argument("source", help="Local C source file")
@@ -1274,8 +1278,8 @@ def _add_compile(sub: argparse._SubParsersAction) -> None:
              "(`qmu compile poc.c --run -- /tmp/target 1 DATA`).",
     )
     p.add_argument("--run", action="store_true", help="Run after compiling")
-    p.add_argument("--cflags", default="-static -lpthread", help="Compiler flags")
-    p.add_argument("--timeout", type=float, default=60.0, help="Execution timeout")
+    p.add_argument("--cflags", default=_COMPILE_DEFAULT_CFLAGS, help="Compiler flags")
+    p.add_argument("--timeout", type=float, default=_COMPILE_DEFAULT_TIMEOUT, help="Execution timeout")
     p.add_argument(
         "--host",
         action="store_true",
@@ -1291,7 +1295,9 @@ def _add_compile(sub: argparse._SubParsersAction) -> None:
              "'clang --target=aarch64-linux-gnu')",
     )
     _add_common_opts(p)
-    p.set_defaults(handler=_handle_compile)
+    # `trailing_positionals`: ARGs after `--run`/`--` land in program_args on
+    # every supported Python (`cli._absorb_trailing_positionals`).
+    p.set_defaults(handler=_handle_compile, trailing_positionals="program_args")
 
 
 def _compile_on_host(
@@ -1365,14 +1371,24 @@ def _handle_compile(args: argparse.Namespace) -> Result:
     # Arguments for a program that is never run would be dropped silently;
     # refuse before anything is compiled.
     if getattr(args, "program_args", None) and not args.run:
+        # The corrected command is the caller's own, plus --run: dropping
+        # --host/--cflags/--cc/--timeout would rebuild something else.
+        retry = ["qmu", "compile", args.source]
+        if args.vm:
+            retry += ["--vm", args.vm]
+        if args.host_build:
+            retry.append("--host")
+        if args.cc is not None:
+            retry += ["--cc", args.cc]
+        if args.cflags != _COMPILE_DEFAULT_CFLAGS:
+            retry += ["--cflags", args.cflags]
+        if args.timeout != _COMPILE_DEFAULT_TIMEOUT:
+            retry += ["--timeout", f"{args.timeout:g}"]
+        retry += ["--run", "--", *args.program_args]
         raise QMUError(
             "compile got program arguments without --run: "
             + shlex.join(args.program_args),
-            hint=(
-                f"qmu compile {shlex.quote(args.source)}"
-                + (f" --vm {args.vm}" if args.vm else "")
-                + f" --run -- {shlex.join(args.program_args)}"
-            ),
+            hint=shlex.join(retry),
         )
     inst = _choose_running(args.vm, "compile")
     _require_ssh(inst)
