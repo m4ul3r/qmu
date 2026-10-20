@@ -121,6 +121,8 @@ if os.environ.get("KBUILD_EXECUTE_INNER") == "1":
 
 inner = args[-1]
 if "CONFIG_ONLY='true'" in inner:
+    # the container configures the shared tree, then copies its .config out
+    (source / ".config").write_text("CONFIG_DEBUG_INFO=y\\nCONFIG_GDB_SCRIPTS=y\\n")
     raise SystemExit(0)
 
 omit = os.environ.get("KBUILD_OMIT_ARTIFACT")
@@ -150,7 +152,7 @@ write_artifact("build/Module.symvers", "0x00000000\\t_printk\\tvmlinux\\tEXPORT_
 (source / "vmlinux").write_text("ELF symbols\\n")
 (source / "System.map").write_text("ffffffff81000000 T _text\\n")
 (source / "vmlinux.unstripped").write_text("ELF unstripped\\n")
-(source / ".config").write_text("CONFIG_X=y\\n")
+(source / ".config").write_text("CONFIG_DEBUG_INFO=y\\nCONFIG_GDB_SCRIPTS=y\\n")
 (source / "arch/x86/boot/bzImage").write_text("kernel image\\n")
 write_artifact("scripts/gdb/vmlinux-gdb.py", "# generated loader\\n")
 write_artifact("scripts/gdb/linux/constants.py", "LX_CONFIG_HZ = 250\\n")
@@ -337,7 +339,9 @@ def test_container_config_only_does_not_build_image_or_helpers(kbuild_env):
     result = kbuild_env.run("--config-only")
     assert result.returncode == 0, result.stderr
     values = _parse_assignments(result.stdout)
-    assert list(values) == ["CONFIG"]
+    assert list(values) == ["CONFIG", "KERNEL_SRC"]
+    # KERNEL_SRC is the tree configured with CONFIG, ready for `make -C`.
+    assert Path(values["KERNEL_SRC"], ".config").read_text() == Path(values["CONFIG"]).read_text()
     assert "CONFIG_GDB_SCRIPTS=y" in Path(values["CONFIG"]).read_text()
     assert not (source / "helper-called").exists()
     assert not (source / "arch/x86/boot/bzImage").exists()
@@ -433,7 +437,9 @@ def test_config_only_outputs_only_config_and_skips_scripts_gdb(kbuild_env, tmp_p
     cold = tmp_path / "config-only"
     result = kbuild_env.run("--config-only", "--outdir", str(cold))
     assert result.returncode == 0, result.stderr
-    assert result.stdout == f"CONFIG={cold}/.config\n"
+    assert result.stdout == (
+        f"CONFIG={cold}/.config\nKERNEL_SRC={kbuild_env.source_makefile.parent}\n"
+    )
     assert (cold / ".config").is_file()
     assert not (cold / "vmlinux-gdb.py").exists()
 
@@ -443,7 +449,9 @@ def test_config_only_outputs_only_config_and_skips_scripts_gdb(kbuild_env, tmp_p
     kbuild_env.clear_docker_log()
     warm_config = kbuild_env.run("--config-only")
     assert warm_config.returncode == 0
-    assert warm_config.stdout == f"CONFIG={output}/.config\n"
+    assert warm_config.stdout == (
+        f"CONFIG={output}/.config\nKERNEL_SRC={kbuild_env.source_makefile.parent}\n"
+    )
     assert kbuild_env.docker_runs() == []
 
 
@@ -662,3 +670,138 @@ def test_clean_is_scoped_to_the_source_tree_and_spares_arch_boot(kbuild_env):
     src = kbuild_env.source_makefile.parent
     # The boot image remains available in the retained source tree.
     assert (src / "arch/x86/boot/bzImage").is_file()
+
+
+def test_config_only_keep_residue_leaves_the_tree_for_a_hand_build(kbuild_env):
+    """#165: `--config-only --keep-residue` is the start of a hand `make -C
+    "$KERNEL_SRC"`; it must not strip what is already in the tree."""
+    src = kbuild_env.source_makefile.parent
+    (src / "kernel").mkdir(parents=True, exist_ok=True)
+    (src / "kernel/fork.o").write_text("obj\n")
+
+    kept = kbuild_env.run("--config-only", "--keep-residue")
+    assert kept.returncode == 0, kept.stderr
+    assert (src / "kernel/fork.o").is_file()
+
+    kbuild_env.run("--config-only", "--no-cache")
+    assert not (src / "kernel/fork.o").exists()
+
+
+# ---------------------------------------------------------------------------
+# custom kconfig overlay (--config-enable / --config-disable / --config-fragment)
+# ---------------------------------------------------------------------------
+
+# scripts/config as far as kbuild uses it: edits .config in place.
+FAKE_SCRIPTS_CONFIG = """#!/usr/bin/env python3
+import re, sys
+from pathlib import Path
+op, sym, *rest = sys.argv[1:]
+value = {"--enable": "y", "--module": "m", "--disable": None}.get(op)
+if op == "--set-str":
+    value = '"%s"' % rest[0]
+elif op == "--set-val":
+    value = rest[0]
+cfg = Path(".config")
+lines = cfg.read_text().splitlines() if cfg.exists() else []
+lines = [l for l in lines if not re.match(rf"^(CONFIG_{sym}=|# CONFIG_{sym} is not set)", l)]
+lines.append(f"CONFIG_{sym}={value}" if value else f"# CONFIG_{sym} is not set")
+cfg.write_text("\\n".join(lines) + "\\n")
+"""
+
+
+def _use_real_kconfig(kbuild_env):
+    """The real container shell, with a scripts/config that edits .config and
+    an olddefconfig that drops $KBUILD_TEST_UNMET (an unmet `depends on`)."""
+    source = _use_real_helper_targets(kbuild_env, "modern")
+    config = source / "scripts/config"
+    config.write_text(FAKE_SCRIPTS_CONFIG)
+    config.chmod(0o755)
+    makefile = kbuild_env.source_makefile
+    makefile.write_text(makefile.read_text().replace(
+        "kvm_guest.config olddefconfig:\n\t@:\n",
+        "kvm_guest.config:\n\t@:\nolddefconfig:\n"
+        "\t@if test -n \"$$KBUILD_TEST_UNMET\"; then "
+        "sed -i \"/^CONFIG_$$KBUILD_TEST_UNMET=/d\" .config; fi\n",
+    ))
+    return source
+
+
+def test_overlay_is_applied_after_the_builtin_overlays(kbuild_env):
+    _use_real_kconfig(kbuild_env)
+    result = kbuild_env.run(
+        "--config-enable", "NF_TABLES,CONFIG_USER_NS", "--config-disable", "KASAN"
+    )
+    assert result.returncode == 0, result.stderr
+    values = _parse_assignments(result.stdout)
+    config = Path(values["CONFIG"]).read_text().splitlines()
+    assert "CONFIG_NF_TABLES=y" in config
+    assert "CONFIG_USER_NS=y" in config
+    assert "# CONFIG_KASAN is not set" in config  # the built-in overlay enables it
+    assert "CONFIG_DEBUG_INFO=y" in config        # the built-in overlays still apply
+    assert Path(values["KERNEL"]).is_file()
+
+
+def test_a_custom_config_never_shares_another_configs_cache(kbuild_env, tmp_path):
+    stock = kbuild_env.run()
+    assert stock.returncode == 0, stock.stderr
+    stock_kernel = _parse_assignments(stock.stdout)["KERNEL"]
+
+    kbuild_env.clear_docker_log()
+    custom = kbuild_env.run("--config-enable", "NF_TABLES")
+    assert custom.returncode == 0, custom.stderr
+    assert kbuild_env.docker_runs(), "a custom config was served the stock build"
+    custom_kernel = _parse_assignments(custom.stdout)["KERNEL"]
+    assert Path(custom_kernel).parent != Path(stock_kernel).parent
+
+    # The same overlay spelled as a fragment is the same config: a cache hit.
+    fragment = tmp_path / "nft.config"
+    fragment.write_text("# netfilter\nCONFIG_NF_TABLES=y\n")
+    kbuild_env.clear_docker_log()
+    again = kbuild_env.run("--config-fragment", str(fragment), fail_if_docker_runs=True)
+    assert again.returncode == 0, again.stderr
+    assert _parse_assignments(again.stdout)["KERNEL"] == custom_kernel
+
+    # A different overlay is a different build; the stock cache still hits.
+    kbuild_env.clear_docker_log()
+    other = kbuild_env.run("--config-enable", "NF_TABLES", "--config-disable", "KASAN")
+    assert other.returncode == 0, other.stderr
+    assert kbuild_env.docker_runs()
+    assert _parse_assignments(other.stdout)["KERNEL"] not in (custom_kernel, stock_kernel)
+    kbuild_env.clear_docker_log()
+    assert kbuild_env.run(fail_if_docker_runs=True).returncode == 0
+
+
+def test_an_outdir_holding_another_config_is_rebuilt(kbuild_env, tmp_path):
+    outdir = tmp_path / "shared-outdir"
+    assert kbuild_env.run("--outdir", str(outdir), "--config-enable", "NF_TABLES").returncode == 0
+    kbuild_env.clear_docker_log()
+    stock = kbuild_env.run("--outdir", str(outdir))
+    assert stock.returncode == 0, stock.stderr
+    assert kbuild_env.docker_runs(), "the stock config was served a custom build"
+
+
+def test_a_setting_olddefconfig_drops_fails_the_build(kbuild_env):
+    """A kernel quietly missing the requested option is the failure the
+    verify step exists for: no assignments, the symbol named, nothing cached."""
+    _use_real_kconfig(kbuild_env)
+    kbuild_env.env["KBUILD_TEST_UNMET"] = "NF_TABLES"
+    result = kbuild_env.run("--config-enable", "NF_TABLES,USER_NS")
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "CONFIG_NF_TABLES=y" in result.stderr
+    assert "CONFIG_USER_NS" not in result.stderr
+
+    del kbuild_env.env["KBUILD_TEST_UNMET"]
+    retry = kbuild_env.run("--config-enable", "NF_TABLES,USER_NS")
+    assert retry.returncode == 0, retry.stderr
+    assert "CONFIG_NF_TABLES=y" in Path(_parse_assignments(retry.stdout)["CONFIG"]).read_text()
+
+
+@pytest.mark.parametrize("line", ["CONFIG_FOO=maybe", "FOO=y", 'CONFIG_FOO="a\\"b"'])
+def test_a_malformed_fragment_is_refused_before_anything_runs(kbuild_env, tmp_path, line):
+    fragment = tmp_path / "bad.config"
+    fragment.write_text(line + "\n")
+    result = kbuild_env.run("--config-fragment", str(fragment), fail_if_docker_runs=True)
+    assert result.returncode == 2
+    assert f"{fragment}:1" in result.stderr
+    assert kbuild_env.docker_runs() == []
