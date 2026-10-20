@@ -216,7 +216,9 @@ def appliance_kernel_problem(boot: Path = Path("/boot")) -> str | None:
     return "no /boot/vmlinuz-* is readable (they are mode 0600)"
 
 
-APPLIANCE_PROBE_TIMEOUT = 60.0
+# A warm cache starts in ~3 s and an unreadable-kernel build fails in ~1 s;
+# this only bounds a host where the appliance hangs, so `doctor` stays quick.
+APPLIANCE_PROBE_TIMEOUT = 20.0
 
 
 def probe_appliance(fish: str, timeout: float = APPLIANCE_PROBE_TIMEOUT) -> tuple[bool | None, str]:
