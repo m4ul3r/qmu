@@ -2295,7 +2295,7 @@ def _agreement_view(rc, payload):
         "crash_detected": payload.get("crash_detected"),
         "crash_present": payload.get("crash") is not None,
         "names_qmu_crash": "qmu crash" in hint,
-        "names_qmu_log": "qmu log --tail 100" in hint,
+        "names_qmu_log": "qmu log --vm" in hint and "--tail 100" in hint,
     }
 
 

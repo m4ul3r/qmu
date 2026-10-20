@@ -200,9 +200,11 @@ def _transfer_transport_lost(
     else:
         hint = (
             "SCP transport lost; VM may be unreachable. "
-            "No fresh crash report in serial log. Check: qmu log --tail 100"
+            f"No fresh crash report in serial log. Check: qmu log --vm {inst.vm_id} --tail 100"
         )
-        detail = "No fresh crash detected. Check: qmu log --tail 100"
+        detail = (
+            f"No fresh crash detected. Check: qmu log --vm {inst.vm_id} --tail 100"
+        )
         status = 4
     direction = (
         f"{local} -> guest:{remote}"
@@ -505,7 +507,7 @@ def _transport_lost(ssh: SSHClient, inst: VMInstance) -> bool:
     return True
 
 
-def _ssh_lost_hint(crash: str | None) -> str:
+def _ssh_lost_hint(crash: str | None, vm_id: str) -> str:
     """The SSH-lost hint text, in one place.
 
     `exec`/`dmesg`/`compile --run` (via :func:`_ssh_lost_payload`) and the
@@ -513,6 +515,10 @@ def _ssh_lost_hint(crash: str | None) -> str:
     told to run must not differ between them: `compile --run` used to name no
     follow-up at all, so an agent whose exploit panicked the guest was never
     pointed at `qmu crash`.
+
+    The log command names the VM: without `--vm` it fails on a shared host
+    (`QMU_REQUIRE_VM=1`, or several VMs running) and the hint cannot be
+    followed literally.
     """
     if crash is not None:
         return (
@@ -521,7 +527,7 @@ def _ssh_lost_hint(crash: str | None) -> str:
         )
     return (
         "SSH connection lost; VM may be unreachable. "
-        "No fresh crash report in serial log. Check: qmu log --tail 100"
+        f"No fresh crash report in serial log. Check: qmu log --vm {vm_id} --tail 100"
     )
 
 
@@ -555,11 +561,14 @@ def _ssh_lost_payload(
     # CORR-5: only assert a kernel crash when a crash report was actually
     # extracted; otherwise the connection merely dropped (VM unreachable) and we
     # must not send the agent chasing a phantom panic.
-    hint = _ssh_lost_hint(crash)
+    hint = _ssh_lost_hint(crash, inst.vm_id)
     if crash is not None:
         text_msg = f"\nCrash from serial log:\n{crash}"
     else:
-        text_msg = "\nNo fresh crash detected in serial log. Check: qmu log --tail 100"
+        text_msg = (
+            f"\nNo fresh crash detected in serial log. "
+            f"Check: qmu log --vm {inst.vm_id} --tail 100"
+        )
     # `exit_code`/`vm_id` are present on every exec envelope: the guest's exit
     # code is unknown here (ssh's own 255 is not the guest's), so it is null
     # rather than absent — a caller reads one key set on every path.
@@ -805,7 +814,7 @@ def _command_timeout_payload(
             f"No fresh crash report in the serial log. Check: qmu status --vm {vm}; "
             f"qmu log --vm {vm} --tail 100"
         )
-        detail = "No fresh crash detected in serial log. Check: qmu log --tail 100"
+        detail = f"No fresh crash detected in serial log. Check: qmu log --vm {vm} --tail 100"
     return (
         124,
         {

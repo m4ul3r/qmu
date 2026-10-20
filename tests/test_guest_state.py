@@ -561,7 +561,7 @@ def test_dmesg_transport_loss_without_fresh_crash_is_exit4(dmesg_ssh, capsys):
     assert payload["ssh_error"] is True
     assert payload["crash_detected"] is False
     assert payload["crash"] is None
-    assert "qmu log --tail 100" in payload["hint"]
+    assert "qmu log --vm state-vm --tail 100" in payload["hint"]
 
 
 def test_dmesg_transport_loss_with_fresh_crash_is_exit3(dmesg_ssh, capsys):
@@ -706,4 +706,4 @@ def test_compile_run_transport_loss_names_the_same_follow_up_as_exec(
     assert payload["ssh_error"] is True
     assert payload["crash_detected"] is panicked
     assert ("qmu crash" in payload["hint"]) is panicked
-    assert ("qmu log --tail 100" in payload["hint"]) is not panicked
+    assert ("qmu log --vm state-vm --tail 100" in payload["hint"]) is not panicked
