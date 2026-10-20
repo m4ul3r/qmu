@@ -182,7 +182,12 @@ bytes, exit <code>)` (`output.text_out_pointer`, #71b — it used to print the
 JSON envelope). A pointer's `ok`/exit is the **operation's** result, not "the
 artifact was written": a failed guest command rendered through text `--out`
 says `exit 7` exactly as the JSON path says `ok: false` + `exit_code` (#108)
-— never let a byte-artifact helper default to success.
+— never let a byte-artifact helper default to success. A json/ndjson pointer
+(spill or `--out`) also repeats the result's scalar outcome keys
+(`output.POINTER_OUTCOME_KEYS`: `exit_code`, `run_exit`, `timed_out`,
+`crash_detected`, `ssh_error`, `error_type`, `hint`, …) next to the artifact
+keys (#156): the spill fires on exactly the noisy commands whose exit class
+matters, and the discriminators used to be readable only inside the file.
 
 **Streamed guest output (#71a) is the one sanctioned exception to "handlers
 never write stdout".** `SSHClient.run(..., on_chunk=)` relays every drained
@@ -439,7 +444,11 @@ loss moves every kernel address.
 Every launch flag has a config key. Boolean flags (`--no-kvm` → `accel=tcg`,
 `--no-reboot` → `[machine] no_reboot`) cannot ride the value `flag_map` —
 copying a store_true's `False` would shadow a `true` in qmu.toml — so
-`_resolve_config_from_args` adds them as overrides only when set. The schema
+`_resolve_config_from_args` adds them as overrides only when set. A plain
+boolean key needs the negative flag too, or the project layer is terminal:
+`--reboot` (mutually exclusive with `--no-reboot`) overrides
+`no_reboot = true` with `False` (#151), and launch notes a config-sourced
+`-no-reboot` in `warnings[]`. The schema
 kind for such keys is `boolean` (`_validate_value`).
 
 ### Launch warnings and `doctor` taxonomy (`lifecycle.py`)

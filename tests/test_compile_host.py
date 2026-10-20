@@ -403,6 +403,34 @@ def test_host_build_then_run_executes_the_pushed_binary(wired, source, capsys):
     assert "pwned" in capsys.readouterr().out
 
 
+def test_run_passes_program_arguments_one_token_each(wired, source, capsys):
+    """#155: a PoC that takes argv (`write_anything TARGET OFFSET DATA`)
+    could not run through `compile --run`; each ARG is one argv entry."""
+    install, _state = wired
+    ssh = install(run_results=[(0, "", ""), (0, "done\n", "")])
+
+    rc = cli.main([
+        "--format", "json", "compile", "--host", "--run", str(source),
+        "--", "/tmp/target", "-1", "two words",
+    ])
+
+    assert rc == 0
+    assert ssh.runs[-1] == "/root/exploit /tmp/target -1 'two words'"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["run_args"] == ["/tmp/target", "-1", "two words"]
+
+
+def test_program_arguments_without_run_are_refused_before_compiling(wired, source, capsys):
+    install, _state = wired
+    ssh = install()
+
+    rc = cli.main(["--format", "json", "compile", "--host", str(source), "--", "x"])
+
+    assert rc == 1
+    assert ssh.runs == [] and ssh.pushes == []
+    assert "--run -- x" in json.loads(capsys.readouterr().out)["hint"]
+
+
 def test_run_text_mode_stdout_is_the_program_output_only(wired, source, capsys):
     """`compile --run ... > out.txt` must hold only what the program printed:
     the banner, the program's stderr and the `[exit code]` trailer are stderr,

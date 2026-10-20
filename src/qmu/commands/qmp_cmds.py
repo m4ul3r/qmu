@@ -28,6 +28,7 @@ from ..snapshot import (
     SAVEVM_BASE_SECONDS,
     SAVEVM_SECONDS_PER_GIB,
     SnapshotResult,
+    UNSNAPSHOTTABLE_DRIVE_RE,
     delete_snapshot,
     list_snapshots,
     load_snapshot,
@@ -209,7 +210,7 @@ def _snapshot_save_timeout(
     )
 
 
-def _snapshot_failure_hint(name: str, vm_id: str, reason: str | None) -> str:
+def _snapshot_failure_hint(name: str, vm_id: str, result: SnapshotResult) -> str:
     """The machine-readable fix for a failed snapshot op (envelope `hint`).
 
     The skill's exit-code table tells agents to "read the `hint`" on exit 1,
@@ -217,6 +218,7 @@ def _snapshot_failure_hint(name: str, vm_id: str, reason: str | None) -> str:
     said only `does not exist in one or more devices` (HMP wording) and left
     the reader to guess that `qmu snapshot list` is the next command.
     """
+    reason = result.reason
     if reason == "missing":
         return (
             f"Snapshot '{name}' is not in the image of VM '{vm_id}'. "
@@ -226,6 +228,20 @@ def _snapshot_failure_hint(name: str, vm_id: str, reason: str | None) -> str:
         return (
             "HMP parses the snapshot name as one token: it cannot contain "
             f"whitespace. Use e.g. '{'-'.join(name.split())}'."
+        )
+    if reason == "drive":
+        # QEMU names the drive it refused; the snapshot table is empty by
+        # construction here, so pointing at it moved nobody forward (#153).
+        match = UNSNAPSHOTTABLE_DRIVE_RE.search(result.message)
+        device = match.group("device") if match else "?"
+        return (
+            f"Drive '{device}' is writable but its format (e.g. raw) cannot "
+            "hold internal snapshots, and savevm/loadvm need every writable "
+            "drive to. Relaunch with snapshot=on (checkpoints last the "
+            "session) or readonly=on added to that drive's -drive spec "
+            "(--drive or [machine] extra_args), or convert the image to qcow2 "
+            f"(qemu-img convert -O qcow2) for durable snapshots. qmu monitor "
+            f"'info block' --vm {vm_id} maps '{device}' to its file."
         )
     return (
         f"Inspect the image's snapshot table with: qmu monitor "
@@ -283,7 +299,7 @@ def _snapshot_result(
                 text = f"{text} Guest resumed (it was stopped by a previous failed load)."
         return Result(data=data, text=text, stem=stem)
     error = f"snapshot {op} failed: {result.message}"
-    hint = _snapshot_failure_hint(args.name, inst.vm_id, result.reason)
+    hint = _snapshot_failure_hint(args.name, inst.vm_id, result)
     notes: list[str] = []
     if op == "load":
         if result.restore_state in ("partial", "unknown"):
@@ -341,7 +357,7 @@ def _handle_snapshot_save(args: argparse.Namespace) -> Result:
         return _snapshot_save_timeout(args, inst, timeout)
     res = _snapshot_result(args, "save", inst, result)
     if res.exit_code != 0:
-        if result.reason != "bad_name":
+        if result.reason not in ("bad_name", "drive"):
             res = res.warn(
                 "[qmu] qmu's implicit rootfs uses a temporary snapshot=on overlay; "
                 "that overlay can hold in-session checkpoints with a raw or qcow2 base, "

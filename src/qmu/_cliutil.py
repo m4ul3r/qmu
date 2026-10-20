@@ -122,11 +122,14 @@ def _resolve_config_from_args(args: argparse.Namespace) -> QMUConfig:
     # qmu.toml, exactly as every other launch flag overrides its config key.
     if getattr(args, "no_kvm", False):
         cli_overrides["accel"] = "tcg"
-    # --no-reboot likewise: a store_true flag whose False default must not
-    # shadow a `[machine] no_reboot = true` in qmu.toml, so only a set flag
-    # becomes an override.
+    # --no-reboot / --reboot likewise: store_true flags whose False default
+    # must not shadow `[machine] no_reboot` in qmu.toml, so only a set flag
+    # becomes an override — `--reboot` the one that clears a project's
+    # `no_reboot = true` for this launch (#151).
     if getattr(args, "no_reboot", False):
         cli_overrides["no_reboot"] = True
+    elif getattr(args, "reboot", False):
+        cli_overrides["no_reboot"] = False
 
     config_path = getattr(args, "config", None)
     return resolve_config(
@@ -837,12 +840,18 @@ def _add_launch_opts(parser: argparse.ArgumentParser, *, run_mode: bool = False)
             "machine type for this arch)."
         )
     parser.add_argument("--ssh-timeout", type=int, default=60, help=ssh_timeout_help)
-    parser.add_argument(
+    reboot = parser.add_mutually_exclusive_group()
+    reboot.add_argument(
         "--no-reboot", dest="no_reboot", action="store_true",
         help="Pass -no-reboot to QEMU: a kernel panic under `panic=N` exits "
              "QEMU instead of rebooting into a fresh boot that buries the "
              "crash report (boot-and-die harnesses rely on this). Without the "
              "flag the bare word would have to follow `--` as a raw QEMU arg.",
+    )
+    reboot.add_argument(
+        "--reboot", dest="reboot", action="store_true",
+        help="Omit -no-reboot even when qmu.toml sets [machine] no_reboot = "
+             "true, so a `panic=N` kernel reboots (reboot-behaviour tests).",
     )
     if not run_mode:
         parser.add_argument("--no-wait-ssh", action="store_true", help="Don't wait for SSH to be ready")

@@ -501,6 +501,18 @@ def _prepare_boot(
     if project is not None:
         sys.stderr.write(f"[qmu] config: {project}\n")
 
+    # `-no-reboot` from a config file is invisible on the command line, and
+    # it inverts what a `panic=N` reboot test observes (#151): name the key
+    # and the flag that clears it.
+    reboot_layer = config.source_layer("no_reboot")
+    if config.no_reboot and reboot_layer not in ("flag", "built-in"):
+        message = (
+            f"-no-reboot from [machine] no_reboot in {reboot_layer}: a panic "
+            "exits QEMU instead of rebooting; pass --reboot to clear it"
+        )
+        sys.stderr.write(f"[qmu] {message}\n")
+        _note(prep, message)
+
     # Harness mode bundles --no-wait-ssh + --no-net
     if getattr(args, "harness", False):
         args.no_wait_ssh = True

@@ -92,6 +92,38 @@ def _source_ok(value: Any, explicit: bool | None) -> bool:
     return True
 
 
+# Keys of a dict result that classify its outcome and name the next step.
+# A pointer envelope (automatic spill or `--out`) repeats them next to the
+# artifact keys, so a reader branching on `ok` can still tell a guest `exit 7`
+# (1) from a mid-command panic (3), a lost transport (4) or a timeout (124),
+# and still has a `hint` to run, without fetching the artifact (#156). Only
+# scalar values are lifted: the bulky fields (`stdout`, `crash`, `error`) are
+# what made the result spill.
+POINTER_OUTCOME_KEYS = (
+    "vm_id",
+    "exit_code",
+    "compile_exit",
+    "run_exit",
+    "timed_out",
+    "crash_detected",
+    "ssh_error",
+    "inconclusive",
+    "may_have_landed",
+    "error_type",
+    "hint",
+)
+
+
+def _outcome_fields(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value[key]
+        for key in POINTER_OUTCOME_KEYS
+        if key in value and (value[key] is None or isinstance(value[key], (bool, int, str)))
+    }
+
+
 def _artifact_payload(
     *,
     artifact_path: Path,
@@ -110,6 +142,7 @@ def _artifact_payload(
         "estimator": TOKEN_ESTIMATOR,
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "summary": _summary(value),
+        **_outcome_fields(value),
     }
 
 

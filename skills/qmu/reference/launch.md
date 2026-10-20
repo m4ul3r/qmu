@@ -34,7 +34,10 @@ qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only 
   instead of rebooting into a fresh boot that buries the report. It changes
   what happens *after* the panic only — bare `wait` returns 3 at the panic
   line either way. Config key: `[machine] no_reboot = true` (the flag wins;
-  `qmu config show` names the layer on its `No-reboot:` row).
+  `qmu config show` names the layer on its `No-reboot:` row). `--reboot`
+  clears a config `true` for one launch (reboot-behaviour tests); a launch
+  whose `-no-reboot` came from a config file says so in `warnings[]` and on
+  stderr (`-no-reboot from [machine] no_reboot in project …`).
 - `--inject LOCAL:/guest/dir` (repeatable; `--partition`, `--mkdir`) runs the
   offline injection before boot. Every target — image, local file, guest
   directory — is validated read-only **before** a same-named running VM is

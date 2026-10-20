@@ -1267,6 +1267,12 @@ def _handle_exec(args: argparse.Namespace) -> Result:
 def _add_compile(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("compile", help="Compile C file in guest (or on the host with --host)")
     p.add_argument("source", help="Local C source file")
+    p.add_argument(
+        "program_args", nargs="*", metavar="ARG",
+        help="With --run: argv for the program, each ARG one argument "
+             "(shell-quoted); put -- before them when one starts with a dash "
+             "(`qmu compile poc.c --run -- /tmp/target 1 DATA`).",
+    )
     p.add_argument("--run", action="store_true", help="Run after compiling")
     p.add_argument("--cflags", default="-static -lpthread", help="Compiler flags")
     p.add_argument("--timeout", type=float, default=60.0, help="Execution timeout")
@@ -1356,6 +1362,18 @@ def _compile_on_host(
 
 
 def _handle_compile(args: argparse.Namespace) -> Result:
+    # Arguments for a program that is never run would be dropped silently;
+    # refuse before anything is compiled.
+    if getattr(args, "program_args", None) and not args.run:
+        raise QMUError(
+            "compile got program arguments without --run: "
+            + shlex.join(args.program_args),
+            hint=(
+                f"qmu compile {shlex.quote(args.source)}"
+                + (f" --vm {args.vm}" if args.vm else "")
+                + f" --run -- {shlex.join(args.program_args)}"
+            ),
+        )
     inst = _choose_running(args.vm, "compile")
     _require_ssh(inst)
     if (refused := _preflight_ssh_guest(inst, stem="compile")) is not None:
@@ -1504,11 +1522,13 @@ def _handle_compile(args: argparse.Namespace) -> Result:
     # `--timeout 1` came back as 4 `ssh_error` ("VM unreachable") against a
     # serving guest, while the same program under `exec` was 124.
     sink = _stream_sink(args, stem="compile")
+    run_args = list(getattr(args, "program_args", None) or [])
+    run_cmd = shlex.join([remote_bin, *run_args])
     status, data, stdout, text, notes = _run_guest_command(
-        ssh, shlex.quote(remote_bin), inst, timeout=args.timeout, sink=sink
+        ssh, run_cmd, inst, timeout=args.timeout, sink=sink
     )
     run_stderr = data.get("stderr", "")
-    data = {**result, **_as_run_fields(data)}
+    data = {**result, **_as_run_fields(data), "run_args": run_args}
     return _guest_result(
         data=data, stdout=stdout, stderr=run_stderr, text=text, notes=notes,
         stem="compile", exit_code=status, sink=sink,

@@ -97,7 +97,9 @@ A result larger than the spill threshold comes back as the same **pointer
 envelope** the CLI's `--format json` prints: `ok` (the operation's result,
 not "the file was written"), `artifact_path`, `format`, `bytes`, `sha256`,
 `token_estimate`, `estimator`, `summary` (the shape of the spilled value —
-`summary.keys` lists its top-level key names, it is **not** the result),
+`summary.keys` lists its top-level key names, it is **not** the result), the
+result's outcome keys when present (`exit_code`, `timed_out`,
+`crash_detected`, `ssh_error`, `hint`, … — `output-contract.md`),
 plus `qmu_exit`. There is no `spilled` key and no preview: the head-of-output
 preview is a `--format text` feature only (`reference/output-contract.md`).
 Branch on the presence of `artifact_path` and read the file.

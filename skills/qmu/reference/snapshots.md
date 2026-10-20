@@ -83,6 +83,15 @@ configured rootfs behind its temporary overlay. `savevm` needs an attached
 snapshot-capable writable layer; harness configurations with only readonly
 drives may not provide one.
 
+**Every writable drive must hold snapshots, not just the root disk.** An
+extra raw `-drive` (an app/data disk in `[machine] extra_args` or a second
+`--drive`) without `snapshot=on`/`readonly=on` makes `save` (and `load`) fail
+with `Device 'virtio1' is writable but does not support snapshots` — the
+device name is QEMU's (`qmu monitor 'info block' --vm X` maps it to the
+file). The `hint` names that drive and the fix: add `snapshot=on`
+(session-only, like the rootfs overlay) or `readonly=on` to its `-drive`
+spec, or convert it to qcow2 for durable snapshots.
+
 ## Networking compatibility
 
 The default user/slirp backend restores in-session checkpoints on current

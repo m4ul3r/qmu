@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -422,6 +423,35 @@ def test_failed_command_json_out_envelope_reports_the_failure(wired, tmp_path, c
     assert payload["ok"] is False
     assert payload["exit_code"] == 7
     assert payload["stdout"] == "nope"
+
+
+@pytest.mark.parametrize("timed_out, exit_class", [(False, 1), (True, 124)])
+def test_a_spilled_failure_keeps_its_classification_on_the_pointer(
+    wired, capsys, monkeypatch, tmp_path, timed_out, exit_class
+):
+    """#156: a failing exec whose envelope spilled printed only the artifact
+    keys, so `exit 7` (1), a timeout (124) and a crash (3) were the same
+    pointer and there was no `hint` to run. The pointer repeats the
+    outcome keys the artifact holds; the bulky output stays in the file."""
+    monkeypatch.setenv("QMU_TEMP_DIR", str(tmp_path / "rt"))
+    big = "x" * 200_000
+    if timed_out:
+        wired(raises=SSHError(
+            "SSH command timed out after 3.0s: cmd", stdout=big, stderr=""
+        ))
+    else:
+        wired(rc=7, stdout=big)
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "cmd"])
+
+    assert rc == exit_class
+    pointer = json.loads(capsys.readouterr().out)
+    stored = json.loads(Path(pointer["artifact_path"]).read_text())
+    assert pointer["ok"] is False and "stdout" not in pointer
+    for key in ("vm_id", "exit_code", "crash_detected", "ssh_error", "hint"):
+        assert pointer[key] == stored[key], key
+    assert pointer.get("timed_out") == stored.get("timed_out")
+    assert pointer["hint"]
 
 
 def test_failed_command_text_spill_keeps_the_bytes_and_the_failure(

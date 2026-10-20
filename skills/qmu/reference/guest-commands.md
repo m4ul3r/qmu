@@ -139,6 +139,7 @@ qmu compile --vm X exploit.c --run --timeout 120
 qmu compile --vm X exploit.c --cflags "-static -lpthread -DDEBUG=1"
 qmu compile --vm X exploit.c --cflags '-static -DMSG=\"hello\"'   # string define, both paths
 qmu compile --vm X exploit.c --host --run           # host cross toolchain, push the binary
+qmu compile --vm X poc.c --run -- /tmp/target 1 DATA  # argv for the program
 qmu compile --vm X exploit.c --host --cc 'clang --target=aarch64-linux-gnu'
 ```
 
@@ -148,9 +149,13 @@ the `--host` path splits it with `shlex`. A define whose value contains a
 space (`-DMSG="hello world"`) survives neither. `--host` picks a cross
 toolchain from the guest arch recorded on the instance — the only path when
 the guest has no gcc, and several times faster than compiling inside a TCG
-guest (`cross-arch.md`). JSON: `compile_cmd`, `compile_exit`, `compiled`,
-`compiled_on`, `run_exit`, `run_stdout`, `run_stderr`, `crash_detected`; the
-host path adds `compiler`, `guest_arch`. `--timeout` bounds the **run**: on
+guest (`cross-arch.md`). Arguments after the source (put `--` first when one
+starts with a dash) are the program's argv under `--run`, **one argument
+each** (shell-quoted, so `'two words'` stays one); they are refused (exit 1)
+without `--run`. JSON: `compile_cmd`, `compile_exit`, `compiled`,
+`compiled_on`, `run_exit`, `run_stdout`, `run_stderr`, `run_args`,
+`crash_detected`; the host path adds `compiler`, `guest_arch`. `--timeout`
+bounds the **run**: on
 expiry the exit is 124 (not 4) with `timed_out: true`, `run_exit: null`, the
 partial `run_stdout`/`run_stderr`, `ssh_error` from one readiness probe, and a
 `hint` (`Guest command exceeded --timeout (Ns) but the guest is still

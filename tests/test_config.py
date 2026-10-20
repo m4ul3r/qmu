@@ -807,6 +807,11 @@ def test_no_reboot_key_layers_like_every_other_launch_flag(isolate_config, monke
     assert _resolve_config_from_args(argparse.Namespace(no_reboot=True)).no_reboot is True
     assert _resolve_config_from_args(argparse.Namespace(no_reboot=False)).no_reboot is False
 
+    # #151: `--reboot` is the CLI layer that clears a project's `true`.
+    ppath.write_text("[machine]\nno_reboot = true\n")
+    cfg = _resolve_config_from_args(argparse.Namespace(no_reboot=False, reboot=True))
+    assert cfg.no_reboot is False and cfg.source_layer("no_reboot") == "flag"
+
 
 def test_no_reboot_must_be_a_boolean(isolate_config):
     path = _write_toml(isolate_config / "nr.toml", '[machine]\nno_reboot = "yes"\n')
