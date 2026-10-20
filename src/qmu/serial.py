@@ -703,6 +703,38 @@ def count_boot_banners(
     return sum(1 for _ in _BOOT_BANNER.finditer(chunk))
 
 
+# Lines the kernel prints at the end of `kernel_init`, after every initcall,
+# just before it starts userspace: `free_initmem` ("Freeing unused kernel
+# image (initmem) memory" on x86, "Freeing unused kernel memory" on arm64),
+# `mark_readonly` ("Write protecting the kernel read-only data") and
+# `run_init_process` ("Run /sbin/init as init process", 5.x+). Boot-time text
+# patching — alternatives, return thunks/retpolines, static keys — is all done
+# by then. KERN_INFO, so a `quiet` console shows none of them.
+_KERNEL_INIT_DONE = re.compile(
+    rb"(?m)^\[\s*\d+\.\d+\] (?:Freeing unused kernel (?:image \(initmem\) )?memory"
+    rb"|Write protecting the kernel read-only data"
+    rb"|Run \S+ as init process)"
+)
+
+
+def kernel_init_done(log_path: str | Path, *, start_offset: int = 0) -> bool:
+    """Whether a boot at/after `start_offset` has finished kernel init.
+
+    The point after which the kernel no longer patches its own text at boot,
+    so a breakpoint inserted later is not overwritten or tripped over by the
+    patcher (`missing return thunk` WARNINGs from `apply_returns`).
+    """
+    try:
+        with Path(log_path).open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            stream.seek(start_offset if 0 <= start_offset <= size else 0)
+            chunk = stream.read()
+    except OSError:
+        return False
+    return _KERNEL_INIT_DONE.search(chunk) is not None
+
+
+
 def current_boot_offset(log_path: str | Path, epoch_offset: int | None) -> int:
     """Byte offset where the *current* guest's output begins.
 

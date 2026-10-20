@@ -73,7 +73,9 @@ prints the report and its `[exit code: N]`/follow-up notes).
 something to warn about — launch-time lints, the debugger-coherence warnings
 (`snapshot save`/`load`, `qmp`/`monitor system_reset`, a guest reboot the
 next command on a `--gdb` VM announces once, `kill` with a stranded pry
-bridge), the `ignoring global config` notice from a broken
+bridge; after a load or reset under qmu's own bridge, a teardown or
+breakpoints left unarmed — the `debugger` object says what qmu did, see
+`reference/debugging.md`), the `ignoring global config` notice from a broken
 `~/.config/qmu/config.toml` (it fires in the config gate before the handler,
 and still lands in the envelope — on success and on an `ok: false` one
 alike; so does the guest-reboot announcement, made while the VM is

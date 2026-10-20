@@ -645,9 +645,11 @@ changed underneath it, so qmu operations that mutate VM reality make the
 debugger's view silently diverge — the same wrong-answer-with-no-error class as
 the crash/transport and state-axis bugs above. qmu owns the lifecycle events and
 knows a VM has a stub (`gdb_port is not None`), so `debug.py` enforces the half
-of the contract the protocol doesn't: **invalidate loudly.** It does NOT drive
-pry, so it warns rather than auto re-syncing/re-arming (that is a pry-side
-capability, #187); the one thing it asks the bridge is `pry status`, below.
+of the contract the protocol doesn't. For the bridge **qmu itself spawned**,
+while it is the attached client (`qmu_bridge_attached`), it acts after a load
+or a reset qmu issued: re-sync with pry's `pry resync`, or tear down and say
+why (#187). Everything else it **invalidates loudly** and never drives; the
+one other thing it asks the bridge is `pry status`, below.
 Every recovery a warning names was run as written against a live bridge,
 under KVM and TCG, because they differ (#183). Under KVM a breakpoint is an
 `int3` in guest RAM: a load or reset takes it out while GDB still counts it
@@ -664,6 +666,33 @@ client-end socket inode in `/proc/net/tcp` against the bridge's
 disconnected while a hand-started client took the stub (`_bridge_ref`, the
 `qmu gdb` refusal, `kill`'s stranded-client note, #186).
 
+- **Owned bridge (#187).** `qmp_cmds` checks `qmu_bridge_attached(inst)` after
+  a successful `snapshot load` and in `_after_mutation` (raw `loadvm`/
+  `system_reset` routes), and calls `debug.drive_bridge_after_loadvm` /
+  `drive_bridge_after_reset`. The returned `BridgeDrive` becomes the
+  envelope's `debugger` object (`action: resynced|torn_down|not_resynced`;
+  `resync` is pry's `--format json` report verbatim — never reshape it),
+  text-mode stderr notes (the receipt; stdout stays the command's own) and
+  warnings only when there is something to act on (not-armed locations,
+  `elf_match: false` on a KASLR kernel — on a nokaslr one that is the
+  kernel's own boot-time patching and only a note — a teardown, a skipped
+  re-sync). The operation's exit code never changes. A load is re-synced at
+  once. A reset is re-synced only on a `nokaslr` guest QEMU reports `running`
+  right after it (the `_status_after_mutation` read), and only once the new
+  boot's console shows the end of kernel init (`serial.kernel_init_done`,
+  bounded by `RESET_KERNEL_WAIT_SECONDS`): the banner is too early, because
+  the kernel still patches its own text (alternatives, return thunks) and a
+  breakpoint on a patched site makes `apply_returns` WARN, which qmu then
+  reports as a crash it caused. No end of init in time (`quiet`), or no `pry`
+  on qmu's PATH: `not_resynced`, the bridge is left alone with the manual
+  recovery — never tear down a healthy bridge for a qmu-side reason. A KASLR
+  reset (new base readable only from the booted guest, and the old base would
+  arm int3s into unrelated code) and a reset at a debugger stop (`prelaunch`;
+  GDB cannot even resume it) are torn down, listing `breakpoints_dropped`. A
+  load that failed mid-restore drives nothing and gets
+  `loadvm_failed_restore_warning` instead of the re-arm recovery: a
+  continue, a resync or a detach can resume the half-restored machine (#87).
+  A failed `pry resync` tears down.
 - `debug_session_present(inst)` is the gate for divergences a *live* client
   would see: true when `gdb_port` is set AND `gdb_client_attached()` cannot
   positively rule out a connected client. The attach probe parses
@@ -721,8 +750,8 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
 A warning keyed on `gdb_port` alone would be noisy on the snapshot-rewind fast
 path when no debugger is attached; the attach probe is what keeps it quiet in
 that common case while still warning whenever a client is (or might be) present.
-This is the qmu-side stopgap layer of umbrella #48; auto re-sync/re-arm and
-true pry-bridge reap need pry-side work.
+This is the qmu side of umbrella #48: the owned bridge is driven (#187);
+guest-initiated reboots stay warn-only, as qmu did not issue them.
 `exec`/`compile --run`/`dmesg` watch QMP while the SSH command runs and abort
 within ~1 s of `running:false` (a breakpoint stop), emitting the same paused
 envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.

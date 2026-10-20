@@ -41,13 +41,17 @@ from ..qmp import QMPCommandError, QMPError, QMPTimeoutError, hmp_failed
 from ..debug import (
     INT3_LIFTED,
     INT3_POSSIBLE,
+    BridgeDrive,
     bridge_alive,
     bridge_instance_id,
     check_unwarned_reboot,
     debug_session_present,
     debug_stub_present,
+    drive_bridge_after_loadvm,
+    drive_bridge_after_reset,
     gdb_client_attached,
     kvm_watchpoint_warning,
+    loadvm_failed_restore_warning,
     loadvm_stale_session_warning,
     mark_debugger_attached,
     mark_debugger_epoch,
@@ -503,17 +507,31 @@ def _handle_snapshot_load(args: argparse.Namespace) -> Result:
             )
         # A load that got as far as reverting the disks also reset the
         # machine (`qemu_system_reset(SHUTDOWN_CAUSE_SNAPSHOT_LOAD)` precedes
-        # the vmstate load), so the #44 divergence applies to it as well.
+        # the vmstate load), so the #44 divergence applies to it as well —
+        # but nothing may drive the debugger now: a continue, a re-sync or a
+        # detach can resume the half-restored machine, qmu's own bridge
+        # included.
         if rewound and debug_session_present(inst):
-            res = res.warn(loadvm_stale_session_warning(inst) + "\n")
+            res = res.warn(loadvm_failed_restore_warning(inst) + "\n")
         return res
     # #44: loadvm rewound the guest, but an attached debugger keeps its pre-load
     # stop reason and breakpoint bookkeeping and never re-syncs — a silent
     # divergence in the rewind-iterate fast path. A pre-restore refusal
-    # (`restore_state: none`) did not rewind.
+    # (`restore_state: none`) did not rewind. The bridge `qmu gdb` spawned,
+    # while it holds the stub, is re-synced (#187); any other client is only
+    # warned about.
+    if qmu_bridge_attached(inst):
+        return _with_drive(res, drive_bridge_after_loadvm(inst, "snapshot load"))
     if debug_session_present(inst):
         res = res.warn(loadvm_stale_session_warning(inst) + "\n")
     return res
+
+
+def _with_drive(res: Result, drive: BridgeDrive) -> Result:
+    """`res` carrying what qmu did to its bridge: the envelope's `debugger`,
+    the text receipt as stderr notes, and any warning."""
+    data = {**res.data, "debugger": drive.data} if isinstance(res.data, dict) else res.data
+    return replace(res, data=data, notes=res.notes + drive.notes).warn(*drive.warnings)
 
 
 def _handle_snapshot_list(args: argparse.Namespace) -> Result:
@@ -1223,19 +1241,25 @@ def _after_mutation(
     inst: VMInstance, verb: str, output: str, epoch: int | None,
     warnings: list[str],
     run_states: tuple[str | None, str | None] = (None, None),
+    drives: list[BridgeDrive] | None = None,
 ) -> VMInstance:
-    """Post-mutation bookkeeping plus the debugger coherence warning.
+    """Post-mutation bookkeeping plus the debugger coherence step.
 
     One switch for all three raw routes. The `human-monitor-command` one was
     silent (dogfood F4): it reset the machine with an attached debugger, rc 0
     and an empty stderr, which is precisely the wrong-answer-with-no-error
     class debug.py exists to prevent. savevm/loadvm suppress on a failed op
     (the same classifier the snapshot handlers use), since a failed op
-    landed still needs. The coherence warnings are appended to `warnings`
-    (even when the persist raises) so the caller can put them on its Result:
-    stderr in every mode and the envelope's `warnings[]` (#74). `run_states`
-    is QEMU's run state right before and right after the mutation.
+    landed still needs. A reset or load under the bridge `qmu gdb` spawned,
+    while it holds the stub, drives it (#187) and appends what it did to
+    `drives`; any other client gets the coherence warning in `warnings`. Both
+    are filled even when the persist raises, so the caller can put them on
+    its Result: stderr in every mode and the envelope's `warnings[]` (#74).
+    `run_states` is QEMU's run state right before and right after the
+    mutation.
     """
+    if drives is None:
+        drives = []
     failed = verb in ("savevm", "loadvm") and _snapshot_failed(output)
     persist_error: OSError | None = None
     if verb in _TCP_RESETTING_VERBS and not failed:
@@ -1252,9 +1276,16 @@ def _after_mutation(
             inst = mark_debugger_epoch(
                 inst, start, banners=1 if verb == "system_reset" else 0
             )
+    owned = (
+        verb in _TCP_RESETTING_VERBS and not failed and qmu_bridge_attached(inst)
+    )
     before, after = run_states
     if verb == "system_reset":
-        if debug_session_present(inst):
+        if owned:
+            drives.append(
+                drive_bridge_after_reset(inst, epoch=epoch, qemu_status=after)
+            )
+        elif debug_session_present(inst):
             warnings.append(
                 reset_dropped_breakpoints_warning(inst, qemu_status=after) + "\n"
             )
@@ -1264,7 +1295,9 @@ def _after_mutation(
             if line is not None:
                 warnings.append(line)
     elif verb == "loadvm":
-        if debug_session_present(inst) and not failed:
+        if owned:
+            drives.append(drive_bridge_after_loadvm(inst, "loadvm"))
+        elif debug_session_present(inst) and not failed:
             warnings.append(loadvm_stale_session_warning(inst) + "\n")
     if persist_error is not None:
         raise persist_error
@@ -1294,8 +1327,9 @@ def _finish_mutation(
     Exit 4: the guest did what was asked; qmu's own state is what failed.
     """
     warnings: list[str] = []
+    drives: list[BridgeDrive] = []
     try:
-        _after_mutation(inst, verb, output, epoch, warnings, run_states)
+        _after_mutation(inst, verb, output, epoch, warnings, run_states, drives)
     except OSError as exc:
         error = (
             f"{verb or 'command'} reached the guest, but qmu could not record "
@@ -1308,7 +1342,7 @@ def _finish_mutation(
             "directory writable and re-check with: qmu status --vm "
             f"{inst.vm_id}"
         )
-        return Result(
+        res = Result(
             data={
                 **data,
                 "ok": False,
@@ -1322,7 +1356,11 @@ def _finish_mutation(
             exit_code=4,
             refusal=True,
         ).warn(*warnings)
-    return Result(data=data, text=text, stem=stem).warn(*warnings)
+    else:
+        res = Result(data=data, text=text, stem=stem).warn(*warnings)
+    for drive in drives:
+        res = _with_drive(res, drive)
+    return res
 
 
 def _handle_qmp(args: argparse.Namespace) -> Result:

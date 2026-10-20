@@ -281,6 +281,7 @@ def test_snapshot_load_pre_restore_refusal_does_not_warn_stale(monkeypatch, caps
     err = capsys.readouterr().err
     assert rc == 1
     assert "does NOT re-sync" not in err
+    assert debug.loadvm_failed_restore_warning(inst) not in err
     assert "snapshot load failed" in err
 
 
@@ -290,7 +291,8 @@ def test_snapshot_load_failure_after_restoration_began_warns_stale(
 ):
     # #87 x #44: a load that got past the tag check reverted the disks and
     # reset the machine before the vmstate load failed, so the attached
-    # debugger's view diverged exactly as it does on a successful load.
+    # debugger's view diverged — and the recovery must not resume the
+    # half-restored machine (no continue/re-sync/detach).
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
     monkeypatch.setattr(
@@ -304,7 +306,8 @@ def test_snapshot_load_failure_after_restoration_began_warns_stale(
     rc = _run(qmp_cmds._handle_snapshot_load, _snap_args())
     err = capsys.readouterr().err
     assert rc == 1
-    assert "does NOT re-sync" in err
+    assert debug.loadvm_failed_restore_warning(inst) in err
+    assert debug.loadvm_stale_session_warning(inst) not in err
     assert "snapshot load failed" in err
 
 

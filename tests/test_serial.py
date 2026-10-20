@@ -962,3 +962,24 @@ def test_scan_growth_shrunk_log_without_a_banner_rescans_from_zero(tmp_path):
 
 def test_scan_growth_missing_log_is_inert(tmp_path):
     assert scan_console_growth(tmp_path / "nope.log", scanned=7, boot_offset=3) == (7, 3, False)
+
+
+def test_kernel_init_done_is_scoped_to_the_boot_after_the_offset(tmp_path):
+    """The reset re-sync arms breakpoints only once the new boot has finished
+    kernel init (its boot-time text patching is over); the previous boot's
+    end-of-init lines must not count, and a `quiet` boot shows none."""
+    from qmu.serial import kernel_init_done
+
+    old = (
+        b"[    0.000000] Linux version 6.1.11 (b@h) (gcc) #1 SMP\n"
+        b"[    1.353989] Run /sbin/init as init process\n"
+    )
+    new_banner = b"[    0.000000] Linux version 6.1.11 (b@h) (gcc) #1 SMP\n"
+    log = tmp_path / "s.log"
+    log.write_bytes(old + new_banner)
+    assert kernel_init_done(log, start_offset=0) is True
+    assert kernel_init_done(log, start_offset=len(old)) is False
+    # arm64 words free_initmem differently; any end-of-init line counts.
+    log.write_bytes(old + new_banner + b"[    2.1] Freeing unused kernel memory: 9024K\n")
+    assert kernel_init_done(log, start_offset=len(old)) is True
+    assert kernel_init_done(tmp_path / "missing.log") is False
