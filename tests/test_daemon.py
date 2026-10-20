@@ -415,6 +415,42 @@ def test_status_during_a_proxied_savevm_is_busy_not_the_debugger_halt(
     assert daemon_client.vm_state("fake-vm")["qmp_busy"] is False
 
 
+@pytest.mark.parametrize("argv", [["qmp", "stop"], ["monitor", "stop"]])
+def test_status_right_after_a_proxied_stop_is_paused_not_busy(
+    argv, daemon_env, vm, monkeypatch, capsys
+):
+    """#170: the STOP a proxied `stop` causes arrives while the command is in
+    flight, which is #137's savevm signature. Unlike a save, the halt is the
+    command's whole effect and QEMU answers again at once: a `status` the
+    moment `stop` returned (an MCP client's next call) said `qmp: busy`,
+    `guest: unknown` and SSH-probed the halted guest."""
+    from qmu.commands import qmp_cmds
+
+    daemon_client.watch("fake-vm")
+    for module in (lifecycle, qmp_cmds):
+        monkeypatch.setattr(module, "choose_instance", lambda vm_id=None: vm["inst"])
+    server = vm["server"]
+
+    def halt(req):
+        server.replies["query-status"] = {"status": "paused", "running": False, "singlestep": False}
+        server.emit("STOP")
+        return "" if req["execute"] == "human-monitor-command" else {}
+
+    server.replies["stop"] = halt
+    server.replies["human-monitor-command"] = halt
+
+    assert cli.main(["--format", "json", *argv, "--vm", "fake-vm"]) == 0
+    capsys.readouterr()
+    state = daemon_client.vm_state("fake-vm")
+    assert state["qmp_busy"] is False and state["running"] is False, state
+    assert state["qemu_status"] == "paused"
+    assert cli.main(["--format", "json", "status", "--vm", "fake-vm"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert (status["qmp"], status["qemu_status"], status["guest"]) == (
+        "daemon", "paused", lifecycle.GUEST_PAUSED,
+    )
+
+
 def test_snapshot_load_moves_the_daemon_scope_with_the_record(
     daemon_env, vm, monkeypatch, capsys
 ):
