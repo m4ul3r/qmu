@@ -22,9 +22,26 @@ qmu exec --vm X "./exploit" --timeout 120 --format json
 
 ## `exec` result
 
-JSON: `vm_id`, `command`, `exit_code` (null when the command did not finish),
-`stdout`, `stderr`, `timed_out`, `ssh_error`, `crash_detected`, `crash`,
-`hint`. qmu's own exit is **not** the guest's: it is 0 when the guest command
+JSON keys present on **every** path that started the command: `vm_id`,
+`exit_code` (null when the command did not finish), `ssh_error`,
+`crash_detected`. The rest depend on the path (the preflight refusals are
+below):
+
+| path | qmu exit | extra keys |
+|---|---|---|
+| command finished (any guest code) | 0 / 1 | `stdout`, `stderr`, `kernel_warning_detected`, `kernel_warning` (the kernel report the command produced — a *survived* KASAN/WARNING/Oops — or `null`), `hint` only when non-zero |
+| `--timeout` expired, guest still answers | 124 | `timed_out: true`, `timeout`, `command`, partial `stdout`/`stderr`, `hint` |
+| transport lost / terminal panic | 3 (fresh report) / 4 | `command`, `crash` (report or `null`), `hint`, partial `stdout`/`stderr` |
+| vCPU halted mid-command | 1 | `command`, `guest_state`, `qemu_status`, `hint`, partial `stdout`/`stderr` |
+
+A report the guest **survived** is attributed to the command only through
+`kernel_warning_detected`/`kernel_warning`: on that path `crash_detected` is
+`false` and there is no `crash` key, so under `kasan.fault=report` branch on
+`kernel_warning_detected`. `timed_out` and `command` are absent from a
+finished command's envelope (read `env.get("timed_out")`). `stdout_lossy`/
+`stderr_lossy: true` appear only when invalid UTF-8 was replaced.
+
+qmu's own exit is **not** the guest's: it is 0 when the guest command
 exited 0 and 1 when it exited non-zero, with the guest's code preserved only
 in `exit_code` (`exit 255` → qmu exit 1, `exit_code: 255`, `ok: false`,
 `ssh_error: false`, `crash_detected: false` — not a crash; 3 always needs a
