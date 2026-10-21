@@ -324,7 +324,7 @@ def test_qmp_system_reset_warns_when_debugged(monkeypatch, capsys):
     rc = _run(qmp_cmds._handle_qmp, _qmp_args("system_reset"))
     err = capsys.readouterr().err
     assert rc == 0
-    assert "drops the gdbstub's breakpoint" in err
+    assert "has a GDB stub and was just reset" in err
     assert "hits stay 0" in err
 
 
@@ -344,7 +344,7 @@ def test_qmp_system_reset_warning_rides_in_the_envelope(monkeypatch, capsys, fmt
     assert payload["ok"] is True
     (warning,) = payload["warnings"]
     assert warning.startswith("VM 'dg' has a GDB stub and was just reset")
-    assert "drops the gdbstub's breakpoint" in captured.err
+    assert "has a GDB stub and was just reset" in captured.err
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
@@ -388,7 +388,7 @@ def test_monitor_system_reset_warns_when_debugged(monkeypatch, capsys):
     rc = _run(qmp_cmds._handle_monitor, _monitor_args(["system_reset"]))
     err = capsys.readouterr().err
     assert rc == 0
-    assert "drops the gdbstub's breakpoint" in err
+    assert "has a GDB stub and was just reset" in err
 
 
 def test_monitor_unrelated_command_does_not_warn(monkeypatch, capsys):
@@ -484,7 +484,7 @@ def test_qmp_hmp_system_reset_warns_when_debugged(monkeypatch, capsys):
     rc = _run(qmp_cmds._handle_qmp, _hmp_qmp_args("system_reset"))
     err = capsys.readouterr().err
     assert rc == 0
-    assert "drops the gdbstub's breakpoint" in err
+    assert "has a GDB stub and was just reset" in err
 
 
 def test_qmp_hmp_help_system_reset_does_not_warn(monkeypatch, capsys):
@@ -771,7 +771,7 @@ def test_wait_warns_on_observed_reset_when_debugged(monkeypatch, tmp_path, capsy
     captured = capsys.readouterr()
     assert rc == 0
     assert json.loads(captured.out)["last_event"] == "RESET"
-    assert "drops the gdbstub's breakpoint" in captured.err
+    assert "has a GDB stub and" in captured.err
 
 
 def test_wait_reset_no_warning_without_debugger(monkeypatch, tmp_path, capsys):
@@ -783,7 +783,7 @@ def test_wait_reset_no_warning_without_debugger(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr()
     assert rc == 0
     assert json.loads(captured.out)["last_event"] == "RESET"
-    assert "drops the gdbstub's breakpoint" not in captured.err
+    assert "has a GDB stub and" not in captured.err
 
 
 # --- what a save can hold of the debugger's breakpoints (#188) ---------------
@@ -960,6 +960,68 @@ def test_reset_at_a_debugger_stop_says_to_boot_it_with_qmu_cont(monkeypatch, cap
         )
         assert _run(qmp_cmds._handle_monitor, _monitor_args(["system_reset"])) == 0
         assert ("qmu cont --vm dg" in capsys.readouterr().err) is told
+
+
+@pytest.mark.parametrize(
+    "status,client,ours,resume",
+    [
+        ("debug", True, False, "pry --instance <id> continue --background"),
+        ("paused", True, True, "pry --instance qmu-dg continue --background"),
+        ("paused", True, False, None),  # a pause nobody can attribute
+        ("debug", False, False, None),  # no client: nobody holds the stop
+    ],
+)
+def test_cont_of_a_debugger_stop_says_it_resumed_behind_the_debugger(
+    monkeypatch, capsys, status, client, ours, resume
+):
+    """Live (#225): `qmu cont` at a stop a debugger holds runs the guest with
+    every breakpoint lifted while GDB still believes it stopped, and the
+    next pry command halts it again. The resume still happens (exit 0); the
+    envelope says so and names the debugger's own resume."""
+    inst = _gdb_inst(1234)
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(_StatusQMP(status))
+    )
+    monkeypatch.setattr(debug, "gdb_client_attached", lambda inst: client)
+    monkeypatch.setattr(debug, "bridge_holds_stub", lambda inst: ours)
+    args = argparse.Namespace(vm="dg", force=False, format="json", out=None)
+    assert _run(qmp_cmds._handle_cont, args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    if resume is None:
+        assert "warnings" not in payload
+    else:
+        (warning,) = payload["warnings"]
+        assert f"`{resume}`" in warning
+
+
+def test_a_paused_save_no_debugger_confirmed_does_not_send_the_reader_to_save_again(
+    monkeypatch, capsys
+):
+    """Live (#229): under a client qmu did not spawn, the `running` save's
+    recovery is to save at that client's stop — which is QEMU `paused` held
+    across the save, a stop qmu cannot attribute, so `possible` again. That
+    warning must not hand out the same recovery, or the reader loops."""
+    inst = _gdb_inst(1234)
+    inst.kvm = True
+    _install_qmp_seams(monkeypatch, inst, present=True)
+    monkeypatch.setattr(debug, "bridge_stopped", lambda inst: None)
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'clean' saved."))
+    warnings = {}
+    for status in ("running", "paused"):
+        monkeypatch.setattr(
+            qmp_cmds, "_qmp_ctx", lambda inst, s=status: contextlib.nullcontext(_StatusQMP(s))
+        )
+        args = _snap_args()
+        args.format = "json"
+        assert _run(qmp_cmds._handle_snapshot_save, args) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["breakpoints_in_image"] == "possible"
+        (warnings[status],) = payload["warnings"]
+    assert "qmu snapshot save --vm dg" in warnings["running"]
+    assert "qmu snapshot save" not in warnings["paused"]
+    assert warnings["paused"] != warnings["running"]
 
 
 # --- a guest reboot nobody issued is announced by the next command (#184) ----

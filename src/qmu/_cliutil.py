@@ -38,7 +38,7 @@ from .instance import (
 from .output import write_bytes_result, write_output_result
 from .qmp import QMPBusyError, QMPClient, QMPError
 from . import daemon_client
-from .debug import coherence_warnings
+from .debug import CONT_BEHIND_DEBUGGER, coherence_warnings, debugger_resume
 from .serial import current_boot_offset, has_terminal_panic
 from .ssh import SSHAuthError, SSHClient
 
@@ -513,7 +513,13 @@ def _stopped_guest_payload(
     the disk rewound and the devices not, and continuing that machine is
     the inconsistent resume the failed load refused to perform. The recovery
     is another load of a known-good snapshot, or kill and relaunch.
+
+    A stop a debugger holds (`debug.debugger_resume`: a gdbstub stop, or the
+    `qmu gdb` bridge's attach/interrupt) leads with the debugger's resume:
+    `qmu cont` there runs the guest with every breakpoint lifted and leaves
+    GDB believing it stopped, so its next command halts the guest again (#225).
     """
+    resume = debugger_resume(inst, qemu_status)
     if qemu_status == "restore-vm":
         recovery = (
             f"qmu snapshot load <known-good> --vm {inst.vm_id}, or "
@@ -529,6 +535,19 @@ def _stopped_guest_payload(
             "load failed mid-restore; the machine state is inconsistent.",
             f"Recover with: {recovery}",
             "Do not: qmu cont (resumes a rewound disk under un-restored devices)",
+        ]
+    elif resume is not None:
+        command, gloss = resume
+        hint = (
+            f"VM '{inst.vm_id}' is {qemu_status}: a debugger holds this stop. "
+            f"Resume with: {command}{gloss}. Not qmu cont --vm {inst.vm_id}: "
+            f"{CONT_BEHIND_DEBUGGER}."
+        )
+        text = [
+            f"VM '{inst.vm_id}' is {qemu_status} (vCPU halted by a debugger).",
+            f"Resume with: {command}{gloss}",
+            f"Do not: qmu cont --vm {inst.vm_id} "
+            f"({CONT_BEHIND_DEBUGGER.removeprefix('`qmu cont` ')})",
         ]
     else:
         hint = (
