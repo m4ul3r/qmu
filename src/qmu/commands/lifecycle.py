@@ -2692,9 +2692,11 @@ def _wait_already_stopped(args: argparse.Namespace, inst: Any) -> Result:
     """Bare `wait --vm X` on a VM whose process exited before the wait began.
 
     The retained log is scanned from its last boot, like every other reader.
-    The harness auto-clean is honoured only once the recorded pid is positively
-    gone — a stopped record never names a live process, but the rule that
-    identity death must be proven before metadata is removed stays uniform.
+    It is never auto-cleaned: the harness auto-clean belongs to a wait that
+    witnessed the exit. Here another command (`kill --no-clean`, a `wait
+    --no-clean`) already decided what stays, and the scan is scoped to the
+    last boot — a `panic=N` guest's earlier panics were never in this
+    payload, so deleting the log lost them for good (#214).
     """
     scope = current_boot_offset(inst.serial_log, inst.guest_epoch_serial_offset)
     crash = extract_crash(inst.serial_log, start_offset=scope)
@@ -2735,7 +2737,10 @@ def _finish_wait(
     _unknown_params = _warn_unknown_kernel_params(inst)
 
     cleaned = False
-    if stopped and inst.harness and not args.no_clean and not instance_alive(inst):
+    if (
+        stopped and reason != _WAIT_REASON_ALREADY_STOPPED and inst.harness
+        and not args.no_clean and not instance_alive(inst)
+    ):
         # Identity death is proven. Remove owned state directly; do not pass a
         # potentially recycled PID to _kill_vm's pid-only signaling.
         remove_instance(inst.vm_id)
@@ -2775,7 +2780,8 @@ def _finish_wait(
     elif reason == _WAIT_REASON_ALREADY_STOPPED:
         lines = [
             f"VM '{inst.vm_id}' stopped ({reason}, elapsed={elapsed:.2f}s): it "
-            f"had exited before this wait began; its retained log was scanned."
+            f"had exited before this wait began; its retained log was scanned "
+            f"and kept (remove with: qmu prune --vm {inst.vm_id})."
         ]
     else:
         lines = [
@@ -2928,7 +2934,7 @@ def _pattern_wait_standalone(
                 tail, matcher, final=saw_dead, stop_at_panic=not args.ignore_crash
             )
         except OSError as exc:
-            return _pattern_inconclusive(args, inst, exc)
+            return _pattern_inconclusive(args, inst, str(exc), type(exc).__name__)
         if scan.terminal_panic:
             terminal_panic_seen = True
         if scan.matched_line is not None:
@@ -2984,22 +2990,25 @@ def _pattern_wait_standalone(
     )
 
 
-def _pattern_inconclusive(args: argparse.Namespace, inst: Any, exc: BaseException) -> Result:
+def _pattern_inconclusive(
+    args: argparse.Namespace, inst: Any, cause: str, error_type: str
+) -> Result:
     """The serial log could not be read: infra class (4), never "no match".
 
     Evidence that cannot be read is NOT a negative result. Exit 1 is "the
     marker did not appear"; an agent branching on it would record a missing
-    log as a failed experiment. The envelope says so.
+    log as a failed experiment. The envelope says so. `cause`/`error_type`
+    are the read failure's, whether this process or the daemon hit it.
     """
     message = (
-        f"Cannot inspect serial log for '{inst.vm_id}': {exc}. "
+        f"Cannot inspect serial log for '{inst.vm_id}': {cause}. "
         "Pattern result is inconclusive."
     )
     return Result(
         data={
             "ok": False,
             "error": message,
-            "error_type": type(exc).__name__,
+            "error_type": error_type,
             "inconclusive": True,
             "vm_id": inst.vm_id,
             "pattern": args.pattern,
@@ -3031,7 +3040,7 @@ def _pattern_wait_via_daemon(
         reply = _daemon_wait_request(args, inst, pattern=args.pattern, start_offset=start_offset)
     except daemon_client.DaemonError as exc:
         if exc.fields.get("inconclusive"):
-            return _pattern_inconclusive(args, inst, OSError(str(exc)))
+            return _pattern_inconclusive(args, inst, str(exc), exc.error_type)
         raise QMPError(str(exc)) from exc
     except _WaitReleased as released:
         daemon_client.mark_released(inst.vm_id)
@@ -3126,9 +3135,14 @@ def _finish_pattern_wait(
         exit_code = 0
     elif crash and terminal_panic_seen:
         exit_code = 3
+        # A stopped VM (explicit --vm on a retained log) has nothing to kill;
+        # its remnant goes with `prune`, as the `process_exited` hint says.
+        reap = (
+            f"then reap: qmu kill --vm {vm}" if instance_alive(inst)
+            else f"then qmu prune --vm {vm}"
+        )
         result["hint"] = (
-            f"Guest panicked before /{p}/ matched; read it: qmu crash --vm {vm}; "
-            f"then reap: qmu kill --vm {vm}"
+            f"Guest panicked before /{p}/ matched; read it: qmu crash --vm {vm}; {reap}"
         )
     elif reason == "process_exited":
         exit_code = 1

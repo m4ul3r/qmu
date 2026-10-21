@@ -35,6 +35,7 @@ from ..instance import (
     VMInstance,
     choose_instance,
     find_instance,
+    instance_alive,
 )
 from ..serial import (
     current_boot_offset,
@@ -1909,11 +1910,20 @@ def _handle_crash(args: argparse.Namespace) -> Result:
     elif not log_exists:
         reason = "serial log not found"
         text = f"No crash detected in {scope_text}: {reason}."
-        hint = (
-            f"The serial log {inst.serial_log} is gone (pruned, or the cache "
-            f"dir changed); qmu status --vm {inst.vm_id} shows what qmu still "
-            "knows. Next time keep it with: qmu kill --no-clean"
-        )
+        if instance_alive(inst):
+            # `kill --no-clean` keeps a log when a VM stops; this one went
+            # while the VM still runs, so that advice answers nothing (#216).
+            hint = (
+                f"The serial log {inst.serial_log} is gone although VM "
+                f"'{inst.vm_id}' is still running (removed outside qmu); qmu "
+                f"status --vm {inst.vm_id} shows what qmu still knows."
+            )
+        else:
+            hint = (
+                f"The serial log {inst.serial_log} is gone (pruned, or the cache "
+                f"dir changed); qmu status --vm {inst.vm_id} shows what qmu still "
+                "knows. Next time keep it with: qmu kill --no-clean"
+            )
     else:
         reason = f"no crash markers found in {scope_reason}"
         text = f"No crash detected in {scope_text}: {reason}."
@@ -2014,19 +2024,25 @@ def _handle_log(args: argparse.Namespace) -> Result:
     tail_lines = 50 if args.tail is None else args.tail
 
     log = read_log(inst.serial_log) if whole_log else tail_log(inst.serial_log, lines=tail_lines)
+    # `available`/`empty` describe the log FILE, never this filtered response:
+    # a populated log that `--grep` matched nothing in (or `--tail 0`) said
+    # `available: false, empty: true`, and a missing log under `--grep` read
+    # as an ordinary no-match (#215). `available` — the file exists and was
+    # read; `empty` — it holds no bytes (or is not there to hold any).
+    available = log is not None
+    empty = not available or (not log and serial_log_offset(inst.serial_log) == 0)
     value = log or ""
 
     matches: int | None = None
     if args.grep is not None and value:
         value, matches = _grep_lines(value, args.grep, max(0, args.context))
 
-    available = bool(value)
     data = {
         "ok": True,
         "vm_id": inst.vm_id,
         "log": value,
         "available": available,
-        "empty": not available,
+        "empty": empty,
     }
     if args.grep is not None:
         data["grep"] = args.grep
@@ -2037,10 +2053,14 @@ def _handle_log(args: argparse.Namespace) -> Result:
 
     if value:
         text = value
+    elif not available:
+        text = f"Serial log is missing or unreadable: {inst.serial_log}"
+    elif empty:
+        text = "Serial log is empty."
     elif args.grep is not None:
         scope = "the serial log" if whole_log else f"the last {tail_lines} lines"
         text = f"No lines in {scope} matched /{args.grep}/."
     else:
-        text = "Serial log is empty or missing."
+        text = f"--tail {tail_lines} selected no lines of the serial log."
 
     return Result(data=data, text=text, stem="log")

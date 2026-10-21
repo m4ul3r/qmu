@@ -71,7 +71,7 @@ Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `
 | `held_back` in `prune`/`status`, `held_reason: "age"` | a metadata-free `.qemu.log`/`.qmp.sock` remnant younger than `--older-than` (24 h); `list` shows it `[stopped]` (`profile=? kernel=?`); kill-preserved logs are never held back | `qmu prune --vm X --older-than 0` |
 | `held_reason: "malformed-metadata"`, `prune` lists it under `refused[]` (`{vm_id, reason, path}`) | the VM's `.json` is unreadable and no serial log corroborates it; **not** age-gated — `--older-than 0` cannot clear it, by design | repair or delete the named `.json` by hand, then `qmu prune --vm X` |
 | `held_reason: "qmp-busy"` | the remnant's socket still answers: a QEMU is alive behind it | reap it first (`qmu kill --vm X` / `qmu prune --orphans`), then prune |
-| `reason: "already_stopped"` (bare `wait`, exit 0) | QEMU had exited before the wait began | read `crash` and `console_tail[]` from this result |
+| `reason: "already_stopped"` (bare `wait`, exit 0) | QEMU had exited before the wait began | read `crash` and `console_tail[]` from this result; the retained state is never auto-cleaned here (`qmu crash --vm X --full-history` still reads earlier boots) — `qmu prune --vm X` when done |
 | `error_type: "SCPFileError"` (exit 1) | missing local file, a directory, bad remote dir | fix the path; archive directories first |
 | `error_type: "SnapshotError"` (exit 1) | HMP refused; on `load` read `restore_state`: `none` → nothing restored (a missing tag is caught before `loadvm`, guest never stopped; `resumed: true` only if QEMU refused a listed tag); `partial`/`unknown` → disks already rewound, guest **left paused** on purpose (`guest_paused: true`) | `none`: run the `hint` (`qmu snapshot list --vm X`); `partial`/`unknown`: load a known-good tag or `kill` + `launch` — never a blind `qmu cont`; `reference/snapshots.md` |
 | `error_type: "ConfigError"`, `errors[]` | every schema problem in the file, with `source`/`key`/`hint` | fix all listed keys; cleanup commands are blocked until it parses (or run them from outside the project dir) |
@@ -270,9 +270,9 @@ whether or not `--no-reboot` is set; `--no-reboot` only decides what happens
 next (QEMU exits under `panic=N` instead of rebooting into a fresh boot that
 buries the report), so a second `wait` then reports `already_stopped` + the
 `crash`. Exit 3 leaves QEMU running: `qmu kill --vm X` keeps the report,
-`qmu prune --vm X` drops it. A confirmed exit auto-cleans a harness VM
-(`.json` + `.serial.log`) unless `--no-clean` — read `crash`/`console_tail`
-from `wait`'s own output. Semantics: `reference/wait.md`.
+`qmu prune --vm X` drops it. An exit the wait saw (`process_exited`) auto-cleans
+a harness VM unless `--no-clean` (read `crash`/`console_tail` from `wait`'s own
+output); `already_stopped` never cleans. Semantics: `reference/wait.md`.
 
 ## Snapshot-rewind loop
 
@@ -387,7 +387,7 @@ Read on demand with `read skill://qmu/reference/<file>.md`:
 |---|---|
 | `reference/output-contract.md` | envelope shapes, result-style failures, `UsageError`, spilling, `--out`, `qmu --version` |
 | `reference/launch.md` | every launch flag, profiles, `--drive`/`--no-net`/`--no-kvm`, state axes in depth, `kill`/`prune`/`list` rules |
-| `reference/guest-commands.md` | `exec`/`run`/`compile`/`push`/`pull`/`dmesg` detail, `--cflags`, `rootfs inject/ls/cat/rm`, mkrootfs key-only SSH |
+| `reference/guest-commands.md` | `exec`/`run`/`compile`/`push`/`pull`/`dmesg` detail, the `log` envelope (`available`/`empty`), `--cflags`, `rootfs inject/ls/cat/rm`, mkrootfs key-only SSH |
 | `reference/wait.md` | bare `wait` semantics, `--pattern` scope and line rules, auto-clean |
 | `reference/troubleshooting.md` | config layering/schema/validation, `config show`, `doctor` rows, libguestfs fix, auto-selection |
 | `reference/evidence-contract.md` | before promoting a matched marker or a green run into a claim |

@@ -989,3 +989,57 @@ def test_kernel_init_done_is_scoped_to_the_boot_after_the_offset(tmp_path):
     assert kernel_init_done(log, start_offset=len(old)) is False
     log.write_bytes(old + b"\r\nDebian GNU/Linux 12 drv ttyS0\r\n\r\ndrv login: ")
     assert kernel_init_done(log, start_offset=len(old)) is True
+
+
+# ---------------------------------------------------------------------------
+# #219: headlines count only as the kernel prints them, where a message starts
+# ---------------------------------------------------------------------------
+
+
+def test_module_named_oops_does_not_head_its_own_fault_report(tmp_path):
+    """arm64 4.4: the taint notice of a module named `oops` sits directly
+    above the fault headline and used to become the report's first line."""
+    log = tmp_path / "serial.log"
+    log.write_text(
+        "oops: loading out-of-tree module taints kernel.\n"
+        "Unable to handle kernel NULL pointer dereference at virtual address 00000000\n"
+        "pgd = ffffffc0b9cba000\n"
+        "Internal error: Oops: 96000005 [#1] PREEMPT SMP\n"
+        "---[ end trace 0123456789abcdef ]---\n"
+    )
+
+    crash = extract_crash(log)
+
+    assert crash.splitlines()[0].startswith("Unable to handle kernel NULL pointer")
+
+
+@pytest.mark.parametrize("line", [
+    "[    6.326862] myapp: oops: hello from userspace",
+    "[   18.047840] selftest: no kernel panic expected",
+    "[   18.047840] selftest: no Kernel panic - not syncing expected",
+    "localhost login: [    6.3] test: checking slab-out-of-bounds handling",
+    "[    9.300000] oops: loading out-of-tree module taints kernel.",
+])
+def test_console_text_with_crash_words_is_not_a_crash(tmp_path, line):
+    """Userspace writes to /dev/kmsg flipped the guest to `crashed` (and the
+    panic wording to `panicked`) with no kernel fault at all."""
+    log = tmp_path / "serial.log"
+    log.write_text("[    0.000000] Linux version 6.1.11 (x) #1\n" + line + "\n[   19.0] done\n")
+
+    assert extract_crash(log) is None
+    assert has_terminal_panic(log) is False
+    assert not _is_crash_start(line)
+
+
+@pytest.mark.parametrize("line", [
+    "[   86.641500] BUG: KASAN: slab-use-after-free in uaf_init+0x80/0x120 [uaf]",
+    "[    1.2][    T1] BUG: kernel NULL pointer dereference, address: 0000000000000000",
+    "localhost login: [    6.4] WARNING: CPU: 0 PID: 1 at fs/foo.c:12 foo+0x1/0x2",
+    "localhost login: Kernel panic - not syncing: Attempted to kill init!",
+    "[   22.1] watchdog: BUG: soft lockup - CPU#0 stuck for 22s! [a:1]",
+    "NMI watchdog: BUG: soft lockup - CPU#1 stuck for 23s! [a:1]",
+    "[    3.0] int3: 0000 [#1] PREEMPT SMP NOPTI",
+    "kernel BUG at mm/slub.c:379!",
+])
+def test_kernel_headlines_still_start_a_report(line):
+    assert _is_crash_start(line)

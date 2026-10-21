@@ -35,7 +35,8 @@ line/scope rules that decide whether `--pattern` can ever match.
   the latest timestamped kernel boot banner (`serial.current_boot_offset`),
   so earlier-boot evidence is excluded even when the reboot was not observed
   over QMP. The result names that boundary — `scan_offset` and `scan_scope`
-  (`boot-banner` or `epoch`) in JSON, "scanned from byte N" in text — so a
+  (`boot-banner` or `epoch`) in JSON on every outcome, "scanned from byte N"
+  in text on every non-match outcome (timeout, crash, process exit) — so a
   marker that fell before it is never a silent miss. One thing moves the
   boundary that is not a reboot: a guest that replays `dmesg` to the console
   reproduces the timestamped banner verbatim — print your marker *after* any
@@ -73,9 +74,11 @@ and before any `panic=N` timer fires. It decides what happens *next*: with
 `already_stopped` with the same `crash`); without it the guest reboots into
 a fresh boot whose banner moves the scan scope past the report, so a `wait`
 started *after* the reboot sees a healthy boot and ends in `124` with `crash:
-null`. Pass it for every `panic=N` kernel. After exit 3 the VM is still
-running: `qmu kill --vm X` (report kept) then `qmu prune --vm X`; a
-`--no-clean` remnant is also removed by `qmu prune --vm X`.
+null`. Pass it for every `panic=N` kernel. After exit 3 on a running VM:
+`qmu kill --vm X` (report kept) then `qmu prune --vm X`; a `--pattern` wait
+on a stopped VM's retained log that finds the panic has nothing to kill and
+its `hint` names `qmu prune --vm X` alone. A `--no-clean` remnant is also
+removed by `qmu prune --vm X`.
 
 ## `qmu wait` without `--pattern`
 
@@ -101,7 +104,7 @@ from a `--pattern` wait, is the receipt for a successful harness run.
 | Exit | `reason` | Meaning |
 |---|---|---|
 | `0` | `process_exited` | the recorded QEMU process identity exited during the wait; `crash` carries the terminal crash (null if none; text prints `Crash from serial log:`, otherwise `Console tail:`); `guest: null` |
-| `0` | `already_stopped` | QEMU had exited before the wait began (explicit `--vm`); `crash` and `console_tail` are read from the retained log scoped to its last boot; `guest: null`; harness auto-clean still honoured |
+| `0` | `already_stopped` | QEMU had exited before the wait began (explicit `--vm`); `crash` and `console_tail` are read from the retained log scoped to its last boot; `guest: null`; **never auto-cleaned** (`cleaned: false`, even for a harness VM): another command already decided what stays, and earlier boots in the log were never in this payload. Remove it with `qmu prune --vm X` |
 | `3` | `terminal_panic` | `Kernel panic - not syncing` while QEMU still runs: `stopped: false`, `guest: "panicked"`, `crash` populated. `qmu kill --vm X` preserves the report for `qmu crash --vm X` |
 | `124` | `timeout` | `--timeout` elapsed with the process alive; `ok: false`, `stopped: false` |
 | `4` | — | `QMPError`: QMP unreachable for more than 1 s with the pid alive (EOF alone is never success; a persistent failure never cleans the live VM) |
@@ -150,17 +153,22 @@ from a `--pattern` wait, is the receipt for a successful harness run.
   breakpoint again.
 - Every failed verdict carries `hint`: `timeout` → raise `--timeout` or check
   `qmu status --vm X; qmu log --vm X --tail 50`; `terminal_panic` → `qmu
-  crash --vm X` then `qmu kill --vm X`; a `--pattern` `process_exited` →
-  `qmu log --vm X --tail 100` then `qmu prune --vm X`.
+  crash --vm X` then `qmu kill --vm X`; a `--pattern` crash → `qmu crash
+  --vm X` then `qmu kill --vm X` while QEMU runs, `qmu prune --vm X` once it
+  has stopped; a `--pattern` `process_exited` → `qmu log --vm X --tail 100`
+  then `qmu prune --vm X`.
 - No command prints the profile-sourced unknown-parameter note; `launch`
   keeps it in JSON only. Operator-param warnings still appear on `launch`.
 
-**`wait` auto-cleans harness VMs only after confirming that the recorded QEMU
-process identity exited** (removes `.json` + `.serial.log`) unless you pass
-`--no-clean`. A live-PID timeout or a terminal panic never auto-cleans. Read
-the terminal crash and `console_tail` from `wait`'s own output rather than a
-later `qmu crash`/`qmu log` — after a confirmed exit, the log may already be
-gone. Non-harness VMs are never auto-cleaned by `wait`. `wait --help` documents
+**`wait` auto-cleans harness VMs only when the wait itself saw the recorded
+QEMU process identity exit** (`process_exited`; removes `.json` +
+`.serial.log`) unless you pass `--no-clean`. A live-PID timeout, a terminal
+panic, and a VM that had already stopped before the wait began
+(`already_stopped` — kept by `kill --no-clean`, an earlier `wait
+--no-clean`, or a crash `kill` kept) never auto-clean. After a witnessed exit
+read the terminal crash and `console_tail` from `wait`'s own output rather
+than a later `qmu crash`/`qmu log` — the log may already be gone.
+Non-harness VMs are never auto-cleaned by `wait`. `wait --help` documents
 only the `--pattern` codes; the bare-wait table above is the contract.
 
 ## `--pattern` outcomes
@@ -171,4 +179,4 @@ only the `--pattern` codes; the bare-wait table above is the contract.
 | `3` | a terminal panic appeared first (`crash`); a *survived* Oops does not abort; `--ignore-crash` suppresses even the terminal abort |
 | `1` | the VM exited without the pattern and without terminal-panic evidence (a survived report stays in `crash`) |
 | `124` | `--timeout` elapsed with the VM running |
-| `4` | `inconclusive: true`: the serial log is missing or unreadable (`error`, `error_type`, `serial_log`; text `[qmu] Error: Cannot inspect serial log … inconclusive.` on stderr). Never the exit 1 of a genuine no-match |
+| `4` | `inconclusive: true`: the serial log is missing or unreadable — on a running VM (removed from under it) as on a stopped one (`error`, `error_type`, `serial_log`; text `[qmu] Error: Cannot inspect serial log … inconclusive.` on stderr). Never the exit 1 of a genuine no-match, nor a `124` timeout |

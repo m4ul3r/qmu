@@ -1,4 +1,4 @@
-"""qmu log query contract: successful empty/missing and available content."""
+"""qmu log query contract: `available`/`empty` describe the log file (#215)."""
 
 from __future__ import annotations
 
@@ -32,9 +32,18 @@ def _fake_instance(serial_log: str) -> VMInstance:
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson"])
-@pytest.mark.parametrize("case", ["missing", "zero-byte", "tail-zero"])
-def test_empty_log_query_is_successful_and_explicit(
-    monkeypatch, tmp_path, capsys, fmt, case
+@pytest.mark.parametrize(
+    "case, available, empty",
+    [
+        ("missing", False, True),
+        ("zero-byte", True, True),
+        # --tail 0 selects nothing from a populated log; the log is still
+        # there and not empty (#215: it used to say available false).
+        ("tail-zero", True, False),
+    ],
+)
+def test_log_query_with_no_lines_describes_the_file(
+    monkeypatch, tmp_path, capsys, fmt, case, available, empty
 ):
     serial = tmp_path / "vm.serial.log"
     tail = "50"
@@ -59,8 +68,8 @@ def test_empty_log_query_is_successful_and_explicit(
         # now that log/crash auto-select the single running VM.
         "vm_id": "log-vm",
         "log": "",
-        "available": False,
-        "empty": True,
+        "available": available,
+        "empty": empty,
     }
 
 
@@ -86,7 +95,7 @@ def test_nonempty_log_query_is_available(monkeypatch, tmp_path, capsys, fmt):
     }
 
 
-def test_empty_log_text_is_successful_message(monkeypatch, tmp_path, capsys):
+def test_missing_log_text_names_the_missing_file(monkeypatch, tmp_path, capsys):
     serial = tmp_path / "vm.serial.log"
     inst = _fake_instance(str(serial))  # missing file
     monkeypatch.setattr(guest, "find_instance", lambda vm=None: inst)
@@ -94,7 +103,7 @@ def test_empty_log_text_is_successful_message(monkeypatch, tmp_path, capsys):
     rc = cli.main(["log"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert out.strip() == "Serial log is empty or missing."
+    assert str(serial) in out
 
 
 def test_nonempty_log_text_returns_content(monkeypatch, tmp_path, capsys):

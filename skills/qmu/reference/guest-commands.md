@@ -253,6 +253,22 @@ the retry fails too is it an error, naming both attempts (exit 1
 serial console instead: `qmu log --vm X --tail N` (`--grep`/`--context`/
 `--full` too).
 
+## `log`
+
+`qmu log --vm X` prints the serial console's last 50 lines (`--tail N`,
+`--full`); `--grep RE [--context N]` searches the whole log unless `--tail`
+is explicit. Exit 0 whenever the VM is known, also when the log is gone. The
+JSON envelope is `{ok, vm_id, log, available, empty}`, plus `grep`,
+`matches`, `scope` (`full` · `last N lines`) under `--grep`. `available` and
+`empty` describe the **log file**, never the filtered response: `available`
+— the file exists and was read; `empty` — it holds no bytes (`true` when it
+is not there either). So a `--grep` that matched nothing, or `--tail 0`, on
+a populated log is `available: true, empty: false` with `log: ""` (and
+`matches: 0`), while a missing log is `available: false` under `--grep`
+too — never an ordinary no-match. Text: the selected lines; else `Serial
+log is missing or unreadable: <path>` · `Serial log is empty.` · `No lines
+in <scope> matched /RE/.` · `--tail 0 selected no lines of the serial log.`
+
 ## Offline rootfs editing (`qmu rootfs`, libguestfs)
 
 When SSH is not up, this — not `sudo mount`/`cp`/`umount` — is how files get

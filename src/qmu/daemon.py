@@ -1042,11 +1042,9 @@ class Daemon:
             try:
                 scan = scan_for_pattern(tail, matcher, final=final, stop_at_panic=not ignore_crash)
             except OSError as exc:
-                raise _OpError(
-                    f"Cannot inspect serial log for '{watch.vm_id}': {exc}. "
-                    "Pattern result is inconclusive.",
-                    type(exc).__name__, inconclusive=True,
-                ) from exc
+                # The cause alone: the client words the inconclusive verdict
+                # exactly as its standalone loop does, error_type included.
+                raise _OpError(str(exc), type(exc).__name__, inconclusive=True) from exc
             if scan.terminal_panic:
                 terminal_panic_seen = True
             if scan.matched_line is not None:
