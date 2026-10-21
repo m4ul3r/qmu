@@ -695,26 +695,46 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   only when there is something to act on (not-armed locations, a teardown, a
   skipped re-sync; `elf_match: false` is only a note, since the symbols sit at
   the kernel's base — nokaslr, or the base `pry kbase` just validated). The
-  operation's exit code never changes. On a KASLR guest every re-sync goes
-  through `_rebase_and_resync`, at a stop qmu holds: `pry interrupt`, `pry
-  kbase`, `pry resync`, then `pry continue --background` only if qmu's
-  interrupt took the stop. Never let `pry kbase`/`pry resync` stop a running
+  operation's exit code never changes. Every re-sync goes through
+  `_resync_at_stop`, at a stop qmu holds: `pry interrupt`, on a KASLR guest
+  `pry kbase`, `pry resync`, then `pry continue --background` only if the
+  stop is qmu's. Never let `pry kbase`/`pry resync` stop a running
   target themselves there: pry resumes whatever happened, and under KVM that
   resume re-inserts every breakpoint at the bridge's current, possibly stale,
   base — a failed `pry kbase` armed exactly what it was meant to prevent,
   under a warning saying nothing was armed (review of #200). A base `pry
   kbase` cannot validate keeps the stop (`_left_stopped_unrebased`:
   `not_resynced`, `interrupted`, `resumed: false`, no breakpoint in guest
-  RAM, one warning with both rebase routes). A load is re-synced at
+  RAM, one warning with both rebase routes). **Whose stop it is comes from
+  QEMU, never from pry alone (#226):** `debug.BridgeStop` reads the run state
+  right before and right after the interrupt (`run_state`, a fresh QMP read
+  `qmp_cmds._run_state_reader` hands in; the save reads it on its own
+  connection), and the stop is qmu's (`taken`) when pry interrupted or QEMU
+  said `running` before and is not at `debug` after (`stale`). pry's
+  `interrupted: false` is GDB's belief: after `qmu gdb` → `qmu cont` GDB
+  thinks the target stopped while QEMU runs it, its first packet halts the
+  guest (`paused`), and trusting pry left a running guest halted after a
+  save, a load and a KASLR reset. A stale stop is resumed through the bridge
+  (`stale_stop: true`), which re-inserts the breakpoints set since `qmu gdb`;
+  only `debug` after a running `before` (a breakpoint hit in between) is
+  the operator's stop, left there with a `warnings[]` entry naming the
+  resume. A load is re-synced at
   once. A reset is re-synced only when QEMU reports `running` right after it
   (the `_status_after_mutation` read), and only once the new boot's console
-  shows the end of kernel init (`serial.kernel_init_done`, bounded by
-  `RESET_KERNEL_WAIT_SECONDS`): the banner is too early, because the kernel
+  shows the end of kernel init or a getty's `login:` prompt
+  (`serial.kernel_init_done`, bounded by `RESET_KERNEL_WAIT_SECONDS`): the
+  banner is too early, because the kernel
   still patches its own text (alternatives, return thunks) and a breakpoint
   on a patched site makes `apply_returns` WARN, which qmu then reports as a
-  crash it caused. No end of init in time (`quiet`) or no `pry` on qmu's
+  crash it caused. The prompt is what a `quiet` (or `loglevel=` ≤ 6) console
+  still prints; waiting for the init lines alone cost every quiet reset the
+  full 30 s and armed nothing (#205; `serial.init_lines_hidden` names the
+  parameter in the reason). Neither in time, or no `pry` on qmu's
   PATH: `not_resynced`, the bridge is left alone with the manual recovery —
-  never tear down a healthy bridge for a qmu-side reason.
+  never tear down a healthy bridge for a qmu-side reason. That recovery
+  waits for the boot too: under KVM a re-arm run right after a reset is
+  overwritten by the boot even on a nokaslr kernel (#204), so the nokaslr
+  reset warning is `qmu wait --pattern 'login:'` → `pry resync`.
   A reset at a debugger stop (`prelaunch`; GDB cannot even resume it) is
   torn down, listing `breakpoints_dropped` (a KASLR reset used to be torn
   down too, when its base was readable only over SSH; `pry kbase` reads it
@@ -726,11 +746,14 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   every savevm route (`snapshot save`, raw `savevm` through `_raw_mutation`):
   with QEMU `running`, KVM and the owned bridge attached,
   `debug.stop_bridge_for_save` runs `pry interrupt`, the run state is
-  re-read, the save runs at that stop, `breakpoints_in_image` is classified
+  re-read (it completes the `BridgeStop`), the save runs at that stop,
+  `breakpoints_in_image` is classified
   BEFORE `resume_bridge_after_save` runs `pry continue --background` (the
-  `pry status` read must see the stop), and `snapshot save` reports
-  `breakpoints_lifted`. A target that stopped by itself before the interrupt
-  is not resumed; a save that outran its budget (124) leaves the bridge
+  `pry status` read must see the stop), and every save route reports
+  `breakpoints_in_image`/`breakpoints_lifted` (`_SaveStop.image_keys`; the raw
+  routes used to carry neither, #227). A target that stopped by itself (QEMU
+  `debug` after the interrupt) is not resumed and a warning says so; a save
+  that outran its budget (124) leaves the bridge
   stopped and warns, since resuming would put int3s back into RAM QEMU may
   still be saving; a failed save resumes it; any other exception leaving a
   save route (dedicated or raw) resumes it and records the drive's warnings
@@ -873,7 +896,14 @@ envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
   devices over post-snapshot disks; `qmu cont` there runs an inconsistent
   machine (#87). Only a pre-restore refusal (`none`: missing tag, bad name) is
   resumed; the others are deliberately left paused with `guest_paused: true`
-  and a hint that excludes `cont`. HMP failure detection (`qmp.hmp_failed`)
+  and a hint that excludes `cont`. Every `loadvm` route settles through
+  `snapshot.settle_loadvm`: the raw `monitor`/`qmp human-monitor-command`
+  ones have no tag pre-check, so `hmp_loadvm` stops a running guest
+  (`restore-vm`) before refusing a missing tag, and leaving it there sent
+  the reader to a `qmu cont` that refuses `restore-vm` (#206); their
+  `QMUError` carries `restore_state`/`resumed`/`guest_paused`
+  (`QMUError(fields=)`) and the `snapshot load` hint (`_loadvm_failure_hint`;
+  a stuck pause names `qmu cont --force`). HMP failure detection (`qmp.hmp_failed`)
   anchors QEMU's error frames to the start of a line, so error words inside
   data (a tag named `Error:checkpoint`, a register dump) are not failures
   (#86). Mutation bookkeeping (epoch persist) runs *before* the success

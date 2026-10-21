@@ -124,17 +124,6 @@ def test_monitor_benign_output_passes_through(monkeypatch, capsys):
     assert payload == {"ok": True, "output": "VM status: running\r\n"}
 
 
-def test_monitor_loadvm_pre_restore_failure_names_the_paused_guest(monkeypatch, capsys):
-    """The raw route does not restore the run state the way `snapshot load`
-    does, so it must at least say what loadvm did to the guest -- and for a
-    refusal QEMU made before restoring anything, `qmu cont` is the fix."""
-    _install(monkeypatch, "Error: Snapshot 'nope' does not exist in one or more devices")
-    assert cli.main(["monitor", "loadvm", "nope"]) == 1
-    err = capsys.readouterr().err
-    assert "does not exist" in err
-    assert "qmu cont" in err
-
-
 def test_monitor_loadvm_partial_failure_does_not_offer_cont(monkeypatch, capsys):
     """#87 on the raw route: past the tag check loadvm has reverted the disks,
     so `qmu cont` would run an inconsistent machine; the hint must name the
@@ -257,7 +246,8 @@ def test_snapshot_load_failure_reports_a_stuck_pause_with_the_cont_hint(monkeypa
     assert payload["guest_paused"] is True
     assert payload["restore_state"] == "none"
     assert payload["hint"].startswith("loadvm left the guest paused")
-    assert "qmu cont --vm dev" in payload["hint"]
+    # QEMU is left in `restore-vm`, which plain `qmu cont` refuses (#206).
+    assert "qmu cont --vm dev --force" in payload["hint"]
 
     rc = cli.main(["snapshot", "load", "nope", "--vm", "dev"])
     assert rc == 1

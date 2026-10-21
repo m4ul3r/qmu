@@ -87,8 +87,9 @@ if cmd == "kill":
     os.kill(int(argv[2]), signal.SIGTERM)
     print(json.dumps({"killed": True}))
     sys.exit(0)
-# The debugger's stop: `interrupt` takes one (QEMU then reports `paused`),
-# `continue` ends it, `status` reads it.
+# The debugger's stop: `interrupt` takes one (QEMU then reports `paused`, or
+# `debug` for a breakpoint the target hit by itself), `continue` ends it,
+# `status` reads it. The file holds QEMU's run state at that stop.
 stopped = os.path.join(spec, "stopped")
 if cmd == "status":
     print(json.dumps({"state": "stopped" if os.path.exists(stopped) else "running"}))
@@ -100,8 +101,10 @@ json.dump(queue, open(path, "w"))
 if answer.get("rc", 0):
     print(json.dumps({"ok": False, "error": answer["error"]}), file=sys.stderr)
     sys.exit(answer["rc"])
-if cmd == "interrupt" and answer["result"].get("stopped"):
-    open(stopped, "w").close()
+if cmd == "interrupt" and answer["result"].get("stopped") and not os.path.exists(stopped):
+    reason = answer["result"].get("reason") or {}
+    with open(stopped, "w") as mark:
+        mark.write("debug" if reason.get("kind") == "breakpoint-hit" else "paused")
 elif cmd == "continue" and os.path.exists(stopped):
     os.remove(stopped)
 print(json.dumps(answer["result"]))
@@ -141,6 +144,10 @@ def pry(tmp_path, monkeypatch):
         def stopped(self):
             """Whether the fake bridge is at a debugger stop now."""
             return (spec / "stopped").exists()
+
+        def stop(self, qemu_status="paused"):
+            """Put the target at a debugger stop before the command runs."""
+            (spec / "stopped").write_text(qemu_status)
 
         def calls(self):
             log = spec / "calls.jsonl"
@@ -182,16 +189,20 @@ class _QMP:
 
     saves: list[str] = []
 
-    def __init__(self, inst, *, running=True, init_after=0.3):
+    def __init__(self, inst, *, running=True, init_after=0.3, init_text=None):
         self.inst = inst
         self.running = running
         self.init_after = init_after
+        self.init_text = init_text
 
     def _status(self):
         if not self.running:
             return "prelaunch"
         stopped = os.path.join(os.environ.get("FAKE_PRY_DIR", "/nonexistent"), "stopped")
-        return "paused" if os.path.exists(stopped) else "running"
+        if not os.path.exists(stopped):
+            return "running"
+        with open(stopped) as mark:
+            return mark.read() or "paused"
 
     def savevm(self):
         _QMP.saves.append(self._status())
@@ -205,6 +216,9 @@ class _QMP:
         def finish_init():
             time.sleep(self.init_after)
             with open(self.inst.serial_log, "a") as log:
+                if self.init_text is not None:
+                    log.write(self.init_text)
+                    return
                 log.write("[    0.216847] Freeing SMP alternatives memory: 44K\n")
                 log.write(INIT_DONE)
 
@@ -238,7 +252,7 @@ class _QMP:
 
 def _vm(
     tmp_path, monkeypatch, bridge, *, cmdline="console=ttyS0 nokaslr",
-    running=True, init_after=0.3, kvm=True,
+    running=True, init_after=0.3, kvm=True, init_text=None,
 ):
     serial = tmp_path / f"{VM}.serial.log"
     serial.write_text(BANNER + "login: \n")
@@ -256,7 +270,9 @@ def _vm(
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm=None: load_instance(VM))
     monkeypatch.setattr(
         qmp_cmds, "_qmp_ctx",
-        lambda inst: _QMP(inst, running=running, init_after=init_after),
+        lambda inst: _QMP(
+            inst, running=running, init_after=init_after, init_text=init_text
+        ),
     )
     monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
     monkeypatch.setattr(
@@ -465,8 +481,9 @@ def test_every_reset_route_resyncs_a_nokaslr_bridge_only_after_kernel_init(
 def test_a_reset_whose_kernel_never_shows_init_is_not_resynced_and_says_so(
     tmp_path, monkeypatch, capsys, bridge, pry
 ):
-    """A `quiet` boot never prints the end of init: qmu cannot prove the
-    boot-time patching is over, so it arms nothing and keeps the bridge."""
+    """A boot that shows neither the end of init nor a `login:` prompt (a
+    `quiet` console with no getty on it): qmu cannot prove the boot-time
+    patching is over, so it arms nothing and keeps the bridge."""
     _vm(tmp_path, monkeypatch, bridge, init_after=None)
     monkeypatch.setattr(debug, "RESET_KERNEL_WAIT_SECONDS", 0.3)
 
@@ -477,6 +494,32 @@ def test_a_reset_whose_kernel_never_shows_init_is_not_resynced_and_says_so(
     assert pry.ran("resync") == []
     assert bridge.poll() is None
     assert len(payload["warnings"]) == 2, "why, then the manual recovery"
+
+
+QUIET_LOGIN = "\r\nDebian GNU/Linux 12 drv ttyS0\r\n\r\ndrv login: "
+
+
+def test_a_quiet_reset_is_resynced_once_the_getty_prompts(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Live (#205): a `quiet` console never prints the end of kernel init,
+    so every reset blocked the whole budget and armed nothing, while the
+    guest served 5 s in. The getty's `login:` prompt, which `quiet` does
+    not hide, comes after init and ends the wait."""
+    _vm(
+        tmp_path, monkeypatch, bridge, cmdline="console=ttyS0 nokaslr quiet",
+        init_text=QUIET_LOGIN,
+    )
+    armed = _report(_entry("armed", trap_resident=True))
+    pry.answers(resync=[{"result": armed}])
+
+    rc, payload = _json(capsys, ["qmp", "system_reset"])
+
+    assert rc == 0
+    drive = payload["debugger"]
+    assert drive["action"] == "resynced"
+    assert drive["waited_seconds"] < debug.RESET_KERNEL_WAIT_SECONDS
+    assert drive["resync"] == armed
 
 
 @pytest.mark.parametrize("route", [["snapshot", "load", "clean"], ["qmp", "system_reset"]])
@@ -540,11 +583,18 @@ def test_a_kaslr_load_rebases_the_bridge_before_it_resyncs(
     assert bridge.poll() is None
 
 
-def test_a_kaslr_load_into_a_debugger_stop_rebases_there_and_resumes_nothing(
-    tmp_path, monkeypatch, capsys, bridge, pry
+@pytest.mark.parametrize(
+    ("cmdline", "drive"),
+    [("console=ttyS0", ["interrupt", "kbase", "resync"]),
+     ("console=ttyS0 nokaslr", ["interrupt", "resync"])],
+    ids=["kaslr", "nokaslr"],
+)
+def test_a_load_into_a_debugger_stop_resyncs_there_and_resumes_nothing(
+    cmdline, drive, tmp_path, monkeypatch, capsys, bridge, pry
 ):
     """A target the operator had stopped stays at that stop."""
-    _vm(tmp_path, monkeypatch, bridge, cmdline="console=ttyS0")
+    _vm(tmp_path, monkeypatch, bridge, cmdline=cmdline)
+    pry.stop()
     pry.answers(
         interrupt=[{"result": {"interrupted": False, "stopped": True, "state": "stopped"}}],
         resync=[{"result": _report(_entry("armed", trap_resident=True), state="stopped")}],
@@ -553,9 +603,54 @@ def test_a_kaslr_load_into_a_debugger_stop_rebases_there_and_resumes_nothing(
     rc, payload = _json(capsys, ["snapshot", "load", "clean"])
 
     assert rc == 0
-    assert [c[0] for c in pry.calls()] == ["interrupt", "kbase", "resync"]
+    assert [c[0] for c in pry.calls()] == drive
+    assert pry.stopped()
     assert payload["debugger"]["action"] == "resynced"
     assert "interrupted" not in payload["debugger"]
+
+
+_STALE_INTERRUPT = [{"result": {
+    "interrupted": False, "stopped": True, "state": "stopped",
+    "reason": {"kind": "signal", "signal": "SIGINT"},
+}}]
+
+
+@pytest.mark.parametrize(
+    "route", [
+        ["snapshot", "save", "clean"], ["monitor", "savevm", "clean"],
+        ["snapshot", "load", "clean"], ["monitor", "loadvm", "clean"],
+        ["qmp", "system_reset"],
+    ],
+    ids=lambda argv: " ".join(argv[:2]),
+)
+@pytest.mark.parametrize("cmdline", ["console=ttyS0", "console=ttyS0 nokaslr"])
+def test_a_guest_resumed_behind_the_bridges_back_is_running_after_qmu_drives_it(
+    route, cmdline, tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Live (#226): after `qmu gdb` → `qmu cont` GDB believes the target
+    stopped while QEMU runs it. Its first packet halts the guest, and `pry
+    interrupt` answers `interrupted: false` for that stop; trusting it left
+    the running guest halted after a save, a load and a KASLR reset. QEMU
+    said `running` before qmu touched the bridge and is at no breakpoint
+    stop after, so the stop is qmu's and qmu resumes it."""
+    _vm(tmp_path, monkeypatch, bridge, cmdline=cmdline)
+    pry.answers(
+        interrupt=_STALE_INTERRUPT,
+        resync=[{"result": _report(_entry("armed", trap_resident=True), state="stopped")}],
+    )
+
+    rc, payload = _json(capsys, route)
+
+    assert rc == 0
+    assert pry.ran("continue"), "qmu resumes the stop it made"
+    assert not pry.stopped(), "the guest runs again"
+    drive = payload["debugger"]
+    assert drive["interrupted"] is True and drive["resumed"] is True
+    assert drive["stale_stop"] is True
+    if route[1] in ("save", "savevm"):
+        assert _QMP.saves == ["paused"], "saved at the stop, with GDB's breakpoints lifted"
+        assert payload["breakpoints_in_image"] == "lifted"
+        assert payload["breakpoints_lifted"] is True
 
 
 @pytest.mark.parametrize("route", [["snapshot", "load", "clean"], ["qmp", "system_reset"]])
@@ -625,16 +720,17 @@ def test_a_save_of_a_running_guest_stops_the_owned_bridge_across_it(
     drive = payload["debugger"]
     assert drive["action"] == "stopped_for_save"
     assert drive["interrupted"] is True and drive["resumed"] is True
-    if route == "snapshot save":
-        assert payload["breakpoints_in_image"] == "lifted"
-        assert payload["breakpoints_lifted"] is True
+    assert payload["breakpoints_in_image"] == "lifted"
+    assert payload["breakpoints_lifted"] is True
 
 
 def test_a_save_that_found_the_bridge_stopped_by_itself_leaves_that_stop(
     tmp_path, monkeypatch, capsys, bridge, pry
 ):
-    """A breakpoint hit between QEMU's `running` and qmu's interrupt is the
-    operator's stop: the save is taken there and nothing resumes it."""
+    """A breakpoint hit between QEMU's `running` and qmu's interrupt (QEMU
+    `debug` after it) is the operator's stop: the save is taken there and
+    nothing resumes it. The guest the save found running is now halted, and
+    a JSON caller is told so with the resume command (#226)."""
     _vm(tmp_path, monkeypatch, bridge)
     pry.answers(interrupt=[{"result": {
         "interrupted": False, "stopped": True, "state": "stopped",
@@ -648,6 +744,7 @@ def test_a_save_that_found_the_bridge_stopped_by_itself_leaves_that_stop(
     assert pry.stopped()
     assert payload["debugger"]["resumed"] is False
     assert payload["breakpoints_in_image"] == "lifted"
+    assert any(f"pry --instance qmu-{VM} continue --background" in w for w in payload["warnings"])
 
 
 def test_a_save_that_outran_its_budget_leaves_the_bridge_stopped_and_says_so(

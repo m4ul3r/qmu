@@ -715,6 +715,10 @@ _KERNEL_INIT_DONE = re.compile(
     rb"|Write protecting the kernel read-only data"
     rb"|Run \S+ as init process)"
 )
+# A getty's prompt on the console (`<host> login: `, newline-less), which
+# userspace prints well after kernel init and which no console loglevel
+# hides: the readiness signal left on a `quiet` boot (#205).
+_LOGIN_PROMPT = re.compile(rb"(?m)^[^\s\[]\S* login:")
 
 
 def kernel_init_done(log_path: str | Path, *, start_offset: int = 0) -> bool:
@@ -722,7 +726,9 @@ def kernel_init_done(log_path: str | Path, *, start_offset: int = 0) -> bool:
 
     The point after which the kernel no longer patches its own text at boot,
     so a breakpoint inserted later is not overwritten or tripped over by the
-    patcher (`missing return thunk` WARNINGs from `apply_returns`).
+    patcher (`missing return thunk` WARNINGs from `apply_returns`). Shown by
+    the kernel's end-of-init lines or, later still, a getty's `login:`
+    prompt, the one of the two a `quiet` console still prints.
     """
     try:
         with Path(log_path).open("rb") as stream:
@@ -731,7 +737,40 @@ def kernel_init_done(log_path: str | Path, *, start_offset: int = 0) -> bool:
             chunk = stream.read()
     except OSError:
         return False
-    return _KERNEL_INIT_DONE.search(chunk) is not None
+    return (
+        _KERNEL_INIT_DONE.search(chunk) is not None
+        or _LOGIN_PROMPT.search(chunk) is not None
+    )
+
+
+# The `pr_info` level the end-of-init lines print at; the console shows a
+# message only when its level is below the console loglevel.
+_KERN_INFO = 6
+
+
+def init_lines_hidden(cmdline: str) -> str | None:
+    """The cmdline parameter that keeps the end-of-init lines off the console.
+
+    `quiet` (console loglevel 4) or a `loglevel=N` with N <= 6, whichever of
+    `quiet`/`debug`/`loglevel=` comes last (the kernel applies them in
+    order); None when the console shows KERN_INFO, also under
+    `ignore_loglevel`.
+    """
+    hidden: str | None = None
+    for param in cmdline.split():
+        if param == "ignore_loglevel":
+            return None
+        if param == "quiet":
+            hidden = param
+        elif param == "debug":
+            hidden = None
+        elif param.startswith("loglevel="):
+            try:
+                level = int(param.split("=", 1)[1])
+            except ValueError:
+                continue
+            hidden = param if level <= _KERN_INFO else None
+    return hidden
 
 
 

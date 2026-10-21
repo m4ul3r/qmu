@@ -852,23 +852,48 @@ def test_snapshot_save_reports_what_the_image_can_hold(
 
 
 def test_raw_savevm_classifies_like_snapshot_save(monkeypatch, capsys):
+    """#227: the raw routes reach the same HMP `savevm` and compute the same
+    classification; their envelopes carry it too, or a JSON caller saving
+    through them gets only free text, worst for a foreign client with int3s
+    in RAM (`possible`)."""
     inst = _gdb_inst(1234)
     inst.kvm = True
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+    monkeypatch.setattr(debug, "bridge_stopped", lambda inst: None)
+    monkeypatch.setattr(
+        qmp_cmds, "save_snapshot", lambda qmp, name, **kw: _ok(f"Snapshot '{name}' saved.")
+    )
 
     class _Monitor(_StatusQMP):
+        def execute(self, command, arguments=None, timeout=30.0):
+            if command == "human-monitor-command":
+                return self.execute_hmp(arguments["command-line"])
+            return super().execute(command, arguments, timeout)
+
         def execute_hmp(self, command_line, timeout=30.0):
             return ""
 
-    for status, warned in (("debug", False), ("running", True)):
+    for status, expected in (("debug", "lifted"), ("running", "possible")):
         monkeypatch.setattr(
             qmp_cmds, "_qmp_ctx", lambda inst, s=status: contextlib.nullcontext(_Monitor(s))
         )
-        rc = _run(qmp_cmds._handle_monitor, _monitor_args(["savevm", "t"]))
-        err = capsys.readouterr().err
-        assert rc == 0
-        assert ("[qmu] WARNING:" in err) is warned
+        dedicated = _snap_args()
+        dedicated.format = "json"
+        assert _run(qmp_cmds._handle_snapshot_save, dedicated) == 0
+        saved = json.loads(capsys.readouterr().out)
+        assert saved["breakpoints_in_image"] == expected
+        for handler, args in (
+            (qmp_cmds._handle_monitor, _monitor_args(["savevm", "t"])),
+            (qmp_cmds._handle_qmp, _hmp_qmp_args("savevm t")),
+        ):
+            args.format = "json"
+            assert _run(handler, args) == 0
+            captured = capsys.readouterr()
+            payload = json.loads(captured.out)
+            assert payload["breakpoints_in_image"] == expected
+            assert "breakpoints_lifted" not in payload, "qmu stopped no bridge"
+            assert ("[qmu] WARNING:" in captured.err) is (expected == "possible")
 
 
 class _SequenceQMP(_FakeQMP):

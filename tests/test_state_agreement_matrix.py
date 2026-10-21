@@ -3196,6 +3196,8 @@ class _LoadvmQMP:
         if command == "cont":
             self.cont_sent += 1
             self.running, self.status = True, "running"
+        if command == "human-monitor-command":
+            return self.execute_hmp(arguments["command-line"])
         return {}
 
     def execute_hmp(self, command_line, timeout=30.0):
@@ -3336,18 +3338,32 @@ def test_status_and_ssh_commands_agree_a_partially_restored_guest_is_paused(
     assert result["stdout"] == "up\n"
 
 
-def test_pre_restore_refusal_keeps_the_guest_serving(cache, monkeypatch, capsys):
+_LOAD_CLEAN_ARGV = {
+    "snapshot load": ["snapshot", "load", "clean", "--vm", VM],
+    "monitor loadvm": ["monitor", "loadvm", "clean", "--vm", VM],
+    "qmp human-monitor-command loadvm": [
+        "qmp", "human-monitor-command", "--args", '{"command-line": "loadvm clean"}',
+        "--vm", VM,
+    ],
+}
+
+
+@pytest.mark.parametrize("route", sorted(_LOAD_CLEAN_ARGV))
+def test_pre_restore_refusal_keeps_the_guest_serving(route, cache, monkeypatch, capsys):
     """The sibling cell: QEMU said no before restoring anything (the tag is
     listed -- a partial snapshot passes the listing pre-check -- but loadvm
     refuses it), so the guest is exactly what it was and is resumed; `status`
-    says serving and `exec` runs."""
+    says serving and `exec` runs. The raw routes reach the same `hmp_loadvm`,
+    which stops the guest before it looks for the tag, and used to leave it
+    in `restore-vm` with a `qmu cont` hint that `cont` refused (#206): one
+    answer on every route."""
     inst, qmp = _loadvm_subject(
         cache, monkeypatch, "Error: Snapshot 'clean' does not exist in one or more devices"
     )
     monkeypatch.setattr(lifecycle, "_make_ssh", lambda i: _ServingSSH())
     monkeypatch.setattr(guest_mod, "_make_ssh", lambda selected: _ServingSSH(0, "up\n"))
 
-    rc = cli.main(["--format", "json", "snapshot", "load", "clean", "--vm", VM])
+    rc = cli.main(["--format", "json", *_LOAD_CLEAN_ARGV[route]])
     payload = json.loads(capsys.readouterr().out)
     assert rc == 1
     assert {
@@ -3358,6 +3374,7 @@ def test_pre_restore_refusal_keeps_the_guest_serving(cache, monkeypatch, capsys)
     } == {"ok": False, "resumed": True, "guest_paused": False, "restore_state": "none"}
     assert qmp.cont_sent == 1
     assert qmp.running is True
+    assert f"qmu snapshot list --vm {VM}" in payload["hint"]
 
     rc = cli.main(["--format", "json", "status", "--vm", VM])
     assert rc == 0

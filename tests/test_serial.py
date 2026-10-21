@@ -983,3 +983,9 @@ def test_kernel_init_done_is_scoped_to_the_boot_after_the_offset(tmp_path):
     log.write_bytes(old + new_banner + b"[    2.1] Freeing unused kernel memory: 9024K\n")
     assert kernel_init_done(log, start_offset=len(old)) is True
     assert kernel_init_done(tmp_path / "missing.log") is False
+    # #205: a `quiet` boot prints none of those lines but its getty prompt,
+    # which comes after init; a kernel line mentioning `login:` is no prompt.
+    log.write_bytes(old + b"[    3.2] audit: type=1 msg='op=login: res=1'\n")
+    assert kernel_init_done(log, start_offset=len(old)) is False
+    log.write_bytes(old + b"\r\nDebian GNU/Linux 12 drv ttyS0\r\n\r\ndrv login: ")
+    assert kernel_init_done(log, start_offset=len(old)) is True

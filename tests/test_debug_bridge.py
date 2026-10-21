@@ -244,12 +244,21 @@ def test_kaslr_reset_of_a_halted_guest_resumes_after_the_rebase(tmp_path):
     assert w.index("qmu cont --vm vm") < w.index("kbase`") < w.index("continue --background")
 
 
-def test_reset_recovery_skips_the_rebase_on_a_nokaslr_guest(tmp_path):
-    """Addresses did not move: interrupt + continue re-inserts in place."""
+@pytest.mark.parametrize("qemu_status", [None, "running", "prelaunch"])
+def test_nokaslr_reset_recovery_rearms_only_once_the_new_boot_is_up(tmp_path, qemu_status):
+    """Live (#204): addresses did not move, but under KVM a re-arm run right
+    after the reset is overwritten by the boot and every breakpoint stays
+    dead; the same re-arm once the guest is up fires. So the wait for the
+    boot comes before the re-arm, and no rebase is offered."""
     inst = _inst(tmp_path, vm_id="vm", cmdline="console=ttyS0 nokaslr")
-    w = debug.reset_dropped_breakpoints_warning(inst, guest_initiated=True)
+    w = debug.reset_dropped_breakpoints_warning(
+        inst, guest_initiated=qemu_status is None, qemu_status=qemu_status
+    )
     assert "kbase" not in w and "--base" not in w
-    assert w.index("interrupt`") < w.index("continue --background")
+    assert w.index("qmu wait --vm vm") < w.index("resync`")
+    if qemu_status == "prelaunch":
+        assert w.index("qmu cont --vm vm") < w.index("qmu wait --vm vm")
+        assert w.index("resync`") < w.index("continue --background")
 
 
 # --- the load warning: an image from another boot (#200) ---------------------

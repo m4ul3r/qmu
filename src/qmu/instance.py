@@ -31,19 +31,23 @@ class QMUError(RuntimeError):
     launch-time warnings already printed before it failed; both ride in the
     envelope (`envelope_fields`) exactly as a successful Result carries them,
     so a JSON reader running several VMs never has to parse the VM out of
-    the English `hint` (#159) or regex stderr for a lint (#157).
+    the English `hint` (#159) or regex stderr for a lint (#157). `fields`
+    are further machine-readable facts about the failure (a raw `loadvm`'s
+    `restore_state`, #206), merged into the envelope as they are.
     """
 
     def __init__(
-        self, *args: object, hint: str | None = None, vm_id: str | None = None
+        self, *args: object, hint: str | None = None, vm_id: str | None = None,
+        fields: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(*args)
         self.hint = hint if hint is not None else getattr(self, "hint", None)
         self.vm_id = vm_id if vm_id is not None else getattr(self, "vm_id", None)
         self.warnings: list[str] = list(getattr(self, "warnings", None) or ())
+        self.fields: dict[str, Any] = dict(fields or getattr(self, "fields", None) or {})
 
     def envelope_fields(self) -> dict[str, Any]:
-        fields: dict[str, Any] = {}
+        fields: dict[str, Any] = dict(self.fields)
         if self.vm_id is not None:
             fields["vm_id"] = self.vm_id
         if self.warnings:
