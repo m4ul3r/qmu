@@ -12,7 +12,7 @@ import json
 import re
 import shutil
 import subprocess
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .. import daemon_client
@@ -30,11 +30,12 @@ from ..snapshot import (
     SnapshotResult,
     UNSNAPSHOTTABLE_DRIVE_RE,
     delete_snapshot,
+    guest_run_state,
     list_snapshots,
     load_snapshot,
-    loadvm_restore_state,
     save_snapshot,
     savevm_timeout,
+    settle_loadvm,
 )
 from ..serial import serial_log_offset
 from ..qmp import QMPCommandError, QMPError, QMPTimeoutError, hmp_failed
@@ -42,6 +43,7 @@ from ..debug import (
     INT3_LIFTED,
     INT3_POSSIBLE,
     BridgeDrive,
+    BridgeStop,
     bridge_alive,
     bridge_instance_id,
     check_unwarned_reboot,
@@ -113,6 +115,21 @@ def _qemu_status(qmp: object) -> str | None:
     return status if isinstance(status, str) else None
 
 
+def _run_state_reader(inst: VMInstance):
+    """QEMU's run state on a fresh QMP connection, None when QEMU does not
+    answer: what the bridge drive reads around its interrupt to tell a stop
+    qmu made from one the operator's target took (#226)."""
+
+    def read() -> str | None:
+        try:
+            with _qmp_ctx(inst) as qmp:
+                return _qemu_status(qmp)
+        except (QMPError, OSError):
+            return None
+
+    return read
+
+
 def _status_before_save(qmp: object, inst: VMInstance) -> str | None:
     """QEMU's run state right before a savevm on a `--gdb` VM (#188).
 
@@ -162,7 +179,8 @@ class _SaveStop:
     so GDB lifts its breakpoints from guest RAM, takes the save at that stop
     and resumes it after; otherwise (TCG, another client, already stopped)
     the save runs as it is. `begin` takes `before`, QEMU's run state the save
-    starts in, and re-reads it after the interrupt. `finish` classifies the
+    starts in, and re-reads it after the interrupt: the two decide whether
+    the stop is qmu's to resume (`BridgeStop`, #226). `finish` classifies the
     image (`breakpoints_in_image`, which may ask the bridge whether it is
     stopped) BEFORE it resumes the bridge. A save that outran its budget
     leaves the bridge stopped: QEMU may still be writing the image. Any other
@@ -174,7 +192,7 @@ class _SaveStop:
         self.inst = inst
         self.event = event
         self.before: str | None = None
-        self.stop: SaveStop | None = None
+        self.stop: BridgeStop | None = None
         self.warnings: tuple[str, ...] = ()
         self.drive: BridgeDrive | None = None
         self.coherence: tuple[str | None, str | None] = (None, None)
@@ -186,6 +204,7 @@ class _SaveStop:
             self.warnings = (save_stop_failed_warning(self.inst, error),)
         if self.stop is not None:
             self.before = self.save(lambda: _status_before_save(qmp, self.inst))
+            self.stop = self.stop.at(self.before)
 
     def save(self, run):
         """`run()`, resuming the bridge first when it fails other than by
@@ -210,9 +229,21 @@ class _SaveStop:
             self.drive = resume_bridge_after_save(self.stop, self.event)
         return self.drive
 
+    def image_keys(self) -> dict[str, object]:
+        """What the saved image holds of the debugger's breakpoints, for the
+        envelope of every save route (#227): `breakpoints_in_image`, plus
+        `breakpoints_lifted` when qmu stopped its bridge for the save."""
+        state, _ = self.coherence
+        if state is None:
+            return {}
+        keys: dict[str, object] = {"breakpoints_in_image": state}
+        if self.stop is not None:
+            keys["breakpoints_lifted"] = state == INT3_LIFTED
+        return keys
+
     def left_stopped(self) -> tuple[str, ...]:
         """Warnings for a save that outran its budget."""
-        if self.stop is None or not self.stop.interrupted or self.drive is not None:
+        if self.stop is None or not self.stop.taken or self.drive is not None:
             return self.warnings
         return self.warnings + (save_left_stopped_warning(self.stop, self.event),)
 
@@ -422,6 +453,29 @@ def _inconsistent_restore_hint(vm_id: str, result: SnapshotResult) -> str:
     )
 
 
+def _loadvm_failure_hint(name: str, vm_id: str, result: SnapshotResult) -> str:
+    """The `hint` for a failed `loadvm`, on every route that reaches one.
+
+    A load that may have reverted the disks gets the no-`cont` recovery
+    (#87). A pre-restore refusal of a running guest left it stopped in
+    `restore-vm` only when qmu's resume failed too; that stop is safe to
+    resume, but plain `qmu cont` refuses the state (it cannot tell this
+    stop from a failed mid-restore), so the hint names `--force` (#206).
+    """
+    if result.restore_state in ("partial", "unknown"):
+        return _inconsistent_restore_hint(vm_id, result)
+    hint = _snapshot_failure_hint(name, vm_id, result)
+    if result.guest_paused:
+        # The stuck pause is the more urgent fix; it leads the hint.
+        return (
+            "loadvm left the guest paused and qmu could not resume it. Nothing "
+            "was restored, so resuming is safe: qmu cont --vm "
+            f"{vm_id} --force (QEMU reports restore-vm, which plain qmu cont "
+            f"refuses). Then: {hint}"
+        )
+    return hint
+
+
 def _snapshot_result(
     args: argparse.Namespace,
     op: str,
@@ -448,22 +502,11 @@ def _snapshot_result(
     hint = _snapshot_failure_hint(args.name, inst.vm_id, result)
     notes: list[str] = []
     if op == "load":
-        if result.restore_state in ("partial", "unknown"):
-            # The machine, not the pause, is the urgent fact: QEMU reverts
-            # the disks before it loads the vmstate, so a load that failed
-            # here left pre-snapshot devices over post-snapshot disks. qmu
-            # leaves it paused on purpose; `cont` would run that (#87).
-            hint = _inconsistent_restore_hint(inst.vm_id, result)
-        elif result.resumed:
+        hint = _loadvm_failure_hint(args.name, inst.vm_id, result)
+        if result.resumed and result.restore_state not in ("partial", "unknown"):
             notes.append(
                 "loadvm paused the guest before failing; qmu resumed it "
                 "(resumed: true)."
-            )
-        elif result.guest_paused:
-            # The stuck pause is the more urgent fix; it leads the hint.
-            hint = (
-                "loadvm left the guest paused and qmu could not resume it. "
-                f"Resume with: qmu cont --vm {inst.vm_id}. Then: {hint}"
             )
     data = {
         "ok": False,
@@ -540,10 +583,7 @@ def _handle_snapshot_save(args: argparse.Namespace) -> Result:
     # wrote an image.
     state, line = stop.coherence
     if state is not None:
-        extra: dict[str, object] = {"breakpoints_in_image": state}
-        if stop.stop is not None:
-            extra["breakpoints_lifted"] = state == INT3_LIFTED
-        res = replace(res, data={**res.data, **extra})
+        res = replace(res, data={**res.data, **stop.image_keys()})
     if line is not None:
         res = res.warn(line)
     return res
@@ -607,7 +647,12 @@ def _handle_snapshot_load(args: argparse.Namespace) -> Result:
     # while it holds the stub, is re-synced (#187); any other client is only
     # warned about.
     if qmu_bridge_attached(inst):
-        return _with_drive(res, drive_bridge_after_loadvm(inst, "snapshot load"))
+        return _with_drive(
+            res,
+            drive_bridge_after_loadvm(
+                inst, "snapshot load", run_state=_run_state_reader(inst)
+            ),
+        )
     if debug_session_present(inst):
         res = res.warn(loadvm_stale_session_warning(inst) + "\n")
     return res
@@ -1260,29 +1305,54 @@ def _hmp_verb(command_line: str) -> str:
     return tokens[0] if tokens else ""
 
 
-def _hmp_error(command_line: str, output: str) -> QMUError:
+def _hmp_error(
+    command_line: str, output: str, *, vm_id: str | None = None,
+    loadvm: SnapshotResult | None = None,
+) -> QMUError:
     """The exit-1 error for HMP result text that is itself a failure report.
 
     `qmu monitor nonsense-cmd` and `qmu qmp human-monitor-command` used to
     exit 0 / ok:true with "unknown command: 'nonsense-cmd'" inside the
-    payload (snapshot audit D8); `ok` must mean what it says.
+    payload (snapshot audit D8); `ok` must mean what it says. A failed raw
+    `loadvm` (`loadvm`: what `settle_loadvm` made of it) carries what
+    `snapshot load` reports for the same failure — `restore_state`,
+    `resumed`, `guest_paused` and the same hint — so the two routes give one
+    answer (#206).
     """
-    hint = ""
-    if _hmp_verb(command_line) == "loadvm":
-        if loadvm_restore_state(output) == "none":
-            hint = (
-                " (loadvm stops the guest before it looks for the tag and only "
-                "restarts it on success: check `qmu status`, resume with `qmu cont`)"
-            )
-        else:
-            # Past the tag check loadvm reverts the disks before loading the
-            # vmstate; a `cont` here runs the inconsistent result (#87).
-            hint = (
-                " (loadvm may have failed after restoration began: the disks "
-                "may be rewound under device state that is not. Do not `qmu "
-                "cont` it; load a known-good snapshot or `qmu kill` and relaunch)"
-            )
-    return QMUError(f"HMP command {command_line!r} failed: {output.strip()}{hint}")
+    message = f"HMP command {command_line!r} failed: {output.strip()}"
+    if loadvm is None:
+        return QMUError(message, vm_id=vm_id)
+    if loadvm.restore_state != "none":
+        # Past the tag check loadvm reverts the disks before loading the
+        # vmstate; a `cont` here runs the inconsistent result (#87).
+        message += (
+            " (loadvm may have failed after restoration began: the disks "
+            "may be rewound under device state that is not. Do not `qmu "
+            "cont` it; load a known-good snapshot or `qmu kill` and relaunch)"
+        )
+    elif loadvm.resumed:
+        message += (
+            " (loadvm paused the guest before it refused; nothing was restored, "
+            "and qmu resumed it)"
+        )
+    elif loadvm.guest_paused:
+        message += (
+            " (loadvm paused the guest before it refused, and qmu could not "
+            "resume it; nothing was restored)"
+        )
+    tokens = command_line.split()
+    return QMUError(
+        message,
+        hint=_loadvm_failure_hint(
+            tokens[1] if len(tokens) > 1 else "<tag>", vm_id or "<vm_id>", loadvm
+        ),
+        vm_id=vm_id,
+        fields={
+            "restore_state": loadvm.restore_state,
+            "resumed": loadvm.resumed,
+            "guest_paused": loadvm.guest_paused,
+        },
+    )
 
 
 # HMP verbs / QMP methods that replace the guest's running state. Each needs
@@ -1366,7 +1436,10 @@ def _after_mutation(
     if verb == "system_reset":
         if owned:
             drives.append(
-                drive_bridge_after_reset(inst, epoch=epoch, qemu_status=status_after)
+                drive_bridge_after_reset(
+                    inst, epoch=epoch, qemu_status=status_after,
+                    run_state=_run_state_reader(inst),
+                )
             )
         elif debug_session_present(inst):
             warnings.append(
@@ -1374,7 +1447,9 @@ def _after_mutation(
             )
     elif verb == "loadvm":
         if owned:
-            drives.append(drive_bridge_after_loadvm(inst, "loadvm"))
+            drives.append(
+                drive_bridge_after_loadvm(inst, "loadvm", run_state=_run_state_reader(inst))
+            )
         elif debug_session_present(inst) and not failed:
             warnings.append(loadvm_stale_session_warning(inst) + "\n")
     if persist_error is not None:
@@ -1391,8 +1466,7 @@ def _finish_mutation(
     data: dict[str, object],
     text: object,
     stem: str,
-    status_after: str | None = None,
-    save_stop: _SaveStop | None = None,
+    call: _RawCall,
 ) -> Result:
     """Post-mutation bookkeeping, THEN exactly one envelope.
 
@@ -1404,11 +1478,19 @@ def _finish_mutation(
     is what emitting first produced (#88: exit 4 with two JSON documents on
     stdout, the first of which a consumer could accept as the result).
     Exit 4: the guest did what was asked; qmu's own state is what failed.
+    A savevm's envelope carries what the image holds of the debugger's
+    breakpoints, as `snapshot save`'s does (#227), and a loadvm's whether
+    qmu resumed a guest a previous failed load had left stopped (#206).
     """
+    save_stop = call.save_stop
+    if save_stop is not None:
+        data = {**data, **save_stop.image_keys()}
+    if call.loadvm is not None:
+        data = {**data, "resumed": call.loadvm.resumed}
     warnings: list[str] = []
     drives: list[BridgeDrive] = []
     try:
-        _after_mutation(inst, verb, output, epoch, warnings, status_after, drives)
+        _after_mutation(inst, verb, output, epoch, warnings, call.status_after, drives)
     except OSError as exc:
         error = (
             f"{verb or 'command'} reached the guest, but qmu could not record "
@@ -1437,6 +1519,11 @@ def _finish_mutation(
         ).warn(*warnings)
     else:
         res = Result(data=data, text=text, stem=stem).warn(*warnings)
+    if call.loadvm is not None and call.loadvm.resumed:
+        res = replace(res, notes=res.notes + (
+            "[qmu] The guest was stopped by a previous failed load (restore-vm); "
+            "qmu resumed it (resumed: true).",
+        ))
     if save_stop is not None:
         _, line = save_stop.coherence
         res = res.warn(*save_stop.warnings, *([line] if line is not None else []))
@@ -1446,18 +1533,37 @@ def _finish_mutation(
     return res
 
 
-def _raw_mutation(
-    qmp: object, inst: VMInstance, verb: str, run
-) -> tuple[object, str | None, _SaveStop | None]:
-    """A raw route's QMP/HMP call `run()`; `(result, status_after, stop)`.
+@dataclass(frozen=True)
+class _RawCall:
+    """What a raw route's QMP/HMP call did: QEMU's `result`, the run state
+    right after a reset (`status_after`), the savevm bracket (`save_stop`)
+    and a loadvm's settled outcome (`loadvm`)."""
+
+    result: object
+    status_after: str | None = None
+    save_stop: _SaveStop | None = None
+    loadvm: SnapshotResult | None = None
+
+
+def _raw_mutation(qmp: object, inst: VMInstance, verb: str, run) -> _RawCall:
+    """A raw route's QMP/HMP call `run()`.
 
     QEMU's run state after a reset tells a booting guest from one left
     halted at the reset vector. A savevm is bracketed by the run state on
     both sides (#188), with the bridge `qmu gdb` spawned stopped across it
-    (#201), exactly as `snapshot save` does."""
+    (#201), exactly as `snapshot save` does. A loadvm is settled the way
+    `snapshot load` settles it (`settle_loadvm`): `hmp_loadvm` stops a
+    running guest before it looks for the tag, so a refused tag is resumed
+    here too instead of being left in `restore-vm` (#206)."""
+    if verb == "loadvm":
+        was_running, run_state = guest_run_state(qmp)
+        result = run()
+        if not isinstance(result, str):
+            return _RawCall(result)
+        return _RawCall(result, loadvm=settle_loadvm(qmp, result, was_running, run_state))
     if verb != "savevm":
         result = run()
-        return result, _status_after_mutation(qmp, inst, verb), None
+        return _RawCall(result, status_after=_status_after_mutation(qmp, inst, verb))
     stop = _SaveStop(inst, "savevm")
     try:
         stop.begin(qmp, _status_before_save(qmp, inst))
@@ -1467,7 +1573,7 @@ def _raw_mutation(
         raise
     landed = not (isinstance(result, str) and hmp_failed(result))
     stop.finish(_status_after_mutation(qmp, inst, verb), landed)
-    return result, None, stop
+    return _RawCall(result, save_stop=stop)
 
 
 def _handle_qmp(args: argparse.Namespace) -> Result:
@@ -1498,17 +1604,18 @@ def _handle_qmp(args: argparse.Namespace) -> Result:
     epoch = _before_mutation(inst, verb)
     try:
         with _qmp_ctx(inst) as qmp:
-            result, status_after, stop = _raw_mutation(
+            call = _raw_mutation(
                 qmp, inst, verb, lambda: qmp.execute(method, qmp_args)
             )
     except QMPCommandError as exc:
         # A QEMU error REPLY, not a transport fault: the wire worked, so this
         # is the exit-1 class whichever error class QEMU chose.
         raise _qmp_caller_error(method, exc) from exc
+    result = call.result
     if hmp_line is not None and isinstance(result, str) and hmp_failed(result):
-        if stop is not None:
-            stop.record_on_failure()
-        raise _hmp_error(hmp_line, result)
+        if call.save_stop is not None:
+            call.save_stop.record_on_failure()
+        raise _hmp_error(hmp_line, result, vm_id=inst.vm_id, loadvm=call.loadvm)
     # Bookkeeping BEFORE the envelope: the epoch persist can fail (unwritable
     # instance dir), and a success envelope already on stdout cannot be
     # taken back -- `qmu qmp system_reset` printed `ok:true` followed by a
@@ -1517,8 +1624,7 @@ def _handle_qmp(args: argparse.Namespace) -> Result:
     # universal {"ok": ...} contract holds, with the payload under "result".
     return _finish_mutation(
         inst, verb, result if isinstance(result, str) else "", epoch,
-        data={"ok": True, "result": result}, text=result, stem="qmp",
-        status_after=status_after, save_stop=stop,
+        data={"ok": True, "result": result}, text=result, stem="qmp", call=call,
     )
 
 
@@ -1556,17 +1662,15 @@ def _handle_monitor(args: argparse.Namespace) -> Result:
     verb = _hmp_verb(command)
     epoch = _before_mutation(inst, verb)
     with _qmp_ctx(inst) as qmp:
-        result, status_after, stop = _raw_mutation(
-            qmp, inst, verb, lambda: qmp.execute_hmp(command)
-        )
+        call = _raw_mutation(qmp, inst, verb, lambda: qmp.execute_hmp(command))
+    result = call.result
     if hmp_failed(result):
-        if stop is not None:
-            stop.record_on_failure()
-        raise _hmp_error(command, result)
+        if call.save_stop is not None:
+            call.save_stop.record_on_failure()
+        raise _hmp_error(command, result, vm_id=inst.vm_id, loadvm=call.loadvm)
     return _finish_mutation(
         inst, verb, result, epoch,
         data={"ok": True, "output": result},
         text=result if result.strip() else "(no output)",
-        stem="monitor",
-        status_after=status_after, save_stop=stop,
+        stem="monitor", call=call,
     )

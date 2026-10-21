@@ -243,17 +243,8 @@ def load_snapshot(qmp: QMPClient, name: str, timeout: float = 60.0) -> SnapshotR
 
     The tag is checked against `info snapshots` first so the common failure
     (a typo) never reaches `loadvm` at all -- QEMU would stop the guest
-    before noticing. When `loadvm` itself fails, the error text decides
-    (`loadvm_restore_state`): a pre-restore refusal gets the pre-load run
-    state back; anything that may have reverted the disks is left paused and
-    reported as such, because `cont` on it is not a rollback.
-
-    `hmp_loadvm` restarts the guest after a successful load only if it was
-    running before, so the recovery that failure's hint names -- load a
-    known-good tag -- would otherwise succeed and leave the guest stopped in
-    `restore-vm` with no error saying so. A successful load therefore resumes
-    a guest stopped in exactly that state (`resumed: true`); a guest the
-    operator or a debugger paused (`paused`, `debug`, ...) stays paused.
+    before noticing. What `loadvm` itself answers is settled by
+    `settle_loadvm`, which the raw `loadvm` routes share.
     """
     if name not in snapshot_tags(qmp):
         return SnapshotResult(
@@ -263,14 +254,45 @@ def load_snapshot(qmp: QMPClient, name: str, timeout: float = 60.0) -> SnapshotR
             restore_state="none",
         )
     was_running, run_state = guest_run_state(qmp)
-    result = qmp.execute_hmp(f"loadvm {name}", timeout=timeout).strip()
+    result = qmp.execute_hmp(f"loadvm {name}", timeout=timeout)
+    return settle_loadvm(
+        qmp, result, was_running, run_state, loaded=f"Snapshot '{name}' loaded."
+    )
+
+
+def settle_loadvm(
+    qmp: QMPClient,
+    result: str,
+    was_running: bool | None,
+    run_state: str | None,
+    *,
+    loaded: str = "Snapshot loaded.",
+) -> SnapshotResult:
+    """The outcome of an HMP `loadvm` that answered `result`, issued from the
+    run state `guest_run_state` read just before it.
+
+    `hmp_loadvm` stops the guest (`restore-vm`) before it looks for the tag
+    and restarts it only on success, so a failure's error text decides
+    (`loadvm_restore_state`): a pre-restore refusal gets the pre-load run
+    state back; anything that may have reverted the disks is left paused and
+    reported as such, because `cont` on it is not a rollback. Every route
+    to `loadvm` -- `snapshot load`, `monitor loadvm`, `qmp
+    human-monitor-command` -- settles it here, so a missing tag leaves a
+    running guest running on all of them (#206).
+
+    `hmp_loadvm` restarts the guest after a successful load only if it was
+    running before, so the recovery that failure's hint names -- load a
+    known-good tag -- would otherwise succeed and leave the guest stopped in
+    `restore-vm` with no error saying so. A successful load therefore resumes
+    a guest stopped in exactly that state (`resumed: true`); a guest the
+    operator or a debugger paused (`paused`, `debug`, ...) stays paused.
+    """
+    result = result.strip()
     if not hmp_failed(result):
         resumed = False
         if was_running is False and run_state == _FAILED_RESTORE_RUN_STATE:
             resumed = resume_guest(qmp)
-        return SnapshotResult(
-            True, result or f"Snapshot '{name}' loaded.", resumed=resumed
-        )
+        return SnapshotResult(True, result or loaded, resumed=resumed)
     restore_state = loadvm_restore_state(result)
     resumed = guest_paused = False
     if restore_state == "none":

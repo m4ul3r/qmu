@@ -123,8 +123,14 @@ A `load` whose HMP `loadvm` fails is exit 1, `ok:false` with `error`,
   `guest_paused: false`, hint `Snapshot 'X' is not in the image of VM 'Y'.
   List what exists: qmu snapshot list --vm Y`). Only when QEMU itself refuses
   a *listed* tag pre-restore (a partial snapshot) does `loadvm` pause the
-  guest first; qmu then resumes it (`resumed: true`; `guest_paused: true`
-  with a `qmu cont` hint only if that resume itself failed).
+  guest first (`restore-vm`); qmu then resumes it (`resumed: true`;
+  `guest_paused: true` only if that resume itself failed, with a `qmu cont
+  --vm X --force` hint: nothing was restored, and plain `qmu cont` refuses
+  `restore-vm`). The raw routes (`qmu monitor 'loadvm X'`, `qmu qmp
+  human-monitor-command`) have no pre-check, so every refused tag pauses the
+  guest there; qmu resumes it the same way, and their exit-1 `QMUError`
+  envelope carries the same `restore_state`, `resumed`, `guest_paused`,
+  `vm_id` and hint (#206). A running guest stays running on every route.
 - `partial` / `unknown` — restoration had begun (an incompatible device set,
   e.g. an e1000 snapshot loaded into a virtio-net boot; `Missing section
   footer`, `error while loading state`). QEMU reverts the **disks before** it
@@ -144,13 +150,14 @@ A `load` whose HMP `loadvm` fails is exit 1, `ok:false` with `error`,
   the success envelope says so (`resumed: true`, text `Guest resumed (it was
   stopped by a previous failed load).`); afterwards `status` is `serving` and
   `exec` works. A raw `qmu monitor 'loadvm X'` that fails
-  the same way carries the same no-`cont` hint; with a debugger attached the
+  the same way carries the same no-`cont` hint and `restore_state`; with a debugger attached the
   stale-session warning (#44) fires too, because a partial restore did rewind.
 
 HMP error replies on `save`/`load`/`delete` are failures (same envelope), and
 `save` confirms the tag in `info snapshots` before reporting success. The
 success envelope of `load` is `{ok, message, name, resumed}` — `resumed` is
-true only for the recovery case above; a guest the operator or a debugger
+true only for the recovery case above (a raw `loadvm` that succeeds carries
+the same `resumed` next to `output`/`result`); a guest the operator or a debugger
 paused (`paused`/`debug`) stays paused after a successful load, as before. It
 carries no `ssh` key. HMP error detection is anchored to the **start** of a
 reply line (`Error: `, `unknown command: `, `Snapshot '…' does not exist`,
@@ -165,7 +172,9 @@ breakpoints' `int3` bytes into the image (under KVM); a save at a debugger
 stop is clean, and with the bridge `qmu gdb` spawned attached qmu stops it
 for the save and resumes it after (`breakpoints_lifted: true`). On a `--gdb`
 VM the save's envelope says what the image holds as `breakpoints_in_image`
-(`possible` with a warning / `lifted` with a note / `never` under TCG).
+(`possible` with a warning / `lifted` with a note / `never` under TCG), on
+the raw routes (`qmu monitor 'savevm X'`, `qmu qmp human-monitor-command`)
+as on `snapshot save` (#227).
 `snapshot load` leaves an attached debugger with a stale view, and on a KASLR
 guest an image from an earlier boot restores that boot's kernel base: qmu
 rebases (`pry kbase`) and re-syncs (`pry resync`) the bridge `qmu gdb`
