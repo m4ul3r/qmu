@@ -411,12 +411,20 @@ abort decode and the faulting address precede the generic `Oops:` (#140).
 A headline (`Kernel panic - not syncing` too, so `has_terminal_panic`) is
 the kernel's own text in the kernel's own case, and counts only where a
 printk message starts (`_at_message_start`: line start, after the printk
-timestamp/caller field, or behind a getty `login:` prompt). Case-insensitive
+timestamp/caller field, behind a getty `login:` prompt, or behind a shell
+prompt `# `/`$ ` on a console without timestamps). Case-insensitive
 substrings made console text a crash (#219): a module named `oops` taints
 the kernel with `oops: loading out-of-tree module…` right above its fault
 headline, and `myapp: oops:` / `selftest: no kernel panic expected` written
 to `/dev/kmsg` set `guest: crashed`. No bare `Oops:` and no bug-type words:
-the die header and `BUG: KASAN:` already head every real report. What a panic's
+the die header and `BUG: KASAN:` already head every real report. The
+userspace-fault line `traps: <proc>[pid] general protection fault ip:…` is
+no longer a crash either (it never was a kernel fault). Residual: without
+printk timestamps, a headline behind arbitrary newline-less userspace output
+is not recognised. The lead check looks back at most `_LEAD_WINDOW` (64)
+characters, never to the line start: a guest's one long newline-free line
+full of headline words made every reader quadratic (13 s `status` on a
+220 KB line) — keep every per-hit check bounded. What a panic's
 kernel prints right after its own `---[ end Kernel panic` banner (the SMP
 `native_smp_send_reschedule` WARNING) is noise, never "the last crash" —
 only that adjacent splat (`_post_panic_noise`: its headline right after the

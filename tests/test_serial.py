@@ -1043,3 +1043,29 @@ def test_console_text_with_crash_words_is_not_a_crash(tmp_path, line):
 ])
 def test_kernel_headlines_still_start_a_report(line):
     assert _is_crash_start(line)
+
+
+def test_headline_words_on_one_long_console_line_stay_linear(tmp_path):
+    """A guest writing one newline-free line full of headline words made
+    every reader quadratic in the line (a 4 MB line: 198 s per extract)."""
+    import time
+
+    log = tmp_path / "serial.log"
+    log.write_text(
+        "[    0.0] Linux version 6.1.11 (x) #1\n"
+        + ("x" * 190 + " UBSAN: y Kernel panic - not syncing") * 20000
+    )
+
+    started = time.monotonic()
+    assert extract_crash(log) is None
+    assert has_terminal_panic(log) is False
+    assert time.monotonic() - started < 5.0
+
+
+@pytest.mark.parametrize("prompt", ["/ # ", "$ ", "~ # "])
+def test_panic_behind_a_shell_prompt_without_timestamps_is_caught(tmp_path, prompt):
+    log = tmp_path / "serial.log"
+    log.write_text(prompt + "Kernel panic - not syncing: sysrq triggered crash\n")
+
+    assert has_terminal_panic(log) is True
+    assert "sysrq triggered crash" in extract_crash(log)

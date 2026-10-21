@@ -49,14 +49,25 @@ CRASH_HEADLINES = (
 _DIE_HEADER = re.compile(r": [0-9a-f]+ \[#\d+\]")
 
 # What may precede a printk message on its console line: the printk
-# timestamp, the `CONFIG_PRINTK_CALLER` field, or the newline-less getty
-# prompt the first message after boot lands behind (`localhost login: `).
-_MESSAGE_LEAD = re.compile(r"(?:\[\s*\d+\.\d+\]|\[\s*[CT]\d+\]|login:)\s*$")
+# timestamp, the `CONFIG_PRINTK_CALLER` field, the newline-less getty prompt
+# the first message after boot lands behind (`localhost login: `), or a shell
+# prompt (`/ # `, `$ `) on a console without printk timestamps.
+_MESSAGE_LEAD = re.compile(r"(?:(?:\[\s*\d+\.\d+\]|\[\s*[CT]\d+\]|login:)\s*|[#$]\s+)$")
+# How far back from a headline `_at_message_start` looks. Every lead above
+# fits in it; looking back to the line start instead made the check linear
+# in the line per hit, so a guest writing one long newline-free line full of
+# headline words stalled every reader quadratically (220 KB: 13 s `status`).
+_LEAD_WINDOW = 64
 
 
 def _at_message_start(text: str, pos: int) -> bool:
-    """Whether `pos` in `text` is where a printk message begins."""
-    lead = text[text.rfind("\n", 0, pos) + 1:pos]
+    """Whether `pos` in `text` is where a printk message begins.
+
+    Examines at most `_LEAD_WINDOW` characters before `pos`: the whole lead
+    when the line starts inside the window, else its tail.
+    """
+    floor = max(0, pos - _LEAD_WINDOW)
+    lead = text[max(floor, text.rfind("\n", floor, pos) + 1):pos]
     return not lead.strip() or _MESSAGE_LEAD.search(lead) is not None
 
 
@@ -571,13 +582,21 @@ def _lines_at(text: str, positions: list[int]) -> set[int]:
 
 
 def _text_has_terminal_panic(text: str) -> bool:
-    """A `Kernel panic - not syncing` line that is not itself an end banner."""
+    """A `Kernel panic - not syncing` line that is not itself an end banner.
+
+    Each line is judged once, however many headlines it holds, so the scan
+    stays linear in the text.
+    """
+    judged_to = -1
     for pos in _headline_positions(text, _FATAL_PANIC):
+        if pos < judged_to:
+            continue  # same line as a hit already judged an end line
         line_start = text.rfind("\n", 0, pos) + 1
         line_end = text.find("\n", pos)
         line = text[line_start:] if line_end < 0 else text[line_start:line_end]
         if not _is_crash_end(line):
             return True
+        judged_to = len(text) if line_end < 0 else line_end
     return False
 
 

@@ -35,9 +35,10 @@ line/scope rules that decide whether `--pattern` can ever match.
   the latest timestamped kernel boot banner (`serial.current_boot_offset`),
   so earlier-boot evidence is excluded even when the reboot was not observed
   over QMP. The result names that boundary — `scan_offset` and `scan_scope`
-  (`boot-banner` or `epoch`) in JSON on every outcome, "scanned from byte N"
-  in text on every non-match outcome (timeout, crash, process exit) — so a
-  marker that fell before it is never a silent miss. One thing moves the
+  (`boot-banner` or `epoch`) in JSON on every match, crash, exit and timeout
+  (not on the exit-4 `inconclusive` error, which scanned nothing), "scanned
+  from byte N" in text on every non-match outcome (timeout, crash, process
+  exit) — so a marker that fell before it is never a silent miss. One thing moves the
   boundary that is not a reboot: a guest that replays `dmesg` to the console
   reproduces the timestamped banner verbatim — print your marker *after* any
   such dump, or start the wait before it. The boundary is fixed at the start
