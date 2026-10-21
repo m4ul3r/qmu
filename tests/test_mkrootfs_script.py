@@ -992,8 +992,13 @@ def test_export_fixup_runs_before_mke2fs_on_both_image_paths(mkrootfs_env: Mkroo
     log = calls.read_text()
 
     # `docker $*` logs the bash -c script with its newlines, so the helper
-    # invocation spans from "docker run " to the next "docker " line.
-    helper = re.search(r"^docker run .*?(?=^docker |\Z)", log, re.M | re.S).group(0)
+    # invocation spans from "docker run " to the next "docker " line. The
+    # `docker export` feeding it through a pipe runs concurrently and can log
+    # its line in the middle of that script, so it is dropped first.
+    helper_log = "".join(
+        line for line in log.splitlines(keepends=True) if not line.startswith("docker export ")
+    )
+    helper = re.search(r"^docker run .*?(?=^docker |\Z)", helper_log, re.M | re.S).group(0)
     assert re.search(r"-v \S+:/qmu-ctx:ro", helper), helper
     tar_i = helper.index("tar -x -C /rootfs")
     fixup_i = helper.index("sh /qmu-ctx/qmu-export-fixup.sh /rootfs")
