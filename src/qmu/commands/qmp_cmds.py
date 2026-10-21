@@ -47,6 +47,7 @@ from ..debug import (
     bridge_alive,
     bridge_instance_id,
     check_unwarned_reboot,
+    cont_behind_debugger_warning,
     debug_session_present,
     debug_stub_present,
     drive_bridge_after_loadvm,
@@ -168,7 +169,7 @@ def _savevm_coherence(
     if state == INT3_LIFTED:
         return state, savevm_lifted_note(inst, before) + "\n"
     if state == INT3_POSSIBLE:
-        return state, savevm_breakpoint_warning(inst, before) + "\n"
+        return state, savevm_breakpoint_warning(inst, before, after) + "\n"
     return state, None
 
 
@@ -998,12 +999,18 @@ def _handle_gdb(args: argparse.Namespace) -> Result:
     inst = mark_debugger_attached(inst)
 
     # H4: attaching to the gdb stub HALTS the vCPU. Until it is resumed every
-    # SSH command (exec/push/pull/compile) refuses with exit 1 and a `qmu cont`
-    # hint. Say so and tell them how to resume.
+    # SSH command (exec/push/pull/compile) refuses with exit 1. The resume is
+    # the bridge's: `qmu cont` resumes QEMU behind GDB's back, which still
+    # believes the target stopped and halts it again on its next command
+    # (#225).
     warning = (
         "WARNING: the vCPU is now HALTED by the debugger. SSH commands (exec/"
         "push/pull/compile) fail fast with exit 1 until you resume it. Resume "
-        "with `pry continue` (in the debugger) or `qmu cont`."
+        f"through the debugger: `pry --instance {instance_id} continue "
+        "--background` (GDB inserts its breakpoints when it resumes). Not `qmu "
+        "cont`: it resumes QEMU behind GDB's back, and GDB, still believing the "
+        "target stopped, halts it again on its next command (`pry status` "
+        "included)."
     )
     data = {
         "ok": True,
@@ -1031,8 +1038,10 @@ def _handle_gdb(args: argparse.Namespace) -> Result:
             f"once the kernel has booted: `pry --instance {instance_id} kbase` "
             "validates the running kernel's base against this vmlinux and rebases "
             "it (it exits 1 rather than guess). Or obtain the runtime base with "
-            f"`qmu kbase --vm {inst.vm_id} --symbols {symbols_path}` (SSH: `qmu "
-            f"cont` first), then reload with `pry load {symbols_path} --base <KBASE>`."
+            f"`qmu kbase --vm {inst.vm_id} --symbols {symbols_path}` (SSH: resume "
+            f"with `pry --instance {instance_id} continue --background` first), "
+            f"then reload with `pry --instance {instance_id} load {symbols_path} "
+            "--base <KBASE>`."
         )
         data.update({
             "symbols": str(symbols_path),
@@ -1107,7 +1116,12 @@ def _handle_cont(args: argparse.Namespace) -> Result:
     if before_state == "restore-vm":
         data["forced"] = True
         text += " — forced out of restore-vm; the machine state may be inconsistent"
-    return Result(data=data, text=text, stem="cont")
+    result = Result(data=data, text=text, stem="cont")
+    # #225: a stop a debugger holds is the debugger's to resume.
+    behind = cont_behind_debugger_warning(inst, before_state)
+    if behind is not None:
+        result = result.warn(behind)
+    return result
 
 
 # ---------------------------------------------------------------------------

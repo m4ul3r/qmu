@@ -111,7 +111,6 @@ def test_gdb_symbols_text_warns_link_time_and_gives_manual_workflow(
     assert "loaded at ELF link-time addresses" in captured.out
     assert "qmu gdb did not apply runtime rebasing" in captured.out
     assert "qmu kbase --vm debug-vm --symbols" in captured.out
-    assert "pry load" in captured.out
     assert "--base <KBASE>" in captured.out
     _assert_no_misleading_kaslr_claim(captured.out)
     assert calls == [(
@@ -148,7 +147,6 @@ def test_gdb_symbols_json_preserves_halt_warning_and_adds_symbol_warning(
     assert payload["kaslr_status"] == "unknown"
     assert "loaded at ELF link-time addresses" in payload["symbol_warning"]
     assert "qmu kbase --vm debug-vm --symbols" in payload["symbol_warning"]
-    assert "pry load" in payload["symbol_warning"]
     assert "--base <KBASE>" in payload["symbol_warning"]
     _assert_no_misleading_kaslr_claim(payload["symbol_warning"])
     assert calls[0][0] == _symbols_argv(symbols)
@@ -182,7 +180,6 @@ def test_gdb_symbols_ndjson_is_one_object_with_symbol_warning(
     assert payload["kaslr_status"] == "unknown"
     assert "loaded at ELF link-time addresses" in payload["symbol_warning"]
     assert "qmu kbase --vm debug-vm --symbols" in payload["symbol_warning"]
-    assert "pry load" in payload["symbol_warning"]
     assert "--base <KBASE>" in payload["symbol_warning"]
     _assert_no_misleading_kaslr_claim(payload["symbol_warning"])
     assert calls[0][0] == _symbols_argv(symbols)

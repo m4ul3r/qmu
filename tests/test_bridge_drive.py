@@ -378,6 +378,45 @@ def test_a_resync_that_leaves_breakpoints_unarmed_keeps_the_bridge_and_warns(
     assert bridge.poll() is None
 
 
+def test_a_resync_that_repaired_stray_traps_names_every_one_in_every_mode(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Live (#230): since pry #83 `pry resync` writes the symbol file's bytes
+    over traps no breakpoint owns (`stray_traps`), here an int3 a `possible`
+    save baked at `__x64_sys_syncfs`. That is kernel text qmu had rewritten,
+    and pry has misread patched code as a trap before (pry #88), so the
+    receipt names every address it touched, also for a JSON caller."""
+    _vm(tmp_path, monkeypatch, bridge)
+    report = _report()
+    report["stray_traps"] = [
+        {"address": "0xffffffff812667b0", "function": "__x64_sys_syncfs",
+         "guest_bytes": "cc", "elf_bytes": "41", "repaired": True,
+         "source": "scan", "trap_in_memory": True},
+        {"address": "0xffffffff81a00010", "function": "flush_to_ldisc+16",
+         "guest_bytes": "cc", "elf_bytes": "e8", "repaired": False,
+         "source": "scan", "trap_in_memory": True},
+    ]
+    report["summary"].update(stray_traps=2, stray_repaired=1)
+    pry.answers(resync=[{"result": report}])
+
+    rc, payload = _json(capsys, ["snapshot", "load", "clean"])
+
+    assert rc == 0
+    assert payload["debugger"]["resync"] == report, "pry's report is never reshaped"
+    (warning,) = payload["warnings"]
+    for trap in report["stray_traps"]:
+        assert trap["address"] in warning and trap["function"] in warning
+    assert "cc → ELF 41, repaired" in warning
+    assert "cc → ELF e8, NOT repaired" in warning
+
+    rc = cli.main(["snapshot", "load", "clean", "--vm", VM])
+    err = capsys.readouterr().err
+    assert rc == 0
+    receipt = err.split("WARNING")[0]
+    assert "2 stray trap(s), 1 repaired" in receipt
+    assert "0xffffffff812667b0" in receipt and "flush_to_ldisc+16" in receipt
+
+
 def test_a_failed_resync_tears_the_bridge_down_and_lists_what_it_lost(
     tmp_path, monkeypatch, capsys, bridge, pry
 ):

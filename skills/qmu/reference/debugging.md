@@ -29,11 +29,13 @@ only once the guest's `linux_banner` at that base matches the file; it then
 rebases the loaded vmlinux itself (measured on x86-64 6.1 and arm64 7.0: the
 same `_text` as `qmu kbase` and kallsyms). It needs the kernel booted and its
 vmlinux loaded, and exits 1 (`could not determine the kernel base`) rather
-than guess. The SSH route instead: `qmu cont --vm debug-vm`, `eval "$(qmu
+than guess. The SSH route instead: `pry --instance qmu-debug-vm continue
+--background` (no breakpoint is set yet, so nothing is armed), `eval "$(qmu
 kbase --vm debug-vm --symbols "$VMLINUX")"` (KBASE, LINK_BASE, SLIDE — SSH +
 kallsyms only), `pry --instance qmu-debug-vm load "$VMLINUX" --base "$KBASE"`
-(the first pry touch after `qmu cont` halts the guest again), then the same
-`break set` and `continue --background`.
+(on the running target pry stops it, loads, and resumes it), then the same
+`break set` (likewise on a running target). Resume through the bridge, not
+with `qmu cont` (next section).
 
 **The trigger survives the stop.** When the breakpoint fires, `exec` returns
 but leaves the command running: its SSH session stays open for as long as the
@@ -86,8 +88,8 @@ not** issue QMP `cont`, resume/re-halt the guest, invoke pry, or apply a
 symbol base. Operational errors (exit 1) include: harness/no-SSH instances,
 unsupported or legacy (`arch=None`) architecture metadata, restricted
 kallsyms (`kptr_restrict`), missing symbols/tools, missing `_text`, and a
-paused/debugger-stopped guest (returned immediately with `qmu cont`/`pry
-continue` guidance). On arm64 pass `KBASE` as-is: pry keys the slide to
+paused/debugger-stopped guest (returned immediately with the same resume hint
+as the other SSH commands, below). On arm64 pass `KBASE` as-is: pry keys the slide to
 `_text`, so `KBASE` is the right base there too (details and the `_stext`
 anti-pattern in `skill://qmu/reference/cross-arch.md`).
 
@@ -95,27 +97,39 @@ anti-pattern in `skill://qmu/reference/cross-arch.md`).
 
 - **Attaching halts the vCPU.** `qmu gdb` and `pry launch --connect` both
   stop the guest (gdbstub `target remote` = vCPU stop) until an explicit
-  resume: `qmu cont`, `pry continue`, or `qmu monitor cont`.
-- **After `qmu cont`, the first pry command that touches the target halts it
-  again** — `pry load`, `pry kbase`, `pry status`, `pry registers` all do
-  (measured: QMP `running` → one `pry status` → `paused`; `pry kbase` →
-  `paused`). GDB still believes the target is stopped, and the gdbstub stops
-  the VM on any packet received while running. So on the SSH route the order
-  is not optional: `qmu cont` exists to let `qmu kbase` read kallsyms over
-  SSH; after `pry load` the VM is halted again and only `pry continue` makes
-  it serve SSH. `pry kbase` needs no `qmu cont` at all.
-- **One resume authority per stop.** Resume through *either* pry or qmu for a
-  given stop, never both: `qmu cont` after a pry-observed stop leaves GDB's
-  view stale (`Cannot execute this command while the target is running` on
-  the next inspect). Recover with `pry interrupt`, then continue through pry.
+  resume. Resume through the debugger: `pry --instance qmu-<vm> continue
+  --background` (GDB inserts its breakpoints when it resumes). `qmu gdb`'s
+  own warning says the same.
+- **`qmu cont` (or `qmu monitor cont`) resumes QEMU behind GDB's back.** GDB
+  still believes the target is stopped, with every breakpoint lifted (`0x41`
+  at a breakpoint after `qmu cont` from a breakpoint stop, and the canary ran
+  through, under KVM and TCG alike), and its next command halts the guest again, silently: measured
+  after `qmu gdb` → `qmu cont`, every pry command run against the running
+  guest — `pry status`, `registers`, `break list`, `load`, `kbase`, even
+  `interrupt` (`not interrupted (inferior is stopped)`) — left QEMU `paused`,
+  and `pry status` reports the old stop reason at the new frame (`reason:
+  breakpoint #1 hit`, `frame: amd_e400_idle`; pry #100). `qmu cont` on a VM a
+  debugger holds (`debug`, or `paused` under the `qmu gdb` bridge) therefore
+  carries a `warnings[]` entry. Either way `pry --instance qmu-<vm> continue
+  --background` gets back in agreement: the guest runs with `0xcc` at the
+  breakpoint and the canary fires, whether a pry command had re-halted it or
+  not (from a breakpoint stop it takes up to ~2 s: GDB first steps the vCPU
+  off the stop, and QEMU reads `paused` meanwhile — measured 3 of 3). `pry
+  kbase` needs no resume at all.
+- **One resume authority per stop: the debugger.** `qmu cont` is for a halt
+  no debugger holds (a QMP `stop`, an unclean bridge death, a reset that left
+  the vCPU in `prelaunch`).
 - **SSH commands refuse a halted guest fast.** Before `exec`/`push`/`pull`/
   `compile`/`dmesg`/`kbase` builds an SSH client, qmu queries QMP; any
   `running:false` state (`paused`, `debug`, `restore-vm`, `prelaunch`, …)
   fails in ~0.1 s with exit 1, `guest_state:"paused"`, `qemu_status`,
-  `ssh_error:false`, `crash_detected:false` and a `qmu cont` / `pry continue`
-  hint — except `restore-vm` (a failed mid-restore `snapshot load`), whose
+  `ssh_error:false`, `crash_detected:false` and a resume hint — `pry
+  --instance <id> continue --background` when a debugger holds the stop
+  (`debug`, which only a gdbstub stop produces, or `paused` under the `qmu
+  gdb` bridge; `<id>` is `qmu-<vm>` for that bridge), saying why not `qmu
+  cont`; otherwise `qmu cont` — except `restore-vm` (a failed mid-restore `snapshot load`), whose
   hint is a known-good `snapshot load` or `kill` + relaunch and which `qmu
-  cont` itself refuses (`snapshots.md`); text mode prints `[qmu] Error: VM 'X' is debug (vCPU halted).` on
+  cont` itself refuses (`snapshots.md`); text mode prints `[qmu] Error: VM 'X' is debug (vCPU halted by a debugger).` on
   stderr (the word is QEMU's status name: `debug` for a breakpoint stop,
   `paused` after `qmu gdb`/`stop`). A breakpoint that fires **during**
   `exec`/`compile --run`/`dmesg` is caught by the same QMP watch within ~1 s
@@ -236,9 +250,9 @@ does not drive (qmu's own drive replaces them for its bridge).
 
 | You run | What silently breaks | Recover (each run as written against a live bridge) |
 |---|---|---|
-| `qmu snapshot load` | The bridge's connection survives the rewind. Frame and registers are re-read and current, but a bridge that was at a stop keeps reporting the **pre-load stop reason** (`reason: breakpoint #1 hit` while `frame: amd_e400_idle`). **KVM:** breakpoints it had inserted while the guest ran are **no longer in guest RAM** (`0xcc` → `0x53` at the address): still listed `[enabled]`, they never fire (`uname` runs through). **TCG:** breakpoints live in QEMU, not guest RAM, so the load leaves them in force at the addresses they were set at. **KASLR:** the image restores the kernel at the base of the boot it was saved in, which is not the debugger's base once the guest was reset or rebooted since the save, and qmu does not record which boot a tag came from (measured: an image from a boot at `0xffffffff85e00000` loaded into one at `0xffffffff92000000`; re-armed in place, the canary stayed dead, and under TCG the untouched breakpoint too). | **KASLR guest, KVM or TCG:** rebase, then re-arm: `pry --instance qmu-<vm> kbase` (no SSH; rebases the loaded vmlinux to the restored kernel) → `pry --instance qmu-<vm> resync` (`1 armed, 0 not armed`; the canary fired at `0xffffffff860667b0`, under TCG at `0xffffffff910667b0`), or `eval "$(qmu kbase --vm <vm> --symbols "$VMLINUX")"` → `pry --instance qmu-<vm> resync --base "$KBASE"`. A same-boot image takes the same two commands (`kbase` then says `already loaded at this slide`). **`nokaslr`, KVM:** addresses did not move, so re-arm in place: `pry --instance qmu-<vm> interrupt` (`not interrupted (inferior is stopped)` at a stop is fine), then `pry --instance qmu-<vm> continue --background` — GDB re-inserts every breakpoint when it resumes (`0xcc` back; the canary fires: `reason: breakpoint #1 hit`). **`nokaslr`, TCG:** nothing to re-arm; trust the frame, not the reason, until the next stop. A `possible` image brings its `int3`s back: one at a site that still has a breakpoint goes at the debugger's next stop (measured: `pry resync` read `guest_bytes: "41"`, and `0x41` stayed after `break delete`); one whose breakpoint was deleted before the load stays (`0xcc` after `pry resync`) — load a `lifted` image or reboot instead. A second `qmu gdb` is refused with exit 1 (`A debugger client is already attached to port N (pry bridge pid P)`), never a second bridge. |
-| `qmu snapshot save` | Under KVM a software breakpoint is an `int3` (`0xCC`) byte in guest RAM **whenever GDB has the target running**; GDB lifts its breakpoints at a stop. A save taken while the debugger runs the guest **bakes them into the image**; a later `load` + run traps at that address with no live breakpoint → `Oops: int3` at the breakpointed symbol, `Kernel panic - not syncing: Fatal exception in interrupt` — mimicking your PoC crashing the kernel. Measured at the breakpoint address of four images: saved running `0xcc`; at a breakpoint stop, after `pry interrupt`, and by the recovery below `0x53` (clean). Under TCG breakpoints never reach guest RAM. | With the bridge `qmu gdb` spawned attached and the guest running under KVM, qmu does it itself: `pry interrupt` → save → `pry continue --background`, reported as `breakpoints_lifted: true` and `debugger.action: "stopped_for_save"` on every save route (measured: `0xcc` in RAM before the save, `0x41` in the image, the canary fired after). `breakpoints_in_image` says what the image holds, from QEMU's run state read **before and after** the save (savevm resumes a running guest before it returns, so a breakpoint hit right after it reads `debug` for an image taken while running — measured with `0xcc` in the image; both reads must agree): `"possible"` (stderr **warning**: QEMU was `running`, the state moved across the save, or `paused` with no debugger stop qmu could confirm), `"lifted"` (stderr **note**: QEMU `debug`, or `paused` and the bridge `qmu gdb` spawned, as the attached client, reports `stopped`), `"never"` (TCG; nothing printed). For a clean image under another client save at a stop: `pry --instance <id> interrupt` → `qmu snapshot save --vm <vm> <tag>` (→ `"lifted"`, `0x41` in the image) → `pry --instance <id> continue --background`. A breakpoint deleted while the guest runs takes its byte with it (pry stops the target for the delete: `0xcc` → `0x41`); the `int3` nothing tracks is one a `possible` image brought back on load at a site with no breakpoint now, and it survives even a save at a stop. Treat a post-load `int3` crash at a breakpointed function as a debugger artifact, not an exploit result. |
-| `qmu qmp system_reset` / `qmu monitor system_reset`, or a **guest reboot** (`panic=N`, a watchdog, a triple fault, `sysrq b`) | **KVM:** the gdbstub's breakpoint/watchpoint set is **dropped**; the client still lists them `[enabled]` but they never fire again (`hits` frozen). **TCG:** QEMU keeps them at their old addresses — with `nokaslr` they keep firing (measured, no re-arm). **KASLR re-slides on the reboot** (`0xffffffff93400000` → `0xffffffff8d400000`), so the symbols loaded in pry are wrong too and, under either accelerator, the breakpoints sit where nothing runs. A reset that lands while the debugger is **at a stop** leaves the vCPU halted at the reset vector (QEMU `prelaunch`, `EIP=0000fff0`), and `pry continue` does not start it (KVM and TCG alike: no console output after 20 s). | If the warning says the guest is still halted, `qmu cont --vm <vm>` first (it boots; GDB still believes it is stopped). Then, once the new kernel has booted (`qmu wait --vm <vm> --pattern 'login:'`): `pry --instance qmu-<vm> kbase` (no SSH) → `pry --instance qmu-<vm> resync`, or, once SSH answers, `eval "$(qmu kbase --vm <vm> --symbols "$VMLINUX")"` → `pry --instance qmu-<vm> resync --base "$KBASE"`. Both stop and resume a running target themselves (pry #61: `pry load`/`resync` on a running target no longer leaves breakpoints `<PENDING>`), and the breakpoints already set re-resolve to the new base — no re-set (measured: the canary fired at `0xffffffff98e667b0` after `kbase` + `resync`, at `0xffffffffa60667b0` after a `sysrq b` and `qmu kbase` + `resync --base`, under TCG at `0xffffffff956667b0`). After a halted reset they leave it stopped, since GDB believed it stopped all along: finish with `pry --instance qmu-<vm> continue --background`. On a `nokaslr` guest addresses do not move, but under KVM the re-arm must also wait for the boot (#204): run right after the reset, `interrupt` → `continue --background` left `0x41` at the breakpoint and the canary dead, and `pry resync` reports it `unreadable` (`0 armed, 1 not armed`). Once `qmu wait --vm <vm> --pattern 'login:'` matched, `pry --instance qmu-<vm> resync` re-armed it (`1 armed`, `0xcc` back, the canary fired; after a halted reset, `qmu cont` first and `continue --background` after, as above). Under TCG there is nothing to re-arm unless the reset landed at a stop (then `interrupt` → `continue --background` after `qmu cont`). |
+| `qmu snapshot load` | The bridge's connection survives the rewind. Frame and registers are re-read and current, but a bridge that was at a stop keeps reporting the **pre-load stop reason** (`reason: breakpoint #1 hit` while `frame: amd_e400_idle`). **KVM:** breakpoints it had inserted while the guest ran are **no longer in guest RAM** (`0xcc` → `0x53` at the address): still listed `[enabled]`, they never fire (`uname` runs through). **TCG:** breakpoints live in QEMU, not guest RAM, so the load leaves them in force at the addresses they were set at. **KASLR:** the image restores the kernel at the base of the boot it was saved in, which is not the debugger's base once the guest was reset or rebooted since the save, and qmu does not record which boot a tag came from (measured: an image from a boot at `0xffffffff85e00000` loaded into one at `0xffffffff92000000`; re-armed in place, the canary stayed dead, and under TCG the untouched breakpoint too). | **KASLR guest, KVM or TCG:** rebase, then re-arm: `pry --instance qmu-<vm> kbase` (no SSH; rebases the loaded vmlinux to the restored kernel) → `pry --instance qmu-<vm> resync` (`1 armed, 0 not armed`; the canary fired at `0xffffffff860667b0`, under TCG at `0xffffffff910667b0`), or `eval "$(qmu kbase --vm <vm> --symbols "$VMLINUX")"` → `pry --instance qmu-<vm> resync --base "$KBASE"`. A same-boot image takes the same two commands (`kbase` then says `already loaded at this slide`). **`nokaslr`, KVM:** addresses did not move, so re-arm in place: `pry --instance qmu-<vm> interrupt` (`not interrupted (inferior is stopped)` at a stop is fine), then `pry --instance qmu-<vm> continue --background` — GDB re-inserts every breakpoint when it resumes (`0xcc` back; the canary fires: `reason: breakpoint #1 hit`). **`nokaslr`, TCG:** nothing to re-arm; trust the frame, not the reason, until the next stop. A `possible` image brings its `int3`s back, also at a site whose breakpoint was deleted before the load (`0xcc` right after it). **KVM:** `pry --instance <id> resync` (pry #83) writes the symbol file's bytes back over every trap no breakpoint owns in the code it can map and lists each under `stray_traps` (measured with a hand-started client: `guest_bytes: "cc"`, `elf_bytes: "41"`, `repaired: true`, `0x41` after it, and `sync -f /` ran clean); qmu's own load does that for the `qmu gdb` bridge and names every repair (below). A `lifted` image or a reboot is the fallback only for a trap in code no loaded symbol file maps. A second `qmu gdb` is refused with exit 1 (`A debugger client is already attached to port N (pry bridge pid P)`), never a second bridge. |
+| `qmu snapshot save` | Under KVM a software breakpoint is an `int3` (`0xCC`) byte in guest RAM **whenever GDB has the target running**; GDB lifts its breakpoints at a stop. A save taken while the debugger runs the guest **bakes them into the image**; a later `load` + run traps at that address with no live breakpoint → `Oops: int3` at the breakpointed symbol, `Kernel panic - not syncing: Fatal exception in interrupt` — mimicking your PoC crashing the kernel. Measured at the breakpoint address of four images: saved running `0xcc`; at a breakpoint stop, after `pry interrupt`, and by the recovery below `0x53` (clean). Under TCG breakpoints never reach guest RAM. | With the bridge `qmu gdb` spawned attached and the guest running under KVM, qmu does it itself: `pry interrupt` → save → `pry continue --background`, reported as `breakpoints_lifted: true` and `debugger.action: "stopped_for_save"` on every save route (measured: `0xcc` in RAM before the save, `0x41` in the image, the canary fired after). `breakpoints_in_image` says what the image holds, from QEMU's run state read **before and after** the save (savevm resumes a running guest before it returns, so a breakpoint hit right after it reads `debug` for an image taken while running — measured with `0xcc` in the image; both reads must agree): `"possible"` (stderr **warning**: QEMU was `running`, the state moved across the save, or `paused` with no debugger stop qmu could confirm), `"lifted"` (stderr **note**: QEMU `debug`, or `paused` and the bridge `qmu gdb` spawned, as the attached client, reports `stopped`), `"never"` (TCG; nothing printed). For a clean image under another client save at a stop: `pry --instance <id> interrupt` → `qmu snapshot save --vm <vm> <tag>` → `pry --instance <id> continue --background` (measured: `0x41` in the image). qmu can ask only the bridge it spawned whether it took a stop, so that save still reads `"possible"`, with a warning of its own: QEMU was `paused` before and after the save, and if your debugger took that stop (its interrupt, or a QMP `stop` it saw as `SIGINT`) the image holds none of its breakpoints; it names `pry resync` after a load for a trap left anyway, never the save-at-a-stop recovery again. A breakpoint deleted while the guest runs takes its byte with it (pry stops the target for the delete: `0xcc` → `0x41`); the `int3` nothing tracks is one a `possible` image brought back on load that no `pry resync` has repaired since, and it survives even a save at a stop. Treat a post-load `int3` crash at a breakpointed function as a debugger artifact, not an exploit result. |
+| `qmu qmp system_reset` / `qmu monitor system_reset`, or a **guest reboot** (`panic=N`, a watchdog, a triple fault, `sysrq b`) | **KVM:** the new boot loads the kernel over the `int3`s of **software** breakpoints; the client still lists them `[enabled]` but they never fire again (`hits` frozen). **Hardware** breakpoints and watchpoints are not in guest RAM and stay armed at their addresses: with `nokaslr` they keep firing with no re-arm (measured: a `break set --hardware` breakpoint hit after a `sysrq b` reboot, `hits=2`; a watchpoint trapped on the boot's own `sethostname` after a `system_reset`), and on a KASLR guest they stay at the old addresses, which the re-slid kernel no longer runs as those functions. **TCG:** QEMU keeps them at their old addresses — with `nokaslr` they keep firing (measured, no re-arm). **KASLR re-slides on the reboot** (`0xffffffff93400000` → `0xffffffff8d400000`), so the symbols loaded in pry are wrong too and, under either accelerator, the breakpoints sit where nothing runs. A reset that lands while the debugger is **at a stop** leaves the vCPU halted at the reset vector (QEMU `prelaunch`, `EIP=0000fff0`), and `pry continue` does not start it (KVM and TCG alike: no console output after 20 s). | If the warning says the guest is still halted, `qmu cont --vm <vm>` first (it boots; GDB still believes it is stopped). Then, once the new kernel has booted (`qmu wait --vm <vm> --pattern 'login:'`): `pry --instance qmu-<vm> kbase` (no SSH) → `pry --instance qmu-<vm> resync`, or, once SSH answers, `eval "$(qmu kbase --vm <vm> --symbols "$VMLINUX")"` → `pry --instance qmu-<vm> resync --base "$KBASE"`. Both stop and resume a running target themselves (pry #61: `pry load`/`resync` on a running target no longer leaves breakpoints `<PENDING>`), and the breakpoints already set re-resolve to the new base — no re-set (measured: the canary fired at `0xffffffff98e667b0` after `kbase` + `resync`, at `0xffffffffa60667b0` after a `sysrq b` and `qmu kbase` + `resync --base`, under TCG at `0xffffffff956667b0`). After a halted reset they leave it stopped, since GDB believed it stopped all along: finish with `pry --instance qmu-<vm> continue --background`. On a `nokaslr` guest addresses do not move, but under KVM the re-arm must also wait for the boot (#204): run right after the reset, `interrupt` → `continue --background` left `0x41` at the breakpoint and the canary dead, and `pry resync` reports it `unreadable` (`0 armed, 1 not armed`). Once `qmu wait --vm <vm> --pattern 'login:'` matched, `pry --instance qmu-<vm> resync` re-armed it (`1 armed`, `0xcc` back, the canary fired; after a halted reset, `qmu cont` first and `continue --background` after, as above). Under TCG there is nothing to re-arm unless the reset landed at a stop (then `interrupt` → `continue --background` after `qmu cont`). |
 | A **hardware watchpoint** doesn't fire on a write you can prove happened | Wrong virtual address (alias), see above. | Watch the VA the write goes through; `--no-kvm` only to rule out a KVM guest-debug limitation. |
 
 The recoveries above name `qmu-<vm>`, the bridge `qmu gdb` spawned; so do the
@@ -273,7 +287,9 @@ breakpoints then too — measured `0xcc` → `0x41`), but only the client knows
 whether it took that stop: qmu asks `pry status` of the bridge it spawned when
 that bridge is the attached client — and only while QEMU is already paused,
 because a pry command against a target GDB believes stopped halts a running
-VM — and says `possible` for any other client. A running guest under the
+VM — and says `possible` for any other client, with a warning of its own when
+QEMU was `paused` before and after the save: if your debugger took that stop,
+the image holds none of its breakpoints (#229). A running guest under the
 bridge qmu spawned is stopped for the save first (below), so its saves read
 `lifted`.
 
@@ -331,9 +347,19 @@ JSON (`--format json`): `debugger` carries `action` (`resynced` /
   differs from the symbol file (`elf_match: false`) are the kernel's own
   boot-time patching (the breakpoint is where you set it), since the symbols
   sit at the kernel's base — `nokaslr`, or the base `pry kbase` validated: a
-  text note only. Text mode prints the receipt (the `pry kbase` line, then
+  text note only. **Stray traps** (#230): pry's resync (pry #83) also writes
+  the symbol file's bytes over every trap in mapped code that no breakpoint
+  owns (`resync.stray_traps[]`, `summary.stray_traps`/`stray_repaired`);
+  qmu names each one it touched — address and function, guest → ELF bytes,
+  repaired or not — in the receipt and in one `warnings[]` entry, because
+  that is kernel text rewritten: after a load most likely an `int3` a
+  `possible` save baked into the image, after a reset (none is expected)
+  possibly code the kernel patched that pry took for a trap (pry #88). A
+  crash in one of those functions afterwards is a debugger artifact. Text
+  mode prints the receipt (the `pry kbase` line, then
   `Re-synced the pry bridge qmu-<vm> …: N armed, M not armed; target S.`
-  plus one line per location) on stderr, never on stdout; `target running
+  — `K stray trap(s), R repaired;` before `target` when pry found any —
+  plus one line per location and per stray trap) on stderr, never on stdout; `target running
   (qmu resumed it)` after a re-sync at qmu's stop. `state: "stopped"` (a load
   into a debug stop) means resume with `pry --instance qmu-<vm> continue
   --background`; qmu does not resume it (a warning says so when QEMU ran the
@@ -359,6 +385,16 @@ JSON (`--format json`): `debugger` carries `action` (`resynced` /
   save route (`snapshot save`, `monitor savevm`, `qmp human-monitor-command
   savevm`) adds `breakpoints_lifted: true` next to `breakpoints_in_image:
   "lifted"` (#227).
+
+**qmu's stop ends your `pry wait` (#228).** The stop qmu takes for a save, a
+load or a reset is the public `pry interrupt`, so it ends any `pry wait` or
+foreground `pry continue` running on `qmu-<vm>` at that moment: it returns
+exit 0 with `reason: signal SIGINT` at whatever the vCPU was running
+(measured: a `pry wait --timeout 60` in flight returned after 4.6 s across a
+`snapshot save`, 3.7 s across a nokaslr `snapshot load`), and qmu resumes
+the target a moment later, so that stop is already over. It is qmu's, not a
+hit: `pry wait` again. The text receipt says so whenever qmu's interrupt
+stopped a running target (`interrupted: true`).
 
 The operation's own result and exit code are unchanged either way: a load,
 reset or save that succeeded is `ok: true`, exit 0, whatever happened to the

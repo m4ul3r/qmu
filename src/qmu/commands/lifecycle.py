@@ -2384,8 +2384,8 @@ def _wait_standalone(
                 # This wait is what tells the debugger (#184): the next
                 # command must not announce the same reboot again.
                 inst = debug_mod.mark_debugger_epoch(inst, banner, banners=1)
-            # #46: a reset drops the gdbstub breakpoint set without telling the
-            # client. A reset qmu did not issue is seen here mid-wait (between
+            # #46: a reset overwrites the software breakpoints' int3s without
+            # telling the client. A reset qmu did not issue is seen here mid-wait (between
             # commands, `debug.check_unwarned_reboot` catches it, #184).
             # Collected once for the Result (#121): `render` writes it to
             # stderr exactly once and the envelope carries it in `warnings[]`.
