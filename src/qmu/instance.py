@@ -176,6 +176,16 @@ def save_guest_epoch_serial_offset(
     return updated
 
 
+def save_ssh_severed(inst: VMInstance, cause: str) -> VMInstance:
+    """Persist that every SSH session to the guest is being cut now, and why
+    (`ssh_severed_at`/`ssh_severed_by`, #221). Written by the qmu command or
+    the daemon that cuts them, before it does, so the severed command reads
+    it when its ssh exits 255."""
+    updated = replace(inst, ssh_severed_at=time.time(), ssh_severed_by=cause)
+    save_instance(updated)
+    return updated
+
+
 def load_instance(vm_id: str) -> VMInstance | None:
     path = instance_json_path(vm_id)
     if not path.exists():

@@ -12,7 +12,6 @@ import json
 import re
 import shutil
 import subprocess
-import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -24,6 +23,7 @@ from ..instance import (
     proc_pid_start,
     save_guest_epoch_serial_offset,
     save_instance,
+    save_ssh_severed,
 )
 from ..snapshot import (
     SAVEVM_BASE_SECONDS,
@@ -344,9 +344,8 @@ def _sever_sessions(inst: VMInstance, cause: str) -> VMInstance:
     """
     if inst.ssh_port is None:
         return inst  # no SSH endpoint, no session to sever
-    inst = replace(inst, ssh_severed_at=time.time(), ssh_severed_by=cause)
     try:
-        save_instance(inst)
+        inst = save_ssh_severed(inst, cause)
     except OSError:
         pass  # best-effort, like the teardown: the severed command keeps the old wording
     _drop_ssh_master(inst)
@@ -634,9 +633,17 @@ def _persist_epoch(inst: VMInstance, offset: int) -> VMInstance:
 def _handle_snapshot_load(args: argparse.Namespace) -> Result:
     inst = _choose_running(args.vm, "snapshot load")
     epoch_offset = serial_log_offset(inst.serial_log)
-    inst = _sever_sessions(inst, "snapshot load")
+
+    def sever() -> None:
+        # Only once `loadvm` is about to run: a tag the pre-check refuses
+        # mutates nothing, so it must not cut the commands in flight either
+        # (review of #221: a refused load cut an exec whose process then
+        # ran on, while the exec said it had been rewound away).
+        nonlocal inst
+        inst = _sever_sessions(inst, "snapshot load")
+
     with _qmp_ctx(inst) as qmp:
-        result = load_snapshot(qmp, args.name)
+        result = load_snapshot(qmp, args.name, before_restore=sever)
     if result.ok:
         inst = _persist_epoch(inst, epoch_offset)
         inst = _sever_sessions(inst, "snapshot load")

@@ -376,10 +376,17 @@ load`/`save` and the raw `loadvm`/`savevm`/`system_reset` routes tear the
 ControlMaster down through `qmp_cmds._sever_sessions`, which first stamps
 the record (`ssh_severed_at`/`ssh_severed_by`) — before the teardown, so
 the severed command cannot read the record first — and returns the stamped
-instance, which a caller that persists again must carry. `guest._severed_by`
-(checked in `_ssh_255_payload` after `_never_started`, before the probe)
-reads that stamp at or after the command's start, else a kernel boot banner
-past its start (`"guest reboot"`), and `_severed_payload` answers exit 4,
+instance, which a caller that persists again must carry. `snapshot load`
+severs only once its tag passed the pre-check (`load_snapshot(...,
+before_restore=)`): a refused name mutates nothing and cut an exec whose
+process then ran on. A guest-requested QMP RESET (`"guest": true`) is
+stamped `"guest reboot"` by the daemon's `_persist_reset`, before it drops
+the master. `guest._severed_by` (checked in `_ssh_255_payload` after
+`_never_started`, before the probe and once after it) reads that stamp at or
+after the command's start — nothing else: a boot banner is not a reboot,
+`dmesg > /dev/console` reprints it with the session intact and the guest
+command's 255 genuine, so a reboot with the daemon off takes the probe —
+and `_severed_payload` answers exit 4,
 `ssh_error: true`, `exit_code: null`, `severed_by` (3 only for a reboot after
 a fresh report). The restored or rebooted guest answers the probe, which is
 why this used to be "the guest command exited 255" with a hint at an empty

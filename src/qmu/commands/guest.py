@@ -38,7 +38,6 @@ from ..instance import (
     load_instance,
 )
 from ..serial import (
-    count_boot_banners,
     current_boot_offset,
     extract_crash,
     has_terminal_panic,
@@ -631,55 +630,76 @@ def _ssh_lost_payload(
 
 
 # Who cut an in-flight guest command's SSH session (#221), as a reader
-# recognises it, and what that did to the command.
-_SEVER_SOURCES: dict[str, tuple[str, str]] = {
+# recognises it, what that certainly did, and the recovery — worded to hold
+# for every outcome of the cut: a load that QEMU then refuses rewinds
+# nothing, and its command's process runs on.
+_LOAD_RECOVERY = (
+    "If the load succeeded, the guest was rewound and the command's process "
+    "with it: re-run it on the restored guest. If it was refused "
+    "(`restore_state: \"none\"`), nothing was rewound and the process may "
+    "still be running in the guest: check before re-running it."
+)
+_SAVE_RECOVERY = (
+    "The guest kept running; the command dies on its next stdout/stderr "
+    "write. Re-run it after the save, or start a command that must outlive "
+    "a save detached: setsid nohup CMD > /root/out.log 2>&1 < /dev/null &"
+)
+_REBOOT_RECOVERY = (
+    "Check the guest once it serves (qmu status --vm {vm}) and re-run the "
+    "command if it still needs to run."
+)
+_SEVER_SOURCES: dict[str, tuple[str, str, str]] = {
     "snapshot load": (
         "qmu snapshot load",
-        "the guest was rewound to the snapshot, so the command's process "
-        "belongs to the discarded timeline",
+        "it closes the VM's SSH ControlMaster right before `loadvm`",
+        _LOAD_RECOVERY,
     ),
     "loadvm": (
         "a raw qmu monitor/qmp `loadvm`",
-        "the guest was rewound to the snapshot, so the command's process "
-        "belongs to the discarded timeline",
-    ),
-    "system_reset": (
-        "a raw qmu qmp/monitor `system_reset`",
-        "the guest was reset and boots again",
+        "it closes the VM's SSH ControlMaster right before `loadvm`",
+        _LOAD_RECOVERY,
     ),
     "snapshot save": (
         "qmu snapshot save",
-        "it closes the VM's SSH ControlMaster before saving; the command "
-        "dies on its next stdout/stderr write",
+        "it closes the VM's SSH ControlMaster before saving",
+        _SAVE_RECOVERY,
     ),
     "savevm": (
         "a raw qmu monitor/qmp `savevm`",
-        "it closes the VM's SSH ControlMaster before saving; the command "
-        "dies on its next stdout/stderr write",
+        "it closes the VM's SSH ControlMaster before saving",
+        _SAVE_RECOVERY,
+    ),
+    "system_reset": (
+        "a raw qmu qmp/monitor `system_reset`",
+        "it closes the VM's SSH ControlMaster and resets the guest",
+        _REBOOT_RECOVERY,
     ),
     "guest reboot": (
         "a guest reboot",
-        "a new kernel boot banner is in the serial log",
+        "QEMU reported a reset the guest itself requested",
+        _REBOOT_RECOVERY,
     ),
 }
 
 
-def _severed_by(inst: VMInstance, *, started_at: float, start_offset: int) -> str | None:
+def _severed_by(inst: VMInstance, *, started_at: float) -> str | None:
     """What cut a guest command's session after it started, if anything.
 
-    Two signals, neither written by the guest program: the record's
-    `ssh_severed_at` stamp (`qmp_cmds._sever_sessions`, made by a qmu
-    command that tears the ControlMaster down) at or after `started_at`,
-    and a kernel boot banner past `start_offset` (the same log-local ground
-    truth every boot-scope reader uses). A session cut either way used to be
-    reported as the guest command exiting 255 (#221).
+    The one signal is the record's `ssh_severed_at`/`ssh_severed_by` stamp
+    at or after `started_at`, written just before the cut by whoever made
+    it: the qmu command that tears the ControlMaster down for a load, save
+    or reset (`qmp_cmds._sever_sessions`), or the daemon when QEMU reports
+    a guest-requested RESET (`"guest reboot"`). A session cut either way
+    used to be reported as the guest command exiting 255 (#221). Nothing
+    the guest can write decides it: a boot banner in the serial log is not
+    a reboot — `dmesg > /dev/console` reprints it verbatim with the session
+    intact and the guest command really exiting 255 (review of #221). So a
+    guest reboot with the daemon off is not attributed; it takes the probe.
     """
     record = load_instance(inst.vm_id)
     stamped = getattr(record, "ssh_severed_at", None)
     if isinstance(stamped, (int, float)) and stamped >= started_at:
         return record.ssh_severed_by or "snapshot load"
-    if count_boot_banners(inst.serial_log, start_offset=start_offset) > 0:
-        return "guest reboot"
     return None
 
 
@@ -697,26 +717,20 @@ def _severed_payload(
     """
     vm = inst.vm_id
     crash = extract_crash(inst.serial_log, start_offset=start_offset)
-    who, effect = _SEVER_SOURCES.get(cause, (cause, "the session was closed"))
+    who, effect, recovery = _SEVER_SOURCES.get(
+        cause, (cause, "the session was closed", _REBOOT_RECOVERY)
+    )
+    head = (
+        f"The command's SSH session was cut by {who} ({effect}), so its exit "
+        "status is unknown."
+    )
     if crash is not None:
         hint = (
-            f"The command's SSH session was cut by {who} ({effect}), and the "
-            f"kernel printed a crash report while it ran; read it with: qmu "
-            f"crash --vm {vm}"
-        )
-    elif cause in ("snapshot save", "savevm"):
-        hint = (
-            f"The command's SSH session was cut by {who} ({effect}); its exit "
-            "status is unknown. Re-run it after the save, or start a command "
-            "that must outlive a save detached: setsid nohup CMD > "
-            "/root/out.log 2>&1 < /dev/null &"
+            f"{head} The kernel printed a crash report while it ran; read it "
+            f"with: qmu crash --vm {vm}"
         )
     else:
-        hint = (
-            f"The command's SSH session was cut by {who} ({effect}), so its "
-            f"exit status is unknown. Re-run it once the guest serves: qmu "
-            f"status --vm {vm}"
-        )
+        hint = f"{head} {recovery.format(vm=vm)}"
     status = 3 if crash is not None and cause == "guest reboot" else 4
     result: dict[str, Any] = {
         "ok": False,
@@ -749,9 +763,10 @@ def _ssh_255_payload(
     exchange`, :func:`_never_started`) settles it without a probe: the
     command never ran, so a sshd that comes up during the probe window must
     not turn it into "the guest command exited 255" (#177). A session qmu
-    itself cut (a snapshot load/save, a raw reset) or a guest reboot cut
-    (:func:`_severed_by`) is next: the restored or rebooted guest answers the
-    probe, which then called the cut the guest program exiting 255 (#221).
+    itself cut (a snapshot load/save, a raw reset) or the daemon saw a guest
+    reboot cut (:func:`_severed_by`) is next: the restored or rebooted guest
+    answers the probe, which then called the cut the guest program exiting
+    255 (#221).
     Anything else is ambiguous and :func:`_transport_lost` probes. The
     guest's stdout/stderr decide nothing here: a guest command can print
     ssh's words itself (#199).
@@ -760,12 +775,12 @@ def _ssh_255_payload(
         return _ssh_lost_payload(
             command, inst, start_offset=start_offset, connected=False
         )
-    cause = _severed_by(inst, started_at=started_at, start_offset=start_offset)
+    cause = _severed_by(inst, started_at=started_at)
     if cause is None:
         lost = _transport_lost(ssh, inst)
-        # A reboot's banner usually lands while the probe waits on the
-        # rebooting guest: the cut is visible only now.
-        cause = _severed_by(inst, started_at=started_at, start_offset=start_offset)
+        # The stamp may land while the probe runs (the daemon writes a
+        # guest reboot's from its own thread): read it once more.
+        cause = _severed_by(inst, started_at=started_at)
         if cause is None:
             return _ssh_lost_payload(command, inst, start_offset=start_offset) if lost else None
     return _severed_payload(command, inst, cause, start_offset=start_offset)

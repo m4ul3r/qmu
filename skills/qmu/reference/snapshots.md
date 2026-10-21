@@ -118,10 +118,13 @@ master: a `qmu exec`/`run`/`compile --run`/`dmesg` in flight when another
 pane loads (or saves, or resets) the VM is exit 4 with `ssh_error: true`,
 `exit_code: null` and `severed_by: "snapshot load"` (`"snapshot save"`,
 `"loadvm"`, `"savevm"`, `"system_reset"` for the other routes; `"guest
-reboot"` when a new kernel boot banner appeared under it) — never the guest
-program "exiting 255". Re-run it on the restored guest; a command started
-detached in the guest does not survive a load either, since the load rewinds
-its process too.
+reboot"` when the daemon saw QEMU report a guest-requested reset) — never
+the guest program "exiting 255". A tag `snapshot load` refuses before
+`loadvm` (not in `info snapshots`) tears nothing down and cuts nothing. A
+load that succeeded rewound the command's process too: re-run it on the
+restored guest (a command started detached does not survive a load
+either). One QEMU refused after the cut (`restore_state: "none"`) rewound
+nothing: the command may still be running, so check before re-running it.
 
 The guest wall clock resumes at the snapshot's save time and stays behind the
 host by the time since the save (cumulative across loads; a guest with

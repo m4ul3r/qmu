@@ -241,7 +241,7 @@ def test_snapshot_save_failure_does_not_add_int3_warning(monkeypatch, capsys):
 def test_snapshot_load_warns_stale_session_when_debugged(monkeypatch, capsys):
     inst = _gdb_inst(1234)
     _install_qmp_seams(monkeypatch, inst, present=True)
-    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name: _ok("Snapshot 'clean' loaded."))
+    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'clean' loaded."))
     # save_guest_epoch_serial_offset writes instance JSON; stub it to a no-op
     # that returns the instance so the handler proceeds offline.
     monkeypatch.setattr(qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst)
@@ -255,7 +255,7 @@ def test_snapshot_load_warns_stale_session_when_debugged(monkeypatch, capsys):
 def test_snapshot_load_silent_when_not_debugged(monkeypatch, capsys):
     inst = _gdb_inst(None)
     _install_qmp_seams(monkeypatch, inst, present=False)
-    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name: _ok("Snapshot 'clean' loaded."))
+    monkeypatch.setattr(qmp_cmds, "load_snapshot", lambda qmp, name, **kw: _ok("Snapshot 'clean' loaded."))
     monkeypatch.setattr(qmp_cmds, "save_guest_epoch_serial_offset", lambda inst, off: inst)
     monkeypatch.setattr(qmp_cmds, "serial_log_offset", lambda path: 0)
     rc = _run(qmp_cmds._handle_snapshot_load, _snap_args())
@@ -270,7 +270,7 @@ def test_snapshot_load_pre_restore_refusal_does_not_warn_stale(monkeypatch, caps
     _install_qmp_seams(monkeypatch, inst, present=True)
     monkeypatch.setattr(
         qmp_cmds, "load_snapshot",
-        lambda qmp, name: SnapshotResult(
+        lambda qmp, name, **kw: SnapshotResult(
             False, "Error: Snapshot 'clean' does not exist", reason="missing",
             restore_state="none",
         ),
@@ -297,7 +297,7 @@ def test_snapshot_load_failure_after_restoration_began_warns_stale(
     _install_qmp_seams(monkeypatch, inst, present=True)
     monkeypatch.setattr(
         qmp_cmds, "load_snapshot",
-        lambda qmp, name: SnapshotResult(
+        lambda qmp, name, **kw: SnapshotResult(
             False, "Error: Error -22 while loading VM state", reason="hmp",
             guest_paused=True, restore_state=restore_state,
         ),

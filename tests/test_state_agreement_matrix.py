@@ -34,6 +34,7 @@ from qmu.instance import (
     VMInstance,
     classify_vm,
     save_instance,
+    save_ssh_severed,
 )
 from qmu.ssh import GuestText, SSHAborted, SSHError
 from tests.test_daemon import FakeQMPServer, daemon_env  # noqa: F401 — fixture
@@ -2379,13 +2380,15 @@ class _ServingAfterCutSSH:
         return True
 
 
-@pytest.mark.parametrize("cause", ["snapshot load", "guest reboot"])
+@pytest.mark.parametrize("cause", ["snapshot load", "guest reboot", "banner replay"])
 def test_every_ssh_command_agrees_on_a_session_cut_under_it(
     cause, cache, monkeypatch, capsys
 ):
-    """A session another pane's `snapshot load` (or a guest reboot) cut is a
-    transport loss qmu can name, on exec and dmesg alike — never the guest
-    command exiting 255, which the answering probe used to make of it."""
+    """A session another pane's `snapshot load` (or a guest reboot QEMU
+    reported) cut is a transport loss qmu can name, on exec and dmesg alike —
+    never the guest command exiting 255, which the answering probe used to
+    make of it. A boot banner the guest replays to its console is not a
+    reboot: the 255 stays the guest's on both."""
     inst = _ssh_capable_instance(cache)
     save_instance(inst)
     decoy = _decoy_running(monkeypatch)
@@ -2399,6 +2402,8 @@ def test_every_ssh_command_agrees_on_a_session_cut_under_it(
     def cut():
         if cause == "snapshot load":
             qmp_cmds._sever_sessions(inst, cause)
+        elif cause == "guest reboot":
+            save_ssh_severed(inst, cause)  # the daemon, on a guest-requested RESET
         else:
             with open(inst.serial_log, "a") as stream:
                 stream.write("[    0.000000] Linux version 7.0.0 (b@h) (gcc 13) #1 SMP\n")
@@ -2414,13 +2419,16 @@ def test_every_ssh_command_agrees_on_a_session_cut_under_it(
         views[command] = {
             "rc": rc,
             "ok": payload.get("ok"),
-            "ssh_error": payload.get("ssh_error"),
+            "ssh_error": payload.get("ssh_error") is True,
             "exit_code": payload.get("exit_code"),
             "severed_by": payload.get("severed_by"),
         }
-    expected = {
-        "rc": 4, "ok": False, "ssh_error": True, "exit_code": None, "severed_by": cause,
-    }
+    if cause == "banner replay":
+        expected = {"rc": 1, "ok": False, "ssh_error": False, "exit_code": 255, "severed_by": None}
+    else:
+        expected = {
+            "rc": 4, "ok": False, "ssh_error": True, "exit_code": None, "severed_by": cause,
+        }
     for command, view in views.items():
         assert view == expected, f"`qmu {command}` disagrees: {view}"
 
