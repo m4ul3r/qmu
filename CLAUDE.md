@@ -272,7 +272,7 @@ Never collapse them into one enum.
   - `panicked` — `serial.has_terminal_panic()` found `Kernel panic - not
     syncing`; the guest is gone and reaping is correct. SSH is not probed.
   - `paused` — QMP `running:false`; where `qmu gdb` leaves every VM until
-    `qmu cont`. The axis is coarse on purpose; `qemu_status` carries QEMU's
+    it is resumed. The axis is coarse on purpose; `qemu_status` carries QEMU's
     own word, and one value is load-bearing: **`restore-vm`** is a `snapshot
     load` that failed mid-restore (#87, disks rewound, devices not). `qmu
     cont` refuses it (exit 1, `guest_state: "paused"`, `qemu_status`,
@@ -693,7 +693,9 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   pry's `--format json` reports verbatim — never reshape them), text-mode
   stderr notes (the receipt; stdout stays the command's own) and warnings
   only when there is something to act on (not-armed locations, a teardown, a
-  skipped re-sync; `elf_match: false` is only a note, since the symbols sit at
+  skipped re-sync, a trap pry's resync wrote over — `resync.stray_traps[]`,
+  each address named in text and `warnings[]` because that is kernel text
+  rewritten, #230; `elf_match: false` is only a note, since the symbols sit at
   the kernel's base — nokaslr, or the base `pry kbase` just validated). The
   operation's exit code never changes. Every re-sync goes through
   `_resync_at_stop`, at a stop qmu holds: `pry interrupt`, on a KASLR guest
@@ -783,9 +785,24 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   `int3`s in it as `lifted` (reproduced through to an int3 panic on load).
   `paused` alone proves nothing qmu can check: a QMP `stop` is reported to
   the client as SIGINT and an attached GDB lifts its breakpoints then too,
-  but only the client knows it took that stop. `pry status` is asked only
+  but only the client knows it took that stop. So `paused` held across the
+  save with no stop qmu could confirm stays `possible` but gets its own
+  warning (#229): if the reader's debugger took that stop the image is clean,
+  and `pry resync` after a load repairs a trap left anyway — never the
+  save-at-a-stop recovery, which is the save just taken. `pry status` is asked only
   while QEMU is already paused — a pry command against a target GDB believes
   stopped halts a running VM.
+- **Resuming a debugger's stop (#225).** `qmu cont` resumes QEMU behind
+  GDB's back: GDB keeps believing the target stopped, with every breakpoint
+  lifted, and its next command (`pry status` included) halts the guest
+  again. So where a debugger holds the stop (`debug.debugger_resume`: QEMU
+  `debug`, or `paused` under the owned bridge) the paused refusal's `hint`
+  (`_cliutil._stopped_guest_payload`) leads with `pry --instance <ref>
+  continue --background`, `qmu gdb` names that resume, and `qmu cont` there
+  carries a warning. qmu's own stops (the drives above) are the public `pry
+  interrupt`, which ends an operator's in-flight `pry wait`/foreground `pry
+  continue` with `reason: signal SIGINT` (#228, until qmu uses pry's hold
+  primitive, pry #99); the receipts say so.
 - Guest reboots nobody issued (#184): `VMInstance.debugger_epoch_offset`/
   `_banners` record the generation the debugger was last told about (`qmu
   gdb` attach, a reset — whose own banner is still to come, so `banners=1` —
@@ -799,8 +816,10 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   in every mode plus the envelope's `warnings[]` under json/ndjson (#74), so
   the stdout JSON stays one object: `snapshot save` (#45, baked-in `int3`s),
   `snapshot load` (#44, stale stop reason, breakpoints gone from RAM under
-  KVM), `qmp`/`monitor system_reset` (#46, dropped breakpoint set under KVM,
-  stranded by KASLR either way; with QEMU's post-reset run state — a reset at
+  KVM), `qmp`/`monitor system_reset` (#46/#231, software breakpoints' int3s
+  overwritten by the new boot under KVM while hardware breakpoints and
+  watchpoints stay armed at their addresses, stranded by KASLR either way;
+  with QEMU's post-reset run state — a reset at
   a debugger stop leaves the vCPU in `prelaunch`, which `pry continue` does
   not start, so the warning says `qmu cont` first), a guest reboot (#184),
   and `kill` (#40, stranded pry bridge). The

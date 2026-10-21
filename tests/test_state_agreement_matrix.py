@@ -2391,16 +2391,35 @@ _HALTED_ARGV = {
 }
 
 
+@pytest.mark.parametrize("holder", ["no debugger", "qmu bridge", "other client"])
 @pytest.mark.parametrize("output_format", ["text", "json"])
 def test_every_ssh_command_agrees_on_a_vcpu_halted_mid_command(
-    output_format, cache, monkeypatch, capsys, tmp_path
+    output_format, holder, cache, monkeypatch, capsys, tmp_path
 ):
     """A breakpoint fires while exec / dmesg / push / pull / compile run: no
     serial output, no transport drop — only QMP knows. Every command aborts
     on the watcher's QMP poll and reports the preflight's paused envelope
-    (exit 1, `guest_state: paused`, the `qmu cont` hint), never the 20 s
-    keepalive stall into the crash/transport class, in both renderings."""
+    (exit 1, `guest_state: paused`, the resume hint), never the 20 s
+    keepalive stall into the crash/transport class, in both renderings.
+
+    #225: with a debugger attached the `debug` stop is the debugger's: every
+    command leads with its resume (`qmu-<vm>` for the bridge `qmu gdb`
+    spawned, `<id>` for another client) and none offers `qmu cont` as the
+    resume, which would run the guest with every breakpoint lifted."""
+    from dataclasses import replace
+
+    from qmu import debug
+
     inst = _ssh_capable_instance(cache)
+    if holder != "no debugger":
+        inst = replace(inst, gdb_port=1234)
+        monkeypatch.setattr(debug, "gdb_client_attached", lambda i: True)
+        monkeypatch.setattr(debug, "bridge_holds_stub", lambda i: holder == "qmu bridge")
+    resume = {
+        "no debugger": f"qmu cont --vm {VM}",
+        "qmu bridge": f"pry --instance qmu-{VM} continue --background",
+        "other client": "pry --instance <id> continue --background",
+    }[holder]
     decoy = _decoy_running(monkeypatch)
     for mod in (lifecycle, instance_mod):
         monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
@@ -2432,11 +2451,11 @@ def test_every_ssh_command_agrees_on_a_vcpu_halted_mid_command(
             assert payload["crash_detected"] is False, command
             assert payload["ssh_error"] is False, command
             assert payload["vm_id"] == VM, command
-            assert f"qmu cont --vm {VM}" in payload["hint"], command
+            assert f"Resume with: {resume}" in payload["hint"], command
         else:
             out = captured.out + captured.err
-            assert f"VM '{VM}' is debug (vCPU halted)." in out, command
-            assert f"Resume with: qmu cont --vm {VM}" in out, command
+            assert f"VM '{VM}' is debug (vCPU halted" in out, command
+            assert f"Resume with: {resume}" in out, command
             assert "crash" not in out.lower(), command
 
 

@@ -358,6 +358,55 @@ def _bridge_ref(inst: Any) -> tuple[str, str]:
     return "<id>", " (<id>: your bridge's pid or --instance-id, from `pry doctor`)"
 
 
+def debugger_resume(inst: Any, qemu_status: str | None) -> tuple[str, str] | None:
+    """`(command, gloss)` resuming a halted guest a debugger holds (#225).
+
+    `debug` is a gdbstub stop (breakpoint, watchpoint, step) and nothing
+    else; `paused` under the bridge `qmu gdb` spawned is its attach or its
+    interrupt. GDB lifts its breakpoints at a stop and puts them back only
+    when it resumes, so a QMP `cont` (`qmu cont`) there runs the guest with
+    every breakpoint lifted, behind GDB's back: GDB still believes the target
+    stopped, and its next command (`pry status` included) halts the guest
+    again. None when no debugger can be holding this stop: `qmu cont` is the
+    resume then.
+    """
+    if qemu_status == "debug" and debug_session_present(inst):
+        ref, gloss = _bridge_ref(inst)
+        return f"pry --instance {ref} continue --background", gloss
+    if qemu_status == "paused" and qmu_bridge_attached(inst):
+        return f"pry --instance {bridge_instance_id(inst.vm_id)} continue --background", ""
+    return None
+
+
+CONT_BEHIND_DEBUGGER = (
+    "`qmu cont` resumes the guest behind the debugger's back: every breakpoint "
+    "stays lifted, and GDB, still believing the target stopped, halts it again "
+    "on its next command (`pry status` included)"
+)
+
+
+def cont_behind_debugger_warning(inst: Any, before: str | None) -> str | None:
+    """#225 — `qmu cont` resumed a stop a debugger holds (`debugger_resume`).
+
+    Running with no breakpoint in RAM is sometimes the point (reading the
+    kernel base over SSH before a rebase, `_left_stopped_unrebased`), so the
+    warning names the debugger's resume for the guest that should run under
+    it, and what to expect either way.
+    """
+    resume = debugger_resume(inst, before)
+    if resume is None:
+        return None
+    command, gloss = resume
+    return (
+        f"[qmu] WARNING: VM '{inst.vm_id}' was at a debugger stop (QEMU "
+        f"'{before}'); {CONT_BEHIND_DEBUGGER}. To run it under the debugger, "
+        f"resume through it instead, which also works now: `{command}`{gloss} "
+        "(GDB re-inserts its breakpoints when it resumes). If you meant it to "
+        "run with no breakpoint armed (e.g. to read the kernel base over SSH "
+        "first), expect the debugger's next command to halt it.\n"
+    )
+
+
 _PRY_STATUS_TIMEOUT = 5.0
 
 
@@ -639,6 +688,75 @@ def _stale_note(stop: BridgeStop, event: str) -> str:
     )
 
 
+def _waiters_note(stop: BridgeStop, event: str, resumed: bool) -> str | None:
+    """#228: qmu's stop is the public `pry interrupt`, which ends whatever the
+    operator has in flight on the same bridge with a stop of its own; say so,
+    or an agent takes that stop for a real one. Only a stop pry actually made
+    (`interrupted`) ends a waiter: on a target GDB believed stopped none can
+    be waiting."""
+    if stop.report.get("interrupted") is not True:
+        return None
+    ident = bridge_instance_id(stop.inst.vm_id)
+    after = (
+        "which qmu then resumed: that stop was qmu's, not a hit, so wait again"
+        if resumed
+        else "and the target is still at that stop"
+    )
+    return (
+        f"[qmu] qmu's `pry interrupt` for {event} ended any `pry wait` or "
+        f"foreground `pry continue` running on {ident} with a `reason: signal "
+        f"SIGINT` stop, {after}."
+    )
+
+
+def _stray_line(trap: dict[str, Any]) -> str:
+    """One `stray_traps` entry of a `pry resync` report: where, the bytes
+    pry found and the symbol file's, and what pry did."""
+    where = str(trap.get("address", "?"))
+    if trap.get("function"):
+        where += f" ({trap['function']})"
+    if not trap.get("trap_in_memory"):
+        return f"{where}: a breakpoint the stub recorded for nobody, no trap in memory; dropped"
+    found = f"guest {trap.get('guest_bytes', '?')}"
+    if trap.get("elf_bytes"):
+        found += f" → ELF {trap['elf_bytes']}"
+    return f"{where}: {found}, " + (
+        "repaired" if trap.get("repaired") else "NOT repaired (it still traps)"
+    )
+
+
+def _stray_warning(inst: Any, event: str, strays: list[dict[str, Any]]) -> str:
+    """#230: `pry resync` (pry #83) writes the symbol file's bytes over every
+    trap in mapped code that no breakpoint owns. That is kernel text qmu had
+    rewritten, and pry has taken patched code for a trap before (pry #88), so
+    the receipt names every address it touched, in every mode."""
+    ident = bridge_instance_id(inst.vm_id)
+    repaired = sum(bool(t.get("repaired")) for t in strays)
+    if event == "system_reset":
+        origin = (
+            "A reboot loads the kernel afresh, so none is expected after it: "
+            "pry may have taken code the kernel patched for a trap (pry #88)."
+        )
+    else:
+        origin = (
+            "They are most likely int3 bytes baked into the image by a save "
+            "that reported `breakpoints_in_image: \"possible\"`."
+        )
+    return (
+        f"[qmu] WARNING: VM '{inst.vm_id}': the `pry resync` qmu ran on {ident} "
+        f"after {event} found {len(strays)} trap(s) in kernel code that no "
+        f"breakpoint owned and wrote the symbol file's bytes over {repaired}: "
+        + "; ".join(_stray_line(t) for t in strays)
+        + f". {origin} An unexpected crash in one of these functions after "
+        f"{event} is a debugger artifact (a trap left in the code, or a byte pry "
+        "wrote over code the kernel patched), not your PoC's.\n"
+    )
+
+
+def _strays(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return [t for t in report.get("stray_traps") or [] if isinstance(t, dict)]
+
+
 def _resynced(
     inst: Any, event: str, report: dict[str, Any], *,
     kbase: dict[str, Any] | None = None, stop: BridgeStop | None = None,
@@ -655,12 +773,19 @@ def _resynced(
     resumed = taken and resume_error is None
     state = "running (qmu resumed it)" if resumed else report.get("state", "unknown")
     entries = _entries(report)
+    strays = _strays(report)
+    stray_count = (
+        f"{len(strays)} stray trap(s), {sum(bool(t.get('repaired')) for t in strays)} "
+        "repaired; "
+        if strays else ""
+    )
     notes = [_kbase_note(ident, kbase)] if kbase is not None else []
     notes += [
         f"[qmu] Re-synced the pry bridge {ident} (pid {inst.gdb_bridge_pid}) "
         f"after {event}: {summary.get('armed', 0)} armed, "
-        f"{summary.get('not_armed', 0)} not armed; target {state}.",
+        f"{summary.get('not_armed', 0)} not armed; {stray_count}target {state}.",
         *(f"  {_entry_line(e)}" for e in entries),
+        *(f"  stray trap {_stray_line(t)}" for t in strays),
     ]
     warnings: list[str] = []
     if resume_error is not None:
@@ -687,6 +812,12 @@ def _resynced(
         )
     if resumed and stop.stale:
         notes.append(_stale_note(stop, event))
+    if taken:
+        waiters = _waiters_note(stop, event, resumed)
+        if waiters is not None:
+            notes.append(waiters)
+    if strays:
+        warnings.append(_stray_warning(inst, event, strays))
     not_armed = [e for e in entries if e.get("status") in _NOT_ARMED]
     mismatch = [
         e for e in entries
@@ -1086,6 +1217,8 @@ def resume_bridge_after_save(stop: BridgeStop, event: str) -> BridgeDrive:
         ))
     error = _pry_continue(inst)
     data["resumed"] = error is None
+    waiters = _waiters_note(stop, event, error is None)
+    ended = (waiters,) if waiters is not None else ()
     if error is None:
         if stop.stale:
             return BridgeDrive(data=data, notes=(_stale_note(stop, event),))
@@ -1093,9 +1226,10 @@ def resume_bridge_after_save(stop: BridgeStop, event: str) -> BridgeDrive:
             f"[qmu] Stopped the pry bridge {ident} (pid {ref['bridge_pid']}) for "
             f"{event}, so GDB had lifted its breakpoints from guest RAM while QEMU "
             "saved, then resumed it (`pry continue --background`).",
+            *ended,
         ))
     data["resume_error"] = error
-    return BridgeDrive(data=data, warnings=(
+    return BridgeDrive(data=data, notes=ended, warnings=(
         f"[qmu] WARNING: VM '{inst.vm_id}': qmu stopped the pry bridge {ident} "
         f"for {event} and could not resume it ({error}); the guest is halted in "
         f"the debugger: `pry --instance {ident} continue --background`.\n",
@@ -1172,8 +1306,8 @@ def savevm_breakpoint_state(
 # --- Guest generations the debugger was not told about (#184) ----------------
 #
 # A reboot the guest starts itself (panic=N, a watchdog, a triple fault, sysrq)
-# drops the gdbstub's breakpoints and re-slides KASLR exactly like a qmu
-# `system_reset`, but no qmu command issued it. Its kernel boot banner is in
+# overwrites the software breakpoints' int3s and re-slides KASLR exactly like a
+# qmu `system_reset`, but no qmu command issued it. Its kernel boot banner is in
 # the serial log either way, so every command that resolves a running VM
 # compares the banners past the recorded debugger epoch with the ones already
 # accounted for, warns once through the dispatch (`coherence_warnings`), and
@@ -1345,10 +1479,11 @@ def loadvm_stale_session_warning(inst: Any) -> str:
     )
     baked = (
         " An image whose save said `breakpoints_in_image: possible` can bring "
-        f"int3 bytes back: `pry --instance {ref} resync` restores one at a site "
-        "that still has a breakpoint, but one whose breakpoint was deleted "
-        "before the load stays in RAM and traps — load a `lifted` image or "
-        "reboot instead."
+        "int3 bytes back, also at a site whose breakpoint was deleted before the "
+        f"load: `pry --instance {ref} resync` (pry #83) writes the symbol file's "
+        "bytes back over every trap no breakpoint owns in the code it can map "
+        "and lists each one under `stray_traps`; only a trap in code no loaded "
+        "symbol file maps needs a `lifted` image or a reboot instead."
     )
     if _kaslr_off(inst):
         return lead + (
@@ -1380,21 +1515,61 @@ def loadvm_failed_restore_warning(inst: Any) -> str:
     )
 
 
-def savevm_breakpoint_warning(inst: Any, qemu_status: str | None) -> str:
-    """#45/#188 — a save taken outside a debugger stop can hold int3 bytes."""
+def savevm_breakpoint_warning(
+    inst: Any, qemu_status: str | None, after: str | None = None
+) -> str:
+    """#45/#188 — a save taken outside a debugger stop can hold int3 bytes.
+
+    `qemu_status`/`after` are QEMU's run state right before and right after
+    the save. `paused` held across the whole save is a stop qmu could not
+    attribute (#229): a debugger that took it had lifted its breakpoints, but
+    qmu can ask only the bridge it spawned. Repeating the save-at-a-stop
+    recovery there sent the reader round in a loop, since that save is this
+    one; it says what the stop means instead, and what repairs a baked trap.
+    """
     ref, gloss = _bridge_ref(inst)
     state = qemu_status or "unknown"
+    trap = (
+        "after `qmu snapshot load`, reaching one raises a trap with no live "
+        "breakpoint behind it — an Oops/panic at the breakpointed function that "
+        "looks exactly like your PoC crashing the kernel."
+    )
+    if qemu_status == "paused" and after == "paused":
+        who = (
+            "the bridge `qmu gdb` spawned did not report a stop when asked (`pry "
+            "status`)"
+            if not gloss
+            else "qmu can ask only the bridge `qmu gdb` spawned, not the client "
+            "attached now"
+        )
+        return (
+            f"[qmu] WARNING: VM '{inst.vm_id}' has a GDB stub and was saved while "
+            f"QEMU reported 'paused' before and after the save, a stop qmu could "
+            f"not attribute to a debugger ({who}), so it says `possible`. If your "
+            "debugger took this stop (its interrupt, or a QMP `stop`, which GDB "
+            "sees as SIGINT), GDB had lifted its breakpoints and the image holds "
+            "none of them. If it did not, or a debugger that detached uncleanly "
+            "left int3 (0xCC) bytes in guest RAM, the image may carry some: "
+            + trap
+            + f" After a load, `pry --instance {ref} resync`{gloss} writes the "
+            "symbol file's bytes back over any trap no breakpoint owns in the code "
+            "it can map, and lists each one under `stray_traps`."
+        )
+    foreign = (
+        " (qmu cannot confirm a stop of a client it did not spawn, so that save "
+        "says `possible` too, with a warning saying what a stop you took means)"
+        if gloss else ""
+    )
     return (
         f"[qmu] WARNING: VM '{inst.vm_id}' has a GDB stub and was saved while "
         f"QEMU reported '{state}', not a debugger stop qmu could confirm. A "
         "software breakpoint is an int3 (0xCC) byte in guest RAM whenever the "
-        "debugger has the target running, so this image may carry some: after "
-        "`qmu snapshot load`, reaching one raises a trap with no live "
-        "breakpoint behind it — an Oops/panic at the breakpointed function that "
-        "looks exactly like your PoC crashing the kernel. For a clean image, "
-        f"save at a stop: `pry --instance {ref} interrupt`, `qmu snapshot save "
-        f"--vm {inst.vm_id} <tag>`, then `pry --instance {ref} continue "
-        f"--background`{gloss}."
+        "debugger has the target running, so this image may carry some: "
+        + trap
+        + " For a clean image, save at a stop: "
+        f"`pry --instance {ref} interrupt`, `qmu snapshot save --vm {inst.vm_id} "
+        f"<tag>`, then `pry --instance {ref} continue --background`{gloss}"
+        f"{foreign}."
     )
 
 
@@ -1404,26 +1579,31 @@ def savevm_lifted_note(inst: Any, qemu_status: str | None) -> str:
         f"[qmu] Note: VM '{inst.vm_id}' was saved at a debugger stop "
         f"('{qemu_status}'), where GDB has lifted its breakpoints, so this image "
         "holds no int3 for a breakpoint the debugger lists. The exception is an "
-        "int3 nothing tracks: one a `possible` image brought back on load at a "
-        "site that has no breakpoint now stays in RAM and in the image."
+        "int3 nothing tracks: one a `possible` image brought back on load that "
+        "no `pry resync` has repaired since (pry #83 repairs one in the code it "
+        "can map, listed under `stray_traps`) is still in RAM, so in this image."
     )
 
 
 def reset_dropped_breakpoints_warning(
     inst: Any, *, guest_initiated: bool = False, qemu_status: str | None = None
 ) -> str:
-    """#46/#184 — a reset leaves the debugger's breakpoints dead, silently.
+    """#46/#184/#231 — a reset leaves the debugger's software breakpoints dead, silently.
 
-    Under KVM the reset takes them out of guest RAM while GDB still lists them
-    inserted; under TCG QEMU keeps them, at their old virtual addresses. Either
-    way KASLR re-slides the kernel on every boot, so the symbol file pry loaded
-    against the old base resolves to addresses nothing executes (debug audit
-    R25–R26). The recovery re-derives the base once the new kernel is up —
-    `pry kbase` with no SSH (pry #66) or `qmu kbase` over it — and re-arms
-    with `pry resync`, which stops a running target itself (pry #61). Under
-    KVM a nokaslr kernel keeps its addresses, but a breakpoint re-inserted
-    before the new boot is done is overwritten by it, so that re-arm waits
-    for the boot too (#204).
+    Under KVM a software breakpoint is an int3 in guest RAM, and the new boot
+    loads the kernel over it while GDB still lists it inserted; hardware
+    breakpoints and watchpoints live in the vCPU's debug registers, not in
+    RAM, and keep firing at their addresses (measured: a hardware breakpoint
+    hit after a `sysrq b` reboot with no re-arm, and a watchpoint trapped on
+    the boot's own `sethostname` after a nokaslr reset). Under TCG QEMU keeps
+    them all, at their old virtual addresses. Either way KASLR re-slides the
+    kernel on every boot, so the symbol file pry loaded against the old base
+    resolves to addresses nothing executes (debug audit R25–R26). The
+    recovery re-derives the base once the new kernel is up — `pry kbase` with
+    no SSH (pry #66) or `qmu kbase` over it — and re-arms with `pry resync`,
+    which stops a running target itself (pry #61). Under KVM a nokaslr kernel
+    keeps its addresses, but a breakpoint re-inserted before the new boot is
+    done is overwritten by it, so that re-arm waits for the boot too (#204).
 
     `qemu_status` is QEMU's run state right after the reset, when known. A
     reset that lands while the debugger is at a stop leaves the vCPU halted at
@@ -1444,11 +1624,23 @@ def reset_dropped_breakpoints_warning(
         else "was just reset"
     )
     lead = f"[qmu] WARNING: VM '{vm_id}' has a GDB stub and {event}. "
-    if not tcg:
+    if not tcg and halted:
         lead += (
-            "A machine reset drops the gdbstub's breakpoint/watchpoint set "
-            "without notifying the client: an attached debugger still lists "
-            "them as [enabled] but they do not fire (hits stay 0). "
+            "The debugger had lifted its breakpoints at its stop and re-inserts "
+            "them only when it resumes: still listed [enabled], none is in force "
+            "(hits stay 0). "
+        )
+    elif not tcg:
+        lead += (
+            "The new boot loads the kernel over the int3 bytes of the debugger's "
+            "software breakpoints without notifying the client: still listed "
+            "[enabled], they do not fire (hits stay 0). Hardware breakpoints and "
+            "watchpoints are not in guest RAM and stay armed at their addresses"
+            + (
+                ": with nokaslr they keep firing. "
+                if kaslr_off
+                else ", which the re-slid kernel no longer runs as those functions. "
+            )
         )
     elif kaslr_off and halted:
         lead += (

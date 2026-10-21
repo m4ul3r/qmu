@@ -26,7 +26,7 @@ every launch — the host is shared. `qmu <sub> --help` is authoritative.
 | boot-and-die kernel (no SSH) | `qmu launch --harness --no-reboot --name X --no-replace --kernel ./bzImage --initrd ./rd.img --rootfs ./rootfs.img` → `qmu wait --vm X` | 0 exited (`console_tail[]` is the receipt) · 3 panic (`crash`) |
 | put files into an image offline | `qmu rootfs inject ./rootfs.img ./exploit:/root/ --partition 0` → `qmu rootfs ls ./rootfs.img /root --partition 0` | the file is listed. Pass the same `--partition` to **both** commands: `0` = whole-disk image with no partition table (the mkrootfs/cloud default); the default `1` = `/dev/sda1` of a partitioned image, and `ls` without it exits 1 (`Partition /dev/sda1 was not found`) after a successful inject |
 | rewind instead of rebooting | `qmu snapshot save clean --vm X` … `qmu snapshot load clean --vm X` | exit 0; `SnapshotError` → `reference/snapshots.md` |
-| debug with gdb | `qmu launch --gdb --name X --no-replace` → `qmu gdb --vm X --symbols vmlinux` → `qmu cont --vm X` | read `reference/debugging.md` first |
+| debug with gdb | `qmu launch --gdb --name X --no-replace` → `qmu gdb --vm X --symbols vmlinux` → `pry --instance qmu-X continue --background` (not `qmu cont`: GDB still believes the target stopped and halts it again on its next command) | read `reference/debugging.md` first |
 | stop a VM | `qmu kill --vm X` | `logs_preserved: true` means a report is waiting in `qmu crash --vm X`; already stopped → exit 0, `already_stopped: true` |
 | clean up state files | `qmu prune --vm X --dry-run` then without `--dry-run` | `pruned[]`; removes kill-preserved logs at any age; never `prune --all` on a shared host |
 | diagnose the host/config | `qmu doctor` | `[!]` rows are blocking; `[~]`/`[i]` are not |
@@ -38,7 +38,7 @@ Branch on the exit code and `ok`, never on the presence of `error`.
 | Code | Meaning | JSON key to read | Next command |
 |---|---|---|---|
 | `0` | success; for `wait --pattern` the regex matched, for bare `wait` QEMU exited | `ok: true`; `matched_line`, `reason` | continue |
-| `1` | operation failed: guest command non-zero, no/bad `--vm` (or `--vm` omitted under `QMU_REQUIRE_VM=1`), `doctor` unhealthy, `SnapshotError`, `SCPFileError`, `ConfigError`, paused/panicked guest refusal, `wait --pattern` outlived the VM, `crash` found nothing | `error_type` (exception paths) or domain keys (`exit_code`, `guest_state`, `crash_detected`, `reason`) | run the `hint` (every `ok: false` envelope has one, result-specific: guest exit N → its `stderr`, `qmu exec --vm X 'dmesg \| tail -n 30'`; `crash` none → `qmu log --vm X --tail 200` / `--full-history`; `doctor` → fix the `[!]` rows, each `checks[]` row carries its own `hint`); for a refusal, `qmu crash --vm X` / `qmu cont --vm X` |
+| `1` | operation failed: guest command non-zero, no/bad `--vm` (or `--vm` omitted under `QMU_REQUIRE_VM=1`), `doctor` unhealthy, `SnapshotError`, `SCPFileError`, `ConfigError`, paused/panicked guest refusal, `wait --pattern` outlived the VM, `crash` found nothing | `error_type` (exception paths) or domain keys (`exit_code`, `guest_state`, `crash_detected`, `reason`) | run the `hint` (every `ok: false` envelope has one, result-specific: guest exit N → its `stderr`, `qmu exec --vm X 'dmesg \| tail -n 30'`; `crash` none → `qmu log --vm X --tail 200` / `--full-history`; `doctor` → fix the `[!]` rows, each `checks[]` row carries its own `hint`); for a refusal, `qmu crash --vm X` / the resume the `hint` names |
 | `2` | usage error (argparse) ONLY; `error_type: "UsageError"` under JSON | `usage`, `hint` | fix the flags — e.g. quote the guest command |
 | `3` | guest kernel crash, always corroborated by a fresh serial crash report | `crash`, `crash_detected: true`. The guest axis (`guest` on `wait`/`status`) can be either: `"panicked"` for a terminal `Kernel panic - not syncing`, `"crashed"` when the report was **survived** (KASAN `fault=report`, an Oops) but the SSH transport dropped | `qmu crash --vm X`, then `qmu status --vm X`: `qmu kill --vm X` only on `guest: "panicked"`; on `"crashed"` do **not** reap |
 | `4` | transport/infra: `SSHError`/`QMPError`, `no-console-output`, sshd refused the `[ssh] user`/key (`SSHAuthError`, `ssh_status: "auth-failed"`), dropped SSH with NO fresh crash, `wait --pattern` `inconclusive`, internal error | `error_type` + `hint` (exception paths); a guest-command envelope has **no** `error_type` — read `ssh_error: true`, `crash_detected: false`, `hint`; `inconclusive`, `ssh_status`, `ssh_user` | `qmu status --vm X`, `qmu log --vm X --tail 200` |
@@ -52,7 +52,7 @@ Detail (envelope shapes, `hint`/`warnings[]`, result-style failures, spilling, `
 |---|---|---|
 | `guest: "panicked"` (`[running — GUEST PANICKED]`) | terminal `Kernel panic - not syncing`; the guest is gone, QEMU still runs | `qmu crash --vm X`, then `qmu kill --vm X` (logs kept); `list` later shows `[stopped — crash report retained]` |
 | `guest: "crashed"` | an Oops killed one task; the guest still serves | `qmu crash --vm X`; do **not** reap |
-| `guest: "paused"`, `qemu_status: "paused"` / `"debug"` | vCPU halted by `qmu gdb`, a debugger stop, a `snapshot load` into a debug stop (can survive a *clean* `pry kill`), or an unclean bridge death; `crash_detected` is independent — `paused` + `crash_detected: true` means a report is waiting | `qmu cont --vm X` (or `pry continue`); `qmu crash --vm X` if `crash_detected` |
+| `guest: "paused"`, `qemu_status: "paused"` / `"debug"` | vCPU halted by `qmu gdb`, a debugger stop, a `snapshot load` into a debug stop (can survive a *clean* `pry kill`), or an unclean bridge death; `crash_detected` is independent — `paused` + `crash_detected: true` means a report is waiting | a debugger's stop (`debug`, or `paused` under the `qmu gdb` bridge; the refusal `hint` leads with it): `pry --instance qmu-X continue --background` — `qmu cont` would run it with every breakpoint lifted and GDB halts it again on its next command; no debugger: `qmu cont --vm X`; `qmu crash --vm X` if `crash_detected` |
 | `guest: "paused"`, `qemu_status: "restore-vm"` (after a `snapshot load`, or a raw `monitor`/`qmp human-monitor-command` `loadvm`, with `restore_state: "partial"` / `"unknown"`) | the load failed mid-restore: disks already rewound under un-restored devices/RAM; qmu left it paused on purpose | **never** `cont` (`qmu cont` refuses this state, exit 1); recover with `qmu snapshot load <known-good> --vm X` (resumes it) or `qmu kill --vm X` + relaunch. `qmu cont --force --vm X` only if you accept an inconsistent machine |
 | `guest: "unknown"` + `guest_detail` | no positive evidence of a serving guest (`SSH down, 0 bytes of console output`) | `qmu log --vm X --tail 50`; wrong `console=`/arch? see `warnings[]` |
 | `qmp: "busy"`, `qemu_status: "unknown"` | another client holds QEMU's single QMP slot, or QEMU's main loop is held by a command (debugger bridge; a `snapshot save` in progress, also when it runs through the daemon; a `savevm` still running after `snapshot save` exited 124; bare `wait` never holds it) | wait for it; `qmu kill --vm X` still works (signals after 1 s) |
@@ -313,18 +313,17 @@ pry --instance qmu-dbg wait --timeout 10
 pry --instance qmu-dbg backtrace
 ```
 
-Attaching halts the vCPU; SSH commands against a halted guest refuse (exit 1,
-`guest_state: "paused"`), and one stopped mid-command aborts within ~1 s with
-the same envelope. The SSH route to the base: `qmu cont`, `eval "$(qmu kbase
---vm dbg --symbols "$VMLINUX")"` (only SSH and `/proc/kallsyms` — no `--gdb`,
-no bridge), `pry load "$VMLINUX" --base "$KBASE"` (the first pry touch after
-`qmu cont` halts again). While a gdb client is attached, `status`/`list` skip their
-SSH probe (`ssh: "skipped (debugger attached)"`): that probe runs `uname`,
-which would trip `__x64_sys_newuname`. Address your bridge with `pry --instance
-qmu-<vm>` (`bridge_instance_id`; `bridge_pid` also works) on a shared host.
+Attaching halts the vCPU; SSH commands against a halted guest refuse (exit 1, `guest_state: "paused"`),
+and one stopped mid-command aborts within ~1 s with the same envelope. Resume a debugger's stop through the bridge, not
+`qmu cont`: that resumes QEMU behind GDB's back, which halts it again on its next command. SSH route to
+the base: `continue --background`, `eval "$(qmu kbase --vm dbg --symbols "$VMLINUX")"` (SSH + kallsyms
+only), `pry --instance qmu-dbg load "$VMLINUX" --base "$KBASE"`. While a client is attached, `status`/`list`
+skip their SSH probe (`ssh: "skipped (debugger attached)"`), whose `uname` would trip `__x64_sys_newuname`.
+Address your bridge as `pry --instance qmu-<vm>` (`bridge_instance_id`) on a shared host.
 `snapshot load`/`system_reset` rebase (`pry kbase`, KASLR) and re-sync (`pry resync`) the `qmu gdb` bridge
-(JSON `debugger`) or tear it down saying why; `snapshot save` stops it across the save; other clients,
-a guest reboot, `kill` warn: `reference/debugging.md`. ARM: `reference/cross-arch.md`.
+(JSON `debugger`; each trap the resync repaired is in `warnings[]`) or tear it down saying why; `snapshot
+save` stops it across the save. That stop ends a `pry wait` in flight with `reason: signal SIGINT`: wait
+again. Other clients, a guest reboot, `kill` warn: `reference/debugging.md`. ARM: `reference/cross-arch.md`.
 
 ## Raw QEMU access
 
@@ -333,7 +332,7 @@ qmu qmp query-status --vm X
 qmu qmp device_del --vm X --args '{"id": "net0"}'
 qmu monitor "info registers" --vm X
 qmu monitor "x /16xg 0xffffffff81000000" --vm X
-qmu qmp system_reset --vm X                # drops gdbstub breakpoints, re-slides KASLR
+qmu qmp system_reset --vm X                # overwrites software-breakpoint int3s (hardware ones stay), re-slides KASLR
 ```
 
 An HMP reply that *is* an error (`unknown command: …`, a line starting `Error: `)
