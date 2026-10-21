@@ -113,6 +113,23 @@ command after a load can stall on the stale master until its `--timeout`
 that symptom, `ssh -O exit` on the control socket under `$QMU_TEMP_DIR/ssh`
 (or a second `qmu exec`) clears it.
 
+The same teardown ends every guest command still running through that
+master: a `qmu exec`/`run`/`compile --run`/`dmesg` in flight when another
+pane loads (or saves, or resets) the VM is exit 4 with `ssh_error: true`,
+`exit_code: null` and `severed_by: "snapshot load"` (`"snapshot save"`,
+`"loadvm"`, `"savevm"`, `"system_reset"` for the other routes; `"guest
+reboot"` when a new kernel boot banner appeared under it) — never the guest
+program "exiting 255". Re-run it on the restored guest; a command started
+detached in the guest does not survive a load either, since the load rewinds
+its process too.
+
+The guest wall clock resumes at the snapshot's save time and stays behind the
+host by the time since the save (cumulative across loads; a guest with
+reachable NTP will step forward). `qmu log` shows the host-side console,
+which is never rewound: its tail can describe the discarded timeline, with
+uptimes later than the restored guest's. Use `qmu crash`/`wait --pattern`,
+which scope to the load.
+
 A `load` whose HMP `loadvm` fails is exit 1, `ok:false` with `error`,
 `error_type: "SnapshotError"`, `hint`, and three load-only keys: `resumed`,
 `guest_paused`, `restore_state`. What qmu does next depends on how far

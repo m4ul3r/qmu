@@ -24,6 +24,7 @@ from qmu import cli
 from qmu import instance as instance_mod
 from qmu.commands import guest as guest_mod
 from qmu.commands import lifecycle
+from qmu.commands import qmp_cmds
 from qmu.instance import (
     VM_ABSENT,
     VM_HELD_BACK,
@@ -32,6 +33,7 @@ from qmu.instance import (
     VM_STOPPED,
     VMInstance,
     classify_vm,
+    save_instance,
 )
 from qmu.ssh import GuestText, SSHAborted, SSHError
 from tests.test_daemon import FakeQMPServer, daemon_env  # noqa: F401 — fixture
@@ -2357,6 +2359,67 @@ def test_every_ssh_command_agrees_on_a_lost_transport(
         "crash_present": panicked,
         "names_qmu_crash": panicked,
         "names_qmu_log": not panicked,
+    }
+    for command, view in views.items():
+        assert view == expected, f"`qmu {command}` disagrees: {view}"
+
+
+class _ServingAfterCutSSH:
+    """ssh exits 255 because the session was cut under it; the restored or
+    rebooted guest then answers the liveness probe (#221)."""
+
+    def __init__(self, cut):
+        self._cut = cut
+
+    def run(self, command, timeout=30.0, check=False, **kwargs):
+        self._cut()
+        return 255, "", ""
+
+    def is_ready(self, timeout=2):
+        return True
+
+
+@pytest.mark.parametrize("cause", ["snapshot load", "guest reboot"])
+def test_every_ssh_command_agrees_on_a_session_cut_under_it(
+    cause, cache, monkeypatch, capsys
+):
+    """A session another pane's `snapshot load` (or a guest reboot) cut is a
+    transport loss qmu can name, on exec and dmesg alike — never the guest
+    command exiting 255, which the answering probe used to make of it."""
+    inst = _ssh_capable_instance(cache)
+    save_instance(inst)
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+    monkeypatch.setattr(guest_mod, "_preflight_ssh_guest", lambda *a, **kw: None)
+    monkeypatch.setattr(guest_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(guest_mod, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+
+    def cut():
+        if cause == "snapshot load":
+            qmp_cmds._sever_sessions(inst, cause)
+        else:
+            with open(inst.serial_log, "a") as stream:
+                stream.write("[    0.000000] Linux version 7.0.0 (b@h) (gcc 13) #1 SMP\n")
+
+    monkeypatch.setattr(guest_mod, "_make_ssh", lambda selected: _ServingAfterCutSSH(cut))
+
+    views = {}
+    for command in ("exec", "dmesg"):
+        with open(inst.serial_log, "w") as stream:
+            stream.write("boot ok\n")
+        rc = cli.main(["--format", "json", *_LOST_ARGV[command]])
+        payload = json.loads(capsys.readouterr().out)
+        views[command] = {
+            "rc": rc,
+            "ok": payload.get("ok"),
+            "ssh_error": payload.get("ssh_error"),
+            "exit_code": payload.get("exit_code"),
+            "severed_by": payload.get("severed_by"),
+        }
+    expected = {
+        "rc": 4, "ok": False, "ssh_error": True, "exit_code": None, "severed_by": cause,
     }
     for command, view in views.items():
         assert view == expected, f"`qmu {command}` disagrees: {view}"

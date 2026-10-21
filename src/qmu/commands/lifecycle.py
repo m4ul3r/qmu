@@ -963,6 +963,9 @@ class _QMPProbe:
     # The daemon's `vm_state` when `state == QMP_DAEMON`: carries the observed
     # epoch (`epoch_offset`/`epoch_source`) the guest scope is anchored on.
     daemon: dict[str, Any] | None = None
+    # A busy slot whose holder the raise site could name (a daemon this
+    # process bypasses under `QMU_DAEMON=off`, #207): the way out.
+    hint: str | None = None
 
 
 def _daemon_state(inst: Any, *, adopt: bool = True) -> dict[str, Any] | None:
@@ -1032,7 +1035,7 @@ def _query_qmp(inst: Any) -> _QMPProbe:
         with _qmp_ctx(inst) as qmp:
             status = qmp.execute("query-status")
     except QMPBusyError as exc:
-        return _QMPProbe(QMP_BUSY, error=str(exc))
+        return _QMPProbe(QMP_BUSY, error=str(exc), hint=getattr(exc, "hint", None))
     except (QMPError, OSError) as exc:
         return _QMPProbe(QMP_UNREACHABLE, error=str(exc))
     if not isinstance(status, dict):
@@ -2485,6 +2488,8 @@ def _wait_standalone(
         observation = _observe_guest(inst, qmp=probe)
         guest = observation.guest
         guest_detail = observation.detail()
+    if probe is not None and probe.state == QMP_BUSY and probe.hint:
+        warnings.append(f"[qmu] Warning: QMP busy. {probe.hint}\n")
 
     return _finish_wait(
         args, inst,
@@ -3687,7 +3692,10 @@ def _handle_status(args: argparse.Namespace) -> Result:
     notice = _crash_warning(guest, inst.vm_id, crash_detected=obs.crash_detected)
     if notice:
         lines.append(notice.strip())
-    return Result(data=result, text=lines, stem="status")
+    res = Result(data=result, text=lines, stem="status")
+    if qmp.state == QMP_BUSY and qmp.hint:
+        res = res.warn(f"[qmu] Warning: QMP busy. {qmp.hint}\n")
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -4240,7 +4248,17 @@ def _handle_doctor(args: argparse.Namespace) -> Result:
     # it. `unavailable` (a record names a dead pid, or a socket that will
     # not answer) is the one case worth a glance at daemon.log.
     probe = daemon_client.probe()
-    if probe["running"]:
+    if probe["running"] and not probe["used"]:
+        # QMU_DAEMON=off while a daemon runs for this cache (#207): it holds
+        # the QMP slot of every VM it watches, so this process's QMP
+        # commands on those VMs report busy.
+        daemon_detail = (
+            f"running (pid {probe['pid']}) but not used (QMU_DAEMON=off): it holds "
+            "the QMP connection of every VM it watches, so QMP commands here "
+            "report those VMs busy"
+        )
+        daemon_status = "warn"
+    elif probe["running"]:
         stale = "" if probe.get("build_current", True) else " (stale build; respawns on next command)"
         daemon_detail = (
             f"running (pid {probe['pid']}, watching {len(probe['vms'])} VM(s), "
@@ -4258,7 +4276,11 @@ def _handle_doctor(args: argparse.Namespace) -> Result:
         daemon_status = "info"
     checks.append(_doctor_row(
         "daemon", daemon_status, daemon_detail,
-        hint="qmu daemon status" if daemon_status == "warn" else "",
+        hint=(
+            "unset QMU_DAEMON, or qmu daemon stop"
+            if probe["running"] and not probe["used"]
+            else "qmu daemon status" if daemon_status == "warn" else ""
+        ),
         running=probe["running"], mode=probe["mode"],
     ))
 

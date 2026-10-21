@@ -217,6 +217,17 @@ sink. Fakes keep working because `run(**kwargs)` may ignore `on_chunk`; a
 test that asserts *liveness* must relay chunks itself (`StreamingSSH` in
 `tests/test_exec_command.py`, `_StreamingServingSSH` in the matrix).
 
+**A closed consumer is not a failure (#208).** `qmu … | head -1` used to end
+in `[qmu] Error: [Errno 32] Broken pipe`, exit 4, after the work was done.
+`render`, `_emit_error` and the stream sinks (`guest._relay`) catch
+`BrokenPipeError` and call `output.release_closed_streams()`, which points
+the fd of whichever of stdout/stderr polls POLLERR/POLLHUP (its reader is
+gone) at `/dev/null` — so the interpreter's exit flush cannot raise again —
+and the exit code stays the operation's; a streamed guest command runs to
+its own end with the rest discarded. An EPIPE on a stream whose reader is
+still there (a socket) re-raises; one reaching `run_parsed` from any other
+write is 141.
+
 ### Instance lifecycle & PID-recycling guard (`instance.py`, `vm.py`)
 
 A `VMInstance` (dataclass) is persisted as JSON under `~/.cache/qmu/instances/`
@@ -359,6 +370,21 @@ stderr for the reader), never the guest's stderr: a guest command whose
 inner `ssh` fails prints the same words there and exits 255 itself, and
 reading stderr called a command that ran "not started, safe to re-run"
 (#199). Never let the 255 heuristic classify on bytes the guest can write.
+
+A 255 from a session **qmu itself cut** is the same class (#221): `snapshot
+load`/`save` and the raw `loadvm`/`savevm`/`system_reset` routes tear the
+ControlMaster down through `qmp_cmds._sever_sessions`, which first stamps
+the record (`ssh_severed_at`/`ssh_severed_by`) — before the teardown, so
+the severed command cannot read the record first — and returns the stamped
+instance, which a caller that persists again must carry. `guest._severed_by`
+(checked in `_ssh_255_payload` after `_never_started`, before the probe)
+reads that stamp at or after the command's start, else a kernel boot banner
+past its start (`"guest reboot"`), and `_severed_payload` answers exit 4,
+`ssh_error: true`, `exit_code: null`, `severed_by` (3 only for a reboot after
+a fresh report). The restored or rebooted guest answers the probe, which is
+why this used to be "the guest command exited 255" with a hint at an empty
+stderr. The mux client logs nothing when its master is told to exit, so the
+client log cannot carry this signal.
 
 A third answer exists and is neither (#158): sshd answered and **refused the
 login** (`Permission denied (publickey,…)`). Every ssh/scp runs with
@@ -561,7 +587,15 @@ autostarts it detached unless `QMU_DAEMON=off` or `[daemon] autostart=false`,
 and falls back to the standalone path silently on any failure (`require`
 errors instead). **Every handler path keeps working with the layer off** —
 that is the contract, and `tests/test_state_agreement_matrix.py` pins that
-`QMU_DAEMON=off` output carries none of the daemon-only keys.
+`QMU_DAEMON=off` output carries none of the daemon-only keys. `off` keeps
+*this process* off the layer; a daemon an earlier command autostarted still
+holds the QMP slot of every VM it watches (#207). So under `off`,
+`daemon_client.probe()` still reports a live `daemon.json` record (pid +
+start-time, no connect: `running: true`, `used: false`), `daemon stop`
+SIGTERMs it (its graceful stop), and `_qmp_ctx` returns
+`daemon_client.StandaloneQMP`, a `QMPClient` whose `QMPBusyError` names that
+daemon with the way out (`hint`: unset `QMU_DAEMON`, or `qmu daemon stop`);
+`status`/bare `wait` carry the same hint in `warnings[]` (`_QMPProbe.hint`).
 
 - `_cliutil._qmp_ctx` returns a `DaemonQMP` whose `connect()` proxies through
   the daemon when it watches the VM (and that watch is not `qmp_lost`) and is

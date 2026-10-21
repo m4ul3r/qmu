@@ -125,6 +125,15 @@ class VMInstance:
     # so `status`/`list` can answer where a guest service is reachable the
     # way they answer `ssh_port`. Empty for records that predate the field.
     forwards: list[dict] = field(default_factory=list)
+    # When a qmu command last cut every SSH session to the guest, and which
+    # (#221): `snapshot load`/`save` and the raw `loadvm`/`savevm`/
+    # `system_reset` routes tear the ControlMaster down (a load or reset also
+    # rewinds the guest's TCP state). A guest command whose ssh exits 255
+    # after this instant was cut off by qmu, not by the guest — the one
+    # guest-unwritable signal for a session that otherwise looks like the
+    # guest program exiting 255. Wall-clock seconds; None when never stamped.
+    ssh_severed_at: float | None = None
+    ssh_severed_by: str | None = None
 
 
 def _instance_from_dict(data: dict) -> VMInstance:

@@ -476,7 +476,7 @@ def test_debugger_stop_mid_exec_is_reported_not_transport_loss(
     assert payload["crash_detected"] is False
     assert payload["exit_code"] is None
     assert payload["command"] == "uname -r"
-    assert "pry continue" in payload["hint"]
+    assert "continue --background" in payload["hint"]
 
 
 # ---------------------------------------------------------------------------

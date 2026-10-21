@@ -24,7 +24,7 @@ from typing import NoReturn
 from .config import reset_global_config_warnings
 from .debug import reset_coherence_warnings
 from .instance import QMUError, reset_autoselection
-from .output import render_value
+from .output import release_closed_streams, render_value
 from .qmp import QMPError
 from .ssh import SSHError
 from .version import VERSION
@@ -277,7 +277,13 @@ def _emit_usage_error(exc: _UsageError, argv: list[str]) -> NoReturn:
         "usage": usage.strip(),
         "hint": hint,
     }
-    sys.stdout.write(render_value(payload, fmt))
+    try:
+        sys.stdout.write(render_value(payload, fmt))
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # A closed reader still gets exit 2, not a traceback (#208).
+        if not release_closed_streams():
+            raise
     exc.parser.exit(2)
 
 
@@ -409,6 +415,15 @@ def run_parsed(args: argparse.Namespace) -> int:
         return 4
     except KeyboardInterrupt:
         return 130
+    except BrokenPipeError as exc:
+        # `render`/`_emit_error` keep the operation's code when the reader
+        # closed stdout (#208); one that reaches here came from a write
+        # outside them, after which the outcome was never rendered: the
+        # shell's SIGPIPE convention. Any other EPIPE (a socket) is a fault.
+        if release_closed_streams():
+            return 141
+        _emit_error(args, exc, "[qmu] Error:")
+        return 4
     except Exception as exc:  # noqa: BLE001 — agent-facing catch-all
         # CORR-3: never surface a raw Python traceback to the agent. Any
         # unexpected internal error (the main() catch-all, plus infra-subprocess

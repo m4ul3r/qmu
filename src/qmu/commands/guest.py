@@ -35,8 +35,10 @@ from ..instance import (
     VMInstance,
     choose_instance,
     find_instance,
+    load_instance,
 )
 from ..serial import (
+    count_boot_banners,
     current_boot_offset,
     extract_crash,
     has_terminal_panic,
@@ -50,6 +52,7 @@ from ..output import (
     _artifact_payload,
     _estimate_tokens,
     _spill_path,
+    release_closed_streams,
     text_out_pointer,
 )
 from ..runtime import invalidate_owned_spill_marker, mark_spill_artifact
@@ -627,12 +630,117 @@ def _ssh_lost_payload(
     return status, result, [headline, text_msg]
 
 
+# Who cut an in-flight guest command's SSH session (#221), as a reader
+# recognises it, and what that did to the command.
+_SEVER_SOURCES: dict[str, tuple[str, str]] = {
+    "snapshot load": (
+        "qmu snapshot load",
+        "the guest was rewound to the snapshot, so the command's process "
+        "belongs to the discarded timeline",
+    ),
+    "loadvm": (
+        "a raw qmu monitor/qmp `loadvm`",
+        "the guest was rewound to the snapshot, so the command's process "
+        "belongs to the discarded timeline",
+    ),
+    "system_reset": (
+        "a raw qmu qmp/monitor `system_reset`",
+        "the guest was reset and boots again",
+    ),
+    "snapshot save": (
+        "qmu snapshot save",
+        "it closes the VM's SSH ControlMaster before saving; the command "
+        "dies on its next stdout/stderr write",
+    ),
+    "savevm": (
+        "a raw qmu monitor/qmp `savevm`",
+        "it closes the VM's SSH ControlMaster before saving; the command "
+        "dies on its next stdout/stderr write",
+    ),
+    "guest reboot": (
+        "a guest reboot",
+        "a new kernel boot banner is in the serial log",
+    ),
+}
+
+
+def _severed_by(inst: VMInstance, *, started_at: float, start_offset: int) -> str | None:
+    """What cut a guest command's session after it started, if anything.
+
+    Two signals, neither written by the guest program: the record's
+    `ssh_severed_at` stamp (`qmp_cmds._sever_sessions`, made by a qmu
+    command that tears the ControlMaster down) at or after `started_at`,
+    and a kernel boot banner past `start_offset` (the same log-local ground
+    truth every boot-scope reader uses). A session cut either way used to be
+    reported as the guest command exiting 255 (#221).
+    """
+    record = load_instance(inst.vm_id)
+    stamped = getattr(record, "ssh_severed_at", None)
+    if isinstance(stamped, (int, float)) and stamped >= started_at:
+        return record.ssh_severed_by or "snapshot load"
+    if count_boot_banners(inst.serial_log, start_offset=start_offset) > 0:
+        return "guest reboot"
+    return None
+
+
+def _severed_payload(
+    command: str, inst: VMInstance, cause: str, *, start_offset: int
+) -> tuple[int, dict[str, Any], list[str]]:
+    """The (status, data, text) triple for a session qmu or a reboot cut.
+
+    A dropped transport with no crash report is 4 under the contract, and
+    here the drop is explained: `ssh_error: true`, `exit_code: null` (ssh's
+    255 is not the guest's) and `severed_by` naming the cause. A report the
+    command provoked stays attributed (`crash_detected`/`crash`); only a
+    reboot after one keeps the crash class (3), as a dropped transport
+    with a fresh report does — qmu's own teardown is never a kernel crash.
+    """
+    vm = inst.vm_id
+    crash = extract_crash(inst.serial_log, start_offset=start_offset)
+    who, effect = _SEVER_SOURCES.get(cause, (cause, "the session was closed"))
+    if crash is not None:
+        hint = (
+            f"The command's SSH session was cut by {who} ({effect}), and the "
+            f"kernel printed a crash report while it ran; read it with: qmu "
+            f"crash --vm {vm}"
+        )
+    elif cause in ("snapshot save", "savevm"):
+        hint = (
+            f"The command's SSH session was cut by {who} ({effect}); its exit "
+            "status is unknown. Re-run it after the save, or start a command "
+            "that must outlive a save detached: setsid nohup CMD > "
+            "/root/out.log 2>&1 < /dev/null &"
+        )
+    else:
+        hint = (
+            f"The command's SSH session was cut by {who} ({effect}), so its "
+            f"exit status is unknown. Re-run it once the guest serves: qmu "
+            f"status --vm {vm}"
+        )
+    status = 3 if crash is not None and cause == "guest reboot" else 4
+    result: dict[str, Any] = {
+        "ok": False,
+        "vm_id": vm,
+        "exit_code": None,
+        "ssh_error": True,
+        "severed_by": cause,
+        "crash_detected": crash is not None,
+        "command": command,
+        "crash": crash,
+        "hint": hint,
+    }
+    text = [f"SSH session cut by {who} while running: {command}"]
+    text.append(f"\nCrash from serial log:\n{crash}" if crash is not None else hint)
+    return status, result, text
+
+
 def _ssh_255_payload(
     ssh: SSHClient,
     command: str,
     inst: VMInstance,
     *,
     start_offset: int,
+    started_at: float,
 ) -> tuple[int, dict[str, Any], list[str]] | None:
     """The SSH-lost triple for an rc-255 session the serial log and QMP did
     not explain, or None when the guest command itself returned 255.
@@ -640,17 +748,27 @@ def _ssh_255_payload(
     ssh's own pre-session failure (`Connection timed out during banner
     exchange`, :func:`_never_started`) settles it without a probe: the
     command never ran, so a sshd that comes up during the probe window must
-    not turn it into "the guest command exited 255" (#177). Anything else is
-    ambiguous and :func:`_transport_lost` probes. The guest's stdout/stderr
-    decide nothing here: a guest command can print ssh's words itself (#199).
+    not turn it into "the guest command exited 255" (#177). A session qmu
+    itself cut (a snapshot load/save, a raw reset) or a guest reboot cut
+    (:func:`_severed_by`) is next: the restored or rebooted guest answers the
+    probe, which then called the cut the guest program exiting 255 (#221).
+    Anything else is ambiguous and :func:`_transport_lost` probes. The
+    guest's stdout/stderr decide nothing here: a guest command can print
+    ssh's words itself (#199).
     """
     if _never_started(ssh, inst):
         return _ssh_lost_payload(
             command, inst, start_offset=start_offset, connected=False
         )
-    if _transport_lost(ssh, inst):
-        return _ssh_lost_payload(command, inst, start_offset=start_offset)
-    return None
+    cause = _severed_by(inst, started_at=started_at, start_offset=start_offset)
+    if cause is None:
+        lost = _transport_lost(ssh, inst)
+        # A reboot's banner usually lands while the probe waits on the
+        # rebooting guest: the cut is visible only now.
+        cause = _severed_by(inst, started_at=started_at, start_offset=start_offset)
+        if cause is None:
+            return _ssh_lost_payload(command, inst, start_offset=start_offset) if lost else None
+    return _severed_payload(command, inst, cause, start_offset=start_offset)
 
 
 def _explain_lost_transport(
@@ -961,6 +1079,23 @@ def _with_guest_output(
 STREAM_SPILL_BYTES = DEFAULT_SPILL_TOKEN_LIMIT * _CHARS_PER_TOKEN
 
 
+def _relay(stream: Any, data: bytes | str) -> None:
+    """Write and flush one relayed chunk on `stream` (`sys.stdout`/`stderr`).
+
+    A reader that closed the stream (`qmu exec … | head -5`, #208) drops
+    the rest of it: the guest command still runs to its own end and qmu
+    exits with that command's code, as the buffered rendering does.
+    """
+    try:
+        stream.flush()
+        target = stream.buffer if isinstance(data, bytes) else stream
+        target.write(data)
+        target.flush()
+    except BrokenPipeError:
+        if not release_closed_streams():
+            raise
+
+
 class _TextStreamSink:
     """Relay guest output to the terminal as it arrives (text mode).
 
@@ -1018,9 +1153,7 @@ class _TextStreamSink:
         if stream == "stderr":
             self._err_received += len(data)
             if data:
-                sys.stderr.flush()
-                sys.stderr.buffer.write(data)
-                sys.stderr.buffer.flush()
+                _relay(sys.stderr, data)
                 self.err_at_line_start = data.endswith(b"\n")
             return
         self._out_received += len(data)
@@ -1048,9 +1181,7 @@ class _TextStreamSink:
         self._file.flush()
 
     def _emit(self, data: bytes) -> None:
-        sys.stdout.flush()
-        sys.stdout.buffer.write(data)
-        sys.stdout.buffer.flush()
+        _relay(sys.stdout, data)
         self._shown += len(data)
 
     def finish(
@@ -1092,12 +1223,9 @@ class _TextStreamSink:
             )
         else:
             rendered = text_out_pointer(artifact)
-        sys.stdout.flush()
-        sys.stdout.buffer.write(rendered.encode("utf-8"))
-        sys.stdout.buffer.flush()
+        _relay(sys.stdout, rendered.encode("utf-8"))
         if self._spilled:
-            sys.stderr.write(f"[qmu] Output spilled to {self._path}\n")
-            sys.stderr.flush()
+            _relay(sys.stderr, f"[qmu] Output spilled to {self._path}\n")
 
 
 class _NdjsonStreamSink:
@@ -1125,8 +1253,7 @@ class _NdjsonStreamSink:
             },
             sort_keys=True,
         )
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
+        _relay(sys.stdout, line + "\n")
 
     def finish(self, *args: Any, **kwargs: Any) -> None:
         return None
@@ -1204,6 +1331,7 @@ def _classify_guest_command(
     relays guest stderr itself, so the stderr bytes then stay out of `notes`.
     """
     command_start_offset = serial_log_offset(inst.serial_log)
+    started_at = time.time()
     watcher = _guest_abort_watcher(inst, start_offset=command_start_offset)
 
     def detach_to() -> Path | None:
@@ -1262,7 +1390,8 @@ def _classify_guest_command(
         explained = _explain_lost_transport(
             command, inst, start_offset=command_start_offset, session_note=True
         ) or _ssh_255_payload(
-            ssh, command, inst, start_offset=command_start_offset
+            ssh, command, inst, start_offset=command_start_offset,
+            started_at=started_at,
         )
         if explained is not None:
             return _with_guest_output(explained, stdout, stderr, note_stderr=note_stderr)
@@ -1772,6 +1901,7 @@ def _handle_dmesg(args: argparse.Namespace) -> Result:
         # count would otherwise be misparsed as a tail option).
         cmd = f"dmesg | tail -n {max(args.tail, 0)}"
     command_start_offset = serial_log_offset(inst.serial_log)
+    started_at = time.time()
     watcher = _guest_abort_watcher(inst, start_offset=command_start_offset)
 
     try:
@@ -1812,7 +1942,8 @@ def _handle_dmesg(args: argparse.Namespace) -> Result:
         explained = _explain_lost_transport(
             cmd, inst, start_offset=command_start_offset
         ) or _ssh_255_payload(
-            ssh, cmd, inst, start_offset=command_start_offset
+            ssh, cmd, inst, start_offset=command_start_offset,
+            started_at=started_at,
         )
         if explained is not None:
             status, data, out, text, notes = _with_guest_output(

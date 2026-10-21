@@ -95,6 +95,13 @@ says the reset did happen even though the command failed.
 
 Branch on the exit code and `ok`, never on the presence of `error`.
 
+A reader that closes the pipe early (`qmu status --vm X | head -1`, a pager
+quit) is not a failure: qmu drops the rest of that stream silently and exits
+with the operation's own code — `0` for a successful `status`, `1` for a
+failed one. A streamed guest command keeps running to its own end with the
+rest of its stdout discarded. It used to print `[qmu] Error: [Errno 32]
+Broken pipe` and exit 4.
+
 ## Guest-command text mode
 
 `exec`, `compile --run`, `dmesg`, `run`: stdout is the guest's stdout, **byte

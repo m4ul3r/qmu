@@ -105,19 +105,22 @@ daemon's log alone (#121).
 
 | Command | Effect |
 |---|---|
-| `daemon status` | `running` with pid, uptime, build id, socket, idle budget, client count and the watched VMs (`qemu_status`/`last_event`/`exited`/`panicked`); or `not running (<reason>)`: `not running`, `stale record`, `disabled (QMU_DAEMON=off)`, `unresponsive`. Never spawns. JSON `running`, `mode`, `build_current`, `vms[]`. |
+| `daemon status` | `running` with pid, uptime, build id, socket, idle budget, client count and the watched VMs (`qemu_status`/`last_event`/`exited`/`panicked`); or `not running (<reason>)`: `not running`, `stale record`, `disabled (QMU_DAEMON=off)` (no live daemon recorded for this cache), `unresponsive`. Under `QMU_DAEMON=off` a live daemon recorded in `<cache>/daemon.json` is still reported — `running (pid N; not used: QMU_DAEMON=off)`, JSON `running: true`, `used: false`, read from the record alone (no connect, so no clients/`vms[]`). Never spawns. JSON `running`, `used`, `mode`, `build_current`, `vms[]`. |
 | `daemon start` | spawn detached if none serves this cache dir (`started`/`already_running`). |
-| `daemon stop` | ask it to exit (releases every QMP connection); a record whose socket does not answer gets SIGTERM. |
+| `daemon stop` | ask it to exit (releases every QMP connection); a record whose socket does not answer gets SIGTERM, and so does a live daemon under `QMU_DAEMON=off` (its own graceful stop; `signalled: true`). |
 | `daemon run` | the foreground server `start` spawns; `--idle-exit N`. |
 
 `qmu doctor` carries a `daemon` row (`[+] running …`, `[i] not running` is
-the normal idle state, `[~] unavailable` points at `daemon.log`).
+the normal idle state, `[~] unavailable` points at `daemon.log`, `[~] running
+(pid N) but not used (QMU_DAEMON=off)` names the bypassed daemon).
 
 ## Troubleshooting
 
-- **`qmp: busy` under `QMU_DAEMON=off`** while a daemon watches that VM: the
-  daemon holds the slot. Either drop the override (the command then reads
-  the daemon's state) or `qmu daemon stop` first.
+- **`qmp: busy` / `QMPBusyError` under `QMU_DAEMON=off`** while a daemon
+  runs for the cache: the daemon holds the QMP slot of every VM it watches.
+  The error, and a `warnings[]` entry on `status`/bare `wait`, name the
+  daemon's pid; either drop the override (the command then goes through the
+  daemon) or `qmu daemon stop` first.
 - **Stale socket** (`daemon.sock` present, nothing answers): the client
   checks the record's pid + start-time, unlinks the stale socket/record and
   respawns. `qmu daemon status` says `stale record`; `qmu daemon stop`

@@ -10,6 +10,7 @@ timeout) and it still said `qmp: connected`; `kill` 14 s because its graceful
 from __future__ import annotations
 
 import json
+import os
 import socket
 import time
 from pathlib import Path
@@ -201,3 +202,77 @@ def test_kill_on_a_busy_socket_signals_within_about_a_second(
 
     assert signals and signals[0] == _cliutil.signal.SIGTERM
     assert elapsed < 1.6
+
+
+# ---------------------------------------------------------------------------
+# QMU_DAEMON=off while a daemon this cache autostarted still runs (#207)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bypassed_daemon():
+    """A live `daemon.json` for this cache: this test process stands in for
+    the daemon (its own pid + /proc start-time pass the identity check)."""
+    from qmu import daemon_client
+    from qmu.instance import proc_pid_start
+
+    path = daemon_client.record_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "pid": os.getpid(), "pid_start": proc_pid_start(os.getpid()),
+        "build_id": "0123456789abcdef", "socket": str(path.parent / "daemon.sock"),
+        "cache_dir": str(path.parent), "started_at": time.time() - 30, "idle_exit": 600.0,
+    }))
+    return os.getpid()
+
+
+def test_busy_qmp_under_off_names_the_bypassed_daemon(
+    held_socket, bypassed_daemon, tmp_path, monkeypatch, capsys
+):
+    """The generic busy hint sent the reader looking for a `qmu wait` that did
+    not exist; the holder is the daemon QMU_DAEMON=off keeps this process
+    from using."""
+    from qmu.commands import qmp_cmds
+
+    inst = _vm(tmp_path, held_socket)
+    _register(monkeypatch, inst)
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm=None: inst)
+
+    rc = cli.main(["--format", "json", "qmp", "query-status", "--vm", "busy-vm"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 4
+    assert payload["error_type"] == "QMPBusyError"
+    assert f"pid {bypassed_daemon}" in payload["error"]
+    assert "qmu daemon stop" in payload["hint"]
+    assert "QMU_DAEMON" in payload["hint"]
+
+    rc = cli.main(["--format", "json", "status", "--vm", "busy-vm"])
+    status = json.loads(capsys.readouterr().out)
+    assert rc == 0 and status["qmp"] == "busy"
+    assert any("qmu daemon stop" in w for w in status["warnings"])
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_daemon_status_under_off_reports_a_live_recorded_daemon(
+    fmt, bypassed_daemon, capsys
+):
+    rc = cli.main(["--format", fmt, "daemon", "status"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    if fmt == "json":
+        payload = json.loads(out)
+        assert payload["running"] is True
+        assert payload["used"] is False
+        assert payload["mode"] == "off"
+        assert payload["pid"] == bypassed_daemon
+    else:
+        assert f"running (pid {bypassed_daemon}; not used: QMU_DAEMON=off" in out
+
+
+def test_daemon_status_under_off_with_no_live_daemon_is_not_running(capsys):
+    rc = cli.main(["--format", "json", "daemon", "status"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["running"] is False
+    assert payload["reason"] == "disabled (QMU_DAEMON=off)"
