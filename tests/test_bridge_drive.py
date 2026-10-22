@@ -22,7 +22,7 @@ import time
 
 import pytest
 
-from qmu import cli, debug
+from qmu import _cliutil, cli, debug
 from qmu.commands import qmp_cmds
 from qmu.instance import VMInstance, load_instance, proc_pid_start, save_instance
 from qmu.snapshot import SnapshotResult
@@ -98,8 +98,14 @@ held = os.path.join(spec, "held")
 hold = "--hold" in argv
 release = "--release" in argv
 if cmd == "status":
-    print(json.dumps({"state": "stopped" if os.path.exists(stopped) else "running"}))
+    payload = {"state": "stopped" if os.path.exists(stopped) else "running"}
+    if os.path.exists(held) and json.load(open(held)):
+        payload["reason"] = {"kind": "held"}  # pry says so for a hold that resumes
+    print(json.dumps(payload))
     sys.exit(0)
+if hold and os.path.exists(held):
+    print(json.dumps({"ok": False, "error": "the target is held already (`pry interrupt --hold`); `pry continue --release` ends that hold"}), file=sys.stderr)
+    sys.exit(1)
 if hold and os.environ.get("FAKE_PRY_NO_HOLD"):
     print("usage: pry [-h] ...\npry: error: unrecognized arguments: --hold", file=sys.stderr)
     sys.exit(2)
@@ -941,6 +947,80 @@ def test_a_save_that_outran_its_budget_leaves_the_bridge_stopped_and_says_so(
     assert pry.ran("continue") == []
     assert pry.stopped() and pry.held()
     assert any(f"pry --instance qmu-{VM} continue --release" in w for w in payload["warnings"])
+
+
+def _expire_save(monkeypatch):
+    def expired(qmp, name, timeout=None):
+        raise qmp_cmds.QMPTimeoutError("human-monitor-command", timeout)
+
+    monkeypatch.setattr(qmp_cmds, "save_snapshot", expired)
+
+
+def test_the_paused_refusal_after_a_kept_save_hold_names_its_release(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Review of #228, live: after a save that outran its budget kept qmu's
+    hold, `exec`'s paused refusal said `pry continue --background`, which a
+    held bridge refuses. The refusal (shared by every SSH command, `wait`
+    and `cont`) now names the release, and when to run it."""
+    _vm(tmp_path, monkeypatch, bridge)
+    _expire_save(monkeypatch)
+    _json(capsys, ["snapshot", "save", "clean"])
+
+    data, _ = _cliutil._stopped_guest_payload(load_instance(VM), "paused")
+
+    assert f"pry --instance qmu-{VM} continue --release" in data["hint"]
+    assert "continue --background" not in data["hint"]
+    assert f"qmu snapshot list --vm {VM}" in data["hint"]
+
+
+def test_the_paused_refusal_after_a_kept_rebase_hold_names_the_rebase_and_release(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    _vm(tmp_path, monkeypatch, bridge, cmdline="console=ttyS0")
+    pry.answers(kbase=[{"rc": 1, "error": "no kernel symbol file is loaded"}])
+    _json(capsys, ["snapshot", "load", "clean"])
+
+    data, _ = _cliutil._stopped_guest_payload(load_instance(VM), "paused")
+
+    assert f"pry --instance qmu-{VM} continue --release" in data["hint"]
+    assert f"pry --instance qmu-{VM} kbase" in data["hint"]
+    assert "continue --background" not in data["hint"]
+
+
+def test_a_kept_hold_released_by_hand_no_longer_shapes_the_refusal(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """pry's status is the cross-check: once the hold is gone, a stop is a
+    debugger's ordinary one again."""
+    _vm(tmp_path, monkeypatch, bridge)
+    _expire_save(monkeypatch)
+    _json(capsys, ["snapshot", "save", "clean"])
+    (tmp_path / "pry" / "held").unlink()  # the operator's `pry continue --release`
+
+    data, _ = _cliutil._stopped_guest_payload(load_instance(VM), "paused")
+
+    assert f"pry --instance qmu-{VM} continue --background" in data["hint"]
+
+
+def test_the_next_drive_takes_over_a_kept_hold_and_ends_it(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """A hold qmu kept makes pry refuse a second one; the next qmu drive on
+    the bridge takes it over and releases it, instead of failing to stop."""
+    _vm(tmp_path, monkeypatch, bridge)
+    _expire_save(monkeypatch)
+    _json(capsys, ["snapshot", "save", "clean"])
+    pry.answers(resync=[{"result": _report(_entry("armed", trap_resident=True), state="stopped")}])
+
+    rc, payload = _json(capsys, ["snapshot", "load", "clean"])
+
+    assert rc == 0
+    drive = payload["debugger"]
+    assert drive["action"] == "resynced" and drive["resumed"] is True
+    assert not pry.held() and not pry.stopped()
+    assert load_instance(VM).bridge_hold is None
+
 
 
 @pytest.mark.parametrize("route", ["snapshot save", "monitor savevm"])

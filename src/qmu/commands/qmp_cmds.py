@@ -71,7 +71,7 @@ from ..debug import (
     reap_bridge,
     reset_dropped_breakpoints_warning,
     resume_bridge_after_save,
-    save_left_stopped_warning,
+    keep_bridge_stopped_after_save,
     save_stop_failed_warning,
     savevm_breakpoint_state,
     savevm_breakpoint_warning,
@@ -256,7 +256,7 @@ class _SaveStop:
         """Warnings for a save that outran its budget."""
         if self.stop is None or self.drive is not None:
             return self.warnings
-        warning = save_left_stopped_warning(self.stop, self.event)
+        warning = keep_bridge_stopped_after_save(self.stop, self.event)
         return self.warnings + ((warning,) if warning is not None else ())
 
     def record_on_failure(self) -> None:

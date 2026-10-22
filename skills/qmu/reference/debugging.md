@@ -491,6 +491,19 @@ wait with exit 0 and `reason: signal SIGINT` at whatever the vCPU was
 running, a stop qmu resumed a moment later. The text receipt says the wait
 was kept (`qmu held that stop …`).
 
+**A hold qmu keeps** (a save that outran its budget, a base `pry kbase`
+could not validate) is recorded on the VM (`bridge_hold` in its record).
+While it is in place every report of the halted guest (the SSH commands'
+paused refusal, `wait`'s halted timeout, `qmu cont`'s warning) names `pry
+--instance qmu-<vm> continue --release` as the resume, with what comes first
+(`qmu snapshot list` showing the tag; or the rebase, `pry kbase` and `pry
+resync`), never the `continue --background` a held bridge refuses. pry's
+status confirms it (`reason: held`, or `resynced` after your own resync at
+the hold); once you release it by hand the reports are a debugger's ordinary
+ones again. The next qmu drive on the bridge (a load, a reset, a save) takes
+the kept hold over instead of failing to stop it, and ends it with its own
+release.
+
 **A pry without the hold** (from before pry #108, or a bridge an older pry
 spawned: `pry interrupt --hold` is an unknown flag or op) gets the public
 bracket instead — `pry interrupt`, then `pry continue --background` for a

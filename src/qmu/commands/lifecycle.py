@@ -3288,6 +3288,8 @@ def _finish_pattern_wait(
             f"halted (QEMU '{halt}')"
         )
         held = debug_mod.debugger_holding(inst, halt)
+        if held is not None and debug_mod.held_by_qmu(inst) is not None:
+            held = None  # `pry wait` waits through qmu's hold; the hint names its release
         inspect = (
             f" `pry --instance {held[0]} wait` shows the stop{held[1]}."
             if held is not None else ""
