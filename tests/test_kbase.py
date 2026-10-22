@@ -75,7 +75,7 @@ class FakeSSH:
         self.result = result
         self.calls: list[tuple[str, float]] = []
 
-    def run(self, command, timeout=30.0, check=False):
+    def run(self, command, timeout=30.0, check=False, **kwargs):
         self.calls.append((command, timeout))
         return self.result
 
@@ -545,7 +545,7 @@ def test_kbase_ssh_error_is_infrastructure_exit_4(
     symbols = tmp_path / "vmlinux"
     fake = FakeSSH()
 
-    def fail_run(command, timeout=30.0, check=False):
+    def fail_run(command, timeout=30.0, check=False, **kwargs):
         raise SSHError("guest transport unavailable")
 
     fake.run = fail_run

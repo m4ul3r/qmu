@@ -962,13 +962,28 @@ def test_reset_at_a_debugger_stop_says_to_boot_it_with_qmu_cont(monkeypatch, cap
         assert ("qmu cont --vm dg" in capsys.readouterr().err) is told
 
 
+class _ContQMP(_StatusQMP):
+    """`cont` runs the vCPU; `rehalt` is the status it is back in at once —
+    an int3 no debugger owns re-runs (#237) — or None for a real resume."""
+
+    def __init__(self, status, rehalt=None):
+        super().__init__(status)
+        self.rehalt = rehalt
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        if command == "cont":
+            self.status = self.rehalt or "running"
+            return {}
+        return super().execute(command, arguments, timeout)
+
+
 @pytest.mark.parametrize(
     "status,client,ours,resume",
     [
         ("debug", True, False, "pry --instance <id> continue --background"),
         ("paused", True, True, "pry --instance qmu-dg continue --background"),
         ("paused", True, False, None),  # a pause nobody can attribute
-        ("debug", False, False, None),  # no client: nobody holds the stop
+        ("paused", False, False, None),  # no client: nobody holds the stop
     ],
 )
 def test_cont_of_a_debugger_stop_says_it_resumed_behind_the_debugger(
@@ -981,7 +996,7 @@ def test_cont_of_a_debugger_stop_says_it_resumed_behind_the_debugger(
     inst = _gdb_inst(1234)
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(
-        qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(_StatusQMP(status))
+        qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(_ContQMP(status))
     )
     monkeypatch.setattr(debug, "gdb_client_attached", lambda inst: client)
     monkeypatch.setattr(debug, "bridge_holds_stub", lambda inst: ours)
@@ -994,6 +1009,40 @@ def test_cont_of_a_debugger_stop_says_it_resumed_behind_the_debugger(
     else:
         (warning,) = payload["warnings"]
         assert f"`{resume}`" in warning
+
+
+@pytest.mark.parametrize("rehalt", ["debug", None], ids=["int3-re-runs", "runs-on"])
+def test_cont_at_a_breakpoint_no_debugger_owns_never_says_resumed(
+    monkeypatch, capsys, rehalt
+):
+    """Live (#237): a debugger that died without detaching leaves its int3
+    in RAM and in QEMU's breakpoint list; the guest halts in `debug` with no
+    client on the stub. `qmu cont` re-runs the int3 and QEMU is back in
+    `debug` at once — it answered exit 0 "resumed (status: debug)" and
+    every hint said `qmu cont`. A new client is what clears it (QEMU drops
+    a gone client's breakpoints), so every answer names that."""
+    inst = _gdb_inst(1234)
+    qmp = _ContQMP("debug", rehalt=rehalt)
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
+    monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(qmp))
+    monkeypatch.setattr(qmp_cmds, "_CONT_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(debug, "gdb_client_attached", lambda inst: False)
+    args = argparse.Namespace(vm="dg", force=False, format="json", out=None)
+
+    rc = _run(qmp_cmds._handle_cont, args)
+    payload = json.loads(capsys.readouterr().out)
+
+    clear = "qmu gdb --vm dg --symbols <vmlinux>"
+    if rehalt:
+        assert rc == 1 and payload["ok"] is False
+        assert payload["resumed"] is False
+        assert payload["guest_state"] == "paused" and payload["qemu_status"] == "debug"
+        assert clear in payload["hint"] and "pry --instance qmu-dg continue" in payload["hint"]
+        assert "Resume with: qmu cont" not in payload["hint"]
+    else:
+        assert rc == 0 and payload["ok"] is True
+        (warning,) = payload["warnings"]
+        assert clear in warning
 
 
 def test_a_paused_save_no_debugger_confirmed_does_not_send_the_reader_to_save_again(

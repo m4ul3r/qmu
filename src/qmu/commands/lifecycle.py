@@ -22,6 +22,7 @@ import shlex
 import shutil
 import signal
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -102,6 +103,7 @@ from .._cliutil import (
     _qmp_ctx,
     _resolve_config_from_args,
     _ssh_user,
+    _stopped_guest_payload,
     forward_label,
 )
 
@@ -1088,6 +1090,10 @@ class _GuestObservation:
     # the VM: "observed" (a RESET it witnessed) or "banner" (inferred from
     # the log). None on the standalone path, where only the banner exists.
     epoch_source: str | None = None
+    # #237: a `paused` guest QEMU holds at a gdbstub stop (`debug`) with no
+    # client on the stub — a breakpoint a dead debugger left behind, which
+    # `qmu cont` re-runs at once. Attaching a debugger clears it.
+    orphaned_stop: bool = False
 
     @property
     def qmp_state(self) -> str | None:
@@ -1107,7 +1113,14 @@ class _GuestObservation:
         return "skipped"
 
     def detail(self) -> str | None:
-        """Why the axis says `unknown`, for the reader who has to act on it."""
+        """Why the axis says `unknown`, for the reader who has to act on it —
+        or, for a paused guest at a breakpoint no debugger owns, why `qmu
+        cont` cannot resume it (#237)."""
+        if self.guest == GUEST_PAUSED and self.orphaned_stop:
+            return (
+                f"{debug_mod.ORPHANED_STOP}; no debugger is attached, and `qmu "
+                "cont` re-runs its trap"
+            )
         if self.guest != GUEST_UNKNOWN:
             return None
         reasons: list[str] = []
@@ -1200,6 +1213,7 @@ def _observe_guest(
             GUEST_PAUSED, start, console_bytes, qmp, has_endpoint,
             ssh_ready=False if has_endpoint else None,
             crash_detected=crash_detected, epoch_source=epoch_source,
+            orphaned_stop=debug_mod.orphaned_breakpoint_stop(inst, qmp.status),
         )
 
     # #39-adjacent: the readiness probe logs in, and a login runs `uname`.
@@ -2286,7 +2300,8 @@ def _add_wait(sub: argparse._SubParsersAction) -> None:
                    help="Block until this regex matches a serial console line, instead of "
                         "waiting for the VM to exit. With explicit --vm, also reads retained "
                         "stopped logs. Exits 0 on match, 3 on terminal panic, "
-                        "1 on exit without a match, 124 on timeout.")
+                        "1 on exit without a match or at a debugger stop (QEMU "
+                        "`debug`), 124 on timeout.")
     p.add_argument("--ignore-crash", action="store_true",
                    help="With --pattern: keep waiting through a terminal panic instead of "
                         "aborting on it")
@@ -2919,12 +2934,17 @@ def _pattern_wait_standalone(
 ) -> Result:
     """The poll loop over the serial log: one `scan_for_pattern` step and one
     PID-liveness check per tick, until a match, a terminal panic, the process
-    exits, or `deadline` passes.
+    exits, the guest halts at a debugger stop, or `deadline` passes.
 
     Also the continuation of a daemon-backed wait whose subscription the
     daemon ended (`released`, #118): the scan restarts at `start_offset` —
     every line before the daemon's cursor had already failed to match, so
     the verdict is the same — and `start`/`deadline` are the original wait's.
+
+    On a `--gdb` VM QEMU's run state is read too (`_RunStateWatch`): a
+    breakpoint stop halts the vCPU without a byte of console output, and the
+    wait used to burn its whole `--timeout` on it and hint "raise --timeout"
+    (#235).
     """
     tail = SerialTail(inst.serial_log, offset=start_offset)
     matched_line: str | None = None
@@ -2932,6 +2952,8 @@ def _pattern_wait_standalone(
     crash: str | None = None
     saw_dead = False
     terminal_panic_seen = False
+    run_state = _RunStateWatch(inst) if inst.gdb_port is not None else None
+    halt: str | None = None
 
     while True:
         try:
@@ -2977,8 +2999,26 @@ def _pattern_wait_standalone(
             saw_dead = True
             continue
 
+        if run_state is not None and run_state.poll() == "debug":
+            # A halted guest writes nothing more, so the withheld trailing
+            # fragment is all it wrote: release it before deciding, or a
+            # newline-less marker already on the console is a false no-match.
+            try:
+                scan = scan_for_pattern(
+                    tail, matcher, final=True, stop_at_panic=not args.ignore_crash
+                )
+            except OSError as exc:
+                return _pattern_inconclusive(args, inst, str(exc), type(exc).__name__)
+            if scan.matched_line is not None:
+                matched_line, reason = scan.matched_line, "pattern_matched"
+            else:
+                reason, halt = "debugger_stop", "debug"
+            break
+
         if deadline is not None and time.monotonic() >= deadline:
             reason = "timeout"
+            if run_state is not None:
+                halt = run_state.poll(fresh=True)
             break
 
         time.sleep(_PATTERN_POLL_INTERVAL)
@@ -2991,8 +3031,50 @@ def _pattern_wait_standalone(
         matched_line=matched_line, reason=reason, crash=crash,
         terminal_panic_seen=terminal_panic_seen, start_offset=start_offset,
         scan_scope=scan_scope, elapsed=time.monotonic() - start,
-        warnings=warnings,
+        warnings=warnings, halt=halt,
     )
+
+
+class _RunStateWatch:
+    """QEMU's run state for a `--pattern` wait on a `--gdb` VM (#235).
+
+    One `query-status` per `interval`, run on a daemon thread that is joined
+    for at most `_WAIT_QMP_BUDGET`: a QMP slot another client holds costs a
+    2 s greeting timeout, and waiting it out inline stalled the serial scan
+    and the deadline (the rule `guest._GuestWatcher` follows for SSH
+    commands). One query is in flight at a time; a poll that finds it still
+    blocked reads the last answer.
+    """
+
+    def __init__(self, inst: Any, interval: float = 1.0) -> None:
+        self._inst = inst
+        self._interval = interval
+        self._next = 0.0
+        self._thread: threading.Thread | None = None
+        self._halted: str | None = None
+
+    def _query(self) -> None:
+        probe = _query_qmp(self._inst)
+        connected = probe.state in (QMP_CONNECTED, QMP_DAEMON)
+        self._halted = probe.status if connected and probe.running is False else None
+
+    def poll(self, *, fresh: bool = False) -> str | None:
+        """QEMU's status word while it says the vCPUs are halted, else None;
+        `fresh` asks now whatever the interval."""
+        now = time.monotonic()
+        if fresh or now >= self._next:
+            self._next = now + self._interval
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._query, name="qmu-wait-qmp", daemon=True
+                )
+                self._thread.start()
+                self._thread.join(_WAIT_QMP_BUDGET)
+        return self._halted
+
+
+# How long one `_RunStateWatch` poll waits for QEMU's answer.
+_WAIT_QMP_BUDGET = 0.2
 
 
 def _pattern_inconclusive(
@@ -3064,11 +3146,23 @@ def _pattern_wait_via_daemon(
         )
     elif reason == "process_exited":
         crash = extract_crash(inst.serial_log, start_offset=start_offset)
+    # #235: the daemon ends the wait at a gdbstub stop (`debugger_stop`) and
+    # reports the run state it ended in; a timeout on a halted `--gdb` guest
+    # names the halt, as the standalone loop does.
+    halt: str | None = None
+    qemu_status = reply.get("qemu_status")
+    if reason == "debugger_stop":
+        halt = qemu_status if isinstance(qemu_status, str) else "debug"
+    elif (
+        reason == "timeout" and inst.gdb_port is not None
+        and reply.get("running") is False and isinstance(qemu_status, str)
+    ):
+        halt = qemu_status
     return _finish_pattern_wait(
         args, inst,
         matched_line=matched_line, reason=reason, crash=crash,
         terminal_panic_seen=terminal_panic_seen, start_offset=start_offset,
-        scan_scope=scan_scope, elapsed=float(reply.get("elapsed", 0.0)),
+        scan_scope=scan_scope, elapsed=float(reply.get("elapsed", 0.0)), halt=halt,
     )
 
 
@@ -3084,9 +3178,16 @@ def _finish_pattern_wait(
     scan_scope: str,
     elapsed: float,
     warnings: Sequence[str] = (),
+    halt: str | None = None,
 ) -> Result:
     """Render one `--pattern` outcome: 0 match, 3 terminal panic, 1 exit
-    without a match, 124 timeout."""
+    without a match or a debugger stop, 124 timeout.
+
+    `halt` is QEMU's status when the guest ended the wait halted: `debug`
+    for a `debugger_stop` (#235), or any halt a timeout ended in, which the
+    timeout then names instead of "raise --timeout" — no marker reaches the
+    console until the guest is resumed.
+    """
     matched = matched_line is not None
     _unknown_params = _warn_unknown_kernel_params(inst)
     result = {
@@ -3128,11 +3229,21 @@ def _finish_pattern_wait(
             f"VM '{inst.vm_id}' exited after {elapsed:.2f}s without matching "
             f"/{args.pattern}/ ({scope_note}).",
         ]
+    elif reason == "debugger_stop":
+        lines_out = [
+            f"VM '{inst.vm_id}' halted at a debugger stop (QEMU '{halt}') after "
+            f"{elapsed:.2f}s, before /{args.pattern}/ matched ({scope_note}).",
+        ]
     else:
         lines_out = [
             f"Timed out after {elapsed:.2f}s waiting for /{args.pattern}/ "
             f"on '{inst.vm_id}' ({scope_note}).",
         ]
+        if halt is not None:
+            lines_out.append(
+                f"The guest is halted (QEMU '{halt}'): nothing reaches its "
+                "console until it is resumed."
+            )
     if crash:
         lines_out.append("\nCrash from serial log:\n" + crash)
     vm, p = inst.vm_id, args.pattern
@@ -3155,6 +3266,34 @@ def _finish_pattern_wait(
             f"QEMU exited before /{p}/ matched; read the retained log: "
             f"qmu log --vm {vm} --tail 100; then qmu prune --vm {vm}"
         )
+    elif halt is not None:
+        # A guest halted at the end of the wait (#235): its marker cannot
+        # come until something resumes it, so name the stop and its resume
+        # instead of a longer --timeout, which cannot help.
+        exit_code = 1 if reason == "debugger_stop" else 124
+        stop, stop_text = _stopped_guest_payload(inst, halt)
+        result["guest_state"] = stop["guest_state"]
+        result["qemu_status"] = halt
+        lead = (
+            f"VM '{vm}' halted at a debugger stop before /{p}/ matched"
+            if reason == "debugger_stop"
+            else f"Pattern /{p}/ did not appear within --timeout, and the guest is "
+            f"halted (QEMU '{halt}')"
+        )
+        held = debug_mod.debugger_holding(inst, halt)
+        inspect = (
+            f" `pry --instance {held[0]} wait` shows the stop{held[1]}."
+            if held is not None else ""
+        )
+        result["hint"] = (
+            f"{lead}: no marker reaches the console until the guest is resumed, "
+            f"so a longer --timeout cannot help.{inspect} {stop['hint']} Then rerun "
+            f"this wait: it rescans from byte {start_offset}, so a marker printed "
+            "meanwhile still matches."
+        )
+        if held is not None:
+            lines_out.append(f"Read the stop: pry --instance {held[0]} wait{held[1]}")
+        lines_out.extend(stop_text[1:])
     else:
         exit_code = 124
         result["hint"] = (
@@ -3217,13 +3356,27 @@ def _guest_note(obs: _GuestObservation) -> str | None:
     if obs.guest == GUEST_CRASHED:
         return "crash report waiting, run `qmu crash`"
     if obs.guest == GUEST_PAUSED:
-        note = "vCPU paused, `qmu cont` resumes"
+        note = (
+            f"vCPU {debug_mod.ORPHANED_STOP}, `qmu gdb` then `pry continue` clears it"
+            if obs.orphaned_stop
+            else "vCPU paused, `qmu cont` resumes"
+        )
         if obs.crash_detected:
             note += ", crash report waiting, run `qmu crash`"
         return note
     if obs.guest == GUEST_UNKNOWN:
         return f"guest unknown ({obs.detail()})"
     return None
+
+
+def _orphaned_stop_hint(inst: Any) -> str:
+    """`status`'s recovery for a guest at a breakpoint no debugger owns (#237),
+    the same one the SSH commands' paused refusal and `cont` give."""
+    recovery = debug_mod.orphaned_stop_recovery(inst)
+    return (
+        f"VM '{inst.vm_id}' is {debug_mod.ORPHANED_STOP}: `qmu cont` re-runs its "
+        f"trap and the vCPU halts again at once. {recovery[0].upper()}{recovery[1:]}."
+    )
 
 
 def _handle_list(args: argparse.Namespace) -> Result:
@@ -3643,6 +3796,8 @@ def _handle_status(args: argparse.Namespace) -> Result:
     }
     if obs.ssh_auth_failed:
         result["hint"] = _auth_refused_hint(inst)
+    elif obs.orphaned_stop:
+        result["hint"] = _orphaned_stop_hint(inst)
     if obs.epoch_source and qmp.daemon is not None:
         # Daemon-served only: "observed" means a RESET was witnessed and the
         # scope is anchored on it; "banner" means the newest kernel boot
@@ -3685,6 +3840,8 @@ def _handle_status(args: argparse.Namespace) -> Result:
         lines.append(f"  SSH user:  {inst.ssh_user}")
     if obs.ssh_auth_failed:
         lines.append(f"  Hint:      {_auth_refused_hint(inst)}")
+    elif obs.orphaned_stop:
+        lines.append(f"  Hint:      {_orphaned_stop_hint(inst)}")
     for forward in inst.forwards:
         lines.append(f"  Forward:   {forward_label(forward)}")
     if inst.gdb_port:

@@ -137,13 +137,15 @@ discrimination identically; they used to disagree, which reported a missing
 daemon in the kernel-crash class that callers branch on to mean "the exploit
 crashed the kernel".
 
-`qmu wait --pattern` maps its four terminal states onto the same codes: match
+`qmu wait --pattern` maps its terminal states onto the same codes: match
 `-> 0`, **terminal-panic**-before-match `-> 3`, VM-died-before-match `-> 1`,
-timeout `-> 124`. A survived crash does not abort — the guest still runs, so
+a **debugger stop** (QEMU `debug`) before the match `-> 1` (`reason:
+"debugger_stop"`, the paused envelope's `guest_state`/`qemu_status`/resume
+`hint`, #235), timeout `-> 124`. A survived crash does not abort — the guest still runs, so
 the marker can still arrive, and aborting on it made callers paste
 `--ignore-crash` onto every wait, which is how a real panic gets missed.
 It exists so agents stop hand-rolling `until grep -q ... serial.log; do sleep;
-done`, which cannot terminate on either of the middle two.
+done`, which cannot terminate on a panic, a dead VM or a debugger stop.
 
 ### Output rendering (`_cliutil.Result`, `_cliutil.render`, `output.py`)
 
@@ -516,7 +518,16 @@ a spurious exit 1. A missing/unreadable log is exit 4 with `inconclusive:
 true`, never the exit 1 of a genuine no-match — on a running VM too:
 `read_lines` raises on a missing file (a recorded VM's QEMU created it before
 the record existed), so a log removed from under a running VM is no longer
-a 124 timeout on the daemon and standalone paths alike (#216).
+a 124 timeout on the daemon and standalone paths alike (#216). On a `--gdb`
+VM the wait also ends at a gdbstub stop (QEMU `debug`: no marker can come
+until a debugger resumes the guest, #235): the daemon from its cached run
+state (`daemon._at_debugger_stop`, QEMU's own `query-status` word after a
+STOP, never under `status_stale`), the standalone loop from
+`lifecycle._RunStateWatch` — one `query-status` a second on a daemon
+thread joined for at most 0.2 s, so a held QMP slot never stalls the scan.
+Any other halt (`paused`) can be qmu's own drive stop or a save, so the wait
+goes on; a timeout that ends halted names the halt and its resume hint
+instead of "raise --timeout".
 
 ### Bare `wait` and QMP contention (`lifecycle._query_qmp`, `qmp.QMPBusyError`)
 
@@ -811,7 +822,23 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   through the IDT). A load that failed mid-restore drives nothing and gets
   `loadvm_failed_restore_warning` instead of the re-arm recovery: a
   continue, a resync or a detach can resume the half-restored machine (#87).
-  A failed `pry resync` tears down.
+  A failed `pry resync` tears down — except two failures that say nothing
+  about the bridge's view. One that only ran out of the budget qmu gives it
+  (`PRY_RESYNC_TIMEOUT`, 120 s = pry's own op limit; the scan of a 7.0
+  KASAN vmlinux took 19–23 s on a loaded host, and the old 20 s tore
+  healthy bridges down, #233) is `not_resynced`, `timed_out: true`: the
+  bridge is kept, qmu's stop resumed (its symbols already sit at the
+  kernel's base), and the warning names `pry resync --timeout` — read off
+  the clock (`_pry_resync`), never pry's wording. And QEMU exiting under
+  the drive (`_qemu_gone`: a step failed, QMP no longer answers, the pid
+  identity goes within `_QEMU_EXIT_GRACE` — a big KVM guest closes its
+  sockets well before its pid goes) is `torn_down` with `qemu_exited:
+  true`, pointing at `status`/`crash`/`log`, never at a reattach (#236).
+  After a rebase (`_rebase_slides`) qmu reads `pry break list` at its stop:
+  a raw-address (`*0x…`) breakpoint does not follow the symbols, and the
+  warning names its new address (pry's `rebased_address`, else old −
+  previous slide + slide) with the delete/set commands (#238); breakpoints
+  set by symbol or file:line re-resolve, and only those texts say so.
 - **Save under the owned bridge (#201).** `qmp_cmds._SaveStop` brackets
   every savevm route (`snapshot save`, raw `savevm` through `_raw_mutation`):
   with QEMU `running`, KVM and the owned bridge attached,
@@ -870,7 +897,15 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   carries a warning. qmu's own stops (the drives above) are the public `pry
   interrupt`, which ends an operator's in-flight `pry wait`/foreground `pry
   continue` with `reason: signal SIGINT` (#228, until qmu uses pry's hold
-  primitive, pry #99); the receipts say so.
+  primitive, pry #99); the receipts say so. A `debug` stop with
+  positively no client on the stub (`debug.orphaned_breakpoint_stop`) is a
+  dead debugger's int3 still in RAM and in QEMU's gdbstub list: `qmu cont`
+  re-runs it and QEMU is back in `debug` at once, so `cont` reads the run
+  state after itself (one 0.25 s settle from `debug`) and answers exit 1,
+  `resumed: false` for any halt there; `status`/`list` (`guest_detail`,
+  `_GuestObservation.orphaned_stop`), the paused refusal and `cont` name
+  the case and what clears it — `qmu gdb` (QEMU drops a gone client's
+  breakpoints when a new one connects) then `pry continue` (#237).
 - Guest reboots nobody issued (#184): `VMInstance.debugger_epoch_offset`/
   `_banners` record the generation the debugger was last told about (`qmu
   gdb` attach, a reset — whose own banner is still to come, so `banners=1` —
@@ -904,9 +939,11 @@ path when no debugger is attached; the attach probe is what keeps it quiet in
 that common case while still warning whenever a client is (or might be) present.
 This is the qmu side of umbrella #48: the owned bridge is driven (#187);
 guest-initiated reboots stay warn-only, as qmu did not issue them.
-`exec`/`compile --run`/`dmesg` watch QMP while the SSH command runs and abort
-within ~1 s of `running:false` (a breakpoint stop), emitting the same paused
-envelope the preflight uses (exit 1) instead of waiting out the SSH keepalive.
+`exec`/`compile`/`push`/`pull`/`dmesg`/`kbase` watch QMP while the SSH command
+runs and abort within ~1 s of `running:false` (a breakpoint stop), emitting the
+same paused envelope the preflight uses (exit 1) instead of waiting out the SSH
+keepalive; `kbase` borrows `guest`'s watcher (a lazy import) and keeps stdout
+empty (#234).
 
 ## Gotchas
 

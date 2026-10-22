@@ -51,7 +51,28 @@ line/scope rules that decide whether `--pattern` can ever match.
   stopped VM cannot silently satisfy a new wait.
 - **Debugged VMs.** Never poll a debugged VM by re-attaching pry
   (`pry launch --connect` in a loop) — every attach halts the guest.
-  `qmu wait --pattern` and `qmu log --grep` never touch the gdbstub.
+  `qmu wait --pattern` and `qmu log --grep` never touch the gdbstub. A
+  breakpoint, watchpoint or step that halts the guest (QEMU `debug`) before
+  or during a `--pattern` wait **ends it at once**, as it ends an `exec`:
+  exit **1**, `reason: "debugger_stop"`, `guest_state: "paused"`,
+  `qemu_status: "debug"`, and a `hint` naming `pry --instance <id> wait`
+  (shows the stop) and the debugger's resume (`pry --instance <id> continue
+  --background`; the `qmu gdb` + `pry continue` attach when no debugger owns
+  the stop) — no marker reaches the console until the guest runs again
+  (#235). A newline-less marker already on the console when the stop comes
+  is final — the halted guest writes nothing more — so it is released and
+  still matches (exit 0), as on a VM that exited. Rerun the wait after the
+  resume: it rescans from the boot boundary,
+  so a marker printed meanwhile still matches. Any other halt (`paused`: an
+  attach, an interrupt, a QMP `stop`, qmu's own stop around a save or a
+  re-sync) can be over in a moment, so the wait goes on; a timeout that ends
+  with the guest still halted carries `guest_state`/`qemu_status` and the
+  resume `hint` instead of "raise --timeout". Both the daemon-backed and the
+  standalone path do this: the daemon from its cached run state (QEMU's own
+  `query-status` word after a `STOP` event), the standalone loop from one
+  short-lived `query-status` a second, read off-thread so a held QMP slot
+  never delays the serial scan. Only `--gdb` VMs are asked (no other VM can
+  stop in `debug`).
 
 ## Harness mode
 
@@ -153,11 +174,13 @@ from a `--pattern` wait, is the receipt for a successful harness run.
   instead, #184). Re-arm per `reference/debugging.md` before trusting a
   breakpoint again.
 - Every failed verdict carries `hint`: `timeout` → raise `--timeout` or check
-  `qmu status --vm X; qmu log --vm X --tail 50`; `terminal_panic` → `qmu
+  `qmu status --vm X; qmu log --vm X --tail 50` (on a `--gdb` guest still
+  halted at the end, the halt and its resume instead); `terminal_panic` → `qmu
   crash --vm X` then `qmu kill --vm X`; a `--pattern` crash → `qmu crash
   --vm X` then `qmu kill --vm X` while QEMU runs, `qmu prune --vm X` once it
   has stopped; a `--pattern` `process_exited` → `qmu log --vm X --tail 100`
-  then `qmu prune --vm X`.
+  then `qmu prune --vm X`; a `--pattern` `debugger_stop` → `pry wait` and
+  the debugger's resume, then the wait again.
 - No command prints the profile-sourced unknown-parameter note; `launch`
   keeps it in JSON only. Operator-param warnings still appear on `launch`.
 
@@ -178,6 +201,6 @@ only the `--pattern` codes; the bare-wait table above is the contract.
 |---|---|
 | `0` | matched; `matched_line`, `scan_offset`, `scan_scope` |
 | `3` | a terminal panic appeared first (`crash`); a *survived* Oops does not abort; `--ignore-crash` suppresses even the terminal abort |
-| `1` | the VM exited without the pattern and without terminal-panic evidence (a survived report stays in `crash`) |
-| `124` | `--timeout` elapsed with the VM running |
+| `1` | the VM exited without the pattern and without terminal-panic evidence (a survived report stays in `crash`); or `reason: "debugger_stop"`: the guest halted at a breakpoint/watchpoint/step stop (QEMU `debug`), with `guest_state: "paused"`, `qemu_status` and the resume `hint` |
+| `124` | `--timeout` elapsed with the VM running (a `--gdb` guest halted at the end adds `guest_state: "paused"`, `qemu_status` and the resume `hint`) |
 | `4` | `inconclusive: true`: the serial log is missing or unreadable — on a running VM (removed from under it) as on a stopped one (`error`, `error_type`, `serial_log`; text `[qmu] Error: Cannot inspect serial log … inconclusive.` on stderr). Never the exit 1 of a genuine no-match, nor a `124` timeout |

@@ -38,7 +38,14 @@ from .instance import (
 from .output import release_closed_streams, write_bytes_result, write_output_result
 from .qmp import QMPBusyError, QMPClient, QMPError
 from . import daemon_client
-from .debug import CONT_BEHIND_DEBUGGER, coherence_warnings, debugger_resume
+from .debug import (
+    CONT_BEHIND_DEBUGGER,
+    ORPHANED_STOP,
+    coherence_warnings,
+    debugger_resume,
+    orphaned_breakpoint_stop,
+    orphaned_stop_recovery,
+)
 from .serial import current_boot_offset, has_terminal_panic
 from .ssh import SSHAuthError, SSHClient
 
@@ -542,6 +549,9 @@ def _stopped_guest_payload(
     `qmu gdb` bridge's attach/interrupt) leads with the debugger's resume:
     `qmu cont` there runs the guest with every breakpoint lifted and leaves
     GDB believing it stopped, so its next command halts the guest again (#225).
+    A gdbstub stop with no client on the stub is an orphaned breakpoint
+    (`debug.orphaned_breakpoint_stop`): `qmu cont` re-runs its trap and the
+    vCPU halts again at once, and attaching a debugger is what clears it (#237).
     """
     resume = debugger_resume(inst, qemu_status)
     if qemu_status == "restore-vm":
@@ -572,6 +582,21 @@ def _stopped_guest_payload(
             f"Resume with: {command}{gloss}",
             f"Do not: qmu cont --vm {inst.vm_id} "
             f"({CONT_BEHIND_DEBUGGER.removeprefix('`qmu cont` ')})",
+        ]
+    elif orphaned_breakpoint_stop(inst, qemu_status):
+        recovery = orphaned_stop_recovery(inst)
+        hint = (
+            f"VM '{inst.vm_id}' is {qemu_status}: {ORPHANED_STOP}, and no "
+            f"debugger is attached to its stub. Not qmu cont --vm {inst.vm_id}: "
+            "it re-runs the trap and the vCPU halts again at once. "
+            f"{recovery[0].upper()}{recovery[1:]}."
+        )
+        text = [
+            f"VM '{inst.vm_id}' is {qemu_status} (vCPU {ORPHANED_STOP}; no "
+            "debugger attached).",
+            f"Clear it: {recovery.removeprefix('attach a debugger to clear it: ')}",
+            f"Do not: qmu cont --vm {inst.vm_id} (it re-runs the trap; the vCPU "
+            "halts again at once)",
         ]
     else:
         hint = (
