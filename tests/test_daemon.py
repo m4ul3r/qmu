@@ -1124,3 +1124,27 @@ def test_daemon_start_and_stop_spawn_and_reap_a_real_process(monkeypatch, capsys
     assert not daemon_client.socket_path_for(None).exists()
     log = daemon_client.log_path().read_text()
     assert "serving" in log and "stopped" in log
+
+
+@pytest.mark.parametrize("mode", ["daemon", "standalone"])
+def test_a_newline_less_marker_written_before_the_debugger_stop_still_matches(
+    mode, daemon_env, tmp_path, monkeypatch, capsys
+):
+    """Review of #235, live: `printf MARKER > /dev/ttyS0; sync -f /` hit the
+    breakpoint with the marker on the console as a trailing fragment, and
+    the wait answered `debugger_stop` before the idle-fragment scan ever
+    offered it. A halted guest writes nothing more, so the fragment is
+    final: it matches."""
+    server, halt = _debugged_vm(tmp_path, monkeypatch, mode)
+    try:
+        with (tmp_path / "dbg.serial.log").open("a") as log:
+            log.write("R37_FRAGMENT")
+        halt("debug")
+        rc = cli.main(["--format", "json", "wait", "--pattern", "R37_FRAGMENT$", "--timeout", "10"])
+        payload = json.loads(capsys.readouterr().out)
+    finally:
+        server.close()
+
+    assert rc == 0, payload
+    assert payload["reason"] == "pattern_matched"
+    assert payload["matched_line"].endswith("R37_FRAGMENT")

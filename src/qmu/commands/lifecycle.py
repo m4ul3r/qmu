@@ -3000,7 +3000,19 @@ def _pattern_wait_standalone(
             continue
 
         if run_state is not None and run_state.poll() == "debug":
-            reason, halt = "debugger_stop", "debug"
+            # A halted guest writes nothing more, so the withheld trailing
+            # fragment is all it wrote: release it before deciding, or a
+            # newline-less marker already on the console is a false no-match.
+            try:
+                scan = scan_for_pattern(
+                    tail, matcher, final=True, stop_at_panic=not args.ignore_crash
+                )
+            except OSError as exc:
+                return _pattern_inconclusive(args, inst, str(exc), type(exc).__name__)
+            if scan.matched_line is not None:
+                matched_line, reason = scan.matched_line, "pattern_matched"
+            else:
+                reason, halt = "debugger_stop", "debug"
             break
 
         if deadline is not None and time.monotonic() >= deadline:

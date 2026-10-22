@@ -1078,7 +1078,19 @@ class Daemon:
             if _at_debugger_stop(watch):
                 # #235: a breakpoint, watchpoint or step halted the vCPU; no
                 # marker reaches the console until the debugger resumes it.
-                reason = "debugger_stop"
+                # A halted guest writes nothing more, so its withheld
+                # trailing fragment is final: release it before deciding.
+                try:
+                    scan = scan_for_pattern(
+                        tail, matcher, final=True, stop_at_panic=not ignore_crash
+                    )
+                except OSError as exc:
+                    raise _OpError(str(exc), type(exc).__name__, inconclusive=True) from exc
+                if scan.matched_line is not None:
+                    matched = scan.matched_line
+                    reason = "pattern_matched"
+                else:
+                    reason = "debugger_stop"
                 break
             now = time.monotonic()
             if deadline is not None and now >= deadline:

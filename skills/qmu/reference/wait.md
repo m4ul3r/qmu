@@ -59,7 +59,10 @@ line/scope rules that decide whether `--pattern` can ever match.
   (shows the stop) and the debugger's resume (`pry --instance <id> continue
   --background`; the `qmu gdb` + `pry continue` attach when no debugger owns
   the stop) — no marker reaches the console until the guest runs again
-  (#235). Rerun the wait after the resume: it rescans from the boot boundary,
+  (#235). A newline-less marker already on the console when the stop comes
+  is final — the halted guest writes nothing more — so it is released and
+  still matches (exit 0), as on a VM that exited. Rerun the wait after the
+  resume: it rescans from the boot boundary,
   so a marker printed meanwhile still matches. Any other halt (`paused`: an
   attach, an interrupt, a QMP `stop`, qmu's own stop around a save or a
   re-sync) can be over in a moment, so the wait goes on; a timeout that ends

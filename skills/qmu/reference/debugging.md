@@ -396,7 +396,9 @@ to 3 s for its process to finish exiting first: a 2 GiB KASAN guest still
 had its `/proc` entry when pry reported the stub gone.
 
 **Raw-address breakpoints after a rebase (#238).** When the `pry kbase` qmu
-ran moved the symbols (`kbase.apply.previous_slide` → `kbase.slide`), qmu
+ran moved the symbols (`kbase.apply.previous_slide` → `kbase.slide`) — also
+when the `pry resync` after it ran out of time, whose own `pry resync
+--timeout` recovery would leave such a breakpoint where it is — qmu
 reads `pry break list` at its stop and names every breakpoint set at a raw
 address (`*0x…`) in one `warnings[]` entry: it stayed at its old address,
 no `pry resync` moves it, and the same instruction is now at old − previous

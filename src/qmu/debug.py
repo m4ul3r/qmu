@@ -751,7 +751,7 @@ def _raw_moved_warning(
         where = {
             "unreadable": "nothing is mapped at its address now",
             "armed": "still armed at its address, where the moved kernel has other code",
-        }.get(status, f"{status} at its address")
+        }.get(status, f"{status} at its address" if status else "still at its address")
         flags = " --hardware" if bp.get("kind") == "hw-breakpoint" else ""
         if bp.get("temporary"):
             flags += " --temporary"
@@ -1168,7 +1168,8 @@ def _qemu_exited(inst: Any, event: str, failed: str) -> BridgeDrive:
 
 def _resync_timed_out(
     inst: Any, event: str, *, stop: BridgeStop, kbase: dict[str, Any] | None,
-    resume_error: str | None, **extra: Any,
+    resume_error: str | None, raw: dict[int, dict[str, Any]] | None = None,
+    **extra: Any,
 ) -> BridgeDrive:
     """`pry resync` ran out of the budget qmu gave it (#233).
 
@@ -1234,7 +1235,14 @@ def _resync_timed_out(
         data["resume_error"] = resume_error
     if kbase is not None:
         data["kbase"] = kbase
-    return BridgeDrive(data=data, notes=tuple(notes), warnings=(warning,))
+    warnings = [warning]
+    slides = _rebase_slides(kbase)
+    if slides is not None and raw:
+        # No resync report to say whether each is armed: name them all.
+        warnings.append(_raw_moved_warning(
+            inst, event, slides, [({}, bp) for _, bp in sorted(raw.items())]
+        ))
+    return BridgeDrive(data=data, notes=tuple(notes), warnings=tuple(warnings))
 
 
 def _not_resynced(inst: Any, event: str, reason: str, recovery: str) -> BridgeDrive:
@@ -1363,9 +1371,14 @@ def _resync_at_stop(
         if _qemu_gone(inst, run_state):
             return _qemu_exited(inst, event, f"`pry resync` failed: {error}")
         if timed_out:
+            # #238 holds here too: the rebase `pry kbase` made left every
+            # raw-address breakpoint behind, and the `pry resync` the warning
+            # names cannot move one (review of #233).
+            raw = _raw_breakpoints(inst) if _rebase_slides(kbase) is not None else None
             resume_error = _pry_continue(inst) if stop.taken else None
             return _resync_timed_out(
-                inst, event, stop=stop, kbase=kbase, resume_error=resume_error, **extra,
+                inst, event, stop=stop, kbase=kbase, resume_error=resume_error,
+                raw=raw, **extra,
             )
         return _torn_down(inst, event, happened, f"`pry resync` failed: {error}")
     raw = _raw_breakpoints(inst) if _rebase_slides(kbase) is not None else None

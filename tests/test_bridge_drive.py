@@ -1078,3 +1078,28 @@ def test_a_raw_address_breakpoint_a_rebase_left_behind_is_named_with_its_new_add
     assert ("if it was set while the symbols sat at slide 0x4e00000" in warning) is (rebased is None)
     assert "once that code is mapped" not in warning
     assert "#1" not in warning, "a breakpoint set by symbol followed the rebase"
+
+
+def test_a_resync_that_runs_out_of_time_after_a_rebase_still_moves_raw_breakpoints(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Review of #233 x #238, live: a KASLR reset whose `pry resync` ran out
+    of time named only `pry resync --timeout 600`, which left a `*0x…`
+    breakpoint armed at its old address, inside other code. The rebase
+    happened anyway, so the timed-out drive names the new address too."""
+    _vm(tmp_path, monkeypatch, bridge, cmdline="console=ttyS0")
+    monkeypatch.setattr(debug, "PRY_RESYNC_TIMEOUT", 0.3)
+    pry.answers(
+        break_=[{"result": [*BREAK_LIST, RAW]}],
+        resync=[{"rc": 1, "error": _RUNAWAY, "sleep": 0.4}],
+    )
+
+    rc, payload = _json(capsys, ["qmp", "system_reset"])
+
+    assert rc == 0
+    assert payload["debugger"]["timed_out"] is True
+    moved = f"{0xffffffff8d8b01c4 - 0x4e00000 + 0x11000000:#x}"
+    raw_warnings = [w for w in payload["warnings"] if "does not follow a rebase" in w]
+    assert len(raw_warnings) == 1
+    assert f"pry --instance qmu-{VM} break set '*{moved}'" in raw_warnings[0]
+    assert f"pry --instance qmu-{VM} break delete 2" in raw_warnings[0]
