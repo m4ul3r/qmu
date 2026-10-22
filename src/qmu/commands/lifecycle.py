@@ -3018,7 +3018,9 @@ def _pattern_wait_standalone(
         if deadline is not None and time.monotonic() >= deadline:
             reason = "timeout"
             if run_state is not None:
-                halt = run_state.poll(fresh=True)
+                # The wait is over: this read may take its time (a loaded
+                # host answers slower than the in-loop budget).
+                halt = run_state.poll(fresh=True, budget=_WAIT_QMP_FINAL_BUDGET)
             break
 
         time.sleep(_PATTERN_POLL_INTERVAL)
@@ -3058,9 +3060,10 @@ class _RunStateWatch:
         connected = probe.state in (QMP_CONNECTED, QMP_DAEMON)
         self._halted = probe.status if connected and probe.running is False else None
 
-    def poll(self, *, fresh: bool = False) -> str | None:
+    def poll(self, *, fresh: bool = False, budget: float | None = None) -> str | None:
         """QEMU's status word while it says the vCPUs are halted, else None;
-        `fresh` asks now whatever the interval."""
+        `fresh` asks now whatever the interval. `budget` waits that long for
+        the answer, also for a query already in flight."""
         now = time.monotonic()
         if fresh or now >= self._next:
             self._next = now + self._interval
@@ -3069,12 +3072,16 @@ class _RunStateWatch:
                     target=self._query, name="qmu-wait-qmp", daemon=True
                 )
                 self._thread.start()
-                self._thread.join(_WAIT_QMP_BUDGET)
+                self._thread.join(_WAIT_QMP_BUDGET if budget is None else budget)
+            elif budget is not None:
+                self._thread.join(budget)
         return self._halted
 
 
 # How long one `_RunStateWatch` poll waits for QEMU's answer.
 _WAIT_QMP_BUDGET = 0.2
+# The same read once the wait has timed out: nothing is stalled by it then.
+_WAIT_QMP_FINAL_BUDGET = 3.0
 
 
 def _pattern_inconclusive(

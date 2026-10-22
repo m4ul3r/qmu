@@ -770,6 +770,12 @@ class Daemon:
             watch.inst.serial_log, start_offset=scanned_from, end_offset=scanned
         )
         with self.cond:
+            if watch.scanned != scanned_from:
+                # An epoch moved past these bytes while they were read
+                # (`adopt_epoch` after a `snapshot load`): what they hold
+                # belongs to a guest that no longer exists. The next tick
+                # scans from the new position.
+                return
             if shrank:
                 # The log shrank: a new log generation, nothing observed
                 # about it yet.
