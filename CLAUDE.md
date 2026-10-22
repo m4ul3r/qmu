@@ -404,10 +404,27 @@ between proves the first event ended, so a resumed WARNING is never bridged
 into a later unrelated panic. The rule is also what splits a
 `kasan_multi_shot` flood into its reports, so only the newest is returned
 (#142) — the newest *complete* one when the last is still being printed. A
-report starts at the event's headline — `CRASH_START_PATTERNS`
-carries arm's `Unable to handle kernel`, `kernel BUG at`, and the die-header
-shape `<what>: <hex> [#N]` (`int3: 0000 [#1]`) because the abort decode and
-the faulting address precede the generic `Oops:` (#140). What a panic's
+report starts at the event's headline — `CRASH_HEADLINES`
+carries arm's `Unable to handle kernel`, `kernel BUG at`, and `_DIE_HEADER`
+the die-header shape `<what>: <hex> [#N]` (`int3: 0000 [#1]`) because the
+abort decode and the faulting address precede the generic `Oops:` (#140).
+A headline (`Kernel panic - not syncing` too, so `has_terminal_panic`) is
+the kernel's own text in the kernel's own case, and counts only where a
+printk message starts (`_at_message_start`: line start, after the printk
+timestamp/caller field, behind a getty `login:` prompt, or behind a shell
+prompt `# `/`$ ` on a console without timestamps). Case-insensitive
+substrings made console text a crash (#219): a module named `oops` taints
+the kernel with `oops: loading out-of-tree module…` right above its fault
+headline, and `myapp: oops:` / `selftest: no kernel panic expected` written
+to `/dev/kmsg` set `guest: crashed`. No bare `Oops:` and no bug-type words:
+the die header and `BUG: KASAN:` already head every real report. The
+userspace-fault line `traps: <proc>[pid] general protection fault ip:…` is
+no longer a crash either (it never was a kernel fault). Residual: without
+printk timestamps, a headline behind arbitrary newline-less userspace output
+is not recognised. The lead check looks back at most `_LEAD_WINDOW` (64)
+characters, never to the line start: a guest's one long newline-free line
+full of headline words made every reader quadratic (13 s `status` on a
+220 KB line) — keep every per-hit check bounded. What a panic's
 kernel prints right after its own `---[ end Kernel panic` banner (the SMP
 `native_smp_send_reschedule` WARNING) is noise, never "the last crash" —
 only that adjacent splat (`_post_panic_noise`: its headline right after the
@@ -460,7 +477,10 @@ pass. `_wait_for_pattern` takes *one extra scan* after `instance_alive()` goes
 false (the `saw_dead` flag): the guest can print its marker and exit between a
 scan and the liveness check, and dropping that line would turn a success into
 a spurious exit 1. A missing/unreadable log is exit 4 with `inconclusive:
-true`, never the exit 1 of a genuine no-match.
+true`, never the exit 1 of a genuine no-match — on a running VM too:
+`read_lines` raises on a missing file (a recorded VM's QEMU created it before
+the record existed), so a log removed from under a running VM is no longer
+a 124 timeout on the daemon and standalone paths alike (#216).
 
 ### Bare `wait` and QMP contention (`lifecycle._query_qmp`, `qmp.QMPBusyError`)
 
@@ -636,7 +656,11 @@ that is the contract, and `tests/test_state_agreement_matrix.py` pins that
 commands (`push`/`pull`/`exec`/`compile`/`dmesg`) then error via `_require_ssh`;
 serial/QMP commands (`log`/`crash`/`wait`/`qmp`/`monitor`/`kill`) work. `qmu wait`
 polls `query-status` + PID liveness (see *Bare `wait`* above) and auto-cleans a
-harness VM only after the recorded pid is positively gone. Every bare-`wait`
+harness VM only when the wait itself saw the exit (`process_exited`, the
+recorded pid positively gone). `already_stopped` never cleans (#214): some
+other command (`kill --no-clean`, a crash `kill`) already decided what
+stays, and the payload is scoped to the last boot, so deleting the log lost
+a `panic=N` guest's earlier panics for good. Every bare-`wait`
 result carries `console_tail` (last 20 lines of the scanned scope) so a
 successful run whose log is about to be auto-cleaned still has a receipt;
 text prints it under `Console tail:` when QEMU exited without a crash. A
