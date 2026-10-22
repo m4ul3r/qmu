@@ -37,6 +37,7 @@ from ..snapshot import (
     guest_run_state,
     list_snapshots,
     load_snapshot,
+    missing_argument_command,
     save_snapshot,
     savevm_timeout,
     settle_loadvm,
@@ -70,7 +71,7 @@ from ..debug import (
     reap_bridge,
     reset_dropped_breakpoints_warning,
     resume_bridge_after_save,
-    save_left_stopped_warning,
+    keep_bridge_stopped_after_save,
     save_stop_failed_warning,
     savevm_breakpoint_state,
     savevm_breakpoint_warning,
@@ -183,17 +184,19 @@ def _savevm_coherence(
 class _SaveStop:
     """A savevm with the bridge `qmu gdb` spawned stopped across it (#201).
 
-    Under KVM, with that bridge attached and QEMU running, qmu interrupts it
-    so GDB lifts its breakpoints from guest RAM, takes the save at that stop
-    and resumes it after; otherwise (TCG, another client, already stopped)
-    the save runs as it is. `begin` takes `before`, QEMU's run state the save
-    starts in, and re-reads it after the interrupt: the two decide whether
-    the stop is qmu's to resume (`BridgeStop`, #226). `finish` classifies the
-    image (`breakpoints_in_image`, which may ask the bridge whether it is
-    stopped) BEFORE it resumes the bridge. A save that outran its budget
-    leaves the bridge stopped: QEMU may still be writing the image. Any other
-    failure resumes it, and `record_on_failure` hands what qmu did to the
-    error envelope.
+    Under KVM, with that bridge attached and QEMU running, qmu stops it
+    (`pry interrupt --hold`, so an operator's `pry wait` in flight keeps
+    waiting, #228) so GDB lifts its breakpoints from guest RAM, takes the
+    save at that stop and gives it back after; otherwise (TCG, another
+    client, already stopped) the save runs as it is. `begin` takes `before`,
+    QEMU's run state the save starts in, and re-reads it after the
+    interrupt: the two decide whether the stop is qmu's to resume
+    (`BridgeStop`, #226). `finish` classifies the image
+    (`breakpoints_in_image`, which may ask the bridge whether it is stopped)
+    BEFORE it gives the bridge back. A save that outran its budget leaves
+    the bridge stopped (and held): QEMU may still be writing the image. Any
+    other failure gives it back, and `record_on_failure` hands what qmu did
+    to the error envelope.
     """
 
     def __init__(self, inst: VMInstance, event: str):
@@ -251,9 +254,10 @@ class _SaveStop:
 
     def left_stopped(self) -> tuple[str, ...]:
         """Warnings for a save that outran its budget."""
-        if self.stop is None or not self.stop.taken or self.drive is not None:
+        if self.stop is None or self.drive is not None:
             return self.warnings
-        return self.warnings + (save_left_stopped_warning(self.stop, self.event),)
+        warning = keep_bridge_stopped_after_save(self.stop, self.event)
+        return self.warnings + ((warning,) if warning is not None else ())
 
     def record_on_failure(self) -> None:
         """An exception other than the save's own timeout is leaving the
@@ -399,6 +403,7 @@ def _snapshot_save_timeout(
         "ok": False,
         "error": error,
         "error_type": _SNAPSHOT_ERROR_TYPE,
+        "vm_id": inst.vm_id,
         "name": args.name,
         "timeout": timeout,
         "may_have_landed": True,
@@ -435,6 +440,15 @@ def _snapshot_failure_hint(name: str, vm_id: str, result: SnapshotResult) -> str
         return (
             "HMP parses the snapshot name as one token: it cannot contain "
             f"whitespace. Use e.g. '{'-'.join(name.split())}'."
+        )
+    if reason == "usage":
+        # HMP's parser refused the line before the command ran (#239).
+        command = missing_argument_command(result.message) or "loadvm"
+        return (
+            f"HMP `{command}` needs a snapshot name; QEMU refused the line before "
+            f"running it, so nothing was touched. Name the tag: qmu monitor "
+            f"'{command} <tag>' --vm {vm_id}; list the tags: qmu snapshot list "
+            f"--vm {vm_id}"
         )
     if reason == "drive":
         # QEMU names the drive it refused; the snapshot table is empty by
@@ -542,6 +556,7 @@ def _snapshot_result(
         "ok": False,
         "error": error,
         "error_type": _SNAPSHOT_ERROR_TYPE,
+        "vm_id": inst.vm_id,
         "name": args.name,
         "hint": hint,
     }

@@ -385,13 +385,96 @@ def debugger_resume(inst: Any, qemu_status: str | None) -> tuple[str, str] | Non
     stopped, and its next command (`pry status` included) halts the guest
     again. None when no debugger can be holding this stop
     (`debugger_holding`): `qmu cont` is the resume then, unless the stop is
-    an orphaned breakpoint (`orphaned_breakpoint_stop`).
+    an orphaned breakpoint (`orphaned_breakpoint_stop`). Where qmu kept its
+    hold on its bridge (`held_by_qmu`), the only resume pry accepts is `pry
+    continue --release`, with what must come first.
     """
     held = debugger_holding(inst, qemu_status)
     if held is None:
         return None
     ref, gloss = held
+    if qemu_status in ("paused", "debug") and qmu_bridge_attached(inst):
+        hold = held_by_qmu(inst)
+        if hold is not None:
+            return _release_resume(inst, hold)
     return f"pry --instance {ref} continue --background", gloss
+
+
+def held_by_qmu(inst: Any) -> dict[str, Any] | None:
+    """The hold qmu kept on its bridge (`VMInstance.bridge_hold`), while it
+    is still in place; None otherwise.
+
+    The record is qmu's own (written where a drive keeps its hold); pry's
+    status confirms a hold whose release resumes the target: `held` while
+    nobody ran anything at it, and `resynced` once the operator's own `pry
+    resync` ran there (pry reports the holder's op instead). Any other stop
+    reason means the hold was released since and the bridge stopped again
+    for something else. A hold at a stop that was already there (a save
+    that outran its budget at the operator's breakpoint) keeps that stop's
+    reason, so pry cannot confirm it: the record stands until qmu takes or
+    adopts a hold again.
+    """
+    hold = _kept_hold(inst)
+    if hold is None:
+        return None
+    if hold.get("resumes", True) is not True:
+        return hold
+    payload = _pry_status(inst)
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    if not (isinstance(reason, dict) and reason.get("kind") in ("held", "resynced")):
+        return None
+    return hold
+
+
+def _release_resume(inst: Any, hold: dict[str, Any]) -> tuple[str, str]:
+    """`(command, gloss)` resuming a stop qmu kept with its hold: only `pry
+    continue --release` ends it, and the gloss says what has to come first."""
+    ident = bridge_instance_id(inst.vm_id)
+    event = hold.get("event", "a snapshot operation")
+    if hold.get("why") == "rebase":
+        first = (
+            f" (qmu holds this stop: `pry kbase` could not validate the kernel's base "
+            f"after {event}, and resuming re-inserts every breakpoint at the base the "
+            f"bridge has. If the image was not saved in this boot, rebase first: "
+            f"pry --instance {ident} load <vmlinux> if it has no kernel symbol file, "
+            f"pry --instance {ident} kbase, pry --instance {ident} resync; then release. "
+            "A plain `pry continue` is refused until the release)"
+        )
+    else:
+        first = (
+            f" once `qmu snapshot list --vm {inst.vm_id}` shows the tag (qmu holds "
+            f"this stop because {event} outran its budget: QEMU may still be writing "
+            "the image, and resuming puts the breakpoints back into that RAM. A plain "
+            "`pry continue` is refused until the release)"
+        )
+    if not hold.get("resumes", True):
+        first += (
+            f"; the release leaves the target at its stop, so then: pry --instance "
+            f"{ident} continue --background"
+        )
+    return f"pry --instance {ident} continue --release", first
+
+
+def _record_hold(inst: Any, event: str, why: str, *, resumes: bool) -> None:
+    """Persist that qmu kept its hold (`VMInstance.bridge_hold`); best-effort."""
+    try:
+        current = load_instance(inst.vm_id) or inst
+        save_instance(replace(current, bridge_hold={
+            "bridge_pid": inst.gdb_bridge_pid, "event": event, "why": why,
+            "resumes": resumes,
+        }))
+    except OSError:
+        pass
+
+
+def _clear_hold(inst: Any) -> None:
+    """qmu's kept hold is over (qmu took or released a hold since)."""
+    try:
+        current = load_instance(inst.vm_id)
+        if current is not None and getattr(current, "bridge_hold", None) is not None:
+            save_instance(replace(current, bridge_hold=None))
+    except OSError:
+        pass
 
 
 def orphaned_breakpoint_stop(inst: Any, qemu_status: str | None) -> bool:
@@ -481,6 +564,17 @@ def bridge_stopped(inst: Any) -> bool | None:
     touches a target GDB believes stopped halts a running VM (the gdbstub
     stops on any packet), so on a running guest this read is not free.
     """
+    payload = _pry_status(inst)
+    if payload is None:
+        return None
+    state = payload.get("state")
+    return state == "stopped" if isinstance(state, str) else None
+
+
+def _pry_status(inst: Any) -> dict[str, Any] | None:
+    """`pry status` of the bridge `qmu gdb` recorded, while it is the
+    attached client; None otherwise or when it did not answer. Same rule as
+    `bridge_stopped`: only while QEMU is already halted."""
     if not qmu_bridge_attached(inst):
         return None
     pry = shutil.which("pry")
@@ -496,8 +590,7 @@ def bridge_stopped(inst: Any) -> bool | None:
         return None
     if result.returncode != 0 or not isinstance(payload, dict):
         return None
-    state = payload.get("state")
-    return state == "stopped" if isinstance(state, str) else None
+    return payload
 
 
 # --- Driving the bridge qmu owns (#187, #200, #201, #226) ---------------------
@@ -800,7 +893,7 @@ def _owned_ref(inst: Any) -> dict[str, Any]:
 def _pry_interrupt(inst: Any) -> tuple[dict[str, Any] | None, str | None]:
     """`pry interrupt` on the owned bridge; `interrupted` in the report is
     False when GDB believed the target stopped already (`BridgeStop` reads
-    what that belief is worth)."""
+    what that belief is worth). Only for a pry without the hold (below)."""
     report, error = _pry_json(
         ["interrupt", "--instance", str(inst.gdb_bridge_pid), "--format", "json"],
         timeout=_PRY_STOP_TIMEOUT,
@@ -809,6 +902,52 @@ def _pry_interrupt(inst: Any) -> tuple[dict[str, Any] | None, str | None]:
         return None, error
     if not (isinstance(report, dict) and report.get("stopped") is True):
         return None, "`pry interrupt` did not report a stop"
+    return report, None
+
+
+def _pry_hold(inst: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """`pry interrupt --hold` on the owned bridge (pry #108): a stop taken
+    for qmu's own ops that does not end a `pry wait` or foreground `pry
+    continue` the operator has in flight (#228). Its `run_state.will_resume`
+    says pry stopped a running target, so the release resumes it; false
+    when GDB found the target stopped already, or it stopped by itself
+    while pry was stopping it."""
+    report, error = _pry_json(
+        ["interrupt", "--hold", "--instance", str(inst.gdb_bridge_pid), "--format", "json"],
+        timeout=_PRY_STOP_TIMEOUT,
+    )
+    if error is not None:
+        return None, error
+    if not (
+        isinstance(report, dict) and report.get("held") is True
+        and isinstance(report.get("run_state"), dict)
+    ):
+        return None, "`pry interrupt --hold` did not report a hold"
+    return report, None
+
+
+# What a pry from before the hold (pry #108) answers `pry interrupt --hold`
+# with: its CLI does not know the flag (argparse, exit 2), or a bridge it
+# spawned earlier does not know the op.
+_NO_HOLD = ("unrecognized arguments: --hold", "Unknown op: 'hold'")
+
+
+def _hold_unsupported(error: str) -> bool:
+    return any(marker in error for marker in _NO_HOLD)
+
+
+def _pry_release(inst: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """`pry continue --release`: end qmu's hold. It resumes the target only
+    when the hold stopped a running one (`run_state.resumed`)."""
+    report, error = _pry_json(
+        ["continue", "--release", "--instance", str(inst.gdb_bridge_pid),
+         "--format", "json"],
+        timeout=_PRY_STOP_TIMEOUT,
+    )
+    if error is not None:
+        return None, error
+    if not (isinstance(report, dict) and report.get("released") is True):
+        return None, "`pry continue --release` did not report a release"
     return report, None
 
 
@@ -824,7 +963,9 @@ def _pry_continue(inst: Any) -> str | None:
 
 @dataclass(frozen=True)
 class BridgeStop:
-    """The owned bridge at the stop qmu went to take with `pry interrupt`.
+    """The owned bridge at the stop qmu went to take with `pry interrupt
+    --hold` (`held`), or with the public `pry interrupt` where the pry on
+    PATH has no hold.
 
     `before`/`after` are QEMU's run state right before and right after the
     interrupt. pry's `interrupted` is only GDB's belief, and GDB can believe
@@ -843,12 +984,21 @@ class BridgeStop:
     report: dict[str, Any]
     before: str | None
     after: str | None = None
+    held: bool = False
+
+    @property
+    def interrupted(self) -> bool:
+        """pry stopped a target GDB had running. Under a hold that is
+        `will_resume`: the release resumes it."""
+        if self.held:
+            return self.report["run_state"].get("will_resume") is True
+        return self.report.get("interrupted") is True
 
     @property
     def stale(self) -> bool:
         """The bridge believed the target stopped while QEMU ran it."""
         return (
-            self.report.get("interrupted") is not True
+            not self.interrupted
             and self.before == "running"
             and self.after != "debug"
         )
@@ -856,7 +1006,7 @@ class BridgeStop:
     @property
     def taken(self) -> bool:
         """qmu made this stop, so qmu resumes it."""
-        return self.report.get("interrupted") is True or self.stale
+        return self.interrupted or self.stale
 
     def at(self, after: str | None) -> BridgeStop:
         """This stop, with QEMU's run state right after the interrupt."""
@@ -864,11 +1014,88 @@ class BridgeStop:
 
 
 def _stop(inst: Any, before: str | None) -> tuple[BridgeStop | None, str | None]:
-    """`pry interrupt` the owned bridge, QEMU's run state being `before`."""
+    """Stop the owned bridge for qmu, QEMU's run state being `before`.
+
+    A hold (`pry interrupt --hold`) where pry has one: the public `pry
+    interrupt` ends whatever the operator has in flight on the bridge with a
+    `reason: signal SIGINT` stop that qmu then resumes (#228). A pry from
+    before the hold gets that public interrupt, and the receipt says what
+    it did to a waiter (`_waiters_note`)."""
+    report, error = _pry_hold(inst)
+    if error is None:
+        _clear_hold(inst)  # a hold qmu kept before is over, or this would fail
+        return BridgeStop(inst, report, before, held=True), None
+    kept = _kept_hold(inst)
+    if kept is not None and "held already" in error:
+        # The hold a previous qmu command kept (a save that outran its
+        # budget, a rebase pry could not validate) is still in place: this
+        # drive takes it over, and its release ends it.
+        resumes = kept.get("resumes", True) is True
+        report = {
+            "held": True, "reason": {"kind": "held"}, "adopted": True,
+            "run_state": {"was_running": resumes, "interrupted": resumes,
+                          "will_resume": resumes},
+        }
+        _clear_hold(inst)
+        return BridgeStop(inst, report, before, held=True), None
+    if not _hold_unsupported(error):
+        return None, error
     report, error = _pry_interrupt(inst)
     if error is not None:
         return None, error
     return BridgeStop(inst, report, before), None
+
+
+def _kept_hold(inst: Any) -> dict[str, Any] | None:
+    """qmu's record of a hold it kept on this bridge, unchecked."""
+    current = load_instance(inst.vm_id) or inst
+    hold = getattr(current, "bridge_hold", None)
+    if isinstance(hold, dict) and hold.get("bridge_pid") == inst.gdb_bridge_pid:
+        return hold
+    return None
+
+
+def _end_stop(stop: BridgeStop) -> str | None:
+    """Give the bridge back after qmu's ops at `stop`; the error, if any.
+
+    A hold is always released (`pry continue --release`), or the bridge
+    refuses every resume the operator tries; the release resumes the target
+    only when pry stopped it. A stop qmu made that the release did not
+    resume (a stale view, #226), or any stop qmu made without a hold, is
+    resumed with `pry continue --background`. A stop that is not qmu's
+    stays where it is."""
+    if stop.held:
+        release, error = _pry_release(stop.inst)
+        if error is not None:
+            return error
+        if not stop.taken or release["run_state"].get("resumed") is True:
+            return None
+    elif not stop.taken:
+        return None
+    return _pry_continue(stop.inst)
+
+
+def _resume_steps(stop: BridgeStop) -> str:
+    """The command(s) that resume a target qmu left at `stop` (taken)."""
+    ident = bridge_instance_id(stop.inst.vm_id)
+    background = f"`pry --instance {ident} continue --background`"
+    if not stop.held:
+        return background
+    release = f"`pry --instance {ident} continue --release`"
+    if stop.interrupted:
+        return release
+    return f"{release} (it ends qmu's hold and leaves the target stopped), then {background}"
+
+
+def _release_failed_warning(stop: BridgeStop, event: str, error: str) -> str:
+    """qmu could not release its hold at a stop that was not its own."""
+    ident = bridge_instance_id(stop.inst.vm_id)
+    return (
+        f"[qmu] WARNING: VM '{stop.inst.vm_id}': qmu could not release its hold "
+        f"on the pry bridge {ident} after {event} ({error}); until it is released "
+        f"the bridge refuses to resume the target: `pry --instance {ident} "
+        "continue --release` ends it (the target stays at its stop).\n"
+    )
 
 
 def _stale_note(stop: BridgeStop, event: str) -> str:
@@ -884,23 +1111,30 @@ def _stale_note(stop: BridgeStop, event: str) -> str:
 
 
 def _waiters_note(stop: BridgeStop, event: str, resumed: bool) -> str | None:
-    """#228: qmu's stop is the public `pry interrupt`, which ends whatever the
-    operator has in flight on the same bridge with a stop of its own; say so,
-    or an agent takes that stop for a real one. Only a stop pry actually made
-    (`interrupted`) ends a waiter: on a target GDB believed stopped none can
-    be waiting."""
-    if stop.report.get("interrupted") is not True:
+    """#228: what qmu's stop did to a `pry wait` or foreground `pry continue`
+    the operator had in flight on the same bridge. Under a hold, nothing: it
+    kept waiting. The public `pry interrupt` of a pry without the hold ends
+    it with a stop of its own; say so, or an agent takes that stop for a
+    real one. Only a stop pry actually made (`interrupted`) concerns a
+    waiter: on a target GDB believed stopped none can be waiting."""
+    if not stop.interrupted:
         return None
     ident = bridge_instance_id(stop.inst.vm_id)
+    if stop.held:
+        return (
+            f"[qmu] qmu held that stop (`pry interrupt --hold`), so a `pry wait` "
+            f"or foreground `pry continue` running on {ident} kept waiting through it."
+        )
     after = (
         "which qmu then resumed: that stop was qmu's, not a hit, so wait again"
         if resumed
         else "and the target is still at that stop"
     )
     return (
-        f"[qmu] qmu's `pry interrupt` for {event} ended any `pry wait` or "
-        f"foreground `pry continue` running on {ident} with a `reason: signal "
-        f"SIGINT` stop, {after}."
+        f"[qmu] This pry predates `pry interrupt --hold` (pry #108), so qmu's "
+        f"`pry interrupt` for {event} ended any `pry wait` or foreground `pry "
+        f"continue` running on {ident} with a `reason: signal SIGINT` stop, {after}. "
+        "With a pry that has the hold (and a bridge spawned by it), that wait keeps waiting."
     )
 
 
@@ -986,7 +1220,9 @@ def _resynced(
         *(f"  stray trap {_stray_line(t)}" for t in strays),
     ]
     warnings: list[str] = []
-    if resume_error is not None:
+    if resume_error is not None and not taken:
+        warnings.append(_release_failed_warning(stop, event, resume_error))
+    elif resume_error is not None:
         warnings.append(
             f"[qmu] WARNING: VM '{inst.vm_id}': qmu stopped the pry bridge {ident} "
             f"to re-sync it after {event} and could not resume it ({resume_error}); "
@@ -1059,6 +1295,8 @@ def _resynced(
             + f". Re-run `pry --instance {ident} resync` once that code is mapped.\n"
         )
     data: dict[str, Any] = {"action": "resynced", "event": event, **_owned_ref(inst), **extra}
+    if stop is not None:
+        data["held"] = stop.held
     if taken:
         data["interrupted"] = True
         data["resumed"] = resumed
@@ -1066,6 +1304,8 @@ def _resynced(
             data["stale_stop"] = True
         if resume_error is not None:
             data["resume_error"] = resume_error
+    elif resume_error is not None:
+        data["release_error"] = resume_error
     if kbase is not None:
         data["kbase"] = kbase
     data["resync"] = report
@@ -1183,6 +1423,7 @@ def _resync_timed_out(
     ref = _owned_ref(inst)
     ident = ref["bridge_instance_id"]
     resumed = stop.taken and resume_error is None
+    released = stop.taken or resume_error is None
     reason = (
         f"`pry resync` ran out of time: it did not finish within the "
         f"{PRY_RESYNC_TIMEOUT} s qmu gives it"
@@ -1198,11 +1439,13 @@ def _resync_timed_out(
             f"({resume_error}): the guest is halted in the debugger, `pry "
             f"--instance {ident} continue --background` resumes it"
         )
-    else:
+    elif released:
         target = (
             "the target is left at the debugger stop it was at: `pry --instance "
             f"{ident} continue --background` resumes it"
         )
+    else:
+        target = "the target is left at the debugger stop it was at"
     rebased = (
         f", its symbols at the base `pry kbase` validated ({kbase['base']})"
         if kbase is not None else ""
@@ -1227,15 +1470,18 @@ def _resync_timed_out(
     )
     data: dict[str, Any] = {
         "action": "not_resynced", "event": event, **ref, "reason": reason,
-        "timed_out": True, "interrupted": stop.taken, "resumed": resumed, **extra,
+        "timed_out": True, "held": stop.held, "interrupted": stop.taken,
+        "resumed": resumed, **extra,
     }
     if stop.stale:
         data["stale_stop"] = True
     if resume_error is not None:
-        data["resume_error"] = resume_error
+        data["resume_error" if stop.taken else "release_error"] = resume_error
     if kbase is not None:
         data["kbase"] = kbase
     warnings = [warning]
+    if not released:
+        warnings.append(_release_failed_warning(stop, event, resume_error))
     slides = _rebase_slides(kbase)
     if slides is not None and raw:
         # No resync report to say whether each is armed: name them all.
@@ -1275,8 +1521,8 @@ _NO_PRY = "`pry` is not on qmu's PATH"
 # event, and the first step back.
 _LOAD_BASE = (
     "which is right only if the image was saved in this boot: if nothing reset "
-    "or rebooted the guest since the save, `pry --instance {ident} continue "
-    "--background` re-arms them in place. Otherwise rebase first:"
+    "or rebooted the guest since the save, {resume} re-arms them in place. "
+    "Otherwise rebase first:"
 )
 _RESET_BASE = "which the reset re-slid, so they are stale. Rebase first:"
 
@@ -1289,40 +1535,57 @@ def _left_stopped_unrebased(
     At a stop GDB holds none of its breakpoints in guest RAM; resuming puts
     every one back at the address the bridge has, which is the stale base
     if the kernel moved. So the target is left stopped and the warning says
-    how to rebase before resuming it.
+    how to rebase before resuming it. A hold whose release would resume
+    the target stays for the operator to release (`pry continue --release`
+    is then the resume, and a `pry wait` in flight keeps waiting until it);
+    one whose release resumes nothing is given back at once.
     """
     ref = _owned_ref(inst)
     ident = ref["bridge_instance_id"]
-    held = (
+    left = (
         "left at the stop qmu took for the rebase"
         if stop.taken
         else "left at the debugger stop it was already at"
     )
+    release_error = None
+    if stop.held and not stop.interrupted:
+        _, release_error = _pry_release(inst)
+    if release_error is None and stop.held and not stop.interrupted:
+        resume = f"`pry --instance {ident} continue --background`"
+    else:
+        resume = _resume_steps(stop)
+    if stop.held and stop.interrupted:
+        left += " (qmu still holds it: `pry continue --background` is refused until the release)"
+        _record_hold(inst, event, "rebase", resumes=True)
     reason = f"`pry kbase` could not validate the kernel's base: {error}"
     warning = (
         f"[qmu] WARNING: VM '{inst.vm_id}': qmu did not re-sync the pry bridge "
         f"`qmu gdb` spawned ({ident}, pid {ref['bridge_pid']}) after {event}: "
-        f"{reason}. The target is {held}, with none of its breakpoints in "
+        f"{reason}. The target is {left}, with none of its breakpoints in "
         "guest RAM, rather than resume it: resuming re-inserts every breakpoint "
         "at the address the bridge has now, "
-        + at_stake.format(ident=ident)
+        + at_stake.format(resume=resume)
         + f" `pry --instance {ident} load <vmlinux>` if `pry kbase` found no "
         f"kernel symbol file, then `pry --instance {ident} kbase` and `pry "
         f"--instance {ident} resync`; or, over SSH, `qmu cont --vm {inst.vm_id}` "
         "(the guest runs with no breakpoint in RAM), `eval \"$(qmu kbase --vm "
         f"{inst.vm_id} --symbols <vmlinux>)\"`, then `pry --instance {ident} "
         "resync --base $KBASE --symbols <vmlinux>` (it stops the guest again). "
-        f"Then `pry --instance {ident} continue --background`. A breakpoint set "
+        f"Then {resume}. A breakpoint set "
         "at a raw address (`*0x…`) does not follow a rebase: delete it and set "
         "it again.\n"
     )
     data = {
         "action": "not_resynced", "event": event, **ref, "reason": reason,
-        "interrupted": stop.taken, "resumed": False,
+        "held": stop.held, "interrupted": stop.taken, "resumed": False,
     }
     if stop.stale:
         data["stale_stop"] = True
-    return BridgeDrive(data=data, warnings=(warning,))
+    warnings = (warning,)
+    if release_error is not None:
+        data["release_error"] = release_error
+        warnings += (_release_failed_warning(stop, event, release_error),)
+    return BridgeDrive(data=data, warnings=warnings)
 
 
 def _resync_at_stop(
@@ -1339,7 +1602,8 @@ def _resync_at_stop(
     kbase` that failed. And a bridge whose view is stale (GDB believes the
     target stopped while QEMU runs it, #226) resumes nothing: its first
     packet halts the guest, and pry reports the stop it believed in. So qmu
-    takes the stop itself (`pry interrupt`), reading QEMU's run state on both
+    takes the stop itself (`pry interrupt --hold`, so an operator's `pry
+    wait` in flight keeps waiting, #228), reading QEMU's run state on both
     sides of it (`run_state`), both run at that stop, and qmu resumes the
     target only when the stop is its own (`BridgeStop.taken`) and the
     symbols sit at a validated base. A target the operator had stopped is
@@ -1375,14 +1639,14 @@ def _resync_at_stop(
             # raw-address breakpoint behind, and the `pry resync` the warning
             # names cannot move one (review of #233).
             raw = _raw_breakpoints(inst) if _rebase_slides(kbase) is not None else None
-            resume_error = _pry_continue(inst) if stop.taken else None
+            resume_error = _end_stop(stop)
             return _resync_timed_out(
                 inst, event, stop=stop, kbase=kbase, resume_error=resume_error,
                 raw=raw, **extra,
             )
         return _torn_down(inst, event, happened, f"`pry resync` failed: {error}")
     raw = _raw_breakpoints(inst) if _rebase_slides(kbase) is not None else None
-    resume_error = _pry_continue(inst) if stop.taken else None
+    resume_error = _end_stop(stop)
     if resume_error is not None and _qemu_gone(inst, run_state):
         return _qemu_exited(inst, event, f"`pry continue` failed: {resume_error}")
     return _resynced(
@@ -1517,16 +1781,18 @@ def _boot_not_done(inst: Any, waited: float) -> str:
 # Under KVM GDB's breakpoints are int3 bytes in guest RAM whenever it has the
 # target running, and a savevm freezes them into the image. At a debugger stop
 # GDB has lifted them, so with its own bridge attached and the guest running
-# qmu stops the bridge, saves, and resumes it: the image is clean without the
-# operator's interrupt / save / continue. The caller reads QEMU's run state
-# right after the interrupt (`BridgeStop.at`), which decides whether the stop
-# was qmu's to resume.
+# qmu holds the bridge stopped (`pry interrupt --hold`, which a `pry wait` in
+# flight sits out, #228), saves, and releases it: the image is clean without
+# the operator's interrupt / save / continue. The caller reads QEMU's run
+# state right after the interrupt (`BridgeStop.at`), which decides whether
+# the stop was qmu's to resume.
 
 
 def stop_bridge_for_save(
     inst: Any, qemu_status: str | None
 ) -> tuple[BridgeStop | None, str | None]:
-    """`pry interrupt` the owned bridge before a savevm; `(stop, error)`.
+    """Stop the owned bridge before a savevm (`_stop`: a hold where pry has
+    one); `(stop, error)`.
 
     `(None, None)` where it does not apply: TCG (breakpoints never reach
     guest RAM), QEMU not `running` (a debugger stop is already clean, and a
@@ -1555,7 +1821,8 @@ def _stop_reason(report: dict[str, Any]) -> str:
 
 
 def resume_bridge_after_save(stop: BridgeStop, event: str) -> BridgeDrive:
-    """Resume the bridge `stop_bridge_for_save` stopped, once the save returned.
+    """Give the bridge `stop_bridge_for_save` stopped back, once the save
+    returned (`_end_stop`: release qmu's hold, resume a stop qmu made).
 
     Only a stop qmu made (`stop.taken`) is resumed: the target running when
     qmu went to stop it and not at a gdbstub stop right after, whatever pry
@@ -1568,30 +1835,36 @@ def resume_bridge_after_save(stop: BridgeStop, event: str) -> BridgeDrive:
     ident = ref["bridge_instance_id"]
     data: dict[str, Any] = {
         "action": "stopped_for_save", "event": event, **ref,
-        "interrupted": stop.taken,
+        "held": stop.held, "interrupted": stop.taken,
     }
     if stop.stale:
         data["stale_stop"] = True
+    error = _end_stop(stop)
     if not stop.taken:
         data["resumed"] = False
-        return BridgeDrive(data=data, warnings=(
+        warnings = [
             f"[qmu] WARNING: VM '{inst.vm_id}': the target stopped by itself "
             f"({_stop_reason(stop.report)}; QEMU '{stop.after}') as qmu went to "
             f"stop the pry bridge {ident} for {event}; the image was saved at that "
             "stop, and the guest is left halted there: `pry --instance "
             f"{ident} continue --background` resumes it.\n",
-        ))
-    error = _pry_continue(inst)
+        ]
+        if error is not None:
+            data["release_error"] = error
+            warnings.append(_release_failed_warning(stop, event, error))
+        return BridgeDrive(data=data, warnings=tuple(warnings))
     data["resumed"] = error is None
     waiters = _waiters_note(stop, event, error is None)
     ended = (waiters,) if waiters is not None else ()
     if error is None:
         if stop.stale:
             return BridgeDrive(data=data, notes=(_stale_note(stop, event),))
+        how = " with a hold (`pry interrupt --hold`)" if stop.held else ""
+        back = "`pry continue --release`" if stop.held else "`pry continue --background`"
         return BridgeDrive(data=data, notes=(
             f"[qmu] Stopped the pry bridge {ident} (pid {ref['bridge_pid']}) for "
-            f"{event}, so GDB had lifted its breakpoints from guest RAM while QEMU "
-            "saved, then resumed it (`pry continue --background`).",
+            f"{event}{how}, so GDB had lifted its breakpoints from guest RAM while "
+            f"QEMU saved, then resumed it ({back}).",
             *ended,
         ))
     data["resume_error"] = error
@@ -1602,16 +1875,36 @@ def resume_bridge_after_save(stop: BridgeStop, event: str) -> BridgeDrive:
     ))
 
 
-def save_left_stopped_warning(stop: BridgeStop, event: str) -> str:
-    """The save outran its budget with the owned bridge stopped for it by qmu."""
+def keep_bridge_stopped_after_save(stop: BridgeStop, event: str) -> str | None:
+    """The save outran its budget with the owned bridge stopped for it: the
+    warning to give, after recording a hold qmu keeps (`_record_hold`, read
+    by the paused refusal's resume, `debugger_resume`).
+
+    Nothing is given back then (resuming would put the breakpoints back
+    into RAM QEMU may still be saving, and the bridge's own reads wait on
+    QEMU's main loop as QMP does): a stop qmu made is left stopped, and a
+    hold at the operator's stop is left in place. None when there is
+    nothing to say (a stop that was not qmu's, without a hold)."""
     ident = bridge_instance_id(stop.inst.vm_id)
-    return (
-        f"[qmu] WARNING: VM '{stop.inst.vm_id}': qmu stopped the pry bridge "
-        f"{ident} for {event}, and left it stopped because the save had not "
-        "returned: resuming then would put its breakpoints back into RAM that "
-        "may still be being saved. Once `qmu snapshot list` shows the tag, "
-        f"resume it: `pry --instance {ident} continue --background`.\n"
-    )
+    lead = f"[qmu] WARNING: VM '{stop.inst.vm_id}': "
+    if stop.held:
+        _record_hold(stop.inst, event, "save", resumes=stop.interrupted)
+    if stop.taken:
+        return (
+            f"{lead}qmu stopped the pry bridge {ident} for {event}, and left it "
+            "stopped because the save had not returned: resuming then would put "
+            "its breakpoints back into RAM that may still be being saved. Once "
+            f"`qmu snapshot list` shows the tag, resume it: {_resume_steps(stop)}.\n"
+        )
+    if stop.held:
+        return (
+            f"{lead}the target stopped by itself as qmu went to stop the pry "
+            f"bridge {ident} for {event}, and qmu's hold on that stop is still in "
+            "place because the save had not returned. Once `qmu snapshot list` "
+            f"shows the tag, `pry --instance {ident} continue --release` ends the "
+            "hold and leaves the target at its stop.\n"
+        )
+    return None
 
 
 def save_stop_failed_warning(inst: Any, error: str) -> str:

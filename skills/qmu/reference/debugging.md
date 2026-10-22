@@ -345,21 +345,23 @@ savevm`, `qmp human-monitor-command savevm`).
 
 | Event | qmu's action |
 |---|---|
-| load succeeded | Every re-sync runs at a stop qmu holds: `pry interrupt`, then `pry resync`, then `pry continue --background` when the stop is qmu's (see *Who resumes* below). On a nokaslr guest that is all (the restored image is mapped). On a KASLR guest (no `nokaslr` on the recorded cmdline) the image restores the kernel at the base of the boot it was saved in, which a reset or reboot since the save has moved (#200), so qmu rebases at that stop first: `pry interrupt`, `pry kbase`, `pry resync`, then `pry continue --background` (measured: rebased `0x1a000000` → `0xc200000`, the canary fired at the restored kernel's address). The stop comes first because `pry kbase` and `pry resync` each stop a running target and resume it, and that resume re-inserts every breakpoint at the address the bridge has, successful or not (measured before this order: a failed `pry kbase` left `0xcc` at the old address and the canary fired). A target that was already at a debugger stop is re-synced (and rebased) there and not resumed. If `pry kbase` cannot validate a base (e.g. `no kernel symbol file is loaded`), the target stays at that stop with none of its breakpoints in guest RAM (measured: `0x41` at the breakpoint, `exec` refused with `guest_state: "paused"`), `not_resynced` with `interrupted: true`, `resumed: false`, and the warning gives both ways on: `continue --background` if the image is from this boot, else rebase first (`pry load <vmlinux>` if needed, `pry kbase`, `pry resync`; or `qmu cont`, `qmu kbase`, `pry resync --base $KBASE --symbols <vmlinux>`) — each run as written. If the re-sync fails, the bridge is torn down — unless it only ran out of time or QEMU exited under it (*When a drive step fails*, below); if qmu cannot find `pry` on its own PATH, the bridge is left alone (`not_resynced`). |
+| load succeeded | Every re-sync runs at a stop qmu holds: `pry interrupt --hold`, then `pry resync`, then `pry continue --release`, which resumes the target when the stop is qmu's (see *Who resumes* and *qmu's stop is a hold* below). On a nokaslr guest that is all (the restored image is mapped). On a KASLR guest (no `nokaslr` on the recorded cmdline) the image restores the kernel at the base of the boot it was saved in, which a reset or reboot since the save has moved (#200), so qmu rebases at that stop first: `pry interrupt --hold`, `pry kbase`, `pry resync`, then `pry continue --release` (measured: rebased `0x1a000000` → `0xc200000`, the canary fired at the restored kernel's address). The stop comes first because `pry kbase` and `pry resync` each stop a running target and resume it, and that resume re-inserts every breakpoint at the address the bridge has, successful or not (measured before this order: a failed `pry kbase` left `0xcc` at the old address and the canary fired). A target that was already at a debugger stop is re-synced (and rebased) there and not resumed (the release leaves it at its stop). If `pry kbase` cannot validate a base (e.g. `no kernel symbol file is loaded`), the target stays at that stop with none of its breakpoints in guest RAM (measured: `0x41` at the breakpoint, `exec` refused with `guest_state: "paused"`), `not_resynced` with `interrupted: true`, `resumed: false`, `held: true`: qmu's hold stays in place (a plain `pry continue` is refused until it is released, and a `pry wait` in flight keeps waiting), and the warning gives both ways on: `pry continue --release` if the image is from this boot, else rebase first (`pry load <vmlinux>` if needed, `pry kbase`, `pry resync`; or `qmu cont`, `qmu kbase`, `pry resync --base $KBASE --symbols <vmlinux>`), then `pry continue --release`. If the re-sync fails, the bridge is torn down — unless it only ran out of time or QEMU exited under it (*When a drive step fails*, below); if qmu cannot find `pry` on its own PATH, the bridge is left alone (`not_resynced`). |
 | load failed mid-restore (`restore_state: "partial"`/`"unknown"`) | Nothing, to any client: `pry continue`, a re-sync of a target pry believes running, or a detach can each resume the half-restored machine. The warning says so; load a known-good snapshot first (that re-syncs), or `qmu kill`. |
-| reset, QEMU `running` after it | qmu waits until the new boot's console shows the **end of kernel init** (`Freeing unused kernel image (initmem) memory` / `Write protecting the kernel read-only data` / `Run /sbin/init as init process`) or a getty's **`login:` prompt**, which comes later and which a `quiet` console (or a `loglevel=` of 6 or less) still prints where it hides the end-of-init lines (#205: a `quiet` nokaslr reset re-synced after `waited_seconds: 2.91`, 5.5 s for the whole command, and the canary fired; it used to block 30 s and arm nothing). Then it re-syncs at a stop it holds exactly as for a load: `pry interrupt`, on a KASLR guest `pry kbase` (the re-slid base, read through the IDT with no SSH and validated against the vmlinux, pry #66), `pry resync`, `pry continue --background`. The banner alone is too early: the new kernel still patches its own text (alternatives, return thunks, static keys), and a breakpoint armed on a patched site trips the patcher (`missing return thunk` WARNING from `apply_returns`, which then reads as a guest crash). Measured on KVM: init done and armed ≈2 s after the reset (KASLR: rebased `0xc200000` → `0x1a000000`, the canary fired in the new boot, no crash reported); under TCG the same after a slower boot. If `pry kbase` cannot validate a base, the target stays at qmu's stop with no breakpoint in guest RAM (`not_resynced`, `interrupted: true`, `resumed: false`; the warning's rebase steps, both routes, were run as written — a breakpoint set at a raw address does not follow a rebase and is set again). If neither shows within 30 s (a `quiet` console with no getty on it, a slow or stuck boot; the reason names the cmdline's `quiet`/`loglevel=` when it has one) or `pry` is not on qmu's PATH, qmu arms nothing and leaves the bridge alone (`not_resynced`) with the manual recovery, which waits for the boot too (#204). A boot-time hit of the canary (e.g. `__x64_sys_newuname`, which systemd calls) stops the guest in the debugger like any hit. |
+| reset, QEMU `running` after it | qmu waits until the new boot's console shows the **end of kernel init** (`Freeing unused kernel image (initmem) memory` / `Write protecting the kernel read-only data` / `Run /sbin/init as init process`) or a getty's **`login:` prompt**, which comes later and which a `quiet` console (or a `loglevel=` of 6 or less) still prints where it hides the end-of-init lines (#205: a `quiet` nokaslr reset re-synced after `waited_seconds: 2.91`, 5.5 s for the whole command, and the canary fired; it used to block 30 s and arm nothing). Then it re-syncs at a stop it holds exactly as for a load: `pry interrupt --hold`, on a KASLR guest `pry kbase` (the re-slid base, read through the IDT with no SSH and validated against the vmlinux, pry #66), `pry resync`, `pry continue --release`. The banner alone is too early: the new kernel still patches its own text (alternatives, return thunks, static keys), and a breakpoint armed on a patched site trips the patcher (`missing return thunk` WARNING from `apply_returns`, which then reads as a guest crash). Measured on KVM: init done and armed ≈2 s after the reset (KASLR: rebased `0xc200000` → `0x1a000000`, the canary fired in the new boot, no crash reported); under TCG the same after a slower boot. If `pry kbase` cannot validate a base, the target stays at qmu's held stop with no breakpoint in guest RAM (`not_resynced`, `interrupted: true`, `resumed: false`, `held: true`; the warning's rebase steps end in `pry continue --release` — a breakpoint set at a raw address does not follow a rebase and is set again). If neither shows within 30 s (a `quiet` console with no getty on it, a slow or stuck boot; the reason names the cmdline's `quiet`/`loglevel=` when it has one) or `pry` is not on qmu's PATH, qmu arms nothing and leaves the bridge alone (`not_resynced`) with the manual recovery, which waits for the boot too (#204). A boot-time hit of the canary (e.g. `__x64_sys_newuname`, which systemd calls) stops the guest in the debugger like any hit. |
 | reset of a guest the debugger had halted (QEMU not `running` after it) | **Torn down.** The vCPU sits at the reset vector (`prelaunch`), where no kernel address is readable: `pry resync` reports every breakpoint `unreadable` and `pry continue` fails (`Command aborted`, measured). A clean detach lets QEMU run the guest, so it boots (measured 7 of 8 times); once it stayed halted until `qmu cont`, and the warning says to `qmu cont` it first when `qmu status` shows it `paused`. |
-| save of a guest QEMU reports `running`, under KVM (#201) | `pry interrupt`, so GDB lifts its breakpoints from guest RAM; the save at that stop; then `pry continue --background` when the stop is qmu's (*Who resumes*). A target that stopped by itself (a breakpoint hit between QEMU's `running` and the interrupt: QEMU `debug` after it) is the operator's stop: saved there, not resumed, and a `warnings[]` entry says the guest is halted with `pry --instance qmu-<vm> continue --background`. A save that outran its budget leaves the bridge stopped (resuming would put the breakpoints back into RAM QEMU may still be saving) and says how to resume it; a failed save still resumes it. If `pry interrupt` fails, the save runs with the guest running and warns. Under TCG nothing is done (breakpoints never reach guest RAM). |
+| save of a guest QEMU reports `running`, under KVM (#201) | `pry interrupt --hold`, so GDB lifts its breakpoints from guest RAM; the save at that stop; then `pry continue --release`, which resumes the target when the stop is qmu's (*Who resumes*). A target that stopped by itself (a breakpoint hit between QEMU's `running` and the interrupt: QEMU `debug` after it) is the operator's stop: saved there, not resumed (the release leaves it there), and a `warnings[]` entry says the guest is halted with `pry --instance qmu-<vm> continue --background`. A save that outran its budget leaves the bridge stopped and qmu's hold in place (resuming would put the breakpoints back into RAM QEMU may still be saving) and its warning names the resume, `pry continue --release` once `qmu snapshot list` shows the tag; a failed save still gives the bridge back. If the stop fails, the save runs with the guest running and warns. Under TCG nothing is done (breakpoints never reach guest RAM). |
 
 **Who resumes (#226).** qmu resumes only a stop it made: QEMU said `running`
-right before its `pry interrupt`, and is not at a gdbstub stop (`debug`: a
-breakpoint, watchpoint or step) right after it. pry's `interrupted` is only
+right before its `pry interrupt --hold`, and is not at a gdbstub stop (`debug`: a
+breakpoint, watchpoint or step) right after it. pry's answer (`will_resume`
+under the hold, `interrupted` without one) is only
 GDB's belief, and after `qmu gdb` → `qmu cont` (QMP `cont` resumes the vCPU
 behind GDB's back) GDB believes the target is stopped: the bridge's first
-packet halts the running guest (`paused`) and pry answers `not interrupted
-(inferior is stopped)`. qmu used to take that at its word and leave a guest
+packet halts the running guest (`paused`) and pry answers that it stopped
+nothing, so its release resumes nothing. qmu used to take that at its word and leave a guest
 that was running halted after a save, a load and a KASLR reset; it now
-resumes it through the bridge (`stale_stop: true`), which also re-inserts
+releases the hold and resumes it through the bridge (`pry continue
+--background`, `stale_stop: true`), which also re-inserts
 the breakpoints set since `qmu gdb` (measured after `qmu gdb` → `pry kbase`
 → `break set __x64_sys_syncfs` → `qmu cont`: `0x41` at the breakpoint and
 `sync -f /` ran through; after the save `0xcc` and the canary fired; QEMU
@@ -410,7 +412,9 @@ mapped", which can never work for one.
 
 JSON (`--format json`): `debugger` carries `action` (`resynced` /
 `torn_down` / `not_resynced` / `stopped_for_save`), `event`, `bridge_pid`,
-`bridge_instance_id`, and
+`bridge_instance_id`, `held` whenever qmu stopped the bridge (`true`: the
+stop was a `pry interrupt --hold`; `false`: this pry has no hold and qmu
+used the public `pry interrupt`, see *qmu's stop is a hold* below), and
 
 - `resynced`: `resync` — `pry resync --format json` exactly as pry returns it
   (`state`, `run_state`, `breakpoints[]` with per-location `status`/`detail`,
@@ -454,31 +458,62 @@ JSON (`--format json`): `debugger` carries `action` (`resynced` /
 - `not_resynced`: `reason`; when qmu could not re-sync for a reason of its
   own (no `pry`, no end of the boot on the console) the bridge is untouched and `warnings[]`
   carries why plus the same recovery a client qmu does not drive gets. When
-  `pry kbase` could not validate a base, the data also carries
+  `pry kbase` could not validate a base, the data also carries `held`,
   `interrupted` (qmu took the stop) and `resumed: false`: the target is at a
   debugger stop with no breakpoint in guest RAM, and the one warning names
-  how to rebase and resume it. A `pry resync` that ran out of time adds
+  how to rebase and resume it — with `held: true` and a stop pry made, qmu's
+  hold is still in place, and the resume is `pry --instance qmu-<vm>
+  continue --release` (a plain `pry continue` is refused until then; a hold
+  whose release would resume nothing is given back at once). A `pry resync` that ran out of time adds
   `timed_out: true`, `interrupted`, `resumed` (and `kbase`,
   `waited_seconds`, `stale_stop`, `resume_error` as for `resynced`); its one
   warning names the `pry resync --timeout` to run.
 - `stopped_for_save`: `interrupted` (false when the target had stopped by
   itself at a breakpoint, QEMU `debug`; then a warning says it is left
   halted), `stale_stop: true` when the bridge believed the target stopped
-  while QEMU ran it, `resumed`, and `resume_error` when `pry continue`
-  failed (then a warning says the guest is halted in the debugger). Every
+  while QEMU ran it, `resumed`, and `resume_error` when giving the bridge
+  back failed (then a warning says the guest is halted in the debugger). Every
   save route (`snapshot save`, `monitor savevm`, `qmp human-monitor-command
   savevm`) adds `breakpoints_lifted: true` next to `breakpoints_in_image:
   "lifted"` (#227).
+- Where a stop was not qmu's (the operator's, which qmu leaves in place),
+  qmu still releases its hold; if that release fails the data carries
+  `release_error` and a warning names `pry --instance qmu-<vm> continue
+  --release`, since a held bridge refuses every other resume.
 
-**qmu's stop ends your `pry wait` (#228).** The stop qmu takes for a save, a
-load or a reset is the public `pry interrupt`, so it ends any `pry wait` or
-foreground `pry continue` running on `qmu-<vm>` at that moment: it returns
-exit 0 with `reason: signal SIGINT` at whatever the vCPU was running
-(measured: a `pry wait --timeout 60` in flight returned after 4.6 s across a
-`snapshot save`, 3.7 s across a nokaslr `snapshot load`), and qmu resumes
-the target a moment later, so that stop is already over. It is qmu's, not a
-hit: `pry wait` again. The text receipt says so whenever qmu's interrupt
-stopped a running target (`interrupted: true`).
+**qmu's stop is a hold (#228).** The stop qmu takes for a save, a load or a
+reset is `pry interrupt --hold` (pry #108), and it gives it back with `pry
+continue --release`: a `pry wait` or foreground `pry continue` running on
+`qmu-<vm>` at that moment keeps waiting through qmu's stop and returns the
+next real stop (`breakpoint #1 hit`), and `pry status` says `reason: held`
+while qmu holds it. The public `pry interrupt` qmu used before ended such a
+wait with exit 0 and `reason: signal SIGINT` at whatever the vCPU was
+running, a stop qmu resumed a moment later. The text receipt says the wait
+was kept (`qmu held that stop …`).
+
+**A hold qmu keeps** (a save that outran its budget, a base `pry kbase`
+could not validate) is recorded on the VM (`bridge_hold` in its record).
+While it is in place every report of the halted guest (the SSH commands'
+paused refusal, `wait`'s halted timeout, `qmu cont`'s warning) names `pry
+--instance qmu-<vm> continue --release` as the resume, with what comes first
+(`qmu snapshot list` showing the tag; or the rebase, `pry kbase` and `pry
+resync`), never the `continue --background` a held bridge refuses. pry's
+status confirms it (`reason: held`, or `resynced` after your own resync at
+the hold); once you release it by hand the reports are a debugger's ordinary
+ones again. The next qmu drive on the bridge (a load, a reset, a save) takes
+the kept hold over instead of failing to stop it, and ends it with its own
+release.
+
+**A pry without the hold** (from before pry #108, or a bridge an older pry
+spawned: `pry interrupt --hold` is an unknown flag or op) gets the public
+bracket instead — `pry interrupt`, then `pry continue --background` for a
+stop qmu made — so the save is still clean and the bridge still re-synced;
+the envelope says `held: false`, and the text receipt says the operation
+ended any `pry wait` or foreground `pry continue` on `qmu-<vm>` with a
+`reason: signal SIGINT` stop that was qmu's, not a hit: `pry wait` again,
+or update pry (and re-run `qmu gdb` so the bridge is the new pry's). Any
+other refusal of the hold (one already held) is a failed stop, never
+retried as the public interrupt that would end the waiters.
 
 The operation's own result and exit code are unchanged either way: a load,
 reset or save that succeeded is `ok: true`, exit 0, whatever happened to the

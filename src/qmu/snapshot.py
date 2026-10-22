@@ -89,17 +89,32 @@ def _classify_hmp_failure(message: str) -> str:
 
     `missing` — the tag is not in the image (`loadvm` says "does not exist in
     one or more devices"); `bad_name` — HMP could not parse the name as one
-    token (whitespace); `drive` — a writable drive cannot hold snapshots
-    (`Device 'virtio1' is writable but does not support snapshots`); `hmp` —
-    anything else QEMU refused.
+    token (whitespace); `usage` — HMP's parser found no argument at all
+    (`loadvm: string expected`, #239); `drive` — a writable drive cannot hold
+    snapshots (`Device 'virtio1' is writable but does not support
+    snapshots`); `hmp` — anything else QEMU refused.
     """
     if "does not exist" in message:
         return "missing"
     if "extraneous characters" in message:
         return "bad_name"
+    if _MISSING_ARGUMENT_RE.search(message):
+        return "usage"
     if UNSNAPSHOTTABLE_DRIVE_RE.search(message):
         return "drive"
     return "hmp"
+
+
+# HMP's parse error for a command missing its argument (`loadvm` with no
+# tag): `loadvm: string expected`, then `Try "help loadvm" …`. QEMU rejects
+# the line before the command runs (#239).
+_MISSING_ARGUMENT_RE = re.compile(r"(?m)^\s*(?P<command>\S+): string expected")
+
+
+def missing_argument_command(message: str) -> str | None:
+    """The HMP command a missing-argument parse error names, else None."""
+    match = _MISSING_ARGUMENT_RE.search(message)
+    return match.group("command") if match else None
 
 
 # Default `snapshot save` budget: SAVEVM_BASE_SECONDS + SAVEVM_SECONDS_PER_GIB
@@ -191,6 +206,7 @@ _PRE_RESTORE_LINE_RES = tuple(
         r"(Error: )?Device '[^']*' (is writable but )?does not support snapshots",
         r"unknown command: ",
         r"\S+: extraneous characters at the end of line",
+        r"\S+: string expected",
         r'Try "help',
     )
 )
@@ -297,6 +313,12 @@ def settle_loadvm(
     `restore-vm` with no error saying so. A successful load therefore resumes
     a guest stopped in exactly that state (`resumed: true`); a guest the
     operator or a debugger paused (`paused`, `debug`, ...) stays paused.
+
+    A failure whose text no table places (`unknown`) is still `none` when
+    the run state says so: `hmp_loadvm` stops a running guest before it
+    restores anything and leaves it stopped on every failure, so a guest
+    `running` before the failed `loadvm` and still `running` after it never
+    reached the restore (an HMP parse error, #239).
     """
     result = result.strip()
     if not hmp_failed(result):
@@ -305,13 +327,16 @@ def settle_loadvm(
             resumed = resume_guest(qmp)
         return SnapshotResult(True, result or loaded, resumed=resumed)
     restore_state = loadvm_restore_state(result)
+    running = guest_running(qmp)
+    if restore_state == "unknown" and was_running is True and running is True:
+        restore_state = "none"
     resumed = guest_paused = False
     if restore_state == "none":
-        if was_running and guest_running(qmp) is False:
+        if was_running and running is False:
             resumed = resume_guest(qmp)
             guest_paused = not resumed
     else:
-        guest_paused = guest_running(qmp) is False
+        guest_paused = running is False
     return SnapshotResult(
         False,
         result,

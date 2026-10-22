@@ -323,8 +323,8 @@ skip their SSH probe (`ssh: "skipped (debugger attached)"`), whose `uname` would
 Address your bridge as `pry --instance qmu-<vm>` (`bridge_instance_id`) on a shared host.
 `snapshot load`/`system_reset` rebase (`pry kbase`, KASLR) and re-sync (`pry resync`) the `qmu gdb` bridge (JSON
 `debugger`; each trap the resync repaired, and each raw-address `*0x…` breakpoint the rebase left behind, is in `warnings[]`)
-or tear it down saying why (one that ran out of time is kept: `timed_out`); `snapshot save` stops it across the save. That
-stop ends a `pry wait` in flight with `reason: signal SIGINT`: wait again. Other clients, a reboot, `kill` warn: `reference/debugging.md`. ARM: `reference/cross-arch.md`.
+or tear it down saying why (one that ran out of time is kept: `timed_out`); `snapshot save` stops it across the save. Each stop is a
+`pry interrupt --hold`: a `pry wait` in flight keeps waiting (`held: false`, an older pry: it ends with `signal SIGINT`; wait again). Other clients, a reboot, `kill` warn: `reference/debugging.md`. ARM: `reference/cross-arch.md`.
 
 ## Raw QEMU access
 

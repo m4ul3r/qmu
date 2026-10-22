@@ -777,22 +777,27 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   rewritten, #230; `elf_match: false` is only a note, since the symbols sit at
   the kernel's base — nokaslr, or the base `pry kbase` just validated). The
   operation's exit code never changes. Every re-sync goes through
-  `_resync_at_stop`, at a stop qmu holds: `pry interrupt`, on a KASLR guest
-  `pry kbase`, `pry resync`, then `pry continue --background` only if the
-  stop is qmu's. Never let `pry kbase`/`pry resync` stop a running
+  `_resync_at_stop`, at a stop qmu holds: `pry interrupt --hold`, on a KASLR
+  guest `pry kbase`, `pry resync`, then `pry continue --release` (which
+  resumes the target only if pry stopped it), plus `pry continue
+  --background` for a stale stop the release did not resume
+  (`debug._end_stop`). Never let `pry kbase`/`pry resync` stop a running
   target themselves there: pry resumes whatever happened, and under KVM that
   resume re-inserts every breakpoint at the bridge's current, possibly stale,
   base — a failed `pry kbase` armed exactly what it was meant to prevent,
   under a warning saying nothing was armed (review of #200). A base `pry
   kbase` cannot validate keeps the stop (`_left_stopped_unrebased`:
   `not_resynced`, `interrupted`, `resumed: false`, no breakpoint in guest
-  RAM, one warning with both rebase routes). **Whose stop it is comes from
+  RAM, one warning with both rebase routes; a hold whose release would
+  resume the target stays in place, `pry continue --release` being the
+  resume the warning names). **Whose stop it is comes from
   QEMU, never from pry alone (#226):** `debug.BridgeStop` reads the run state
   right before and right after the interrupt (`run_state`, a fresh QMP read
   `qmp_cmds._run_state_reader` hands in; the save reads it on its own
-  connection), and the stop is qmu's (`taken`) when pry interrupted or QEMU
+  connection), and the stop is qmu's (`taken`) when pry interrupted (under
+  the hold: `run_state.will_resume`) or QEMU
   said `running` before and is not at `debug` after (`stale`). pry's
-  `interrupted: false` is GDB's belief: after `qmu gdb` → `qmu cont` GDB
+  answer is GDB's belief: after `qmu gdb` → `qmu cont` GDB
   thinks the target stopped while QEMU runs it, its first packet halts the
   guest (`paused`), and trusting pry left a running guest halted after a
   save, a load and a KASLR reset. A stale stop is resumed through the bridge
@@ -842,19 +847,33 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
 - **Save under the owned bridge (#201).** `qmp_cmds._SaveStop` brackets
   every savevm route (`snapshot save`, raw `savevm` through `_raw_mutation`):
   with QEMU `running`, KVM and the owned bridge attached,
-  `debug.stop_bridge_for_save` runs `pry interrupt`, the run state is
+  `debug.stop_bridge_for_save` runs `pry interrupt --hold`, the run state is
   re-read (it completes the `BridgeStop`), the save runs at that stop,
   `breakpoints_in_image` is classified
-  BEFORE `resume_bridge_after_save` runs `pry continue --background` (the
-  `pry status` read must see the stop), and every save route reports
+  BEFORE `resume_bridge_after_save` gives the bridge back (`pry continue
+  --release`; the `pry status` read must see the stop), and every save route reports
   `breakpoints_in_image`/`breakpoints_lifted` (`_SaveStop.image_keys`; the raw
   routes used to carry neither, #227). A target that stopped by itself (QEMU
-  `debug` after the interrupt) is not resumed and a warning says so; a save
+  `debug` after the interrupt) is not resumed (the release leaves it) and a
+  warning says so; a save
   that outran its budget (124) leaves the bridge
-  stopped and warns, since resuming would put int3s back into RAM QEMU may
+  stopped and held and warns with the release, since resuming would put int3s back into RAM QEMU may
   still be saving; a failed save resumes it; any other exception leaving a
   save route (dedicated or raw) resumes it and records the drive's warnings
   through `_SaveStop.record_on_failure` → `debug.note_coherence_warnings`.
+- **qmu's stops are holds (#228).** Every drive stop is `pry interrupt
+  --hold` (pry #108): an operator's in-flight `pry wait`/foreground `pry
+  continue` sits it out and returns the next real stop; the public `pry
+  interrupt` ended it with a `reason: signal SIGINT` stop qmu then resumed.
+  A hold is always given back (`_end_stop`: `pry continue --release`, also
+  at the operator's own stop, where it resumes nothing) — a held bridge
+  refuses every other resume. A pry without the hold (its CLI or the
+  bridge an older pry spawned answers `unrecognized arguments: --hold` /
+  `Unknown op: 'hold'`, `debug._hold_unsupported`) falls back to the public
+  `pry interrupt` / `pry continue --background` bracket, `held: false` in
+  the `debugger` object and the SIGINT receipt (`_waiters_note`); any other
+  refusal of the hold is a failed stop, never retried as the public
+  interrupt.
 - `debug_session_present(inst)` is the gate for divergences a *live* client
   would see: true when `gdb_port` is set AND `gdb_client_attached()` cannot
   positively rule out a connected client. The attach probe parses
@@ -894,10 +913,9 @@ disconnected while a hand-started client took the stub (`_bridge_ref`, the
   `debug`, or `paused` under the owned bridge) the paused refusal's `hint`
   (`_cliutil._stopped_guest_payload`) leads with `pry --instance <ref>
   continue --background`, `qmu gdb` names that resume, and `qmu cont` there
-  carries a warning. qmu's own stops (the drives above) are the public `pry
-  interrupt`, which ends an operator's in-flight `pry wait`/foreground `pry
-  continue` with `reason: signal SIGINT` (#228, until qmu uses pry's hold
-  primitive, pry #99); the receipts say so. A `debug` stop with
+  carries a warning. qmu's own stops (the drives above) are holds
+  (`pry interrupt --hold`), which an operator's in-flight `pry wait` sits
+  out (#228). A `debug` stop with
   positively no client on the stub (`debug.orphaned_breakpoint_stop`) is a
   dead debugger's int3 still in RAM and in QEMU's gdbstub list: `qmu cont`
   re-runs it and QEMU is back in `debug` at once, so `cont` reads the run
@@ -1027,7 +1045,12 @@ empty (#234).
   the reader to a `qmu cont` that refuses `restore-vm` (#206); their
   `QMUError` carries `restore_state`/`resumed`/`guest_paused`
   (`QMUError(fields=)`) and the `snapshot load` hint (`_loadvm_failure_hint`;
-  a stuck pause names `qmu cont --force`). HMP failure detection (`qmp.hmp_failed`)
+  a stuck pause names `qmu cont --force`). An HMP parse error (`loadvm` with
+  no tag: `loadvm: string expected`) is `none` with a usage hint, and so is
+  any text the tables cannot place when QEMU said `running` both before and
+  after the failed `loadvm` — it stops a running guest before restoring
+  anything (#239). Every `SnapshotError` envelope (`save`/`load`/`delete`,
+  the save timeout) carries `vm_id` (#240). HMP failure detection (`qmp.hmp_failed`)
   anchors QEMU's error frames to the start of a line, so error words inside
   data (a tag named `Error:checkpoint`, a register dump) are not failures
   (#86). Mutation bookkeeping (epoch persist) runs *before* the success

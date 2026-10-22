@@ -134,6 +134,14 @@ class VMInstance:
     # guest program exiting 255. Wall-clock seconds; None when never stamped.
     ssh_severed_at: float | None = None
     ssh_severed_by: str | None = None
+    # A hold qmu kept on the bridge `qmu gdb` spawned (#228 review): the
+    # stop of a save that outran its budget, or of a re-sync whose `pry
+    # kbase` could not validate a base. `{"bridge_pid", "event", "why":
+    # "save"|"rebase", "resumes"}`. A held bridge refuses every resume but
+    # `pry continue --release`, and pry's status does not say a hold is in
+    # place once a holder's op ran at it, so the paused refusal reads this
+    # (cross-checked with `pry status`) to name the release. None otherwise.
+    bridge_hold: dict | None = None
 
 
 def _instance_from_dict(data: dict) -> VMInstance:

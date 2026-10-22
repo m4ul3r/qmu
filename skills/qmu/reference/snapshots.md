@@ -42,7 +42,7 @@ When the budget expires the save has **not failed — its result is unknown**:
 QEMU is still inside `savevm`, the tag usually lands later, and every QMP
 command queues behind it until then. qmu reports exactly that: exit **124**
 (the `wait` timeout code; not 4, the transport did not break), `ok: false`,
-`error_type: "SnapshotError"`, `may_have_landed: true`, `timeout`, and a
+`error_type: "SnapshotError"`, `vm_id`, `may_have_landed: true`, `timeout`, and a
 `hint` naming the one command that settles it: `qmu snapshot list --vm V
 --timeout 300` (twice the budget, ≥ 300 s), which waits for QEMU to answer
 instead of dying at the 30 s `list` default while QEMU is still writing.
@@ -135,8 +135,9 @@ uptimes later than the restored guest's. Use `qmu crash`/`wait --pattern`,
 which scope to the load.
 
 A `load` whose HMP `loadvm` fails is exit 1, `ok:false` with `error`,
-`error_type: "SnapshotError"`, `hint`, and three load-only keys: `resumed`,
-`guest_paused`, `restore_state`. What qmu does next depends on how far
+`error_type: "SnapshotError"`, `vm_id`, `hint`, and three load-only keys: `resumed`,
+`guest_paused`, `restore_state` (every `SnapshotError` from `save`/`load`/`delete`
+keys the VM `vm_id`, as the raw routes' errors do, #240). What qmu does next depends on how far
 `loadvm` got (`restore_state`):
 
 - `none` — nothing was restored. A tag absent from `info snapshots` is
@@ -152,6 +153,14 @@ A `load` whose HMP `loadvm` fails is exit 1, `ok:false` with `error`,
   guest there; qmu resumes it the same way, and their exit-1 `QMUError`
   envelope carries the same `restore_state`, `resumed`, `guest_paused`,
   `vm_id` and hint (#206). A running guest stays running on every route.
+  `qmu monitor loadvm` with **no tag** (or the same through `qmp
+  human-monitor-command`) is HMP's parse error (`loadvm: string expected`,
+  `Try "help loadvm"`): QEMU rejects the line before `loadvm` runs, so it is
+  `none` with a usage hint naming `qmu monitor 'loadvm <tag>' --vm X` and
+  `qmu snapshot list --vm X` (#239). Any failure qmu cannot place by its
+  text is `none` as well when QEMU said `running` both before and after it:
+  `loadvm` stops a running guest before it restores anything and leaves it
+  stopped on every failure.
 - `partial` / `unknown` — restoration had begun (an incompatible device set,
   e.g. an e1000 snapshot loaded into a virtio-net boot; `Missing section
   footer`, `error while loading state`). QEMU reverts the **disks before** it
