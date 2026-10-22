@@ -1075,6 +1075,11 @@ class Daemon:
             if watch.released:
                 reason = "released"
                 break
+            if _at_debugger_stop(watch):
+                # #235: a breakpoint, watchpoint or step halted the vCPU; no
+                # marker reaches the console until the debugger resumes it.
+                reason = "debugger_stop"
+                break
             now = time.monotonic()
             if deadline is not None and now >= deadline:
                 reason = "timeout"
@@ -1086,6 +1091,7 @@ class Daemon:
                 while (
                     watch.log_size == seen_size and not watch.exited
                     and not watch.released and not session.closed.is_set()
+                    and not _at_debugger_stop(watch)
                 ):
                     remaining = wake - time.monotonic()
                     if remaining <= 0:
@@ -1093,6 +1099,8 @@ class Daemon:
                     self.cond.wait(remaining)
         if reason == "released":
             stream({"kind": "released"})
+        with self.cond:
+            snapshot = watch.state()
         return {
             "matched_line": matched,
             "reason": reason,
@@ -1100,7 +1108,25 @@ class Daemon:
             "elapsed": round(time.monotonic() - start, 3),
             "scan_offset": scan_from,
             "exited": watch.exited,
+            # The run state the wait ended in: a timeout on a halted guest
+            # names the halt rather than "raise --timeout" (#235).
+            "running": snapshot["running"],
+            "qemu_status": snapshot["qemu_status"],
+            "qmp_busy": snapshot["qmp_busy"],
         }
+
+
+def _at_debugger_stop(watch: VMWatch) -> bool:
+    """QEMU holds the guest at a gdbstub stop (breakpoint, watchpoint, step).
+
+    `debug` is only ever QEMU's own word, from a `query-status` the STOP
+    event triggers (a STOP alone caches `paused`), and never while a proxied
+    command left the run state unknown (`status_stale`).
+    """
+    return (
+        watch.running is False and watch.qemu_status == "debug"
+        and not watch.status_stale
+    )
 
 
 class _OpError(Exception):

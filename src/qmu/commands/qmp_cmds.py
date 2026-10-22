@@ -2,7 +2,9 @@
 
 Everything here drives the VM through its QMP socket (or, for gdb, the pry
 subprocess against the GDB stub). Shared helpers come from :mod:`.._cliutil`;
-this module imports no other ``commands.*`` module and never imports ``cli``.
+this module never imports ``cli``, and imports a sibling ``commands.*``
+module only lazily, inside a handler: lifecycle's non-running describer and
+guest's SSH command watcher (`kbase`).
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -40,6 +43,7 @@ from ..snapshot import (
 )
 from ..serial import serial_log_offset
 from ..qmp import QMPCommandError, QMPError, QMPTimeoutError, hmp_failed
+from ..ssh import SSHError
 from ..debug import (
     INT3_LIFTED,
     INT3_POSSIBLE,
@@ -60,6 +64,8 @@ from ..debug import (
     mark_debugger_attached,
     mark_debugger_epoch,
     note_coherence_warnings,
+    orphaned_breakpoint_stop,
+    orphaned_cont_warning,
     qmu_bridge_attached,
     reap_bridge,
     reset_dropped_breakpoints_warning,
@@ -815,6 +821,16 @@ def _add_kbase(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "kbase",
         help="Read the guest runtime kernel base and KASLR slide",
+        description=(
+            "Read the guest runtime kernel base and KASLR slide over SSH "
+            "(/proc/kallsyms) and print eval-able KBASE, LINK_BASE and SLIDE. "
+            "A halted guest is refused before SSH, and a debugger stop while "
+            "kallsyms is read (a breakpoint the read or its login trips) is "
+            "reported within about 1 s, as exec, compile, push, pull and dmesg "
+            "report one: exit 1, guest_state paused, qemu_status, the resume "
+            "hint. Every refusal goes to stderr, so eval \"$(qmu kbase ...)\" "
+            "stays a no-op."
+        ),
     )
     p.add_argument(
         "--symbols",
@@ -845,7 +861,28 @@ def _handle_kbase(args: argparse.Namespace) -> Result:
 
     symbols_path, link_base = _read_link_text(args.symbols)
     ssh = _make_ssh(inst)
-    rc, stdout, stderr = ssh.run(_KALLSYMS_QUERY, timeout=10.0)
+    # #234: the same watch as every other SSH command. A breakpoint the read
+    # (or sshd setting up its session: `commit_creds`) trips halts the vCPU
+    # with no serial output, and the bare read sat out its 10 s budget into
+    # exit 4 "SSH command timed out" with a transport hint. Lazy: `guest` is
+    # a sibling command module.
+    from .guest import _explain_lost_transport, _guest_abort_watcher
+
+    start_offset = serial_log_offset(inst.serial_log)
+    watcher = _guest_abort_watcher(inst, start_offset=start_offset)
+    try:
+        rc, stdout, stderr = ssh.run(_KALLSYMS_QUERY, timeout=10.0, abort_when=watcher)
+    except SSHError:
+        explained = _explain_lost_transport(
+            _KALLSYMS_QUERY, inst, start_offset=start_offset,
+            halted_status=watcher.halted_status,
+        )
+        if explained is None:
+            raise
+        # The paused (exit 1) or panic (exit 3) envelope, with the prose on
+        # stderr: stdout stays empty, so `eval "$(qmu kbase ...)"` is a no-op.
+        exit_code, data, text = explained
+        return Result(data=data, text=text, stem="kbase", exit_code=exit_code, refusal=True)
     if rc != 0:
         diagnostic = (stderr or stdout or "no diagnostic").strip()
         raise QMUError(
@@ -1118,6 +1155,12 @@ def _add_cont(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(handler=_handle_cont)
 
 
+# How long `cont` gives a vCPU resumed from a gdbstub stop before it trusts a
+# `running` answer: an orphaned int3 halts it again within microseconds, but
+# QEMU may answer the `query-status` right behind the `cont` first (#237).
+_CONT_SETTLE_SECONDS = 0.25
+
+
 def _handle_cont(args: argparse.Namespace) -> Result:
     inst = _choose_running(args.vm, "cont")
     with _qmp_ctx(inst) as qmp:
@@ -1139,9 +1182,25 @@ def _handle_cont(args: argparse.Namespace) -> Result:
         # already running QEMU raises an error, which surfaces as QMPError.
         qmp.execute("cont")
         status = qmp.execute("query-status")
+        if before_state == "debug" and _halted(status) is None:
+            time.sleep(_CONT_SETTLE_SECONDS)
+            status = qmp.execute("query-status")
     run_state = (
         status.get("status", "unknown") if isinstance(status, dict) else str(status)
     )
+    halted = _halted(status)
+    if halted is not None:
+        # #237: QEMU took the `cont` and the vCPU is halted again — an int3
+        # nobody owns re-runs at once. That is not a resume.
+        data, text = _stopped_guest_payload(inst, halted)
+        data["status"] = run_state
+        data["resumed"] = False
+        lead = (
+            f"VM '{inst.vm_id}' did not stay resumed: QEMU took the cont, and "
+            f"the vCPU halted again at once (status: {run_state})."
+        )
+        data["hint"] = f"{lead} {data['hint']}"
+        return _refusal(data=data, text=[lead, *text], stem="cont")
     data = {"ok": True, "vm_id": inst.vm_id, "status": run_state}
     text = f"VM '{inst.vm_id}' resumed (status: {run_state})"
     if before_state == "restore-vm":
@@ -1152,7 +1211,21 @@ def _handle_cont(args: argparse.Namespace) -> Result:
     behind = cont_behind_debugger_warning(inst, before_state)
     if behind is not None:
         result = result.warn(behind)
+    elif orphaned_breakpoint_stop(inst, before_state):
+        result = result.warn(orphaned_cont_warning(inst))
     return result
+
+
+def _halted(status: object) -> str | None:
+    """QEMU's status word when a `query-status` reply says the vCPUs are not
+    running, else None (running, or no answer to judge by) — the rule
+    `_cliutil._qmp_stopped_status` applies to the SSH commands."""
+    if not isinstance(status, dict) or status.get("running") is True:
+        return None
+    name = status.get("status")
+    if status.get("running") is False:
+        return name if isinstance(name, str) else "paused"
+    return name if isinstance(name, str) and name != "running" else None
 
 
 # ---------------------------------------------------------------------------

@@ -148,7 +148,11 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
   command refuses in under a second: exit 1, `guest_state: "panicked" |
   `"paused"`, `hint` naming `qmu crash --vm X` / `qmu kill --vm X` or `qmu cont
   --vm X` (for `qemu_status: "restore-vm"` the hint is a known-good `snapshot
-  load` or `kill` + relaunch instead — never `cont`). A debugger stop that
+  load` or `kill` + relaunch instead — never `cont`; for a stop a debugger
+  holds, `pry --instance <id> continue --background`; for `debug` with no
+  debugger attached, a breakpoint a dead debugger left, `qmu gdb --vm X
+  --symbols <vmlinux>` then `pry --instance qmu-X continue --background`,
+  `reference/debugging.md`). A debugger stop that
   fires mid-command returns within ~1 s with the same `paused` envelope —
   never a keepalive wait — and the output that reached the host
   before the stop (bytes the guest wrote just before it may still be in the
@@ -160,8 +164,9 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
   connection stays up however long the vCPU is stopped, at most 16 MiB of output is
   kept). What still ends it is the SSH connection going away: `snapshot
   load`, a reset and `kill` drop the ControlMaster — use the `setsid nohup`
-  form for a trigger that must survive those. `compile`'s gcc step and
-  `dmesg` are aborted (their session closed).
+  form for a trigger that must survive those. `compile`'s gcc step,
+  `dmesg` and `kbase`'s kallsyms read are aborted (their session closed;
+  `kbase` keeps stdout empty, so `eval` stays a no-op).
 - Text mode: `reference/output-contract.md` → *Guest-command text mode*.
 
 ## `run`

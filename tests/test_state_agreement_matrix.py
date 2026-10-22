@@ -2477,42 +2477,55 @@ _HALTED_ARGV = {
 }
 
 
-@pytest.mark.parametrize("holder", ["no debugger", "qmu bridge", "other client"])
+@pytest.mark.parametrize(
+    "holder", ["no debugger", "qmu bridge", "other client", "orphaned breakpoint"]
+)
 @pytest.mark.parametrize("output_format", ["text", "json"])
 def test_every_ssh_command_agrees_on_a_vcpu_halted_mid_command(
     output_format, holder, cache, monkeypatch, capsys, tmp_path
 ):
-    """A breakpoint fires while exec / dmesg / push / pull / compile run: no
-    serial output, no transport drop — only QMP knows. Every command aborts
-    on the watcher's QMP poll and reports the preflight's paused envelope
-    (exit 1, `guest_state: paused`, the resume hint), never the 20 s
+    """A breakpoint fires while exec / dmesg / push / pull / compile / kbase
+    run: no serial output, no transport drop — only QMP knows. Every command
+    aborts on the watcher's QMP poll and reports the preflight's paused
+    envelope (exit 1, `guest_state: paused`, the resume hint), never the 20 s
     keepalive stall into the crash/transport class, in both renderings.
+    `kbase` sat out its 10 s budget into exit 4 "SSH command timed out"
+    (#234); in text it still prints nothing on stdout, so `eval` is a no-op.
 
     #225: with a debugger attached the `debug` stop is the debugger's: every
     command leads with its resume (`qmu-<vm>` for the bridge `qmu gdb`
     spawned, `<id>` for another client) and none offers `qmu cont` as the
-    resume, which would run the guest with every breakpoint lifted."""
+    resume, which would run the guest with every breakpoint lifted. #237:
+    with no client on the stub the stop is a breakpoint a dead debugger
+    left, which `qmu cont` re-runs at once: every command names the attach
+    that clears it."""
     from dataclasses import replace
 
     from qmu import debug
 
     inst = _ssh_capable_instance(cache)
+    inst = replace(inst, arch="x86_64")  # `kbase` needs the recorded arch
     if holder != "no debugger":
         inst = replace(inst, gdb_port=1234)
-        monkeypatch.setattr(debug, "gdb_client_attached", lambda i: True)
+        monkeypatch.setattr(debug, "gdb_client_attached", lambda i: holder != "orphaned breakpoint")
         monkeypatch.setattr(debug, "bridge_holds_stub", lambda i: holder == "qmu bridge")
     resume = {
-        "no debugger": f"qmu cont --vm {VM}",
-        "qmu bridge": f"pry --instance qmu-{VM} continue --background",
-        "other client": "pry --instance <id> continue --background",
+        "no debugger": f"Resume with: qmu cont --vm {VM}",
+        "qmu bridge": f"Resume with: pry --instance qmu-{VM} continue --background",
+        "other client": "Resume with: pry --instance <id> continue --background",
+        "orphaned breakpoint": f"qmu gdb --vm {VM} --symbols <vmlinux>",
     }[holder]
     decoy = _decoy_running(monkeypatch)
     for mod in (lifecycle, instance_mod):
         monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
-    monkeypatch.setattr(guest_mod, "choose_instance", lambda vm=None: inst)
-    monkeypatch.setattr(guest_mod, "_preflight_ssh_guest", lambda *a, **kw: None)
-    monkeypatch.setattr(guest_mod, "_make_ssh", lambda selected: _HaltedMidCommandSSH())
+    for mod in (guest_mod, qmp_cmds):
+        monkeypatch.setattr(mod, "choose_instance", lambda vm=None: inst)
+        monkeypatch.setattr(mod, "_preflight_ssh_guest", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_make_ssh", lambda selected: _HaltedMidCommandSSH())
     monkeypatch.setattr(guest_mod, "_qmp_stopped_status", lambda i: "debug")
+    monkeypatch.setattr(
+        qmp_cmds, "_read_link_text", lambda path: (Path(path), 0xFFFFFFFF81000000)
+    )
     clock = [0.0]
 
     def monotonic():
@@ -2521,7 +2534,11 @@ def test_every_ssh_command_agrees_on_a_vcpu_halted_mid_command(
 
     monkeypatch.setattr(guest_mod.time, "monotonic", monotonic)
     (tmp_path / "x.c").write_text("int main(void){return 0;}\n")
-    argvs = {**_HALTED_ARGV, "compile": ["compile", "--vm", VM, "--run", str(tmp_path / "x.c")]}
+    argvs = {
+        **_HALTED_ARGV,
+        "compile": ["compile", "--vm", VM, "--run", str(tmp_path / "x.c")],
+        "kbase": ["kbase", "--vm", VM, "--symbols", str(tmp_path / "vmlinux")],
+    }
 
     for command, argv in argvs.items():
         with open(inst.serial_log, "w") as stream:
@@ -2537,12 +2554,14 @@ def test_every_ssh_command_agrees_on_a_vcpu_halted_mid_command(
             assert payload["crash_detected"] is False, command
             assert payload["ssh_error"] is False, command
             assert payload["vm_id"] == VM, command
-            assert f"Resume with: {resume}" in payload["hint"], command
+            assert resume in payload["hint"], command
         else:
             out = captured.out + captured.err
             assert f"VM '{VM}' is debug (vCPU halted" in out, command
-            assert f"Resume with: {resume}" in out, command
+            assert resume.removeprefix("Resume with: ") in out, command
             assert "crash" not in out.lower(), command
+            if command == "kbase":
+                assert captured.out == "", "`eval \"$(qmu kbase …)\"` must stay a no-op"
 
 
 class _PanicMidCommandSSH:
@@ -3441,6 +3460,112 @@ def test_status_and_ssh_commands_agree_a_partially_restored_guest_is_paused(
     result = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert result["stdout"] == "up\n"
+
+
+class _OrphanedTrapQMP:
+    """One QEMU for every authority, halted at an int3 a dead debugger left
+    (#237): `debug`, and a `cont` re-runs the trap, so QEMU is back in
+    `debug` at once."""
+
+    def __init__(self):
+        self.cont_sent = 0
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        if command == "query-status":
+            return {"running": False, "status": "debug"}
+        if command == "cont":
+            self.cont_sent += 1
+        return {}
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_status_list_ssh_commands_and_cont_agree_on_a_breakpoint_no_debugger_owns(
+    fmt, cache, monkeypatch, capsys
+):
+    """#237: a debugger that died without detaching left its int3 in RAM and
+    in QEMU's breakpoint list, no client is on the stub, and the guest is
+    halted in `debug`. `qmu cont` re-runs the trap — it answered exit 0
+    "resumed (status: debug)" — and every hint said `qmu cont`. What clears
+    it is a new client (QEMU drops a gone client's breakpoints): `status`,
+    `list`, every SSH command's refusal and `cont` name that, and none
+    offers `qmu cont` as the resume."""
+    import contextlib
+    from dataclasses import replace
+
+    from qmu import _cliutil, debug
+
+    inst = replace(_ssh_capable_instance(cache), gdb_port=1234, arch="x86_64")
+    with open(inst.serial_log, "w") as stream:
+        stream.write("[ 0.0] Linux version 6.12.0 (x) #1\nlocalhost login:\n")
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+        monkeypatch.setattr(mod, "find_orphan_qemus", lambda: [], raising=False)
+    for mod in (lifecycle, guest_mod, qmp_cmds):
+        monkeypatch.setattr(mod, "choose_instance", lambda vm=None: inst)
+        monkeypatch.setattr(
+            mod, "_make_ssh",
+            lambda i: (_ for _ in ()).throw(AssertionError("SSH attempted on a halted guest")),
+        )
+    qmp = _OrphanedTrapQMP()
+    for mod in (lifecycle, _cliutil, qmp_cmds):
+        monkeypatch.setattr(mod, "_qmp_ctx", lambda i: contextlib.nullcontext(qmp))
+    monkeypatch.setattr(debug, "gdb_client_attached", lambda i: False if i.gdb_port else None)
+    monkeypatch.setattr(qmp_cmds, "_CONT_SETTLE_SECONDS", 0.0)
+    clear = f"qmu gdb --vm {VM} --symbols <vmlinux>"
+    resume = f"pry --instance qmu-{VM} continue --background"
+
+    rc = cli.main(["--format", fmt, "status", "--vm", VM])
+    out = capsys.readouterr().out
+    assert rc == 0
+    if fmt == "json":
+        status = json.loads(out)
+        assert (status["guest"], status["qemu_status"]) == ("paused", "debug")
+        assert "no debugger owns" in status["guest_detail"]
+        assert clear in status["hint"] and resume in status["hint"]
+    else:
+        assert "Guest:     paused (halted at a breakpoint no debugger owns" in out
+        assert clear in out and resume in out
+
+    rc = cli.main(["--format", fmt, "list"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    if fmt == "json":
+        (row,) = [
+            vm for vm in json.loads(out)["vms"]
+            if vm["vm_id"] == VM and vm["status"] == "running"
+        ]
+        assert row["guest"] == "paused" and "no debugger owns" in row["guest_detail"]
+    else:
+        (row,) = [line for line in out.splitlines() if f" {VM} " in line and "[running" in line]
+        assert "no debugger owns" in row and "`qmu cont` resumes" not in row
+
+    for command, argv in _NO_ENDPOINT_ARGV.items():
+        rc = cli.main(["--format", fmt, *argv])
+        captured = capsys.readouterr()
+        assert rc == 1, f"`qmu {command}` rc={rc}"
+        if fmt == "json":
+            refusal = json.loads(captured.out)
+            assert refusal["guest_state"] == "paused", command
+            assert refusal["qemu_status"] == "debug", command
+            assert clear in refusal["hint"] and resume in refusal["hint"], command
+            assert "Resume with: qmu cont" not in refusal["hint"], command
+        else:
+            assert captured.out == "", f"`qmu {command}` wrote a refusal to stdout"
+            assert clear in captured.err, command
+
+    rc = cli.main(["--format", fmt, "cont", "--vm", VM])
+    captured = capsys.readouterr()
+    assert rc == 1, "`qmu cont` said resumed while QEMU is back in `debug`"
+    assert qmp.cont_sent == 1
+    if fmt == "json":
+        refusal = json.loads(captured.out)
+        assert refusal["ok"] is False and refusal["resumed"] is False
+        assert refusal["status"] == "debug"
+        assert clear in refusal["hint"] and resume in refusal["hint"]
+    else:
+        assert captured.out == ""
+        assert "halted again at once" in captured.err and clear in captured.err
 
 
 _LOAD_CLEAN_ARGV = {

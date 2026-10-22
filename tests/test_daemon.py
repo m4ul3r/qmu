@@ -837,6 +837,95 @@ def test_pattern_wait_on_a_running_vm_whose_log_is_gone_is_inconclusive(
     assert time.monotonic() - started < 3.0
 
 
+def _debugged_vm(tmp_path, monkeypatch, mode):
+    """A `--gdb` VM behind a fake QMP server, served by the daemon or not."""
+    from dataclasses import replace
+
+    from qmu import debug
+
+    log = tmp_path / "dbg.serial.log"
+    log.write_text(BANNER + "booting\n")
+    server = FakeQMPServer(tmp_path / "dbg.qmp.sock")
+    inst = replace(_write_instance("dbg-vm", server.path, log), gdb_port=1234)
+    save_instance(inst)
+    if mode == "daemon":
+        daemon_client.watch("dbg-vm")
+    else:
+        monkeypatch.setenv("QMU_DAEMON", "off")
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm_id=None: inst)
+    monkeypatch.setattr(lifecycle, "instance_alive", lambda inst: True)
+    # A client holds the stub: the stop is its debugger's.
+    monkeypatch.setattr(debug, "gdb_client_attached", lambda inst: True)
+    monkeypatch.setattr(debug, "bridge_holds_stub", lambda inst: False)
+
+    def halt(status: str, settle: bool = True) -> None:
+        server.replies["query-status"] = {"status": status, "running": False}
+        if mode == "daemon":
+            server.emit("STOP")
+            if settle:
+                _wait_until(
+                    lambda: daemon_client.vm_state("dbg-vm")["qemu_status"] == status,
+                    what=f"daemon sees {status}",
+                )
+
+    return server, halt
+
+
+@pytest.mark.parametrize("when", ["before", "during"])
+@pytest.mark.parametrize("mode", ["daemon", "standalone"])
+def test_pattern_wait_ends_at_a_debugger_stop_on_both_paths(
+    mode, when, daemon_env, tmp_path, monkeypatch, capsys
+):
+    """Live (#235): a breakpoint that fired before or during `wait --pattern`
+    halts the vCPU with no console output, and the wait burned its whole
+    `--timeout` (exit 124, "raise --timeout") though QEMU said `debug`. The
+    marker cannot come until the debugger resumes the guest, so the wait
+    ends there, as `exec` does: exit 1, the paused envelope, the debugger's
+    resume — on the daemon-backed and the standalone path alike."""
+    server, halt = _debugged_vm(tmp_path, monkeypatch, mode)
+    try:
+        if when == "before":
+            halt("debug")
+        else:
+            threading.Timer(0.5, halt, args=("debug", False)).start()
+        started = time.monotonic()
+        rc = cli.main(["--format", "json", "wait", "--pattern", "NEVER", "--timeout", "10"])
+        payload = json.loads(capsys.readouterr().out)
+    finally:
+        server.close()
+
+    assert rc == 1, payload
+    assert payload["reason"] == "debugger_stop" and payload["matched"] is False
+    assert payload["guest_state"] == "paused" and payload["qemu_status"] == "debug"
+    assert "pry --instance <id> continue --background" in payload["hint"]
+    assert "pry --instance <id> wait" in payload["hint"]
+    assert "raise --timeout" not in payload["hint"]
+    assert time.monotonic() - started < 5.0
+
+
+@pytest.mark.parametrize("mode", ["daemon", "standalone"])
+def test_pattern_wait_timing_out_on_a_halted_guest_names_the_halt(
+    mode, daemon_env, tmp_path, monkeypatch, capsys
+):
+    """A halt that is not a gdbstub stop (`paused`: an attach, an interrupt,
+    a QMP `stop`) may be over in a moment — qmu's own drives take one — so
+    the wait goes on; but a timeout that ends with the guest halted says so
+    instead of "raise --timeout", which cannot help (#235)."""
+    server, halt = _debugged_vm(tmp_path, monkeypatch, mode)
+    try:
+        halt("paused")
+        rc = cli.main(["--format", "json", "wait", "--pattern", "NEVER", "--timeout", "1.5"])
+        payload = json.loads(capsys.readouterr().out)
+    finally:
+        server.close()
+
+    assert rc == 124, payload
+    assert payload["reason"] == "timeout"
+    assert payload["guest_state"] == "paused" and payload["qemu_status"] == "paused"
+    assert "raise --timeout" not in payload["hint"]
+    assert "Resume with" in payload["hint"]
+
+
 def test_bare_wait_ends_on_observed_exit(daemon_env, vm, monkeypatch, capsys):
     import qmu.daemon as daemon_mod
 

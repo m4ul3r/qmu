@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -358,24 +360,85 @@ def _bridge_ref(inst: Any) -> tuple[str, str]:
     return "<id>", " (<id>: your bridge's pid or --instance-id, from `pry doctor`)"
 
 
-def debugger_resume(inst: Any, qemu_status: str | None) -> tuple[str, str] | None:
-    """`(command, gloss)` resuming a halted guest a debugger holds (#225).
+def debugger_holding(inst: Any, qemu_status: str | None) -> tuple[str, str] | None:
+    """`(instance, gloss)` of the debugger holding a halted guest's stop, the
+    way a `pry --instance` recovery addresses it; None when no debugger can be
+    holding it.
 
     `debug` is a gdbstub stop (breakpoint, watchpoint, step) and nothing
     else; `paused` under the bridge `qmu gdb` spawned is its attach or its
-    interrupt. GDB lifts its breakpoints at a stop and puts them back only
-    when it resumes, so a QMP `cont` (`qmu cont`) there runs the guest with
-    every breakpoint lifted, behind GDB's back: GDB still believes the target
-    stopped, and its next command (`pry status` included) halts the guest
-    again. None when no debugger can be holding this stop: `qmu cont` is the
-    resume then.
+    interrupt.
     """
     if qemu_status == "debug" and debug_session_present(inst):
-        ref, gloss = _bridge_ref(inst)
-        return f"pry --instance {ref} continue --background", gloss
+        return _bridge_ref(inst)
     if qemu_status == "paused" and qmu_bridge_attached(inst):
-        return f"pry --instance {bridge_instance_id(inst.vm_id)} continue --background", ""
+        return bridge_instance_id(inst.vm_id), ""
     return None
+
+
+def debugger_resume(inst: Any, qemu_status: str | None) -> tuple[str, str] | None:
+    """`(command, gloss)` resuming a halted guest a debugger holds (#225).
+
+    GDB lifts its breakpoints at a stop and puts them back only when it
+    resumes, so a QMP `cont` (`qmu cont`) there runs the guest with every
+    breakpoint lifted, behind GDB's back: GDB still believes the target
+    stopped, and its next command (`pry status` included) halts the guest
+    again. None when no debugger can be holding this stop
+    (`debugger_holding`): `qmu cont` is the resume then, unless the stop is
+    an orphaned breakpoint (`orphaned_breakpoint_stop`).
+    """
+    held = debugger_holding(inst, qemu_status)
+    if held is None:
+        return None
+    ref, gloss = held
+    return f"pry --instance {ref} continue --background", gloss
+
+
+def orphaned_breakpoint_stop(inst: Any, qemu_status: str | None) -> bool:
+    """#237 — QEMU at a gdbstub stop (`debug`) with positively no client on
+    the stub.
+
+    A debugger that died without detaching (a GDB abort, a `kill -9`) leaves
+    its int3s in guest RAM, and QEMU's gdbstub keeps them in its breakpoint
+    list: the first guest call into such a function halts the vCPU in
+    `debug`, and a QMP `cont` re-runs the int3, so the vCPU is back in
+    `debug` at once. A new client clears them: QEMU drops a gone client's
+    breakpoints, writing the original bytes back, when the next one
+    connects. Claimed only on a positive "no client" — `gdb_client_attached`
+    None (cannot tell) never is one.
+    """
+    return (
+        qemu_status == "debug"
+        and getattr(inst, "gdb_port", None) is not None
+        and gdb_client_attached(inst) is False
+    )
+
+
+ORPHANED_STOP = (
+    "halted at a breakpoint no debugger owns (a debugger died without removing it)"
+)
+
+
+def orphaned_stop_recovery(inst: Any) -> str:
+    """What clears an orphaned breakpoint stop (`orphaned_breakpoint_stop`)."""
+    return (
+        f"attach a debugger to clear it: qmu gdb --vm {inst.vm_id} --symbols "
+        "<vmlinux> (QEMU drops a gone debugger's breakpoints when a new one "
+        f"connects), then pry --instance {bridge_instance_id(inst.vm_id)} "
+        "continue --background"
+    )
+
+
+def orphaned_cont_warning(inst: Any) -> str:
+    """#237 — `qmu cont` ran a guest out of an orphaned breakpoint stop (a
+    watchpoint's, which does not re-trap at once): QEMU still holds that
+    debugger's breakpoints, so the next hit halts it again."""
+    return (
+        f"[qmu] WARNING: VM '{inst.vm_id}' was {ORPHANED_STOP}. `qmu cont` "
+        "resumed it, but QEMU still holds that debugger's breakpoints and "
+        "watchpoints, so the next hit halts the guest again; "
+        f"{orphaned_stop_recovery(inst)}.\n"
+    )
 
 
 CONT_BEHIND_DEBUGGER = (
@@ -453,8 +516,12 @@ def bridge_stopped(inst: Any) -> bool | None:
 # (`BridgeStop`). Any other client is never driven; it gets the warnings below.
 
 # pry's own transport budget for one `pry resync`, and the headroom over it
-# for the CLI start and the stop/resume around the op.
-PRY_RESYNC_TIMEOUT = 20
+# for the CLI start and the stop/resume around the op. The resync reads and
+# decodes every code section of the loaded vmlinux for stray traps, so its
+# cost grows with the image and with host load: a 7.0 KASAN vmlinux (52.8 MiB
+# of text) took 19–23 s on a loaded host, and the 20 s budget this used to be
+# cost the operator a healthy bridge (#233). 120 s is pry's own op limit.
+PRY_RESYNC_TIMEOUT = 120
 _PRY_CALL_SLACK = 15.0
 # `pry kbase` takes no --timeout; pry's default transport budget is 30 s.
 _PRY_KBASE_TIMEOUT = 30 + _PRY_CALL_SLACK
@@ -466,6 +533,27 @@ _PRY_STOP_TIMEOUT = 15.0
 # not re-sync at all. Measured on KVM: init done ≈1.3 s after the reset; TCG
 # boots several times slower.
 RESET_KERNEL_WAIT_SECONDS = 30.0
+# QEMU closes its sockets (the gdbstub's, QMP's) before its pid goes away,
+# and tearing a large KVM guest down takes a while: a 2 GiB KASAN guest
+# SIGKILLed while qmu drove its bridge still had its /proc entry when pry
+# reported the stub gone (measured, #236). How long a drive step that failed
+# waits for a QEMU whose QMP no longer answers to finish exiting.
+_QEMU_EXIT_GRACE = 3.0
+
+
+def _qemu_gone(inst: Any, run_state: Callable[[], str | None] | None = None) -> bool:
+    """QEMU exited under the drive (#236): the recorded process identity is
+    gone, once a dying process has had `_QEMU_EXIT_GRACE` to finish. A QEMU
+    whose QMP still answers (`run_state`) is alive, with no wait."""
+    if run_state is not None and run_state() is not None:
+        return False
+    deadline = time.monotonic() + _QEMU_EXIT_GRACE
+    while instance_alive(inst):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
 
 # pry's resync statuses that leave a location unable to fire (`not_armed`).
 _NOT_ARMED = frozenset({"pending", "unreadable", "insert-failed", "not-resident"})
@@ -525,7 +613,15 @@ def _pry_json(argv: list[str], *, timeout: float) -> tuple[Any, str | None]:
     return payload, None
 
 
-def _pry_resync(inst: Any) -> tuple[dict[str, Any] | None, str | None]:
+def _pry_resync(inst: Any) -> tuple[dict[str, Any] | None, str | None, bool]:
+    """`pry resync` on the owned bridge: `(report, error, timed_out)`.
+
+    `timed_out` when it failed only after using the whole budget qmu gave
+    it — pry's own op timeout, or the CLI not answering at all (#233). That
+    says the job is big or the host loaded, nothing about the bridge, and
+    is read off the clock rather than pry's wording, which has changed.
+    """
+    started = time.monotonic()
     report, error = _pry_json(
         [
             "resync", "--instance", str(inst.gdb_bridge_pid), "--format", "json",
@@ -534,8 +630,9 @@ def _pry_resync(inst: Any) -> tuple[dict[str, Any] | None, str | None]:
         timeout=PRY_RESYNC_TIMEOUT + _PRY_CALL_SLACK,
     )
     if error is None and not (isinstance(report, dict) and report.get("resynced") is True):
-        return None, "`pry resync` answered without a resync report"
-    return report, error
+        return None, "`pry resync` answered without a resync report", False
+    timed_out = error is not None and time.monotonic() - started >= PRY_RESYNC_TIMEOUT
+    return report, error, timed_out
 
 
 def _pry_kbase(inst: Any) -> tuple[dict[str, Any] | None, str | None]:
@@ -574,6 +671,104 @@ def _kbase_note(ident: str, kbase: dict[str, Any]) -> str:
     return (
         f"[qmu] `pry kbase` on {ident} validated the running kernel's _text at "
         f"{kbase['base']} and {moved}."
+    )
+
+
+def _rebase_slides(kbase: dict[str, Any] | None) -> tuple[int, int] | None:
+    """`(previous_slide, slide)` when the `pry kbase` qmu ran moved the
+    bridge's symbols, else None (nothing moved, or pry did not say from where)."""
+    if kbase is None or not isinstance(kbase.get("apply"), dict):
+        return None
+    apply = kbase["apply"]
+    try:
+        previous, slide = int(apply["previous_slide"], 16), int(kbase["slide"], 16)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not apply.get("applied") or previous == slide:
+        return None
+    return previous, slide
+
+
+# A code breakpoint at a literal address, the way GDB's `*ADDR` takes one
+# (hex, octal, decimal). A `*EXPR` naming a symbol (`*func+4`) is re-evaluated
+# when the symbols move, so it is not raw (pry #112 draws the same line).
+_RAW_ADDRESS = re.compile(r"^\*\s*(?:0[xX]([0-9a-fA-F]+)|(0[0-7]*)|([1-9][0-9]*))\s*$")
+_ADDR_MASK = (1 << 64) - 1
+
+
+def _raw_address(location: Any) -> int | None:
+    match = _RAW_ADDRESS.match(str(location or ""))
+    if match is None:
+        return None
+    hex_digits, octal, decimal = match.groups()
+    if hex_digits is not None:
+        return int(hex_digits, 16)
+    if octal is not None:
+        return int(octal, 8)
+    return int(decimal)
+
+
+def _raw_breakpoints(inst: Any) -> dict[int, dict[str, Any]]:
+    """The owned bridge's breakpoints set at a raw address, by number, read
+    with `pry break list` (a resync entry names its location `N.M`, not the
+    expression it was set with). Empty when the bridge did not answer."""
+    listed, _ = _pry_json(
+        ["break", "list", "--instance", str(inst.gdb_bridge_pid), "--format", "json"],
+        timeout=15.0,
+    )
+    if not isinstance(listed, list):
+        return {}
+    return {
+        bp["number"]: bp for bp in listed
+        if isinstance(bp, dict) and isinstance(bp.get("number"), int)
+        and bp.get("kind") in ("breakpoint", "hw-breakpoint")
+        and _raw_address(bp.get("location")) is not None
+    }
+
+
+def _raw_moved_warning(
+    inst: Any, event: str, slides: tuple[int, int],
+    moved: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> str:
+    """#238: a breakpoint set at a raw address stays at that address when
+    `pry kbase` rebases the symbols, so after a KASLR move it sits where the
+    kernel no longer runs that code, and no `pry resync` can move it. Name
+    the address the same instruction has now and the commands that put the
+    breakpoint there: pry's `rebased_address` when it confirmed the slide
+    the address was set at (pry #112), else old − previous slide + slide."""
+    ident = bridge_instance_id(inst.vm_id)
+    previous, slide = slides
+    items = []
+    for entry, bp in moved:
+        old = _raw_address(bp.get("location"))
+        number = bp["number"]
+        confirmed = isinstance(entry.get("rebased_address"), str)
+        new = (
+            int(entry["rebased_address"], 16) if confirmed
+            else (old - previous + slide) & _ADDR_MASK
+        )
+        status = entry.get("status")
+        where = {
+            "unreadable": "nothing is mapped at its address now",
+            "armed": "still armed at its address, where the moved kernel has other code",
+        }.get(status, f"{status} at its address")
+        flags = " --hardware" if bp.get("kind") == "hw-breakpoint" else ""
+        if bp.get("temporary"):
+            flags += " --temporary"
+        if bp.get("condition"):
+            flags += f" --condition {shlex.quote(str(bp['condition']))}"
+        lead = "" if confirmed else f"if it was set while the symbols sat at slide {previous:#x}, "
+        items.append(
+            f"#{number} `{bp.get('location')}` ({where}): {lead}the same instruction "
+            f"is now at {new:#x}: `pry --instance {ident} break delete {number}`, then "
+            f"`pry --instance {ident} break set '*{new:#x}'{flags}`"
+        )
+    return (
+        f"[qmu] WARNING: VM '{inst.vm_id}': `pry kbase` moved the pry bridge {ident}'s "
+        f"symbols (slide {previous:#x} → {slide:#x}) after {event}; breakpoints set by "
+        "symbol or file:line moved with them, but a breakpoint set at a raw address "
+        "does not follow a rebase, and no `pry resync` moves it: "
+        + "; ".join(items) + ".\n"
     )
 
 
@@ -760,13 +955,16 @@ def _strays(report: dict[str, Any]) -> list[dict[str, Any]]:
 def _resynced(
     inst: Any, event: str, report: dict[str, Any], *,
     kbase: dict[str, Any] | None = None, stop: BridgeStop | None = None,
-    resume_error: str | None = None, **extra: Any,
+    resume_error: str | None = None, raw: dict[int, dict[str, Any]] | None = None,
+    **extra: Any,
 ) -> BridgeDrive:
     """The owned bridge re-synced at `stop`. Its symbols are known to be the
     running kernel's: a nokaslr kernel cannot move, and on a KASLR one
     `kbase` is the base `pry kbase` validated just before. When qmu made the
     stop (`stop.taken`) it resumed the target after the re-sync
-    (`resume_error` when that failed)."""
+    (`resume_error` when that failed). `raw` is the bridge's raw-address
+    breakpoints (`_raw_breakpoints`), read when `kbase` moved the symbols:
+    those stayed where they were (#238)."""
     ident = bridge_instance_id(inst.vm_id)
     summary = report.get("summary") or {}
     taken = stop is not None and stop.taken
@@ -818,10 +1016,22 @@ def _resynced(
             notes.append(waiters)
     if strays:
         warnings.append(_stray_warning(inst, event, strays))
-    not_armed = [e for e in entries if e.get("status") in _NOT_ARMED]
+    slides = _rebase_slides(kbase)
+    moved: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    if slides is not None and raw:
+        for e in entries:
+            number = e.get("number")
+            if (
+                number in raw and number not in {bp["number"] for _, bp in moved}
+                and e.get("status") not in ("disabled", "pending")
+            ):
+                moved.append((e, raw[number]))
+    stayed = {id(e) for e, _ in moved}
+    not_armed = [e for e in entries if e.get("status") in _NOT_ARMED and id(e) not in stayed]
     mismatch = [
         e for e in entries
         if e.get("elf_match") is False and e.get("status") not in _NOT_ARMED
+        and id(e) not in stayed
     ]
     if mismatch:
         # The symbols sit at the kernel's base, so memory that differs from
@@ -838,6 +1048,8 @@ def _resynced(
             f"static keys) — {where}, so they trap where they were set"
             + (", unless the symbol file is not this kernel's." if kbase is None else ".")
         )
+    if moved:
+        warnings.append(_raw_moved_warning(inst, event, slides, moved))
     if not_armed:
         warnings.append(
             f"[qmu] WARNING: VM '{inst.vm_id}': the pry bridge {ident} re-synced "
@@ -860,22 +1072,20 @@ def _resynced(
     return BridgeDrive(data=data, notes=tuple(notes), warnings=tuple(warnings))
 
 
-def _torn_down(
-    inst: Any, event: str, happened: str, reason: str, *, first: str = ""
-) -> BridgeDrive:
-    """Reap the owned bridge and say what was lost and how to get it back.
+def _read_and_reap(inst: Any) -> tuple[list[Any] | None, bool, bool, str]:
+    """Read the owned bridge's breakpoint list, then reap it:
+    `(dropped, was_alive, reaped, lost)`.
 
-    The breakpoint list is read first so the envelope names what went away;
-    `None` when the bridge could not even answer that.
+    The list is read first so the envelope names what went away (`None` when
+    the bridge could not even answer that); `lost` says it in prose.
     """
-    ref = _owned_ref(inst)
-    ident = ref["bridge_instance_id"]
     dropped, _ = _pry_json(
         ["break", "list", "--instance", str(inst.gdb_bridge_pid), "--format", "json"],
         timeout=15.0,
     )
     if not isinstance(dropped, list):
         dropped = None
+    was_alive = bridge_alive(inst)
     reaped = reap_bridge(inst)
     if dropped:
         lost = "; ".join(
@@ -888,6 +1098,16 @@ def _torn_down(
         lost = "It had no breakpoints."
     else:
         lost = "Its breakpoint list could not be read before the teardown."
+    return dropped, was_alive, reaped, lost
+
+
+def _torn_down(
+    inst: Any, event: str, happened: str, reason: str, *, first: str = ""
+) -> BridgeDrive:
+    """Reap the owned bridge and say what was lost and how to get it back."""
+    ref = _owned_ref(inst)
+    ident = ref["bridge_instance_id"]
+    dropped, _, reaped, lost = _read_and_reap(inst)
     fate = (
         "qmu tore that bridge down"
         if reaped
@@ -909,6 +1129,112 @@ def _torn_down(
         "bridge_reaped": reaped, "breakpoints_dropped": dropped,
     }
     return BridgeDrive(data=data, warnings=(warning,))
+
+
+def _qemu_exited(inst: Any, event: str, failed: str) -> BridgeDrive:
+    """QEMU went away while qmu drove its bridge (#236): a SIGKILL, a crash,
+    a concurrent `qmu kill`. The step that failed (`failed`) says nothing
+    about the bridge; the VM is stopped, its stub gone with it, so the
+    bridge is reaped and the warning sends the reader to what happened to
+    the VM — never to a reattach, which needs a running VM.
+    """
+    ref = _owned_ref(inst)
+    ident = ref["bridge_instance_id"]
+    dropped, was_alive, reaped, lost = _read_and_reap(inst)
+    if reaped:
+        fate = "qmu reaped that bridge, whose stub went with QEMU"
+    elif not was_alive:
+        fate = "that bridge has exited too"
+    else:
+        fate = (
+            "qmu tried to reap that bridge and could not confirm it exited "
+            "(check `pry doctor`)"
+        )
+    reason = f"QEMU exited during the re-sync after {event}; the VM is stopped ({failed})"
+    vm = inst.vm_id
+    warning = (
+        f"[qmu] WARNING: VM '{vm}': QEMU exited while qmu was re-syncing the pry "
+        f"bridge `qmu gdb` spawned ({ident}, pid {ref['bridge_pid']}) after {event}, "
+        f"so the VM is stopped ({failed}); {fate}. {lost} "
+        f"There is no guest to reattach to: see what happened with `qmu status "
+        f"--vm {vm}`, `qmu crash --vm {vm}` and `qmu log --vm {vm} --tail 50`.\n"
+    )
+    data = {
+        "action": "torn_down", "event": event, **ref, "reason": reason,
+        "qemu_exited": True, "bridge_reaped": reaped, "breakpoints_dropped": dropped,
+    }
+    return BridgeDrive(data=data, warnings=(warning,))
+
+
+def _resync_timed_out(
+    inst: Any, event: str, *, stop: BridgeStop, kbase: dict[str, Any] | None,
+    resume_error: str | None, **extra: Any,
+) -> BridgeDrive:
+    """`pry resync` ran out of the budget qmu gave it (#233).
+
+    A slow resync is a big image on a loaded host, not a bridge whose view
+    nobody can correct: the bridge is left as it is, its symbols at the
+    kernel's base (nokaslr, or the base `pry kbase` validated just before),
+    and a stop qmu made is resumed as after a re-sync, so GDB re-inserts its
+    breakpoints. What is missing is pry's verification and its stray-trap
+    repair; the warning names the `pry resync` that does both.
+    """
+    ref = _owned_ref(inst)
+    ident = ref["bridge_instance_id"]
+    resumed = stop.taken and resume_error is None
+    reason = (
+        f"`pry resync` ran out of time: it did not finish within the "
+        f"{PRY_RESYNC_TIMEOUT} s qmu gives it"
+    )
+    if resumed:
+        target = (
+            "qmu resumed the target it had stopped for the re-sync, so GDB "
+            "re-inserted its breakpoints"
+        )
+    elif stop.taken:
+        target = (
+            f"qmu could not resume the target it had stopped for the re-sync "
+            f"({resume_error}): the guest is halted in the debugger, `pry "
+            f"--instance {ident} continue --background` resumes it"
+        )
+    else:
+        target = (
+            "the target is left at the debugger stop it was at: `pry --instance "
+            f"{ident} continue --background` resumes it"
+        )
+    rebased = (
+        f", its symbols at the base `pry kbase` validated ({kbase['base']})"
+        if kbase is not None else ""
+    )
+    notes = [_kbase_note(ident, kbase)] if kbase is not None else []
+    notes.append(
+        f"[qmu] `pry resync` on {ident} (pid {ref['bridge_pid']}) after {event} ran "
+        f"out of time ({PRY_RESYNC_TIMEOUT} s): no re-sync report; target "
+        + ("running (qmu resumed it)." if resumed else "stopped.")
+    )
+    warning = (
+        f"[qmu] WARNING: VM '{inst.vm_id}': the `pry resync` qmu ran on the pry "
+        f"bridge `qmu gdb` spawned ({ident}, pid {ref['bridge_pid']}) after {event} "
+        f"ran out of time: it did not finish within the {PRY_RESYNC_TIMEOUT} s qmu "
+        "gives it (it reads and decodes every code section of the loaded vmlinux "
+        "for stray traps, which takes longer for a large image on a loaded host). "
+        f"Nothing is wrong with the bridge, so qmu left it as it is{rebased}; "
+        f"{target}. None of its breakpoints is verified, and any stray trap is "
+        f"still in place: `pry --instance {ident} resync --timeout 600` re-arms and "
+        "checks every one (`summary.not_armed`) and repairs stray traps (it stops "
+        "a running target and resumes it).\n"
+    )
+    data: dict[str, Any] = {
+        "action": "not_resynced", "event": event, **ref, "reason": reason,
+        "timed_out": True, "interrupted": stop.taken, "resumed": resumed, **extra,
+    }
+    if stop.stale:
+        data["stale_stop"] = True
+    if resume_error is not None:
+        data["resume_error"] = resume_error
+    if kbase is not None:
+        data["kbase"] = kbase
+    return BridgeDrive(data=data, notes=tuple(notes), warnings=(warning,))
 
 
 def _not_resynced(inst: Any, event: str, reason: str, recovery: str) -> BridgeDrive:
@@ -1010,10 +1336,16 @@ def _resync_at_stop(
     target only when the stop is its own (`BridgeStop.taken`) and the
     symbols sit at a validated base. A target the operator had stopped is
     left there. When `pry kbase` cannot validate a base, the stop is kept
-    (`_left_stopped_unrebased`).
+    (`_left_stopped_unrebased`). A step that fails because QEMU exited
+    meanwhile is reported as that (`_qemu_exited`, #236); a `pry resync`
+    that only ran out of time leaves the bridge (`_resync_timed_out`, #233).
+    After a rebase the bridge's raw-address breakpoints are read at the stop
+    (`_raw_breakpoints`): they did not move with the symbols (#238).
     """
     stop, error = _stop(inst, run_state())
     if error is not None:
+        if _qemu_gone(inst, run_state):
+            return _qemu_exited(inst, event, f"`pry interrupt` failed: {error}")
         return _not_resynced(
             inst, event, f"qmu could not stop the bridge to re-sync it ({error})",
             recovery,
@@ -1023,14 +1355,26 @@ def _resync_at_stop(
     if at_stake is not None:
         kbase, error = _pry_kbase(inst)
         if error is not None:
+            if _qemu_gone(inst, run_state):
+                return _qemu_exited(inst, event, f"`pry kbase` failed: {error}")
             return _left_stopped_unrebased(inst, event, error, stop, at_stake)
-    report, error = _pry_resync(inst)
+    report, error, timed_out = _pry_resync(inst)
     if error is not None:
+        if _qemu_gone(inst, run_state):
+            return _qemu_exited(inst, event, f"`pry resync` failed: {error}")
+        if timed_out:
+            resume_error = _pry_continue(inst) if stop.taken else None
+            return _resync_timed_out(
+                inst, event, stop=stop, kbase=kbase, resume_error=resume_error, **extra,
+            )
         return _torn_down(inst, event, happened, f"`pry resync` failed: {error}")
+    raw = _raw_breakpoints(inst) if _rebase_slides(kbase) is not None else None
     resume_error = _pry_continue(inst) if stop.taken else None
+    if resume_error is not None and _qemu_gone(inst, run_state):
+        return _qemu_exited(inst, event, f"`pry continue` failed: {resume_error}")
     return _resynced(
         inst, event, report, kbase=kbase, stop=stop, resume_error=resume_error,
-        **extra,
+        raw=raw, **extra,
     )
 
 
@@ -1045,7 +1389,8 @@ def drive_bridge_after_loadvm(
     was reset or rebooted since the save, #200), so `pry kbase` first rebases
     the symbols to the restored kernel. Both at a stop qmu holds
     (`_resync_at_stop`; `run_state` reads QEMU's run state). A re-sync that
-    fails leaves a view nobody can correct: tear down.
+    fails leaves a view nobody can correct: tear down — unless it only ran
+    out of time (#233), or QEMU exited under it (#236).
     """
     recovery = loadvm_stale_session_warning(inst) + "\n"
     if _pry_missing():
@@ -1081,6 +1426,10 @@ def drive_bridge_after_reset(
     """
     event = "system_reset"
     if qemu_status != "running":
+        if _qemu_gone(inst, run_state):
+            return _qemu_exited(
+                inst, event, "QEMU's run state could not be read after the reset"
+            )
         why = (
             f"the guest was halted when it was reset (QEMU '{qemu_status}')"
             if qemu_status is not None
@@ -1112,7 +1461,11 @@ def drive_bridge_after_reset(
     started = time.monotonic()
     deadline = started + RESET_KERNEL_WAIT_SECONDS
     while not kernel_init_done(inst.serial_log, start_offset=epoch):
-        if time.monotonic() >= deadline or not instance_alive(inst):
+        if not instance_alive(inst):
+            return _qemu_exited(
+                inst, event, "the new boot had not finished kernel init"
+            )
+        if time.monotonic() >= deadline:
             return _not_resynced(
                 inst, event, _boot_not_done(inst, time.monotonic() - started), recovery,
             )
@@ -1425,7 +1778,12 @@ def _tcg(inst: Any) -> bool:
 
 
 def _rebase_recovery(vm_id: str, ref: str, gloss: str) -> str:
-    """Re-derive the kernel base and re-arm at it, with or without SSH."""
+    """Re-derive the kernel base and re-arm at it, with or without SSH.
+
+    Breakpoints set by symbol or file:line follow the rebase; one set at a
+    raw address does not (#238), and saying "no re-set needed" for it sent
+    the reader to a `pry resync` that can never arm it.
+    """
     return (
         f"`pry --instance {ref} kbase` (finds the running kernel's _text with no "
         "SSH, validates it against the loaded vmlinux and rebases that file; it "
@@ -1433,8 +1791,11 @@ def _rebase_recovery(vm_id: str, ref: str, gloss: str) -> str:
         f"(re-arms every breakpoint and reports `summary.not_armed`){gloss}; or "
         f"`eval \"$(qmu kbase --vm {vm_id} --symbols <vmlinux>)\"` once SSH "
         f"serves, then `pry --instance {ref} resync --base $KBASE`. Both work "
-        "on a running target, and the breakpoints already set re-resolve to the "
-        "new base (no re-set needed)."
+        "on a running target, and breakpoints set by symbol or file:line "
+        "re-resolve to the new base (no re-set needed). One set at a raw address "
+        "(`*0x…`) stays at that address: delete it and set it again at the "
+        "address minus the old slide plus the new one (`pry resync` names it "
+        "as `rebased_address` when pry knows the slide it was set at)."
     )
 
 

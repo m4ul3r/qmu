@@ -68,7 +68,7 @@ KBASE = {
 }
 
 _FAKE_PRY = r'''
-import json, os, signal, sys
+import json, os, signal, sys, time
 spec = os.environ["FAKE_PRY_DIR"]
 argv = sys.argv[1:]
 if argv[:1] == ["--instance"]:
@@ -98,6 +98,11 @@ path = os.path.join(spec, cmd + ".json")
 queue = json.load(open(path))
 answer = queue.pop(0) if len(queue) > 1 else queue[0]
 json.dump(queue, open(path, "w"))
+if answer.get("sleep"):
+    time.sleep(answer["sleep"])  # a resync that outruns qmu's budget
+if answer.get("kill_qemu"):
+    # QEMU dies while qmu drives the bridge (#236): a SIGKILL, a `qmu kill`.
+    os.kill(int(os.environ["FAKE_QEMU_PID"]), signal.SIGKILL)
 if answer.get("rc", 0):
     print(json.dumps({"ok": False, "error": answer["error"]}), file=sys.stderr)
     sys.exit(answer["rc"])
@@ -225,6 +230,9 @@ class _QMP:
         threading.Thread(target=finish_init, daemon=True).start()
 
     def execute(self, command, arguments=None, timeout=30.0):
+        qemu = os.environ.get("FAKE_QEMU_PID")
+        if qemu and not os.path.exists(f"/proc/{qemu}"):
+            raise qmp_cmds.QMPError("QMP socket gone: QEMU exited")
         if command == "query-status":
             status = self._status()
             return {"running": status == "running", "status": status}
@@ -613,7 +621,7 @@ def test_a_kaslr_load_rebases_the_bridge_before_it_resyncs(
     rc, payload = _json(capsys, _LOAD_ROUTES[route])
 
     assert rc == 0
-    assert [c[0] for c in pry.calls()] == ["interrupt", "kbase", "resync", "continue"]
+    assert [c[0] for c in pry.calls()] == ["interrupt", "kbase", "resync", "break", "continue"]
     assert not pry.stopped()
     drive = payload["debugger"]
     assert drive["action"] == "resynced"
@@ -624,7 +632,7 @@ def test_a_kaslr_load_rebases_the_bridge_before_it_resyncs(
 
 @pytest.mark.parametrize(
     ("cmdline", "drive"),
-    [("console=ttyS0", ["interrupt", "kbase", "resync"]),
+    [("console=ttyS0", ["interrupt", "kbase", "resync", "break"]),
      ("console=ttyS0 nokaslr", ["interrupt", "resync"])],
     ids=["kaslr", "nokaslr"],
 )
@@ -732,7 +740,7 @@ def test_a_kaslr_reset_rebases_and_resyncs_after_kernel_init(
     rc, payload = _json(capsys, ["qmp", "system_reset"])
 
     assert rc == 0
-    assert [c[0] for c in pry.calls()] == ["interrupt", "kbase", "resync", "continue"]
+    assert [c[0] for c in pry.calls()] == ["interrupt", "kbase", "resync", "break", "continue"]
     assert pry.init_seen_at_resync() == [True, True]
     assert not pry.stopped()
     drive = payload["debugger"]
@@ -924,3 +932,149 @@ def test_a_spilled_resync_report_is_read_from_its_artifact(
 
     assert rc == 0
     assert payload["debugger"]["resync"] == report
+
+
+# pry's own words for a resync its op budget cut (pry before #110).
+_RUNAWAY = (
+    "_AsyncTimeout: operation exceeded its timeout and was interrupted (a runaway "
+    "loop in `py exec`?) (the target was interrupted to apply this change and "
+    "has been left stopped)"
+)
+
+
+@pytest.mark.parametrize(
+    ("route", "cmdline"),
+    [(["snapshot", "load", "clean"], "console=ttyS0 nokaslr"),
+     (["qmp", "system_reset"], "console=ttyS0")],
+    ids=["nokaslr-load", "kaslr-reset"],
+)
+def test_a_resync_that_runs_out_of_time_keeps_the_bridge_and_says_so(
+    route, cmdline, tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Live (#233): on a 7.0 KASAN vmlinux under ordinary host load `pry
+    resync` took 19–23 s, past the fixed 20 s budget, and qmu tore down a
+    healthy bridge, losing every breakpoint. A resync that only ran out of
+    time says nothing about the bridge: it is kept, qmu's stop is resumed
+    (the symbols sit at the kernel's base, so GDB re-inserts them there),
+    and the receipt says the resync ran out of time — not pry's "runaway
+    loop in `py exec`?" — with the `pry resync` that verifies them."""
+    _vm(tmp_path, monkeypatch, bridge, cmdline=cmdline)
+    monkeypatch.setattr(debug, "PRY_RESYNC_TIMEOUT", 0.3)
+    pry.answers(resync=[{"rc": 1, "error": _RUNAWAY, "sleep": 0.4}])
+
+    rc, payload = _json(capsys, route)
+
+    assert rc == 0
+    drive = payload["debugger"]
+    assert drive["action"] == "not_resynced" and drive["timed_out"] is True
+    assert drive["interrupted"] is True and drive["resumed"] is True
+    assert bridge.poll() is None, "a slow resync costs no bridge"
+    assert load_instance(VM).gdb_bridge_pid == bridge.pid
+    assert pry.ran("kill") == []
+    assert pry.ran("continue") and not pry.stopped(), "qmu's stop is given back"
+    (warning,) = payload["warnings"]
+    assert "ran out of time" in drive["reason"] and "ran out of time" in warning
+    assert "runaway" not in json.dumps(payload)
+    assert f"pry --instance qmu-{VM} resync --timeout" in warning
+    if "nokaslr" not in cmdline:
+        assert drive["kbase"] == KBASE
+
+
+@pytest.fixture
+def qemu(monkeypatch):
+    """A stand-in QEMU process the fake pry can SIGKILL mid-drive. Reaped as
+    soon as it dies, so its pid is gone, as a real QEMU's (no child of qmu)
+    is."""
+    proc = subprocess.Popen(["sleep", "60"])
+    threading.Thread(target=proc.wait, daemon=True).start()
+    monkeypatch.setenv("FAKE_QEMU_PID", str(proc.pid))
+    yield proc
+    if proc.poll() is None:
+        proc.kill()
+
+
+@pytest.mark.parametrize(
+    ("route", "cmdline", "step"),
+    [(["snapshot", "load", "clean"], "console=ttyS0 nokaslr", "resync"),
+     (["qmp", "system_reset"], "console=ttyS0", "kbase")],
+    ids=["load-resync", "kaslr-reset-kbase"],
+)
+def test_qemu_dying_under_the_drive_says_the_vm_stopped_not_reattach(
+    route, cmdline, step, tmp_path, monkeypatch, capsys, bridge, pry, qemu
+):
+    """Live (#236): QEMU was SIGKILLed (or `qmu kill`ed) while qmu drove its
+    bridge after a load; the teardown warning said "Reattach once the guest
+    is up: qmu gdb …" to a VM that was stopped, and the reason was pry's
+    "Remote target disappeared", which reads as a debugger problem. The
+    drive now names QEMU's exit and points at what happened to the VM."""
+    inst = _vm(tmp_path, monkeypatch, bridge, cmdline=cmdline)
+    from dataclasses import replace
+
+    save_instance(replace(inst, pid=qemu.pid, pid_start=proc_pid_start(qemu.pid)))
+    pry.answers(**{step: [{
+        "rc": 1, "kill_qemu": True,
+        "error": "RuntimeError: Remote target disappeared without an exit code or "
+                 "termination signal; reconnect before inspecting or resuming the target",
+    }]})
+
+    rc, payload = _json(capsys, route)
+
+    assert rc == 0
+    drive = payload["debugger"]
+    assert drive["action"] == "torn_down" and drive["qemu_exited"] is True
+    assert drive["reason"].startswith("QEMU exited during the re-sync after ")
+    assert "the VM is stopped" in drive["reason"]
+    assert drive["breakpoints_dropped"] == BREAK_LIST
+    assert bridge.wait(timeout=5) is not None, "the stub is gone: the bridge is reaped"
+    (warning,) = payload["warnings"]
+    for command in (f"qmu status --vm {VM}", f"qmu crash --vm {VM}", f"qmu log --vm {VM}"):
+        assert command in warning
+    assert "Reattach" not in warning and "qmu gdb --vm" not in warning
+    assert "#1 __x64_sys_newuname" in warning
+
+
+RAW = {
+    "number": 2, "location": "*0xffffffff8d8b01c4", "enabled": True,
+    "kind": "breakpoint", "temporary": False, "condition": None, "hits": 1,
+}
+
+
+@pytest.mark.parametrize(
+    ("status", "rebased"),
+    [("unreadable", None), ("unreadable", "0xffffffff99ab01c4"), ("armed", None)],
+    ids=["unreadable", "pry-names-it", "armed-in-other-code"],
+)
+def test_a_raw_address_breakpoint_a_rebase_left_behind_is_named_with_its_new_address(
+    status, rebased, tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Live (#238): after a KASLR reset qmu's `pry kbase` rebased the
+    symbols, and a breakpoint set at `*0x…` stayed at the old address —
+    `unreadable`, or armed in whatever code the moved kernel put there. The
+    warning said "re-run `pry resync` once that code is mapped", which can
+    never work. It now says a raw address does not follow a rebase, gives
+    the address the instruction has now (pry's `rebased_address` when pry
+    knows the slide it was set at, else old − previous slide + slide) and
+    the delete/set commands. pry's report is not reshaped."""
+    _vm(tmp_path, monkeypatch, bridge, cmdline="console=ttyS0")
+    entry = _entry(
+        status, location="2.1", number=2, address=RAW["location"][1:], function=None,
+        detail="pry's own detail",
+    )
+    if rebased:
+        entry["rebased_address"] = rebased
+    report = _report(_entry("armed", trap_resident=True, elf_match=True), entry)
+    pry.answers(break_=[{"result": [*BREAK_LIST, RAW]}], resync=[{"result": report}])
+
+    rc, payload = _json(capsys, ["qmp", "system_reset"])
+
+    assert rc == 0
+    assert payload["debugger"]["action"] == "resynced"
+    assert payload["debugger"]["resync"] == report
+    moved = rebased or f"{0xffffffff8d8b01c4 - 0x4e00000 + 0x11000000:#x}"
+    (warning,) = payload["warnings"]
+    assert "does not follow a rebase" in warning
+    assert f"pry --instance qmu-{VM} break delete 2" in warning
+    assert f"pry --instance qmu-{VM} break set '*{moved}'" in warning
+    assert ("if it was set while the symbols sat at slide 0x4e00000" in warning) is (rebased is None)
+    assert "once that code is mapped" not in warning
+    assert "#1" not in warning, "a breakpoint set by symbol followed the rebase"
