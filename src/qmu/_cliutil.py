@@ -35,7 +35,7 @@ from .instance import (
     is_pid_alive,
     remove_instance,
 )
-from .output import write_bytes_result, write_output_result
+from .output import release_closed_streams, write_bytes_result, write_output_result
 from .qmp import QMPBusyError, QMPClient, QMPError
 from . import daemon_client
 from .debug import CONT_BEHIND_DEBUGGER, coherence_warnings, debugger_resume
@@ -148,10 +148,11 @@ def _qmp_ctx(inst: VMInstance) -> Any:
     a plain :class:`QMPClient` on the VM's socket otherwise — same `execute`/
     `execute_hmp`/`greeting_timeout` surface either way, so handlers and the
     tests that patch this name never see the difference. With the layer off
-    it is the bare `QMPClient` it always was.
+    it is the plain direct client (`daemon_client.StandaloneQMP`), whose busy
+    error names a live daemon this process bypasses (#207).
     """
     if not daemon_client.enabled():
-        return QMPClient(inst.qmp_socket)
+        return daemon_client.StandaloneQMP(inst.qmp_socket)
     return daemon_client.DaemonQMP(inst, QMPClient)
 
 
@@ -389,11 +390,22 @@ def render(args: argparse.Namespace, result: Result) -> int:
     ``format`` is read defensively so leaf commands that use
     ``_add_format_opts`` (which may leave the attribute unset before defaults)
     behave as ``getattr(args, "format", "text")``. Returns the exit code.
+
+    A reader that closed stdout or stderr (`qmu … | head -1`) drops the rest
+    of that stream and the exit code stays the operation's (#208): it used
+    to escape as `[qmu] Error: [Errno 32] Broken pipe`, exit 4, after the
+    command had succeeded.
     """
-    if not result.silent:
-        _write_result(args, result)
-    for line in result.warnings:
-        sys.stderr.write(line)
+    try:
+        if not result.silent:
+            _write_result(args, result)
+        for line in result.warnings:
+            sys.stderr.write(line)
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except BrokenPipeError:
+        if not release_closed_streams():
+            raise
     return result.exit_code
 
 
@@ -436,22 +448,34 @@ def _write_result(args: argparse.Namespace, result: Result) -> None:
             sys.stderr.write(f"[qmu] {line}\n")
     elif result.streamed:
         pass  # stdout already written as the guest produced it
-    elif result.raw is not None:
-        _write_bytes(args, result)
     else:
-        text = result.text
-        rendered = (
-            "\n".join(
-                item
-                if isinstance(item, str)
-                else json.dumps(item, separators=(",", ":"))
-                for item in text
-            )
-            if isinstance(text, list)
-            else text
-        )
-        _output(rendered, args, stem=result.stem, source_ok=source_ok)
+        try:
+            if result.raw is not None:
+                _write_bytes(args, result)
+            else:
+                _write_text(args, result, source_ok)
+            sys.stdout.flush()
+        except BrokenPipeError:
+            # stdout's reader left; the stderr notes (`[exit code: N]`, the
+            # crash narrative) still belong to a reader that is there.
+            if not release_closed_streams():
+                raise
     _write_notes(result.notes)
+
+
+def _write_text(args: argparse.Namespace, result: Result, source_ok: bool | None) -> None:
+    text = result.text
+    rendered = (
+        "\n".join(
+            item
+            if isinstance(item, str)
+            else json.dumps(item, separators=(",", ":"))
+            for item in text
+        )
+        if isinstance(text, list)
+        else text
+    )
+    _output(rendered, args, stem=result.stem, source_ok=source_ok)
 
 
 def _refusal(*, data: dict[str, Any], text: list[str], stem: str) -> Result:
@@ -697,7 +721,20 @@ def _emit_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) 
     on a successful Result. ``args`` may be partially populated (e.g. if
     argparse failed before defaults were applied), so the format is read
     defensively with getattr().
+
+    The error is real, so the caller's exit code stands when the reader has
+    closed the stream it would go to (#208); nothing else is written.
     """
+    try:
+        _write_error(args, exc, text_prefix)
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except BrokenPipeError:
+        if not release_closed_streams():
+            raise
+
+
+def _write_error(args: argparse.Namespace, exc: BaseException, text_prefix: str) -> None:
     fmt = getattr(args, "format", "text") or "text"
     specific = getattr(exc, "hint", None)
     warnings = dispatch_warnings()

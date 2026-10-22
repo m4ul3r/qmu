@@ -23,6 +23,7 @@ from ..instance import (
     proc_pid_start,
     save_guest_epoch_serial_offset,
     save_instance,
+    save_ssh_severed,
 )
 from ..snapshot import (
     SAVEVM_BASE_SECONDS,
@@ -329,6 +330,28 @@ def _drop_ssh_master(inst: VMInstance) -> None:
     _make_ssh(inst).close_control_master()
 
 
+def _sever_sessions(inst: VMInstance, cause: str) -> VMInstance:
+    """Stamp the record, then close the guest's SSH ControlMaster (#221).
+
+    Closing the master ends every guest command in flight through it, and
+    a load or reset rewinds the guest's TCP state under any other session;
+    that command's ssh then exits 255 with nothing to tell it from the
+    guest program exiting 255. The stamp (`ssh_severed_at`/`_by`, written
+    BEFORE the teardown so the severed command cannot read the record first)
+    is what `guest._severed_by` checks, and it is qmu's own record — never
+    bytes the guest wrote. Returns the stamped instance: a caller that
+    persists `inst` again must carry the stamp, or that write erases it.
+    """
+    if inst.ssh_port is None:
+        return inst  # no SSH endpoint, no session to sever
+    try:
+        inst = save_ssh_severed(inst, cause)
+    except OSError:
+        pass  # best-effort, like the teardown: the severed command keeps the old wording
+    _drop_ssh_master(inst)
+    return inst
+
+
 _SNAPSHOT_ERROR_TYPE = "SnapshotError"
 # Exit code for a `snapshot save` whose budget expired: the window closed and
 # the result is unknown — the same code `wait` uses — not 4, which claims the
@@ -536,7 +559,7 @@ def _handle_snapshot_save(args: argparse.Namespace) -> Result:
     # A master alive at savevm time is frozen into the image as an established
     # guest sshd session that every later load resurrects as an orphan; close
     # it first so the checkpoint carries no half-open connection.
-    _drop_ssh_master(inst)
+    inst = _sever_sessions(inst, "snapshot save")
     stop = _SaveStop(inst, "snapshot save")
     try:
         with _qmp_ctx(inst) as qmp:
@@ -610,12 +633,20 @@ def _persist_epoch(inst: VMInstance, offset: int) -> VMInstance:
 def _handle_snapshot_load(args: argparse.Namespace) -> Result:
     inst = _choose_running(args.vm, "snapshot load")
     epoch_offset = serial_log_offset(inst.serial_log)
-    _drop_ssh_master(inst)
+
+    def sever() -> None:
+        # Only once `loadvm` is about to run: a tag the pre-check refuses
+        # mutates nothing, so it must not cut the commands in flight either
+        # (review of #221: a refused load cut an exec whose process then
+        # ran on, while the exec said it had been rewound away).
+        nonlocal inst
+        inst = _sever_sessions(inst, "snapshot load")
+
     with _qmp_ctx(inst) as qmp:
-        result = load_snapshot(qmp, args.name)
+        result = load_snapshot(qmp, args.name, before_restore=sever)
     if result.ok:
         inst = _persist_epoch(inst, epoch_offset)
-        _drop_ssh_master(inst)
+        inst = _sever_sessions(inst, "snapshot load")
     rewound = result.ok or result.restore_state != "none"
     if rewound and debug_stub_present(inst):
         # The restored guest prints no boot banner; the debugger is told
@@ -1376,8 +1407,9 @@ def _hmp_error(
 _TCP_RESETTING_VERBS = frozenset({"system_reset", "loadvm"})
 
 
-def _before_mutation(inst: VMInstance, verb: str) -> int | None:
-    """Pre-mutation bookkeeping; returns the serial epoch to persist on success.
+def _before_mutation(inst: VMInstance, verb: str) -> tuple[VMInstance, int | None]:
+    """Pre-mutation bookkeeping; returns the (session-severed) instance and
+    the serial epoch to persist on success.
 
     A qmu-issued `system_reset` used to leave `guest_epoch_serial_offset`
     untouched, so `wait --pattern 'login:'` matched the previous boot in
@@ -1386,11 +1418,11 @@ def _before_mutation(inst: VMInstance, verb: str) -> int | None:
     lands, is exactly what `snapshot load` does.
     """
     if verb in _TCP_RESETTING_VERBS:
-        _drop_ssh_master(inst)
-        return serial_log_offset(inst.serial_log)
+        inst = _sever_sessions(inst, verb)
+        return inst, serial_log_offset(inst.serial_log)
     if verb == "savevm":
-        _drop_ssh_master(inst)
-    return None
+        inst = _sever_sessions(inst, verb)
+    return inst, None
 
 
 def _status_after_mutation(qmp: object, inst: VMInstance, verb: str) -> str | None:
@@ -1436,7 +1468,7 @@ def _after_mutation(
                 inst = _persist_epoch(inst, epoch)
             except OSError as exc:
                 persist_error = exc
-        _drop_ssh_master(inst)
+        inst = _sever_sessions(inst, verb)
         if debug_stub_present(inst):
             # The warning below tells the debugger about this generation; a
             # reset's boot banner is still to come and belongs to it (#184).
@@ -1615,7 +1647,7 @@ def _handle_qmp(args: argparse.Namespace) -> Result:
         verb = _hmp_verb(hmp_line) if hmp_line is not None else ""
     else:
         verb = ""
-    epoch = _before_mutation(inst, verb)
+    inst, epoch = _before_mutation(inst, verb)
     try:
         with _qmp_ctx(inst) as qmp:
             call = _raw_mutation(
@@ -1674,7 +1706,7 @@ def _handle_monitor(args: argparse.Namespace) -> Result:
     # shared hooks, keyed on the HMP *verb* so e.g. `monitor help system_reset`
     # -- which resets nothing -- is not caught.
     verb = _hmp_verb(command)
-    epoch = _before_mutation(inst, verb)
+    inst, epoch = _before_mutation(inst, verb)
     with _qmp_ctx(inst) as qmp:
         call = _raw_mutation(qmp, inst, verb, lambda: qmp.execute_hmp(command))
     result = call.result

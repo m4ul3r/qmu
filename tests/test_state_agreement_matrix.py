@@ -24,6 +24,7 @@ from qmu import cli
 from qmu import instance as instance_mod
 from qmu.commands import guest as guest_mod
 from qmu.commands import lifecycle
+from qmu.commands import qmp_cmds
 from qmu.instance import (
     VM_ABSENT,
     VM_HELD_BACK,
@@ -32,6 +33,8 @@ from qmu.instance import (
     VM_STOPPED,
     VMInstance,
     classify_vm,
+    save_instance,
+    save_ssh_severed,
 )
 from qmu.ssh import GuestText, SSHAborted, SSHError
 from tests.test_daemon import FakeQMPServer, daemon_env  # noqa: F401 — fixture
@@ -2361,6 +2364,86 @@ def test_every_ssh_command_agrees_on_a_lost_transport(
         "names_qmu_crash": panicked,
         "names_qmu_log": not panicked,
     }
+    for command, view in views.items():
+        assert view == expected, f"`qmu {command}` disagrees: {view}"
+
+
+class _ServingAfterCutSSH:
+    """ssh exits 255 because the session was cut under it (or the guest
+    command really exited 255); the guest then answers the liveness probe
+    and reports its kernel's uptime — near 0 after a reboot (#221)."""
+
+    def __init__(self, cut, uptime):
+        self._cut = cut
+        self._uptime = uptime
+
+    def run(self, command, timeout=30.0, check=False, **kwargs):
+        if command == "cat /proc/uptime":
+            return 0, f"{self._uptime:.2f} 1.00\n", ""
+        self._cut()
+        return 255, "", ""
+
+    def is_ready(self, timeout=2):
+        return True
+
+
+@pytest.mark.parametrize(
+    "cause", ["snapshot load", "guest reboot", "standalone reboot", "banner replay"]
+)
+def test_every_ssh_command_agrees_on_a_session_cut_under_it(
+    cause, cache, monkeypatch, capsys
+):
+    """A session another pane's `snapshot load` cut, or a guest reboot (QEMU's
+    RESET stamped by the daemon, or — daemon off — a guest kernel younger
+    than the command), is a transport loss qmu can name, on exec and dmesg
+    alike — never the guest command exiting 255, which the answering probe
+    used to make of it. A boot banner the guest replays to its console is
+    not a reboot: the 255 stays the guest's on both."""
+    inst = _ssh_capable_instance(cache)
+    save_instance(inst)
+    decoy = _decoy_running(monkeypatch)
+    for mod in (lifecycle, instance_mod):
+        monkeypatch.setattr(mod, "list_instances", lambda: [decoy, inst])
+    monkeypatch.setattr(guest_mod, "_preflight_ssh_guest", lambda *a, **kw: None)
+    monkeypatch.setattr(guest_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(guest_mod, "choose_instance", lambda vm=None: inst)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+
+    def cut():
+        if cause == "snapshot load":
+            qmp_cmds._sever_sessions(inst, cause)
+        elif cause == "guest reboot":
+            save_ssh_severed(inst, cause)  # the daemon, on a guest-requested RESET
+        elif cause == "banner replay":
+            with open(inst.serial_log, "a") as stream:
+                stream.write("[    0.000000] Linux version 7.0.0 (b@h) (gcc 13) #1 SMP\n")
+
+    rebooted = cause in ("guest reboot", "standalone reboot")
+    monkeypatch.setattr(
+        guest_mod, "_make_ssh",
+        lambda selected: _ServingAfterCutSSH(cut, 0.0 if rebooted else 3600.0),
+    )
+
+    views = {}
+    for command in ("exec", "dmesg"):
+        with open(inst.serial_log, "w") as stream:
+            stream.write("boot ok\n")
+        rc = cli.main(["--format", "json", *_LOST_ARGV[command]])
+        payload = json.loads(capsys.readouterr().out)
+        views[command] = {
+            "rc": rc,
+            "ok": payload.get("ok"),
+            "ssh_error": payload.get("ssh_error") is True,
+            "exit_code": payload.get("exit_code"),
+            "severed_by": payload.get("severed_by"),
+        }
+    if cause == "banner replay":
+        expected = {"rc": 1, "ok": False, "ssh_error": False, "exit_code": 255, "severed_by": None}
+    else:
+        expected = {
+            "rc": 4, "ok": False, "ssh_error": True, "exit_code": None,
+            "severed_by": "guest reboot" if rebooted else cause,
+        }
     for command, view in views.items():
         assert view == expected, f"`qmu {command}` disagrees: {view}"
 

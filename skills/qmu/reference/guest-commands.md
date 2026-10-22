@@ -121,6 +121,21 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
   255". qmu's ssh client logs apart from the guest's stderr, so a guest
   command that itself runs `ssh`, fails to connect and exits 255 is exit 1,
   `exit_code: 255`, `ssh_error: false` like any other 255.
+- A session cut under the command by qmu itself — another `qmu snapshot
+  load` (of a tag that exists)/`save` or a raw `loadvm`/`savevm`/
+  `system_reset` tears the VM's SSH ControlMaster down — or by a guest
+  reboot (`echo b > /proc/sysrq-trigger`, a watchdog: QEMU's RESET stamped
+  by the daemon, or with `QMU_DAEMON=off` a guest kernel whose
+  `/proc/uptime` is younger than the command) is exit 4, `ssh_error: true`,
+  `exit_code: null`, `severed_by: "snapshot load"` (… `"guest reboot"`) and
+  a hint naming the cause, even though the restored or rebooted guest
+  answers SSH; with a fresh crash report it carries `crash`, and a reboot
+  after one is exit 3. The signal is qmu's own record or the guest kernel's
+  clock, never the command's output or the console: a `dmesg` replayed to
+  the console is not a reboot. A reboot the guest is still in the middle of
+  (sshd not back) is the ordinary dropped-transport exit 4. After a load
+  cut, check its result: a refused one (`restore_state: "none"`) rewound
+  nothing, and the command may still be running.
 - A guest that stops answering without a panic or a halt (wedged) holds the
   command until `--timeout` (124); ssh itself never gives up on silence.
 - qmu logs in with its key only (`BatchMode=yes`; never a password prompt,

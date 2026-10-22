@@ -262,6 +262,32 @@ def test_record_write_on_reset_does_not_clobber_other_fields(daemon_env, vm):
     assert load_instance("fake-vm").gdb_bridge_pid == 424242
 
 
+def test_only_a_guest_requested_reset_stamps_the_sessions_it_cut(daemon_env, vm):
+    """#221: the daemon is the one guest-unwritable witness of a guest
+    reboot (QEMU's RESET `guest: true`); it stamps the record before it
+    drops the ControlMaster, so a guest command cut by the reboot is not
+    reported as exiting 255. A host reset was stamped by the qmu command
+    that issued it, so the daemon leaves it alone."""
+    inst = load_instance("fake-vm")
+    inst.ssh_port = 10099  # an SSH endpoint; no key, so no real teardown runs
+    save_instance(inst)
+    daemon_client.watch("fake-vm")
+    log: Path = vm["log"]
+
+    vm["server"].emit("RESET", {"guest": False, "reason": "host-qmp-system-reset"})
+    _wait_until(lambda: load_instance("fake-vm").guest_epoch_source == "observed", what="epoch")
+    assert load_instance("fake-vm").ssh_severed_at is None
+
+    with log.open("a") as f:
+        f.write("sysrq: Resetting\n")
+    before = time.time()
+    vm["server"].emit("RESET", {"guest": True, "reason": "guest-reset"})
+    _wait_until(
+        lambda: load_instance("fake-vm").ssh_severed_by == "guest reboot", what="stamp"
+    )
+    assert load_instance("fake-vm").ssh_severed_at >= before
+
+
 def test_stop_and_resume_events_update_running(daemon_env, vm):
     daemon_client.watch("fake-vm")
     vm["server"].replies["query-status"] = {"status": "debug", "running": False}

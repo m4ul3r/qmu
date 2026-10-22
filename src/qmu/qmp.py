@@ -23,6 +23,13 @@ class QMPBusyError(QMPError):
     per connect behind a `wait` and then report `qmp: connected`.
     """
 
+    def __init__(self, message: str, hint: str | None = None):
+        super().__init__(message)
+        # A raise site that knows who holds the slot (a daemon this process
+        # bypasses under `QMU_DAEMON=off`, #207) names the way out; else the
+        # `error_type` default hint applies.
+        self.hint = hint
+
 
 class QMPTimeoutError(QMPError):
     """A command was sent but QEMU did not answer within the budget.

@@ -277,7 +277,7 @@ def _vm(
     monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
     monkeypatch.setattr(
         qmp_cmds, "load_snapshot",
-        lambda qmp, name: SnapshotResult(True, f"Snapshot '{name}' loaded."),
+        lambda qmp, name, **kw: SnapshotResult(True, f"Snapshot '{name}' loaded."),
     )
     monkeypatch.setattr(_QMP, "saves", [])
 
@@ -480,7 +480,7 @@ def test_a_load_that_failed_mid_restore_never_drives_the_bridge(
     monkeypatch.setattr(qmp_cmds, "debug_session_present", lambda inst: True)
     monkeypatch.setattr(
         qmp_cmds, "load_snapshot",
-        lambda qmp, name: SnapshotResult(
+        lambda qmp, name, **kw: SnapshotResult(
             False, "Error: Error -22 while loading VM state", reason="hmp",
             guest_paused=True, restore_state=restore_state,
         ),

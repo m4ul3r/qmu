@@ -57,7 +57,7 @@ def test_snapshot_load_captures_before_load_and_saves_before_success_emit(
         calls.append("capture")
         return Path(path).stat().st_size
 
-    def load(qmp, name):
+    def load(qmp, name, **kw):
         calls.append("load")
         with log.open("ab") as stream:
             stream.write(b"restored guest output\n")
@@ -96,7 +96,7 @@ def test_snapshot_load_hmp_failure_preserves_epoch(message, tmp_path, monkeypatc
     monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(object()))
     monkeypatch.setattr(
-        qmp_cmds, "load_snapshot", lambda qmp, name: SnapshotResult(False, message)
+        qmp_cmds, "load_snapshot", lambda qmp, name, **kw: SnapshotResult(False, message)
     )
     monkeypatch.setattr(
         qmp_cmds, "save_guest_epoch_serial_offset",
@@ -117,7 +117,7 @@ def test_snapshot_load_qmp_exception_does_not_save(tmp_path, monkeypatch):
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(object()))
     monkeypatch.setattr(
         qmp_cmds, "load_snapshot",
-        lambda qmp, name: (_ for _ in ()).throw(QMPError("load failed")),
+        lambda qmp, name, **kw: (_ for _ in ()).throw(QMPError("load failed")),
     )
     monkeypatch.setattr(
         qmp_cmds, "save_guest_epoch_serial_offset",
@@ -138,7 +138,7 @@ def test_snapshot_load_metadata_failure_emits_no_success(tmp_path, monkeypatch, 
     monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(object()))
     monkeypatch.setattr(
         qmp_cmds, "load_snapshot",
-        lambda qmp, name: SnapshotResult(True, "Snapshot 'clean' loaded."),
+        lambda qmp, name, **kw: SnapshotResult(True, "Snapshot 'clean' loaded."),
     )
     monkeypatch.setattr(
         qmp_cmds, "save_guest_epoch_serial_offset",
@@ -173,3 +173,35 @@ def test_snapshot_save_does_not_advance_epoch(tmp_path, monkeypatch):
     args = argparse.Namespace(vm=None, name="clean", format="text", out=None)
     assert _run(qmp_cmds._handle_snapshot_save, args) == 0
     assert saved == []
+
+
+@pytest.mark.parametrize("listed", [True, False])
+def test_only_an_attempted_load_cuts_the_guest_sessions(listed, tmp_path, monkeypatch):
+    """A tag the pre-check refuses mutates nothing, so it must not close the
+    SSH ControlMaster either: that cut an exec whose process then ran on in
+    the guest while the exec was told it had been rewound away (review of
+    #221). A load that reaches `loadvm` cuts them and stamps the record."""
+    from qmu.instance import load_instance, save_instance
+    from tests.test_snapshot import QEMU11_SINGLE, FakeQMP
+
+    log = tmp_path / "snap.serial.log"
+    log.write_text("old\n")
+    inst = _inst(str(log))
+    save_instance(inst)
+    drops = []
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: drops.append(inst.vm_id))
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: inst)
+    qmp = FakeQMP("", listing=QEMU11_SINGLE if listed else "")
+    monkeypatch.setattr(qmp_cmds, "_qmp_ctx", lambda inst: contextlib.nullcontext(qmp))
+
+    rc = _run(qmp_cmds._handle_snapshot_load, _load_args())
+
+    record = load_instance("snap-vm")
+    if listed:
+        assert rc == 0
+        assert drops and record.ssh_severed_by == "snapshot load"
+    else:
+        assert rc == 1
+        assert "loadvm clean" not in qmp.calls
+        assert drops == []
+        assert record.ssh_severed_at is None

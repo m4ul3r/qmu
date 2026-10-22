@@ -47,7 +47,7 @@ from typing import Any, Callable
 from .config import resolve_config
 from .instance import QMUError, is_pid_alive, proc_pid_start
 from .paths import cache_home, runtime_root, _sun_path_budget
-from .qmp import QMPCommandError, QMPError, QMPTimeoutError
+from .qmp import QMPBusyError, QMPClient, QMPCommandError, QMPError, QMPTimeoutError
 
 DAEMON_SOCKET_NAME = "daemon.sock"
 DAEMON_RECORD_NAME = "daemon.json"
@@ -198,6 +198,56 @@ def record_alive(record: dict[str, Any] | None) -> bool:
     if current is None:
         return not os.path.isdir("/proc")
     return current == recorded
+
+
+def bypassed_daemon(cache_dir: Path | None = None) -> dict[str, Any] | None:
+    """The live daemon record this process does not use, else None.
+
+    `QMU_DAEMON=off` keeps THIS process off the layer; a daemon an earlier
+    command autostarted keeps serving the cache and holding the QMP slot of
+    every VM it watches (#207). Read from `daemon.json` plus the pid
+    identity check — no connect, so the off contract holds.
+    """
+    if daemon_mode() != MODE_OFF:
+        return None
+    record = read_record(cache_dir)
+    return record if record_alive(record) else None
+
+
+def bypassed_busy_detail(record: dict[str, Any]) -> tuple[str, str]:
+    """The (message suffix, hint) for a busy QMP slot while `record`'s daemon
+    is bypassed: name it and the two ways out."""
+    pid = record.get("pid")
+    message = (
+        f"A qmu daemon (pid {pid}) is running for this cache and holds the QMP "
+        "connection of every VM it watches; QMU_DAEMON=off keeps this command "
+        "from going through it."
+    )
+    hint = (
+        f"The qmu daemon (pid {pid}) most likely holds this VM's QMP slot: "
+        "unset QMU_DAEMON so the command goes through the daemon, or release "
+        "every watched VM with qmu daemon stop, then retry"
+    )
+    return message, hint
+
+
+class StandaloneQMP(QMPClient):
+    """The direct `QMPClient` `_qmp_ctx` returns under `QMU_DAEMON=off`.
+
+    Identical to `QMPClient` except that a busy slot on a cache whose daemon
+    this process bypasses names that daemon (#207): the generic busy message
+    sent the reader looking for a `qmu wait` that did not exist.
+    """
+
+    def connect(self) -> dict:
+        try:
+            return super().connect()
+        except QMPBusyError as exc:
+            record = bypassed_daemon()
+            if record is None:
+                raise
+            message, hint = bypassed_busy_detail(record)
+            raise QMPBusyError(f"{exc} {message}", hint=hint) from exc
 
 
 def socket_path_for(cache_dir: Path | None = None) -> Path:
@@ -586,10 +636,31 @@ def probe() -> dict[str, Any]:
     `disabled (QMU_DAEMON=off)`, `not running`, `stale record` (a record
     names a dead pid) or `unresponsive`. `build_current` is False when the
     daemon serves older code than this CLI (the next command respawns it).
+    Under `QMU_DAEMON=off` a live recorded daemon is still `running`, with
+    `used: false` and only what `daemon.json` holds (#207): it keeps holding
+    the QMP slot of every VM it watches, and denying it existed hid the
+    holder of the `busy` this process then gets.
     """
     mode = daemon_mode()
     if mode == MODE_OFF:
-        return {"running": False, "mode": mode, "reason": "disabled (QMU_DAEMON=off)"}
+        record = bypassed_daemon()
+        if record is None:
+            return {"running": False, "mode": mode, "reason": "disabled (QMU_DAEMON=off)"}
+        started = record.get("started_at")
+        uptime = round(time.time() - started, 3) if isinstance(started, (int, float)) else None
+        return {
+            "running": True,
+            "used": False,
+            "mode": mode,
+            "reason": None,
+            "pid": record.get("pid"),
+            "uptime": uptime,
+            "build_id": record.get("build_id"),
+            "socket": record.get("socket"),
+            "cache_dir": record.get("cache_dir"),
+            "idle_exit": record.get("idle_exit"),
+            "build_current": record.get("build_id") == build_id(),
+        }
     record = read_record()
     conn = _connect_socket(socket_path_for(None))
     if conn is None:
@@ -600,7 +671,7 @@ def probe() -> dict[str, Any]:
             info = conn.request("ping")
         except (DaemonError, DaemonUnavailable) as exc:
             return {"running": False, "mode": mode, "reason": f"unresponsive ({exc})", "record": record}
-    out = {"running": True, "mode": mode, "reason": None, **summarize(info)}
+    out = {"running": True, "used": True, "mode": mode, "reason": None, **summarize(info)}
     out["build_current"] = info.get("build_id") == build_id()
     return out
 

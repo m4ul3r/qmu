@@ -1224,3 +1224,123 @@ def test_only_the_client_log_proves_a_session_never_connected(
     else:
         assert payload["exit_code"] == 255
         assert payload["ssh_error"] is False
+
+
+# --- a session qmu or a reboot cut mid-command (#221) --------------------------
+
+
+_BOOT_BANNER = "[    0.000000] Linux version 6.1.11 (b@h) (gcc 13) #1 SMP\n"
+
+
+@pytest.mark.parametrize("cause", ["snapshot load", "system_reset", "guest reboot"])
+def test_a_session_cut_by_a_rewind_or_reboot_is_transport_not_guest_255(
+    wired, monkeypatch, capsys, cause
+):
+    """The restored/rebooted guest answers the liveness probe, which made a
+    cut session read as the guest program exiting 255 (exit 1, `ssh_error:
+    false`, a hint pointing at an empty stderr). The cut is the record's
+    stamp, written by whoever made it — the qmu command that tore the
+    ControlMaster down, or the daemon on a guest-requested QMP RESET."""
+    from qmu.commands import qmp_cmds
+    from qmu.instance import save_instance, save_ssh_severed
+
+    fake = wired(rc=255, ready=True)
+    inst = guest.choose_instance("exec-vm")
+    save_instance(inst)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+    real_run = fake.run
+
+    def run(command, *a, **kw):
+        if cause == "guest reboot":
+            save_ssh_severed(inst, cause)  # what the daemon writes on the RESET
+        else:
+            qmp_cmds._sever_sessions(inst, cause)  # a concurrent load / raw reset
+        return real_run(command, *a, **kw)
+
+    fake.run = run
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "sleep 6; echo DONE"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 4
+    assert payload["ok"] is False
+    assert payload["exit_code"] is None
+    assert payload["ssh_error"] is True
+    assert payload["severed_by"] == cause
+    assert "exited 255" not in payload["hint"]
+
+
+def _answer_uptime(fake, uptime):
+    """The guest kernel's `/proc/uptime` as qmu's follow-up read sees it."""
+    real_run = fake.run
+
+    def run(command, *a, **kw):
+        if command == "cat /proc/uptime":
+            return 0, f"{uptime:.2f} 1.00\n", ""
+        return real_run(command, *a, **kw)
+
+    fake.run = run
+
+
+def test_a_boot_banner_replayed_to_the_console_is_not_a_reboot(wired, capsys):
+    """`dmesg > /dev/console; exit 255` reprints the timestamped boot banner
+    with the session intact: the guest command's 255 is its own, never a
+    reboot that cut it (review of #221)."""
+    from qmu.instance import save_instance
+
+    fake = wired(rc=255, ready=True, append_during_run=_BOOT_BANNER)
+    _answer_uptime(fake, 3600.0)  # the same boot: up long before the command
+    save_instance(guest.choose_instance("exec-vm"))
+
+    rc = cli.main([
+        "--format", "json", "exec", "--vm", "exec-vm",
+        "dmesg > /dev/console; exit 255",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["exit_code"] == 255
+    assert payload["ssh_error"] is False
+    assert "severed_by" not in payload
+
+
+def test_a_reboot_with_no_daemon_is_read_from_the_guest_kernel_uptime(wired, capsys):
+    """With `QMU_DAEMON=off` nothing stamps a guest reboot; the rebooted guest
+    answers the probe, and only its kernel's uptime — younger than the
+    command — says a new boot ran under it (second review of #221)."""
+    from qmu.instance import save_instance
+
+    fake = wired(rc=255, ready=True)
+    _answer_uptime(fake, 0.0)
+    save_instance(guest.choose_instance("exec-vm"))
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "echo b > /proc/sysrq-trigger"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 4
+    assert payload["exit_code"] is None
+    assert payload["ssh_error"] is True
+    assert payload["severed_by"] == "guest reboot"
+
+
+def test_a_stamp_from_before_the_command_does_not_explain_its_255(
+    wired, monkeypatch, capsys
+):
+    """A load that finished before the command started cut nothing of it:
+    the guest's own 255 stays the guest's."""
+    from qmu.commands import qmp_cmds
+    from qmu.instance import save_instance
+
+    wired(rc=255, ready=True)
+    inst = guest.choose_instance("exec-vm")
+    save_instance(inst)
+    monkeypatch.setattr(qmp_cmds, "_drop_ssh_master", lambda inst: None)
+    qmp_cmds._sever_sessions(inst, "snapshot load")
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "exit 255"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["exit_code"] == 255
+    assert payload["ssh_error"] is False
+    assert "severed_by" not in payload

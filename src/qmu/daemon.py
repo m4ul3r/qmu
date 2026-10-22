@@ -78,6 +78,7 @@ from .instance import (
     load_instance,
     proc_pid_start,
     save_guest_epoch_serial_offset,
+    save_ssh_severed,
 )
 from .paths import cache_home
 from .qmp import QMPBusyError, QMPClient, QMPCommandError, QMPError, QMPTimeoutError
@@ -682,17 +683,31 @@ class Daemon:
                     watch.qemu_status = "shutdown"
             self.cond.notify_all()
         if name == "RESET":
+            guest_reset = isinstance(data, dict) and data.get("guest") is True
             threading.Thread(
-                target=self._persist_reset, args=(watch, watch.epoch_offset), daemon=True
+                target=self._persist_reset,
+                args=(watch, watch.epoch_offset, guest_reset),
+                daemon=True,
             ).start()
 
-    def _persist_reset(self, watch: VMWatch, epoch: int) -> None:
+    def _persist_reset(self, watch: VMWatch, epoch: int, guest_reset: bool = False) -> None:
         """Write the observed epoch through a fresh read of the record, and drop
         the SSH ControlMaster that now points at a host key the new boot may
-        not have."""
+        not have.
+
+        A reset the guest asked for (`"guest": true`: sysrq-b, `reboot`, a
+        watchdog) also stamps the record `ssh_severed_by: "guest reboot"`
+        before the teardown, so a guest command whose session it cut is
+        reported as cut, not as exiting 255 (#221). QEMU is the source, not
+        the console: a `dmesg` replayed to the console reprints the boot
+        banner without any reboot. A host reset (`qmu qmp system_reset`) was
+        stamped by the qmu command that issued it.
+        """
         inst = load_instance(watch.vm_id)
         if inst is not None:
             try:
+                if guest_reset and inst.ssh_port is not None:
+                    inst = save_ssh_severed(inst, "guest reboot")
                 watch.inst = save_guest_epoch_serial_offset(inst, epoch, source="observed")
             except (OSError, TypeError, ValueError) as exc:
                 _log(f"{watch.vm_id}: could not persist epoch {epoch}: {exc}")

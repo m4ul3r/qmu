@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .qmp import QMPClient, QMPError, hmp_failed
 
@@ -237,14 +237,23 @@ def loadvm_restore_state(message: str) -> str:
 _FAILED_RESTORE_RUN_STATE = "restore-vm"
 
 
-def load_snapshot(qmp: QMPClient, name: str, timeout: float = 60.0) -> SnapshotResult:
+def load_snapshot(
+    qmp: QMPClient,
+    name: str,
+    timeout: float = 60.0,
+    *,
+    before_restore: Callable[[], None] | None = None,
+) -> SnapshotResult:
     """Load a VM snapshot; resume the guest only when loadvm provably did
     not start restoring it.
 
     The tag is checked against `info snapshots` first so the common failure
     (a typo) never reaches `loadvm` at all -- QEMU would stop the guest
     before noticing. What `loadvm` itself answers is settled by
-    `settle_loadvm`, which the raw `loadvm` routes share.
+    `settle_loadvm`, which the raw `loadvm` routes share. `before_restore`
+    runs once the tag passed that check, right before `loadvm`: the caller's
+    side effects of a load (closing the SSH ControlMaster) belong to a load
+    that is attempted, never to a refused name.
     """
     if name not in snapshot_tags(qmp):
         return SnapshotResult(
@@ -253,6 +262,8 @@ def load_snapshot(qmp: QMPClient, name: str, timeout: float = 60.0) -> SnapshotR
             reason="missing",
             restore_state="none",
         )
+    if before_restore is not None:
+        before_restore()
     was_running, run_state = guest_run_state(qmp)
     result = qmp.execute_hmp(f"loadvm {name}", timeout=timeout)
     return settle_loadvm(

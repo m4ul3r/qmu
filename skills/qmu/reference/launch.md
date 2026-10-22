@@ -12,7 +12,9 @@ qmu launch --name X --no-replace --harness --kernel ./bzImage --initrd ./ramdisk
 qmu launch --name X --no-replace --drive 'file=./disk.qcow2,format=qcow2'   # take over the block topology
 qmu launch --name X --no-replace --no-net                  # -nic none; no SSH endpoint recorded
 qmu launch --name X --no-replace --nic-model e1000         # default virtio-net-pci
-qmu launch --name X --no-replace --no-kvm                  # force TCG ([machine] accel=tcg); boot 20–60 s
+qmu launch --name X --no-replace --no-kvm                  # force TCG ([machine] accel=tcg); boot 20–60 s for current kernels
+                                                           # 4.x kernel + bookworm rootfs under TCG: ~2 min (sshd waits for the
+                                                           # old kernel's entropy pool past a 90 s systemd timeout) — pass --ssh-timeout 180
 qmu launch --name X --no-replace --ssh-timeout 120         # default 60 s
 qmu launch --name X --no-replace --forward 2345 --forward 8080:80   # extra guest TCP ports
 qmu launch --name X --no-replace -- -no-shutdown           # raw QEMU args only after --

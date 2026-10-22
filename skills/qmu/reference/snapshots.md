@@ -113,6 +113,27 @@ command after a load can stall on the stale master until its `--timeout`
 that symptom, `ssh -O exit` on the control socket under `$QMU_TEMP_DIR/ssh`
 (or a second `qmu exec`) clears it.
 
+The same teardown ends every guest command still running through that
+master: a `qmu exec`/`run`/`compile --run`/`dmesg` in flight when another
+pane loads (or saves, or resets) the VM is exit 4 with `ssh_error: true`,
+`exit_code: null` and `severed_by: "snapshot load"` (`"snapshot save"`,
+`"loadvm"`, `"savevm"`, `"system_reset"` for the other routes; `"guest
+reboot"` when the guest rebooted under it — QEMU's RESET seen by the daemon,
+or with the daemon off a guest kernel uptime younger than the command) — never
+the guest program "exiting 255". A tag `snapshot load` refuses before
+`loadvm` (not in `info snapshots`) tears nothing down and cuts nothing. A
+load that succeeded rewound the command's process too: re-run it on the
+restored guest (a command started detached does not survive a load
+either). One QEMU refused after the cut (`restore_state: "none"`) rewound
+nothing: the command may still be running, so check before re-running it.
+
+The guest wall clock resumes at the snapshot's save time and stays behind the
+host by the time since the save (cumulative across loads; a guest with
+reachable NTP will step forward). `qmu log` shows the host-side console,
+which is never rewound: its tail can describe the discarded timeline, with
+uptimes later than the restored guest's. Use `qmu crash`/`wait --pattern`,
+which scope to the load.
+
 A `load` whose HMP `loadvm` fails is exit 1, `ok:false` with `error`,
 `error_type: "SnapshotError"`, `hint`, and three load-only keys: `resumed`,
 `guest_paused`, `restore_state`. What qmu does next depends on how far

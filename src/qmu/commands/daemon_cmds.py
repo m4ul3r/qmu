@@ -103,7 +103,10 @@ def _handle_daemon_stop(args: argparse.Namespace) -> Result:
     conn = daemon_client.connect(autostart=False) if daemon_client.enabled() else None
     if conn is None:
         # No reachable daemon. A live record with a dead socket is a wedged
-        # daemon: signal it rather than report "not running".
+        # daemon: signal it rather than report "not running". Under
+        # QMU_DAEMON=off its socket is not tried at all (no connect), and
+        # SIGTERM is the daemon's own graceful stop — so say that, not that
+        # it failed to answer (#207).
         if daemon_client.record_alive(record) and isinstance(pid, int):
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -116,10 +119,17 @@ def _handle_daemon_stop(args: argparse.Namespace) -> Result:
             }
             if not gone:
                 data["hint"] = _still_alive_hint(pid)
+            if daemon_client.enabled():
+                text = f"Daemon pid {pid} did not answer its socket; sent SIGTERM"
+                text += "." if gone else " but it is still alive."
+            else:
+                text = (f"Daemon pid {pid} stopped (SIGTERM; QMU_DAEMON=off does not use its socket)."
+                        if gone else
+                        f"Daemon pid {pid} was sent SIGTERM (QMU_DAEMON=off does not use its socket) "
+                        "but it is still alive.")
             return Result(
                 data=data,
-                text=f"Daemon pid {pid} did not answer its socket; sent SIGTERM"
-                     + ("." if gone else " but it is still alive."),
+                text=text,
                 stem="daemon",
                 exit_code=0 if gone else 1,
             )
@@ -175,6 +185,21 @@ def _handle_daemon_status(args: argparse.Namespace) -> Result:
     data = {"ok": True, **probe}
     if not probe["running"]:
         return Result(data=data, text=f"Daemon: not running ({probe['reason']})", stem="daemon")
+    if not probe["used"]:
+        # QMU_DAEMON=off with a live recorded daemon (#207): only daemon.json
+        # is read, so no uptime-from-ping, clients or watched VMs.
+        stale = "" if probe["build_current"] else "; STALE build"
+        return Result(
+            data=data,
+            text=[
+                f"Daemon: running (pid {probe['pid']}; not used: QMU_DAEMON=off{stale})",
+                f"  Socket:    {probe['socket']}",
+                "  It holds the QMP connection of every VM it watches, so QMP "
+                "commands under QMU_DAEMON=off report those VMs busy.",
+                "  Use it: unset QMU_DAEMON.  Release every VM: qmu daemon stop",
+            ],
+            stem="daemon",
+        )
     stale = "" if probe["build_current"] else " — STALE build, respawns on next command"
     lines = [
         f"Daemon: running (pid {probe['pid']}, uptime {probe['uptime']:.0f}s, "

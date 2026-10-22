@@ -4,6 +4,8 @@ import hashlib
 import json
 import math
 import os
+import select
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +34,51 @@ def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return repr(value)
+
+
+def reader_gone(stream: Any) -> bool:
+    """Whether `stream` is a pipe (or socket) whose reader has gone away.
+
+    A pipe write end polls POLLERR once its last reader closed; a socket
+    whose peer shut down polls POLLHUP. A stream with no fd (the MCP
+    façade's per-thread capture, pytest's) is never gone.
+    """
+    try:
+        fd = stream.fileno()
+    except (AttributeError, ValueError, OSError):
+        return False
+    poller = select.poll()
+    try:
+        poller.register(fd, select.POLLOUT)
+        events = poller.poll(0)
+    except (OSError, ValueError):
+        return False
+    return any(mask & (select.POLLERR | select.POLLHUP) for _, mask in events)
+
+
+def release_closed_streams() -> bool:
+    """Point stdout/stderr whose reader left at /dev/null; True when any had.
+
+    A closed consumer (`qmu … | head -1`, a pager quit early) is not an
+    operation failure (#208): the caller drops the rest of that stream and
+    exits with the operation's own code. Redirecting the fd (not the Python
+    object) is what keeps the interpreter's flush at exit from raising
+    `BrokenPipeError` a second time over the bytes still buffered.
+    """
+    released = False
+    for stream in (sys.stdout, sys.stderr):
+        if not reader_gone(stream):
+            continue
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, stream.fileno())
+            finally:
+                os.close(devnull)
+        except (OSError, ValueError):
+            continue
+        released = True
+    return released
 
 
 def render_value(value: Any, fmt: str) -> str:
