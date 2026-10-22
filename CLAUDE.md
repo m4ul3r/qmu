@@ -383,10 +383,13 @@ process then ran on. A guest-requested QMP RESET (`"guest": true`) is
 stamped `"guest reboot"` by the daemon's `_persist_reset`, before it drops
 the master. `guest._severed_by` (checked in `_ssh_255_payload` after
 `_never_started`, before the probe and once after it) reads that stamp at or
-after the command's start — nothing else: a boot banner is not a reboot,
-`dmesg > /dev/console` reprints it with the session intact and the guest
-command's 255 genuine, so a reboot with the daemon off takes the probe —
-and `_severed_payload` answers exit 4,
+after the command's start — never console bytes: a boot banner is not a
+reboot, `dmesg > /dev/console` reprints it with the session intact and the
+guest command's 255 genuine. With the daemon off nothing stamps a guest
+reboot, so when the probe answers, `_booted_since` reads the guest kernel's
+`/proc/uptime` (CLOCK_BOOTTIME, unsettable from the guest): shorter than
+the time since the command started means a new boot ran under it
+(`"guest reboot"`). `_severed_payload` answers exit 4,
 `ssh_error: true`, `exit_code: null`, `severed_by` (3 only for a reboot after
 a fresh report). The restored or rebooted guest answers the probe, which is
 why this used to be "the guest command exited 255" with a hint at an empty

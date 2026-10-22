@@ -118,7 +118,8 @@ master: a `qmu exec`/`run`/`compile --run`/`dmesg` in flight when another
 pane loads (or saves, or resets) the VM is exit 4 with `ssh_error: true`,
 `exit_code: null` and `severed_by: "snapshot load"` (`"snapshot save"`,
 `"loadvm"`, `"savevm"`, `"system_reset"` for the other routes; `"guest
-reboot"` when the daemon saw QEMU report a guest-requested reset) — never
+reboot"` when the guest rebooted under it — QEMU's RESET seen by the daemon,
+or with the daemon off a guest kernel uptime younger than the command) — never
 the guest program "exiting 255". A tag `snapshot load` refuses before
 `loadvm` (not in `info snapshots`) tears nothing down and cuts nothing. A
 load that succeeded rewound the command's process too: re-run it on the

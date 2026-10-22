@@ -124,14 +124,16 @@ command (and `run`'s boot failure) also keeps the older `kernel_warning` /
 - A session cut under the command by qmu itself — another `qmu snapshot
   load` (of a tag that exists)/`save` or a raw `loadvm`/`savevm`/
   `system_reset` tears the VM's SSH ControlMaster down — or by a guest
-  reboot QEMU reported to the daemon (`echo b > /proc/sysrq-trigger`, a
-  watchdog) is exit 4, `ssh_error: true`, `exit_code: null`, `severed_by:
-  "snapshot load"` (… `"guest reboot"`) and a hint naming the cause, even
-  though the restored or rebooted guest answers SSH; with a fresh crash
-  report it carries `crash`, and a reboot after one is exit 3. The signal is
-  qmu's own record, never the guest's output or console: a `dmesg` replayed
-  to the console is not a reboot. With `QMU_DAEMON=off` nothing witnesses a
-  guest reboot, so it is the ordinary dropped-transport answer. After a load
+  reboot (`echo b > /proc/sysrq-trigger`, a watchdog: QEMU's RESET stamped
+  by the daemon, or with `QMU_DAEMON=off` a guest kernel whose
+  `/proc/uptime` is younger than the command) is exit 4, `ssh_error: true`,
+  `exit_code: null`, `severed_by: "snapshot load"` (… `"guest reboot"`) and
+  a hint naming the cause, even though the restored or rebooted guest
+  answers SSH; with a fresh crash report it carries `crash`, and a reboot
+  after one is exit 3. The signal is qmu's own record or the guest kernel's
+  clock, never the command's output or the console: a `dmesg` replayed to
+  the console is not a reboot. A reboot the guest is still in the middle of
+  (sshd not back) is the ordinary dropped-transport exit 4. After a load
   cut, check its result: a refused one (`restore_state: "none"`) rewound
   nothing, and the command may still be running.
 - A guest that stops answering without a panic or a halt (wedged) holds the

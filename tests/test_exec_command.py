@@ -1270,13 +1270,26 @@ def test_a_session_cut_by_a_rewind_or_reboot_is_transport_not_guest_255(
     assert "exited 255" not in payload["hint"]
 
 
+def _answer_uptime(fake, uptime):
+    """The guest kernel's `/proc/uptime` as qmu's follow-up read sees it."""
+    real_run = fake.run
+
+    def run(command, *a, **kw):
+        if command == "cat /proc/uptime":
+            return 0, f"{uptime:.2f} 1.00\n", ""
+        return real_run(command, *a, **kw)
+
+    fake.run = run
+
+
 def test_a_boot_banner_replayed_to_the_console_is_not_a_reboot(wired, capsys):
     """`dmesg > /dev/console; exit 255` reprints the timestamped boot banner
     with the session intact: the guest command's 255 is its own, never a
     reboot that cut it (review of #221)."""
     from qmu.instance import save_instance
 
-    wired(rc=255, ready=True, append_during_run=_BOOT_BANNER)
+    fake = wired(rc=255, ready=True, append_during_run=_BOOT_BANNER)
+    _answer_uptime(fake, 3600.0)  # the same boot: up long before the command
     save_instance(guest.choose_instance("exec-vm"))
 
     rc = cli.main([
@@ -1289,6 +1302,25 @@ def test_a_boot_banner_replayed_to_the_console_is_not_a_reboot(wired, capsys):
     assert payload["exit_code"] == 255
     assert payload["ssh_error"] is False
     assert "severed_by" not in payload
+
+
+def test_a_reboot_with_no_daemon_is_read_from_the_guest_kernel_uptime(wired, capsys):
+    """With `QMU_DAEMON=off` nothing stamps a guest reboot; the rebooted guest
+    answers the probe, and only its kernel's uptime — younger than the
+    command — says a new boot ran under it (second review of #221)."""
+    from qmu.instance import save_instance
+
+    fake = wired(rc=255, ready=True)
+    _answer_uptime(fake, 0.0)
+    save_instance(guest.choose_instance("exec-vm"))
+
+    rc = cli.main(["--format", "json", "exec", "--vm", "exec-vm", "echo b > /proc/sysrq-trigger"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 4
+    assert payload["exit_code"] is None
+    assert payload["ssh_error"] is True
+    assert payload["severed_by"] == "guest reboot"
 
 
 def test_a_stamp_from_before_the_command_does_not_explain_its_255(

@@ -676,7 +676,7 @@ _SEVER_SOURCES: dict[str, tuple[str, str, str]] = {
     ),
     "guest reboot": (
         "a guest reboot",
-        "QEMU reported a reset the guest itself requested",
+        "the guest kernel booted again while it ran",
         _REBOOT_RECOVERY,
     ),
 }
@@ -693,14 +693,42 @@ def _severed_by(inst: VMInstance, *, started_at: float) -> str | None:
     used to be reported as the guest command exiting 255 (#221). Nothing
     the guest can write decides it: a boot banner in the serial log is not
     a reboot — `dmesg > /dev/console` reprints it verbatim with the session
-    intact and the guest command really exiting 255 (review of #221). So a
-    guest reboot with the daemon off is not attributed; it takes the probe.
+    intact and the guest command really exiting 255 (review of #221). With
+    the daemon off nothing stamps a guest reboot; :func:`_booted_since`
+    answers that case from the guest kernel's own clock.
     """
     record = load_instance(inst.vm_id)
     stamped = getattr(record, "ssh_severed_at", None)
     if isinstance(stamped, (int, float)) and stamped >= started_at:
         return record.ssh_severed_by or "snapshot load"
     return None
+
+
+def _booted_since(ssh: SSHClient, *, started: float) -> bool:
+    """Whether the guest kernel booted after `started` (`time.monotonic()`
+    when the command began), read from `/proc/uptime` once sshd answers.
+
+    The guest's CLOCK_BOOTTIME cannot be set by anything in the guest (a
+    console replay, a `date -s`, a command's output), so an uptime shorter
+    than the time since the command started means a new boot ran under it:
+    a guest reboot with no daemon to witness QEMU's RESET (review of #221).
+    Without a reboot the uptime is the guest's uptime at the command's start
+    plus the time since, which is never shorter. A snapshot load also rewinds
+    it, but qmu stamps its own loads first. Any failure to read it proves
+    nothing: False.
+    """
+    try:
+        rc, out, _ = ssh.run("cat /proc/uptime", timeout=5)
+    except SSHError:
+        return False
+    elapsed = time.monotonic() - started
+    if rc != 0:
+        return False
+    try:
+        uptime = float(str(out).split()[0])
+    except (IndexError, ValueError):
+        return False
+    return uptime < elapsed
 
 
 def _severed_payload(
@@ -755,6 +783,7 @@ def _ssh_255_payload(
     *,
     start_offset: int,
     started_at: float,
+    started_mono: float,
 ) -> tuple[int, dict[str, Any], list[str]] | None:
     """The SSH-lost triple for an rc-255 session the serial log and QMP did
     not explain, or None when the guest command itself returned 255.
@@ -766,10 +795,12 @@ def _ssh_255_payload(
     itself cut (a snapshot load/save, a raw reset) or the daemon saw a guest
     reboot cut (:func:`_severed_by`) is next: the restored or rebooted guest
     answers the probe, which then called the cut the guest program exiting
-    255 (#221).
-    Anything else is ambiguous and :func:`_transport_lost` probes. The
-    guest's stdout/stderr decide nothing here: a guest command can print
-    ssh's words itself (#199).
+    255 (#221). A guest that answers the probe but whose kernel booted after
+    the command started (:func:`_booted_since`) was rebooted under it too —
+    the daemon-off form of the same cut. Anything else is ambiguous and
+    :func:`_transport_lost` probes. The guest's stdout/stderr and console
+    decide nothing here: a guest command can print ssh's words itself
+    (#199), and replay the boot banner.
     """
     if _never_started(ssh, inst):
         return _ssh_lost_payload(
@@ -782,7 +813,11 @@ def _ssh_255_payload(
         # guest reboot's from its own thread): read it once more.
         cause = _severed_by(inst, started_at=started_at)
         if cause is None:
-            return _ssh_lost_payload(command, inst, start_offset=start_offset) if lost else None
+            if lost:
+                return _ssh_lost_payload(command, inst, start_offset=start_offset)
+            if not _booted_since(ssh, started=started_mono):
+                return None
+            cause = "guest reboot"
     return _severed_payload(command, inst, cause, start_offset=start_offset)
 
 
@@ -1346,7 +1381,7 @@ def _classify_guest_command(
     relays guest stderr itself, so the stderr bytes then stay out of `notes`.
     """
     command_start_offset = serial_log_offset(inst.serial_log)
-    started_at = time.time()
+    started_at, started_mono = time.time(), time.monotonic()
     watcher = _guest_abort_watcher(inst, start_offset=command_start_offset)
 
     def detach_to() -> Path | None:
@@ -1406,7 +1441,7 @@ def _classify_guest_command(
             command, inst, start_offset=command_start_offset, session_note=True
         ) or _ssh_255_payload(
             ssh, command, inst, start_offset=command_start_offset,
-            started_at=started_at,
+            started_at=started_at, started_mono=started_mono,
         )
         if explained is not None:
             return _with_guest_output(explained, stdout, stderr, note_stderr=note_stderr)
@@ -1916,7 +1951,7 @@ def _handle_dmesg(args: argparse.Namespace) -> Result:
         # count would otherwise be misparsed as a tail option).
         cmd = f"dmesg | tail -n {max(args.tail, 0)}"
     command_start_offset = serial_log_offset(inst.serial_log)
-    started_at = time.time()
+    started_at, started_mono = time.time(), time.monotonic()
     watcher = _guest_abort_watcher(inst, start_offset=command_start_offset)
 
     try:
@@ -1958,7 +1993,7 @@ def _handle_dmesg(args: argparse.Namespace) -> Result:
             cmd, inst, start_offset=command_start_offset
         ) or _ssh_255_payload(
             ssh, cmd, inst, start_offset=command_start_offset,
-            started_at=started_at,
+            started_at=started_at, started_mono=started_mono,
         )
         if explained is not None:
             status, data, out, text, notes = _with_guest_output(
