@@ -255,6 +255,8 @@ def test_load_error_is_a_failure_with_the_text_intact():
     ("Error: No block device supports snapshots", "none"),
     ("Error: Device 'ide0-hd0' is writable but does not support snapshots", "none"),
     ('loadvm: extraneous characters at the end of line\r\nTry "help loadvm" for more information', "none"),
+    # #239: `loadvm` with no tag is an HMP parse error; nothing ran.
+    ('loadvm: string expected\r\nTry "help loadvm" for more information', "none"),
     (_INCOMPATIBLE_DEVICE_LOAD, "partial"),
     ("Missing section footer for slirp\nError: Section footer error, section_id: 1", "partial"),
     ("Error: Could not open VM state file", "partial"),
@@ -331,6 +333,19 @@ def test_failed_partial_load_of_a_paused_guest_still_reports_the_pause():
     result = load_snapshot(qmp, "clean")
     assert result.guest_paused is True
     assert result.restore_state == "partial"
+    assert "cont" not in qmp.qmp_calls
+
+
+def test_an_unplaced_failure_of_a_guest_that_never_stopped_restored_nothing():
+    """#239: `hmp_loadvm` stops a running guest before it restores anything
+    and leaves it stopped on every failure, so a guest running before and
+    after a failed `loadvm` never reached the restore, whatever its text.
+    It was `unknown`, whose hint said to kill and relaunch a healthy VM."""
+    err = "Error: Some refusal this table has never seen"
+    qmp = FakeQMP(err, listing=_LISTED_CLEAN, running=[True, True])
+    result = load_snapshot(qmp, "clean")
+    assert result.restore_state == "none"
+    assert result.resumed is False and result.guest_paused is False
     assert "cont" not in qmp.qmp_calls
 
 

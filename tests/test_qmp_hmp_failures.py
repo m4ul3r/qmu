@@ -137,6 +137,44 @@ def test_monitor_loadvm_partial_failure_does_not_offer_cont(monkeypatch, capsys)
     assert "qmu kill" in payload["error"]
 
 
+class _RunningHmpQMP(_HmpQMP):
+    """A guest QEMU reports `running` throughout: HMP refused the line."""
+
+    def execute(self, command, arguments=None, timeout=30.0):
+        if command == "query-status":
+            return {"running": True, "status": "running"}
+        return self._result
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["monitor", "loadvm"],
+     ["qmp", "human-monitor-command", "--args", '{"command-line": "loadvm"}']],
+    ids=["monitor", "human-monitor-command"],
+)
+def test_raw_loadvm_with_no_tag_restored_nothing_and_says_how_to_name_one(
+    monkeypatch, capsys, argv
+):
+    """#239: `loadvm` with no tag is HMP's parse error; QEMU never ran it and
+    the guest never stopped. It was `restore_state: "unknown"` with a hint
+    to kill and relaunch the healthy VM."""
+    monkeypatch.setattr(qmp_cmds, "choose_instance", lambda vm: _Inst())
+    monkeypatch.setattr(
+        qmp_cmds, "_qmp_ctx",
+        lambda inst: contextlib.nullcontext(_RunningHmpQMP(
+            'loadvm: string expected\r\nTry "help loadvm" for more information\r\n'
+        )),
+    )
+    assert cli.main(["--format", "json", *argv, "--vm", "dev"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["restore_state"] == "none"
+    assert payload["resumed"] is False and payload["guest_paused"] is False
+    assert payload["vm_id"] == "dev"
+    assert "qmu monitor 'loadvm <tag>' --vm dev" in payload["hint"]
+    assert "qmu snapshot list --vm dev" in payload["hint"]
+    assert "qmu kill" not in payload["hint"] + payload["error"]
+
+
 @pytest.mark.parametrize("output_format", ["text", "json"])
 def test_every_hmp_route_agrees_error_words_in_data_are_not_a_failure(
     monkeypatch, capsys, output_format

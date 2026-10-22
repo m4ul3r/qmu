@@ -3082,6 +3082,8 @@ def test_every_hmp_route_agrees_an_hmp_error_form_is_a_failure(
             assert payload["ok"] is False, f"`qmu {command}`"
             assert "error" in payload and "error_type" in payload, f"`qmu {command}`: {payload}"
             assert "message" not in payload, f"`qmu {command}` still uses `message`"
+            # #240: the raw routes keyed the VM, the snapshot handlers did not.
+            assert payload.get("vm_id") == VM, f"`qmu {command}` envelope has no vm_id"
         else:
             assert captured.out == "", f"`qmu {command}` wrote a failure to stdout"
             assert captured.err.startswith("[qmu] Error:"), f"`qmu {command}`: {captured.err}"

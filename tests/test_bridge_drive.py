@@ -91,9 +91,24 @@ if cmd == "kill":
 # `debug` for a breakpoint the target hit by itself), `continue` ends it,
 # `status` reads it. The file holds QEMU's run state at that stop.
 stopped = os.path.join(spec, "stopped")
+# qmu's hold (`interrupt --hold`, pry #108): the file holds whether its
+# release resumes the target. A pry from before the hold does not know the
+# flag (FAKE_PRY_NO_HOLD), and a held target refuses a plain `continue`.
+held = os.path.join(spec, "held")
+hold = "--hold" in argv
+release = "--release" in argv
 if cmd == "status":
     print(json.dumps({"state": "stopped" if os.path.exists(stopped) else "running"}))
     sys.exit(0)
+if hold and os.environ.get("FAKE_PRY_NO_HOLD"):
+    print("usage: pry [-h] ...\npry: error: unrecognized arguments: --hold", file=sys.stderr)
+    sys.exit(2)
+if cmd == "continue" and not release and os.path.exists(held):
+    print(json.dumps({"ok": False, "error": "the target is held"}), file=sys.stderr)
+    sys.exit(1)
+if release and not os.path.exists(held):
+    print(json.dumps({"ok": False, "error": "nothing is held"}), file=sys.stderr)
+    sys.exit(1)
 path = os.path.join(spec, cmd + ".json")
 queue = json.load(open(path))
 answer = queue.pop(0) if len(queue) > 1 else queue[0]
@@ -104,15 +119,40 @@ if answer.get("kill_qemu"):
     # QEMU dies while qmu drives the bridge (#236): a SIGKILL, a `qmu kill`.
     os.kill(int(os.environ["FAKE_QEMU_PID"]), signal.SIGKILL)
 if answer.get("rc", 0):
+    if release and os.path.exists(held):
+        os.remove(held)  # a failed release still ends the hold, as pry's does
     print(json.dumps({"ok": False, "error": answer["error"]}), file=sys.stderr)
     sys.exit(answer["rc"])
-if cmd == "interrupt" and answer["result"].get("stopped") and not os.path.exists(stopped):
-    reason = answer["result"].get("reason") or {}
+result = answer["result"]
+if cmd == "interrupt" and result.get("stopped") and not os.path.exists(stopped):
+    reason = result.get("reason") or {}
     with open(stopped, "w") as mark:
         mark.write("debug" if reason.get("kind") == "breakpoint-hit" else "paused")
+if cmd == "interrupt" and hold:
+    # The scripted stop, as `--hold` reports it: `will_resume` when pry
+    # stopped a running target (a plain interrupt's `interrupted`).
+    took = bool(result.get("interrupted"))
+    with open(held, "w") as mark:
+        mark.write(json.dumps(took))
+    result = {
+        **{k: v for k, v in result.items() if k not in ("interrupted", "stopped")},
+        "reason": {"kind": "held"} if took else result.get("reason"),
+        "held": True,
+        "run_state": {"was_running": took, "interrupted": took, "will_resume": took},
+    }
+elif release:
+    with open(held) as mark:
+        resumes = json.load(mark)
+    os.remove(held)
+    if resumes and os.path.exists(stopped):
+        os.remove(stopped)
+    result = {
+        "state": "running" if resumes else "stopped", "released": True,
+        "run_state": {"was_running": resumes, "interrupted": resumes, "resumed": resumes},
+    }
 elif cmd == "continue" and os.path.exists(stopped):
     os.remove(stopped)
-print(json.dumps(answer["result"]))
+print(json.dumps(result))
 '''
 
 
@@ -149,6 +189,10 @@ def pry(tmp_path, monkeypatch):
         def stopped(self):
             """Whether the fake bridge is at a debugger stop now."""
             return (spec / "stopped").exists()
+
+        def held(self):
+            """Whether qmu's hold on the fake bridge is still in place."""
+            return (spec / "held").exists()
 
         def stop(self, qemu_status="paused"):
             """Put the target at a debugger stop before the command runs."""
@@ -632,14 +676,16 @@ def test_a_kaslr_load_rebases_the_bridge_before_it_resyncs(
 
 @pytest.mark.parametrize(
     ("cmdline", "drive"),
-    [("console=ttyS0", ["interrupt", "kbase", "resync", "break"]),
-     ("console=ttyS0 nokaslr", ["interrupt", "resync"])],
+    [("console=ttyS0", ["interrupt", "kbase", "resync", "break", "continue"]),
+     ("console=ttyS0 nokaslr", ["interrupt", "resync", "continue"])],
     ids=["kaslr", "nokaslr"],
 )
 def test_a_load_into_a_debugger_stop_resyncs_there_and_resumes_nothing(
     cmdline, drive, tmp_path, monkeypatch, capsys, bridge, pry
 ):
-    """A target the operator had stopped stays at that stop."""
+    """A target the operator had stopped stays at that stop; qmu's hold on
+    it is given back (a release that resumes nothing), or the operator's
+    own `pry continue` would be refused."""
     _vm(tmp_path, monkeypatch, bridge, cmdline=cmdline)
     pry.stop()
     pry.answers(
@@ -651,7 +697,8 @@ def test_a_load_into_a_debugger_stop_resyncs_there_and_resumes_nothing(
 
     assert rc == 0
     assert [c[0] for c in pry.calls()] == drive
-    assert pry.stopped()
+    assert "--release" in pry.calls()[-1]
+    assert pry.stopped() and not pry.held()
     assert payload["debugger"]["action"] == "resynced"
     assert "interrupted" not in payload["debugger"]
 
@@ -708,7 +755,8 @@ def test_a_kaslr_base_pry_cannot_validate_is_never_armed_at_the_old_one(
     resumes it even when it fails, and under KVM that resume re-inserted
     every breakpoint at the bridge's stale base while qmu said none was
     armed. `pry kbase` now runs at a stop qmu holds, and a failure keeps
-    that stop: nothing is resumed, re-synced or torn down."""
+    that stop: nothing is resumed, re-synced or torn down. The hold stays
+    with it, so the recovery's resume is its release."""
     _vm(tmp_path, monkeypatch, bridge, cmdline="console=ttyS0")
     pry.answers(kbase=[{"rc": 1, "error": "no kernel symbol file is loaded"}])
 
@@ -717,13 +765,15 @@ def test_a_kaslr_base_pry_cannot_validate_is_never_armed_at_the_old_one(
     assert rc == 0
     assert [c[0] for c in pry.calls()] == ["interrupt", "kbase"]
     assert pry.stopped(), "the target stays at qmu's stop: no breakpoint in RAM"
+    assert pry.held()
     drive = payload["debugger"]
     assert drive["action"] == "not_resynced"
     assert drive["interrupted"] is True and drive["resumed"] is False
+    assert drive["held"] is True
     assert "no kernel symbol file is loaded" in drive["reason"]
     assert bridge.poll() is None
     assert any(
-        f"pry --instance qmu-{VM} continue --background" in w for w in payload["warnings"]
+        f"pry --instance qmu-{VM} continue --release" in w for w in payload["warnings"]
     )
 
 
@@ -771,6 +821,83 @@ def test_a_save_of_a_running_guest_stops_the_owned_bridge_across_it(
     assert payload["breakpoints_lifted"] is True
 
 
+_DRIVEN_ROUTES = {
+    "snapshot save": (["snapshot", "save", "clean"], "console=ttyS0"),
+    "kaslr snapshot load": (["snapshot", "load", "clean"], "console=ttyS0"),
+    "nokaslr snapshot load": (["snapshot", "load", "clean"], "console=ttyS0 nokaslr"),
+    "kaslr system_reset": (["qmp", "system_reset"], "console=ttyS0"),
+}
+
+
+@pytest.mark.parametrize("route", sorted(_DRIVEN_ROUTES))
+def test_qmus_stop_is_a_hold_that_an_operators_wait_sits_out(
+    route, tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """#228: the public `pry interrupt` ended an operator's in-flight `pry
+    wait` (or foreground `pry continue`) with a `signal SIGINT` stop qmu then
+    resumed. qmu now takes a hold (`pry interrupt --hold`, pry #108), which
+    a waiter sits out, and gives it back with `pry continue --release`,
+    never a plain resume the bridge would refuse while held."""
+    argv, cmdline = _DRIVEN_ROUTES[route]
+    _vm(tmp_path, monkeypatch, bridge, cmdline=cmdline)
+    pry.answers(resync=[{"result": _report(_entry("armed", trap_resident=True), state="stopped")}])
+
+    rc, payload = _json(capsys, argv)
+
+    assert rc == 0
+    (interrupt,) = pry.ran("interrupt")
+    assert "--hold" in interrupt
+    (release,) = pry.ran("continue")
+    assert "--release" in release
+    assert not pry.stopped() and not pry.held(), "the guest runs again, unheld"
+    drive = payload["debugger"]
+    assert drive["held"] is True
+    assert drive["interrupted"] is True and drive["resumed"] is True
+
+
+@pytest.mark.parametrize("route", sorted(_DRIVEN_ROUTES))
+def test_a_pry_without_the_hold_still_gets_its_bridge_stopped_and_resumed(
+    route, tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """A pry from before pry #108 does not know `--hold` (argparse exit 2):
+    qmu falls back to the public `pry interrupt` / `pry continue
+    --background` bracket, so the save is still clean and the bridge still
+    re-synced, and says so (`held: false`)."""
+    argv, cmdline = _DRIVEN_ROUTES[route]
+    _vm(tmp_path, monkeypatch, bridge, cmdline=cmdline)
+    monkeypatch.setenv("FAKE_PRY_NO_HOLD", "1")
+    pry.answers(resync=[{"result": _report(_entry("armed", trap_resident=True), state="stopped")}])
+
+    rc, payload = _json(capsys, argv)
+
+    assert rc == 0
+    assert [("--hold" in c) for c in pry.ran("interrupt")] == [True, False]
+    assert [("--background" in c) for c in pry.ran("continue")] == [True]
+    assert not pry.stopped()
+    drive = payload["debugger"]
+    assert drive["held"] is False
+    assert drive["interrupted"] is True and drive["resumed"] is True
+    if argv[1] == "save":
+        assert _QMP.saves == ["paused"] and payload["breakpoints_lifted"] is True
+
+
+def test_a_hold_pry_refuses_is_not_retried_as_a_public_interrupt(
+    tmp_path, monkeypatch, capsys, bridge, pry
+):
+    """Only pry's not knowing the hold falls back. A hold pry refused for a
+    reason of its own (one already in place) is a failed stop: the public
+    interrupt would end the very waiters the hold protects."""
+    _vm(tmp_path, monkeypatch, bridge)
+    pry.answers(interrupt=[{"rc": 1, "error": "the target is held already"}])
+
+    rc, payload = _json(capsys, ["snapshot", "save", "clean"])
+
+    assert rc == 0
+    assert len(pry.ran("interrupt")) == 1
+    assert _QMP.saves == ["running"]
+    assert any("the target is held already" in w for w in payload["warnings"])
+
+
 def test_a_save_that_found_the_bridge_stopped_by_itself_leaves_that_stop(
     tmp_path, monkeypatch, capsys, bridge, pry
 ):
@@ -787,8 +914,8 @@ def test_a_save_that_found_the_bridge_stopped_by_itself_leaves_that_stop(
     rc, payload = _json(capsys, ["snapshot", "save", "clean"])
 
     assert rc == 0
-    assert pry.ran("continue") == []
-    assert pry.stopped()
+    assert [c for c in pry.ran("continue") if "--release" not in c] == []
+    assert pry.stopped() and not pry.held(), "the hold is given back, the stop kept"
     assert payload["debugger"]["resumed"] is False
     assert payload["breakpoints_in_image"] == "lifted"
     assert any(f"pry --instance qmu-{VM} continue --background" in w for w in payload["warnings"])
@@ -798,7 +925,8 @@ def test_a_save_that_outran_its_budget_leaves_the_bridge_stopped_and_says_so(
     tmp_path, monkeypatch, capsys, bridge, pry
 ):
     """QEMU may still be writing the image: resuming would put the
-    breakpoints back into RAM being saved."""
+    breakpoints back into RAM being saved. qmu's hold stays in place, and
+    its release is the resume the warning names."""
     _vm(tmp_path, monkeypatch, bridge)
 
     def expired(qmp, name, timeout=None):
@@ -809,9 +937,10 @@ def test_a_save_that_outran_its_budget_leaves_the_bridge_stopped_and_says_so(
     rc, payload = _json(capsys, ["snapshot", "save", "clean"])
 
     assert rc == 124 and payload["may_have_landed"] is True
+    assert payload["vm_id"] == VM
     assert pry.ran("continue") == []
-    assert pry.stopped()
-    assert any(f"pry --instance qmu-{VM} continue --background" in w for w in payload["warnings"])
+    assert pry.stopped() and pry.held()
+    assert any(f"pry --instance qmu-{VM} continue --release" in w for w in payload["warnings"])
 
 
 @pytest.mark.parametrize("route", ["snapshot save", "monitor savevm"])
