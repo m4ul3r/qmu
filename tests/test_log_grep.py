@@ -149,7 +149,23 @@ def test_no_match_is_success_with_an_explicit_message(log_env, capsys):
     assert payload["ok"] is True
     assert payload["log"] == ""
     assert payload["matches"] == 0
-    assert payload["empty"] is True
+    # The log is there and populated; only the filter came back empty (#215).
+    assert payload["available"] is True
+    assert payload["empty"] is False
+
+
+def test_missing_log_under_grep_is_not_an_ordinary_no_match(log_env, capsys):
+    """JSON must tell "no log" from "no match" (#215)."""
+    log_env.unlink()
+    rc, payload = _run(capsys, "--grep", "no such line")
+
+    assert rc == 0
+    assert payload["available"] is False
+    assert payload["matches"] == 0
+
+    rc = cli.main(["log", "--grep", "no such line"])
+    assert rc == 0
+    assert "matched" not in capsys.readouterr().out
 
 
 def test_no_match_text_mode_names_the_scope_searched(log_env, capsys):

@@ -808,6 +808,35 @@ def test_cli_pattern_wait_goes_through_the_daemon(daemon_env, vm, monkeypatch, c
     assert via_daemon == ["yes"]
 
 
+@pytest.mark.parametrize("mode", ["daemon", "standalone"])
+def test_pattern_wait_on_a_running_vm_whose_log_is_gone_is_inconclusive(
+    mode, daemon_env, vm, monkeypatch, capsys
+):
+    """#216: the log removed from under a running VM is unreadable evidence
+    (exit 4, `inconclusive: true`), as on a stopped VM — not a 124 timeout
+    spent polling a file that is not there, on either path."""
+    if mode == "daemon":
+        daemon_client.watch("fake-vm")
+    else:
+        monkeypatch.setenv("QMU_DAEMON", "off")
+    monkeypatch.setattr(lifecycle, "choose_instance", lambda vm_id=None: vm["inst"])
+    monkeypatch.setattr(lifecycle, "instance_alive", lambda inst: True)
+    vm["log"].unlink()
+
+    started = time.monotonic()
+    rc = cli.main(["--format", "json", "wait", "--pattern", "NEVER", "--timeout", "5"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 4, payload
+    assert payload["inconclusive"] is True
+    assert payload["ok"] is False
+    assert "reason" not in payload
+    # Both paths report the read failure the same way, worded once.
+    assert payload["error_type"] == "FileNotFoundError"
+    assert payload["error"].count("Cannot inspect serial log") == 1
+    assert time.monotonic() - started < 3.0
+
+
 def test_bare_wait_ends_on_observed_exit(daemon_env, vm, monkeypatch, capsys):
     import qmu.daemon as daemon_mod
 

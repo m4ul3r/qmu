@@ -970,17 +970,23 @@ def test_wait_on_an_already_stopped_vm_reports_its_last_boot_crash(
 
 
 @pytest.mark.parametrize("no_clean", [False, True])
-def test_wait_on_an_already_stopped_harness_vm_honours_auto_clean(
+def test_wait_on_an_already_stopped_harness_vm_keeps_its_state(
     no_clean, monkeypatch, capsys, tmp_path
 ):
+    """#214: the auto-clean is for a wait that witnessed the exit. Here a
+    `kill --no-clean` kept the state, and the payload is scoped to the last
+    boot, so the earlier boot's panic is only readable from the kept log."""
     rc, payload, _, inst = _invoke_stopped_wait(
-        monkeypatch, capsys, tmp_path, harness=True, serial=BOOT, no_clean=no_clean,
+        monkeypatch, capsys, tmp_path, harness=True,
+        serial=BOOT + TERMINAL_PANIC + BOOT, no_clean=no_clean,
     )
 
     assert rc == 0
     assert payload["reason"] == "already_stopped"
-    assert payload["cleaned"] is (not no_clean)
-    assert (instance_mod.load_instance("wait-vm") is None) is (not no_clean)
+    assert payload["crash"] is None
+    assert payload["cleaned"] is False
+    assert instance_mod.load_instance("wait-vm") is not None
+    assert "sysrq triggered crash" in Path(inst.serial_log).read_text()
 
 
 def test_wait_on_an_already_stopped_vm_text(monkeypatch, capsys, tmp_path):

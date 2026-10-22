@@ -304,6 +304,9 @@ def test_stopped_pattern_obeys_panic_marker_order(
     if expected == 3:
         assert payload["reason"] == "crash"
         assert "Kernel panic - not syncing" in payload["crash"]
+        # #217: a stopped VM has nothing to kill; its remnant goes with prune.
+        assert f"qmu prune --vm {VM}" in payload["hint"]
+        assert "qmu kill" not in payload["hint"]
     assert serial.read_text() == content
 
 

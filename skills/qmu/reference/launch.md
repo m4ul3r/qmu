@@ -294,7 +294,7 @@ recommends `prune --all`. Every prune mode, `--dry-run`, `cache du/ls`:
 
 | File | Purpose | Removed by |
 |---|---|---|
-| `<name>.json` | metadata (pid, ports, kernel, arch, kvm, bridge pid) | `kill` (unless logs are preserved), `prune`, `prune --keep-logs`, `wait` harness auto-clean |
-| `<name>.serial.log` | serial console (`qmu log`) | `kill` (only when the guest is neither `crashed` nor `panicked`), `prune`, `wait` harness auto-clean — kept by `kill --no-clean`, `prune --keep-logs`, `wait --no-clean` |
-| `<name>.qmp.sock` | QMP control socket | `kill`, `prune`, `prune --keep-logs`, `wait` harness auto-clean |
+| `<name>.json` | metadata (pid, ports, kernel, arch, kvm, bridge pid) | `kill` (unless logs are preserved), `prune`, `prune --keep-logs`, `wait` harness auto-clean (of an exit that wait saw) |
+| `<name>.serial.log` | serial console (`qmu log`) | `kill` (only when the guest is neither `crashed` nor `panicked`), `prune`, `wait` harness auto-clean of an exit the wait saw (`process_exited`) — kept by `kill --no-clean`, `prune --keep-logs`, `wait --no-clean`, and never removed by a `wait` on a VM already stopped (`already_stopped`) |
+| `<name>.qmp.sock` | QMP control socket | `kill`, `prune`, `prune --keep-logs`, `wait` harness auto-clean (of an exit that wait saw) |
 | `<name>.qemu.log` | QEMU stdout/stderr | same rule as `.serial.log` |

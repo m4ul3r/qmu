@@ -11,35 +11,82 @@ from pathlib import Path
 # (`Unable to handle kernel ...`) and the whole abort decode (faulting
 # address, `WnR`/`when write`) BEFORE `Internal error: Oops:`, and x86
 # `BUG()` prints `kernel BUG at file:line!` before its die header (#140).
-# The die header itself is matched by shape, `<what>: <hex> [#<n>]`, because
-# its wording is per trap: `int3: 0000 [#1]`, `invalid opcode: 0000 [#1]`,
-# `Internal error: Oops - BUG: ... [#1]` — `int3` matched nothing at all, so
-# a baked-in breakpoint's report fell through to its trailing panic line.
-CRASH_START_PATTERNS = [
-    re.compile(p, re.IGNORECASE)
-    for p in [
-        r"BUG: KASAN:",
-        r"BUG: KMSAN:",
-        r"BUG: KCSAN:",
-        r"BUG: kernel NULL pointer dereference",
-        r"BUG: unable to handle",
-        r"BUG: soft lockup",
-        r"Unable to handle kernel",
-        r"kernel BUG at",
-        r": [0-9a-f]+ \[#\d+\]",
-        r"UBSAN:",
-        r"WARNING: CPU:",
-        r"Oops:",
-        r"general protection fault",
-        r"kernel panic",
-        r"Kernel panic",
-        r"slab-use-after-free",
-        r"slab-out-of-bounds",
-        r"stack-out-of-bounds",
-        r"use-after-free in",
-        r"double-free or invalid-free",
-    ]
-]
+#
+# Each headline is the kernel's own text, in the kernel's own case, and
+# counts only where a printk message starts (`_at_message_start`). Matched
+# case-insensitively anywhere in a line, the list made console text a crash
+# (#219): a module named `oops` prints `oops: loading out-of-tree module
+# taints kernel.` right above its fault headline and headed its own report,
+# and a test writing `selftest: no kernel panic expected` (or `myapp: oops:`)
+# to /dev/kmsg flipped the guest to `crashed`. The soft-lockup headline
+# carries the watchdog's `pr_fmt` prefix (`watchdog: `, `NMI watchdog: `
+# before 4.15). No bare `Oops:`, and no bug-type words (`use-after-free
+# in`, `slab-out-of-bounds`): a real die header is matched by `_DIE_HEADER`
+# and a sanitizer report by its `BUG: KASAN:` line, so those added only
+# false positives.
+CRASH_HEADLINES = (
+    "BUG: KASAN:",
+    "BUG: KMSAN:",
+    "BUG: KCSAN:",
+    "BUG: kernel NULL pointer dereference",
+    "BUG: unable to handle",
+    "BUG: soft lockup",
+    "watchdog: BUG: soft lockup",
+    "NMI watchdog: BUG: soft lockup",
+    "Unable to handle kernel",
+    "kernel BUG at",
+    "UBSAN:",
+    "WARNING: CPU:",
+    "general protection fault",
+    "Kernel panic - not syncing",
+)
+
+# The die header, matched by shape, `<what>: <hex> [#<n>]`, because its
+# wording is per trap: `Oops: 0000 [#1]`, `int3: 0000 [#1]`, `invalid
+# opcode: 0000 [#1]`, `Internal error: Oops - BUG: ... [#1]` — `int3` matched
+# nothing at all, so a baked-in breakpoint's report fell through to its
+# trailing panic line. The kernel prints the code in lowercase hex.
+_DIE_HEADER = re.compile(r": [0-9a-f]+ \[#\d+\]")
+
+# What may precede a printk message on its console line: the printk
+# timestamp, the `CONFIG_PRINTK_CALLER` field, the newline-less getty prompt
+# the first message after boot lands behind (`localhost login: `), or a shell
+# prompt (`/ # `, `$ `) on a console without printk timestamps.
+_MESSAGE_LEAD = re.compile(r"(?:(?:\[\s*\d+\.\d+\]|\[\s*[CT]\d+\]|login:)\s*|[#$]\s+)$")
+# How far back from a headline `_at_message_start` looks. Every lead above
+# fits in it; looking back to the line start instead made the check linear
+# in the line per hit, so a guest writing one long newline-free line full of
+# headline words stalled every reader quadratically (220 KB: 13 s `status`).
+_LEAD_WINDOW = 64
+
+
+def _at_message_start(text: str, pos: int) -> bool:
+    """Whether `pos` in `text` is where a printk message begins.
+
+    Examines at most `_LEAD_WINDOW` characters before `pos`: the whole lead
+    when the line starts inside the window, else its tail.
+    """
+    floor = max(0, pos - _LEAD_WINDOW)
+    lead = text[max(floor, text.rfind("\n", floor, pos) + 1):pos]
+    return not lead.strip() or _MESSAGE_LEAD.search(lead) is not None
+
+
+def _headline_positions(text: str, headline: str) -> list[int]:
+    """Offsets in `text` where `headline` starts a printk message."""
+    positions: list[int] = []
+    pos = text.find(headline)
+    while pos >= 0:
+        if _at_message_start(text, pos):
+            positions.append(pos)
+        pos = text.find(headline, pos + 1)
+    return positions
+
+
+def _crash_start_positions(text: str) -> list[int]:
+    positions = [m.start() for m in _DIE_HEADER.finditer(text)]
+    for headline in CRASH_HEADLINES:
+        positions.extend(_headline_positions(text, headline))
+    return positions
 
 # The `=====...` rule KASAN/KMSAN/KCSAN (and pre-6.5 UBSAN) print above and
 # below every report, as the whole printk message. It is the only boundary
@@ -64,13 +111,10 @@ CRASH_END_PATTERNS = [
     ]
 ]
 
-# One alternation per list: the classifiers run on every line of a scan, and
+# One alternation: the classifier runs on every line of a scan, and
 # `extract_crash` walks a whole boot (megabytes on a chatty guest) for every
 # `status`/`list`/`wait`. Searching 21 patterns per line cost 1.1 s on a 3 MB
-# log; one search each is linear in the log and nothing else.
-_CRASH_START_RE = re.compile(
-    "|".join(p.pattern for p in CRASH_START_PATTERNS), re.IGNORECASE
-)
+# log; one search is linear in the log and nothing else.
 _CRASH_END_RE = re.compile("|".join(p.pattern for p in CRASH_END_PATTERNS))
 
 
@@ -79,7 +123,8 @@ _CRASH_END_RE = re.compile("|".join(p.pattern for p in CRASH_END_PATTERNS))
 # banner and a sanitizer report's closing rule. Every other end marker is a
 # hard boundary.
 _SOFT_END = re.compile(r"---\[ end trace|" + _REPORT_RULE)
-_FATAL_PANIC_START = re.compile(r"Kernel panic - not syncing", re.IGNORECASE)
+# A terminal panic's headline; like every headline, only at a message start.
+_FATAL_PANIC = "Kernel panic - not syncing"
 # The banner a panic prints once it is done (no `panic=N` reboot pending).
 _PANIC_END_BANNER = "---[ end Kernel panic"
 # The per-line text form of `_BOOT_BANNER` (below), for a walk over lines.
@@ -87,12 +132,12 @@ _BOOT_BANNER_LINE = re.compile(r"\[\s*\d+\.\d+\] Linux version \S+ \(")
 
 
 def _is_crash_start(line: str) -> bool:
-    # An end-trace banner (e.g. "---[ end Kernel panic ... ]---") contains the
-    # substring "Kernel panic" and would otherwise match a start pattern. Treat
-    # any end-marker line as END-only so it can never be mistaken for a start.
+    # An end-trace banner (e.g. "---[ end Kernel panic ... ]---") carries a
+    # headline's words. Treat any end-marker line as END-only so it can never
+    # be mistaken for a start.
     if _is_crash_end(line):
         return False
-    return _CRASH_START_RE.search(line) is not None
+    return bool(_crash_start_positions(line))
 
 
 def _is_crash_end(line: str) -> bool:
@@ -155,7 +200,7 @@ def _soft_end_links_to_fatal_panic(lines: list[str], end_index: int) -> bool:
         seen += 1
         if seen > _PANIC_CONTINUATION_WINDOW:
             return False
-        if _FATAL_PANIC_START.search(line) and not _is_crash_end(line):
+        if is_terminal_panic_start(line):
             return True
         if _is_crash_end(line):
             # Another end marker with no panic yet: this episode is over.
@@ -193,21 +238,24 @@ class SerialTail:
         self.offset = max(0, offset)
         self._partial = ""
 
-    def read_lines(self, *, missing_ok: bool = True) -> list[str]:
-        try:
-            with self.path.open("rb") as stream:
-                size = os.fstat(stream.fileno()).st_size
-                if self.offset > size:
-                    # Truncated or replaced underneath us — restart cleanly
-                    # rather than seeking past the end and reading nothing.
-                    self.offset = 0
-                    self._partial = ""
-                stream.seek(self.offset)
-                chunk = stream.read()
-        except FileNotFoundError:
-            if missing_ok:
-                return []
-            raise
+    def read_lines(self) -> list[str]:
+        """Complete lines appended since the last call.
+
+        A missing log raises (`FileNotFoundError`): every reader holds a
+        recorded VM, whose QEMU created the file before its record existed,
+        so a log that is not there was removed underneath it. Reading that as
+        "nothing new yet" made `wait --pattern` on a running VM burn its whole
+        timeout (124) on a log it could not see (#216).
+        """
+        with self.path.open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            if self.offset > size:
+                # Truncated or replaced underneath us — restart cleanly
+                # rather than seeking past the end and reading nothing.
+                self.offset = 0
+                self._partial = ""
+            stream.seek(self.offset)
+            chunk = stream.read()
 
         self.offset += len(chunk)
         if not chunk:
@@ -269,16 +317,18 @@ def scan_for_pattern(
 ) -> PatternScan:
     """Advance `tail` once and look for `matcher` and a terminal panic.
 
-    `final` is the pass after the process is known gone: the log must exist
-    (OSError propagates) and the withheld trailing fragment is released, since
-    the marker may be the last newline-less line QEMU wrote. On a non-final
-    tick where nothing arrived, the fragment is tested in place (never
-    consumed) so a prompt that waits for input can still match whole.
+    `final` is the pass after the process is known gone: the withheld
+    trailing fragment is released, since the marker may be the last
+    newline-less line QEMU wrote. On a non-final tick where nothing arrived,
+    the fragment is tested in place (never consumed) so a prompt that waits
+    for input can still match whole. A log that cannot be read raises
+    (OSError) on every tick, running VM or not: the caller's verdict is
+    then inconclusive, never a timeout or a no-match.
     `stop_at_panic` stops examining lines at a terminal panic start, as a wait
     without `--ignore-crash` does; with it False, a later line can still match.
     """
     read_from = tail.offset
-    lines = tail.read_lines(missing_ok=not final)
+    lines = tail.read_lines()
     if final:
         lines.extend(tail.flush())
     matched: str | None = None
@@ -330,8 +380,11 @@ def extract_crash(
     # Classify every line with whole-text passes instead of two regex
     # searches per line: on a 3 MB boot the per-line calls alone cost 0.5 s,
     # and `status`/`list`/`wait` each pay this walk once.
-    end_lines = _lines_matching(CRASH_END_PATTERNS, text)
-    start_lines = _lines_matching(CRASH_START_PATTERNS, text) - end_lines
+    end_positions: list[int] = []
+    for pattern in CRASH_END_PATTERNS:
+        end_positions.extend(_marker_positions(pattern, text))
+    end_lines = _lines_at(text, end_positions)
+    start_lines = _lines_at(text, _crash_start_positions(text)) - end_lines
 
     # A panic that printed its own `---[ end Kernel panic` banner is the end
     # of that kernel: what it prints right afterwards is panic-path noise,
@@ -499,35 +552,24 @@ def _last_event(
 _REGEX_META = frozenset("\\[](){}.*+?^$|")
 
 
-def _marker_positions(pattern: re.Pattern[str], text: str, lowered: str) -> list[int]:
+def _marker_positions(pattern: re.Pattern[str], text: str) -> list[int]:
     """Start offsets of every hit of one marker pattern in `text`.
 
-    A marker is a literal (`BUG: KASAN:`) far more often than a regex; for
-    those `str.find` on a lowercased copy is the same case-insensitive test
-    at memchr speed, where a 17-way IGNORECASE alternation ran at ~10 MB/s.
+    A literal marker (`Kernel Offset:`) is found with `str.find`, at memchr
+    speed; only a real regex pays for `finditer`.
     """
-    if (
-        any(ch in _REGEX_META for ch in pattern.pattern)
-        # A lowercase form that changed length would desync the offsets.
-        or len(lowered) != len(text)
-    ):
+    if any(ch in _REGEX_META for ch in pattern.pattern):
         return [m.start() for m in pattern.finditer(text)]
-    haystack = lowered if pattern.flags & re.IGNORECASE else text
-    needle = pattern.pattern.lower() if pattern.flags & re.IGNORECASE else pattern.pattern
     positions: list[int] = []
-    pos = haystack.find(needle)
+    pos = text.find(pattern.pattern)
     while pos >= 0:
         positions.append(pos)
-        pos = haystack.find(needle, pos + 1)
+        pos = text.find(pattern.pattern, pos + 1)
     return positions
 
 
-def _lines_matching(patterns: list[re.Pattern[str]], text: str) -> set[int]:
-    """Indices (in `text.splitlines()` numbering) of the lines any pattern hits."""
-    lowered = text.lower()
-    positions: list[int] = []
-    for pattern in patterns:
-        positions.extend(_marker_positions(pattern, text, lowered))
+def _lines_at(text: str, positions: list[int]) -> set[int]:
+    """Indices (in `text.splitlines()` numbering) of the lines holding `positions`."""
     hits: set[int] = set()
     if not positions:
         return hits
@@ -540,13 +582,21 @@ def _lines_matching(patterns: list[re.Pattern[str]], text: str) -> set[int]:
 
 
 def _text_has_terminal_panic(text: str) -> bool:
-    """A `Kernel panic - not syncing` line that is not itself an end banner."""
-    for match in _FATAL_PANIC_START.finditer(text):
-        line_start = text.rfind("\n", 0, match.start()) + 1
-        line_end = text.find("\n", match.end())
+    """A `Kernel panic - not syncing` line that is not itself an end banner.
+
+    Each line is judged once, however many headlines it holds, so the scan
+    stays linear in the text.
+    """
+    judged_to = -1
+    for pos in _headline_positions(text, _FATAL_PANIC):
+        if pos < judged_to:
+            continue  # same line as a hit already judged an end line
+        line_start = text.rfind("\n", 0, pos) + 1
+        line_end = text.find("\n", pos)
         line = text[line_start:] if line_end < 0 else text[line_start:line_end]
         if not _is_crash_end(line):
             return True
+        judged_to = len(text) if line_end < 0 else line_end
     return False
 
 
@@ -790,7 +840,7 @@ def current_boot_offset(log_path: str | Path, epoch_offset: int | None) -> int:
 
 def is_terminal_panic_start(line: str) -> bool:
     """Match a terminal panic start, not a prior report's end banner."""
-    return bool(_FATAL_PANIC_START.search(line)) and not _is_crash_end(line)
+    return bool(_headline_positions(line, _FATAL_PANIC)) and not _is_crash_end(line)
 
 
 def has_terminal_panic(log_path: str | Path, *, start_offset: int = 0) -> bool:
